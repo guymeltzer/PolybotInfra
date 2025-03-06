@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-init
+spec:
+  template:
+    spec:
+      containers:
+        - name: mongodb-init
+          image: mongo:5
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              echo "Waiting for MongoDB to be ready..."
+              until mongo --host mongodb-0.mongodb --eval "print('waited for connection')" &>/dev/null
+              do
+                echo "Retrying connection to MongoDB..."
+                sleep 5
+              done
+              echo "MongoDB is ready. Initializing replica set..."
+              mongo --host mongodb-0.mongodb --eval '
+                rs.initiate({
+                  _id: "rs0",
+                  members: [
+                    {_id: 0, host: "mongodb-0.mongodb:27017"},
+                    {_id: 1, host: "mongodb-1.mongodb:27017"},
+                    {_id: 2, host: "mongodb-2.mongodb:27017"}
+                  ]
+                })
+              '
+              echo "Replica set initialization completed."
+      restartPolicy: OnFailure
