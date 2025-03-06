@@ -2,6 +2,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: mongodb-init
+  namespace: mongodb
 spec:
   template:
     spec:
