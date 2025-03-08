@@ -12,18 +12,18 @@ metadata:
 spec:
   clusterIP: 10.97.15.96
   clusterIPs:
-  - 10.97.15.96
+    - 10.97.15.96
   externalTrafficPolicy: Cluster
   internalTrafficPolicy: Cluster
   ipFamilies:
-  - IPv4
+    - IPv4
   ipFamilyPolicy: SingleStack
   ports:
-  - name: https-port
-    nodePort: 30619
-    port: 30619
-    protocol: TCP
-    targetPort: 30619
+    - name: https-port
+      nodePort: 30619
+      port: 30619
+      protocol: TCP
+      targetPort: 30619
   selector:
     app: polybot
   sessionAffinity: None
