@@ -39,29 +39,9 @@ spec:
                   key: token
             - name: MONGODB_URI
               value: "mongodb://mongodb-0.mongodb:27017,mongodb-1.mongodb:27017,mongodb-2.mongodb:27017/?replicaSet=rs0"
-            - name: SQS_QUEUE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: SQS_QUEUE_URL
-            - name: S3_BUCKET_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: S3_BUCKET_NAME
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: AWS_SECRET_ACCESS_KEY
             - name: TELEGRAM_APP_URL
               valueFrom:
                 secretKeyRef:
                   name: telegram-app-url-secret
                   key: TELEGRAM_APP_URL
-            # Remove YOLOV5_URL as it's not needed
+            # AWS Secrets Manager will be used in the application code

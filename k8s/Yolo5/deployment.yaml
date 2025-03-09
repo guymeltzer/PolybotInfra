@@ -45,13 +45,4 @@ spec:
               value: "image_collection"
             - name: POLYBOT_URL
               value: "http://polybot-service:30619/results"
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: AWS_ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: aws-secrets
-                  key: AWS_SECRET_ACCESS_KEY
+            # AWS Secrets Manager will be used in the application code for AWS credentials
