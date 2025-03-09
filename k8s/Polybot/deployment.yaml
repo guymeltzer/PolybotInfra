@@ -64,6 +64,4 @@ spec:
                 secretKeyRef:
                   name: telegram-app-url-secret
                   key: TELEGRAM_APP_URL
-            # Add YOLOv5 URL for communication with yolo5-service.
-            - name: YOLOV5_URL
-              value: "http://yolo5-service:5000"
+            # Remove YOLOV5_URL as it's not needed
