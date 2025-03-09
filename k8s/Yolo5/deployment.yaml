@@ -40,9 +40,9 @@ spec:
             - name: MONGO_URI
               value: "mongodb://mongo1:27017,mongo2:27017,mongo3:27017"
             - name: MONGO_DB
-              value: "default_db"
+              value: "config"
             - name: MONGO_COLLECTION
-              value: "predictions"
+              value: "image_collection"
             - name: POLYBOT_URL
               value: "http://polybot-service:30619/results"
             - name: AWS_ACCESS_KEY_ID
