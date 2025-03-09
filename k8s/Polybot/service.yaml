@@ -3,12 +3,9 @@ kind: Service
 metadata:
   annotations:
     kubectl.kubernetes.io/last-applied-configuration: |
-      {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"polybot-service","namespace":"default"},"spec":{"ports":[{"name":"https-port","nodePort":30619,"port":30619,"protocol":"TCP","targetPort":30619}],"selector":{"app":"polybot"},"type":"NodePort"}}
-  creationTimestamp: "2025-03-08T15:04:20Z"
+      {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"name":"polybot-service","namespace":"default","spec":{"clusterIP":"10.97.15.96","clusterIPs":["10.97.15.96"],"externalTrafficPolicy":"Cluster","internalTrafficPolicy":"Cluster","ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","ports":[{"name":"https-port","nodePort":30619,"port":30619,"protocol":"TCP","targetPort":30619}],"selector":{"app":"polybot"},"sessionAffinity":"None","type":"NodePort"},"status":{"loadBalancer":{}}}
   name: polybot-service
   namespace: default
-  resourceVersion: "241778"
-  uid: 0ed2dba7-26dc-40cb-bf30-4171c311057d
 spec:
   clusterIP: 10.97.15.96
   clusterIPs:
@@ -28,5 +25,3 @@ spec:
     app: polybot
   sessionAffinity: None
   type: NodePort
-status:
-  loadBalancer: {}
