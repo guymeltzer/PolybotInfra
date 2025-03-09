@@ -6,7 +6,7 @@ tolerations:
     key: node.cloudprovider.kubernetes.io/uninitialized
     value: "true"
 
-
+#
 affinity:
   nodeAffinity:
     requiredDuringSchedulingIgnoredDuringExecution:
