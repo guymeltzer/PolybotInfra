@@ -5,11 +5,12 @@ metadata:
     alb.ingress.kubernetes.io/subnets: subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000
     alb.ingress.kubernetes.io/target-type: instance
     kubectl.kubernetes.io/last-applied-configuration: |
-      {"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"annotations":{"alb.ingress.kubernetes.io/subnets":"subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000","alb.ingress.kubernetes.io/target-type":"instance","kubernetes.io/ingress.class":"alb"},"name":"polybot-ingress","namespace":"default","spec":{"rules":[{"host":"guy-polybot-lg.devops-int-college.com","http":{"paths":[{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/","pathType":"Prefix"},{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/health","pathType":"Prefix"}]}}],"tls":[{"hosts":["guy-polybot-lg.devops-int-college.com"],"secretName":"polybot-tls"}]}}
+      {"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"annotations":{"alb.ingress.kubernetes.io/subnets":"subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000","alb.ingress.kubernetes.io/target-type":"instance","kubernetes.io/ingress.class":"alb"},"finalizers":["ingress.k8s.aws/resources"],"labels":{"app.kubernetes.io/instance":"polybot-app"},"name":"polybot-ingress","namespace":"default"},"spec":{"rules":[{"host":"guy-polybot-lg.devops-int-college.com","http":{"paths":[{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/","pathType":"Prefix"},{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/health","pathType":"Prefix"}]}}],"tls":[{"hosts":["guy-polybot-lg.devops-int-college.com"],"secretName":"polybot-tls"}]}}
     kubernetes.io/ingress.class: alb
   finalizers:
     - ingress.k8s.aws/resources
-  generation: 1
+  labels:
+    app.kubernetes.io/instance: polybot-app
   name: polybot-ingress
   namespace: default
 spec:
