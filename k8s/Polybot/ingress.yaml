@@ -1,44 +1,44 @@
-  apiVersion: networking.k8s.io/v1
-  kind: Ingress
-  metadata:
-    annotations:
-      alb.ingress.kubernetes.io/subnets: subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000
-      alb.ingress.kubernetes.io/target-type: instance
-      kubectl.kubernetes.io/last-applied-configuration: |
-        {"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"annotations":{"alb.ingress.kubernetes.io/subnets":"subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000","alb.ingress.kubernetes.io/target-type":"instance","kubernetes.io/ingress.class":"alb"},"name":"polybot-ingress","namespace":"default"},"spec":{"rules":[{"host":"guy-polybot-lg.devops-int-college.com","http":{"paths":[{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/","pathType":"Prefix"},{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/health","pathType":"Prefix"}]}}],"tls":[{"hosts":["guy-polybot-lg.devops-int-college.com"],"secretName":"polybot-tls"}]}}
-      kubernetes.io/ingress.class: alb
-    creationTimestamp: "2025-03-08T15:01:38Z"
-    finalizers:
-      - ingress.k8s.aws/resources
-    generation: 1
-    name: polybot-ingress
-    namespace: default
-    resourceVersion: "241161"
-    uid: fd2eb2f9-ea09-409d-8b3c-c9dd910a6365
-  spec:
-    rules:
-      - host: guy-polybot-lg.devops-int-college.com
-        http:
-          paths:
-            - backend:
-                service:
-                  name: polybot-service
-                  port:
-                    number: 30619
-              path: /
-              pathType: Prefix
-            - backend:
-                service:
-                  name: polybot-service
-                  port:
-                    number: 30619
-              path: /health
-              pathType: Prefix
-    tls:
-      - hosts:
-          - guy-polybot-lg.devops-int-college.com
-        secretName: polybot-tls
-  status:
-    loadBalancer:
-      ingress:
-        - hostname: internal-k8s-default-polyboti-ff83db9b45-2015656951.eu-north-1.elb.amazonaws.com
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/subnets: subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000
+    alb.ingress.kubernetes.io/target-type: instance
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"networking.k8s.io/v1","kind":"Ingress","metadata":{"annotations":{"alb.ingress.kubernetes.io/subnets":"subnet-0ed67db09e8253867,subnet-0e3a0dc40687f7000","alb.ingress.kubernetes.io/target-type":"instance","kubernetes.io/ingress.class":"alb"},"name":"polybot-ingress","namespace":"default"},"spec":{"rules":[{"host":"guy-polybot-lg.devops-int-college.com","http":{"paths":[{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/","pathType":"Prefix"},{"backend":{"service":{"name":"polybot-service","port":{"number":30619}}},"path":"/health","pathType":"Prefix"}]}}],"tls":[{"hosts":["guy-polybot-lg.devops-int-college.com"],"secretName":"polybot-tls"}]}}
+    kubernetes.io/ingress.class: alb
+  creationTimestamp: "2025-03-08T15:01:38Z"
+  finalizers:
+    - ingress.k8s.aws/resources
+  generation: 1
+  name: polybot-ingress
+  namespace: default
+  resourceVersion: "241161"
+  uid: fd2eb2f9-ea09-409d-8b3c-c9dd910a6365
+spec:
+  rules:
+    - host: guy-polybot-lg.devops-int-college.com
+      http:
+        paths:
+          - backend:
+              service:
+                name: polybot-service
+                port:
+                  number: 30619
+            path: /
+            pathType: Prefix
+          - backend:
+              service:
+                name: polybot-service
+                port:
+                  number: 30619
+            path: /health
+            pathType: Prefix
+  tls:
+    - hosts:
+        - guy-polybot-lg.devops-int-college.com
+      secretName: polybot-tls
+status:
+  loadBalancer:
+    ingress:
+      - hostname: internal-k8s-default-polyboti-ff83db9b45-2015656951.eu-north-1.elb.amazonaws.com
