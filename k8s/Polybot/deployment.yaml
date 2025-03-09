@@ -24,7 +24,7 @@ spec:
             secretName: polybot-tls
       containers:
         - name: polybot
-          image: guymeltzer/polybot:1.0.46
+          image: guymeltzer/polybot:1.0.84
           ports:
             - containerPort: 30619
           volumeMounts:
@@ -64,3 +64,6 @@ spec:
                 secretKeyRef:
                   name: telegram-app-url-secret
                   key: TELEGRAM_APP_URL
+            # Add YOLOv5 URL for communication with yolo5-service.
+            - name: YOLOV5_URL
+              value: "http://yolo5-service:5000"

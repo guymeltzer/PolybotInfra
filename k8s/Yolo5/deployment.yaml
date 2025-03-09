@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yolo5
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yolo5
+  template:
+    metadata:
+      labels:
+        app: yolo5
+    spec:
+      imagePullSecrets:
+        - name: regcred
+      containers:
+        - name: yolo5
+          image: guymeltzer/yolo5:1.0.40
+          ports:
+            - containerPort: 5000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          env:
+            - name: S3_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: aws-secrets
+                  key: S3_BUCKET_NAME
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aws-secrets
+                  key: SQS_QUEUE_URL
+            - name: MONGO_URI
+              value: "mongodb://mongo1:27017,mongo2:27017,mongo3:27017"
+            - name: MONGO_DB
+              value: "default_db"
+            - name: MONGO_COLLECTION
+              value: "predictions"
+            - name: POLYBOT_URL
+              value: "http://polybot-service:30619/results"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-secrets
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-secrets
+                  key: AWS_SECRET_ACCESS_KEY

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: yolo5-service
+spec:
+  selector:
+    app: yolo5
+  ports:
+    - name: http-port
+      port: 5000
+      targetPort: 5000
+  type: ClusterIP  # Instead of NodePort, but may not be needed at all
