@@ -43,10 +43,7 @@ spec:
                   name: polybot-secrets
                   key: MONGO_URI
             - name: MONGO_DB
-              valueFrom:
-                secretKeyRef:
-                  name: polybot-secrets
-                  key: MONGO_DB
+              value: "mongodb://mongodb-0.mongodb.mongodb.svc.cluster.local:27017,mongodb-1.mongodb.mongodb.svc.cluster.local:27017,mongodb-2.mongodb.mongodb.svc.cluster.local:27017/"
             - name: MONGO_COLLECTION
               valueFrom:
                 secretKeyRef:
