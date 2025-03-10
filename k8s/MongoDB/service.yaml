@@ -8,6 +8,5 @@ spec:
   ports:
     - port: 27017
       targetPort: 27017
-      nodePort: 30017  # You can specify any available port within the 30000-32767 range
-  type: NodePort  # Change this to NodePort
+  type: LoadBalancer  # Change this to LoadBalancer
   clusterIP: None
