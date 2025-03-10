@@ -8,5 +8,4 @@ spec:
   ports:
     - port: 27017
       targetPort: 27017
-  type: LoadBalancer  # Change this to LoadBalancer
-  clusterIP: None
+  clusterIP: None  # Headless service for StatefulSet
