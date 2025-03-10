@@ -30,19 +30,28 @@ spec:
             - name: S3_BUCKET_NAME
               valueFrom:
                 secretKeyRef:
-                  name: aws-secrets
+                  name: polybot-secrets
                   key: S3_BUCKET_NAME
             - name: SQS_QUEUE_URL
               valueFrom:
                 secretKeyRef:
-                  name: aws-secrets
+                  name: polybot-secrets
                   key: SQS_QUEUE_URL
             - name: MONGO_URI
-              value: "mongodb://mongo1:27017,mongo2:27017,mongo3:27017"
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: MONGO_URI
             - name: MONGO_DB
-              value: "config"
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: MONGO_DB
             - name: MONGO_COLLECTION
-              value: "image_collection"
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: MONGO_COLLECTION
             - name: POLYBOT_URL
               value: "http://polybot-service:30619/results"
             # AWS Secrets Manager will be used in the application code for AWS credentials
