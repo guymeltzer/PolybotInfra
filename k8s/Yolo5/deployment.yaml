@@ -38,7 +38,7 @@ spec:
                   name: polybot-secrets
                   key: SQS_QUEUE_URL
             - name: MONGO_URI
-              value: "mongodb://mongodb-0.mongodb.mongodb.svc.cluster.local:27017,mongodb-1.mongodb.mongodb.svc.cluster.local:27017,mongodb-2.mongodb.mongodb.svc.cluster.local:27017/?replicaSet=rs0"
+              value: "mongodb://mongodb-0.mongodb:27017,mongodb-1.mongodb:27017,mongodb-2.mongodb:27017/?replicaSet=rs0"
             - name: MONGO_DB
               value: "config"
             - name: MONGO_COLLECTION
