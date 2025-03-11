@@ -43,9 +43,15 @@ spec:
                   name: polybot-secrets
                   key: MONGO_URI
             - name: MONGO_DB
-              value: "config"
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: MONGO_DB
             - name: MONGO_COLLECTION
-              value: "image_collection"
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: MONGO_COLLECTION
             - name: POLYBOT_URL
               value: "http://polybot-service:30619/results"
             # AWS Secrets Manager will be used in the application code for AWS credentials
