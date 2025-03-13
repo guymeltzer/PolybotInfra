@@ -14,6 +14,10 @@ spec:
     spec:
       imagePullSecrets:
         - name: regcred
+      volumes:
+        - name: polybot-certs
+          secret:
+            secretName: polybot-tls  # Same secret as Polybot
       containers:
         - name: yolo5
           image: guymeltzer/yolo5:1.0.86
@@ -26,6 +30,10 @@ spec:
             limits:
               cpu: "200m"
               memory: "256Mi"
+          volumeMounts:
+            - name: polybot-certs
+              mountPath: "/app/certs"
+              readOnly: true
           env:
             - name: S3_BUCKET_NAME
               valueFrom:
