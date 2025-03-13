@@ -52,8 +52,8 @@ spec:
                 secretKeyRef:
                   name: polybot-secrets
                   key: MONGO_COLLECTION
-            #- name: POLYBOT_URL
-            #  value: "http://polybot-service:30619/results"
+            - name: POLYBOT_URL
+              value: "http://polybot-service:30619/results"
             - name: TELEGRAM_APP_URL
               valueFrom:
                 secretKeyRef:
