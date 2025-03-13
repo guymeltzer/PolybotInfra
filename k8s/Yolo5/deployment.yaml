@@ -20,7 +20,7 @@ spec:
             secretName: polybot-tls  # Same secret as Polybot
       containers:
         - name: yolo5
-          image: guymeltzer/yolo5:1.0.86
+          image: guymeltzer/yolo5:1.0.87
           ports:
             - containerPort: 5000
           resources:
