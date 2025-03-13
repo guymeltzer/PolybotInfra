@@ -17,7 +17,10 @@ spec:
       volumes:
         - name: polybot-certs
           secret:
-            secretName: polybot-tls  # Same secret as Polybot
+            secretName: polybot-tls
+        - name: polybot-ca
+          secret:
+            secretName: polybot-ca
       containers:
         - name: yolo5
           image: guymeltzer/yolo5:1.0.88
@@ -33,6 +36,9 @@ spec:
           volumeMounts:
             - name: polybot-certs
               mountPath: "/app/certs"
+              readOnly: true
+            - name: polybot-ca
+              mountPath: "/app/ca"
               readOnly: true
           env:
             - name: S3_BUCKET_NAME
