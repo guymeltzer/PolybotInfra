@@ -16,7 +16,7 @@ spec:
         - name: regcred
       containers:
         - name: yolo5
-          image: guymeltzer/yolo5:1.0.71
+          image: guymeltzer/yolo5:1.0.72
           ports:
             - containerPort: 5000
           resources:
