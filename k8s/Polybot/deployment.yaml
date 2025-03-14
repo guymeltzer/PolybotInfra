@@ -24,7 +24,7 @@ spec:
             secretName: polybot-tls
       containers:
         - name: polybot
-          image: guymeltzer/polybot:1.0.117
+          image: guymeltzer/polybot:1.0.118
           ports:
             - containerPort: 30619
           volumeMounts:
