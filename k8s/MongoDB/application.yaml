@@ -8,7 +8,7 @@ spec:
   project: default  # Added for clarity, optional if default project is fine
   source:
     repoURL: https://github.com/guymeltzer/PolybotInfra.git
-    path: mongodb
+    path: k8s/mongodb
   destination:
     server: https://kubernetes.default.svc
     namespace: mongodb
