@@ -15,7 +15,7 @@ spec:
           value: polybot-cluster
         - name: awsRegion
           value: eu-north-1
-        - name: cloud-provider
+        - name: cloudProvider
           value: aws
         - name: extraArgs.skip-nodes-with-local-storage
           value: "false"
@@ -25,12 +25,12 @@ spec:
           value: "0.5"
         - name: extraArgs.max-node-provision-time
           value: 15m
-destination:
-  server: https://kubernetes.default.svc
-  namespace: kube-system
-syncPolicy:
-  automated:
-    prune: true
-    selfHeal: true
-  syncOptions:
-    - CreateNamespace=true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
