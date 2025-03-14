@@ -1,11 +1,11 @@
 # PolybotInfra/mongodb/application.yaml
-apiVersion: argoproj.io/v1alpha1  # Changed from argocd.argoproj.io/v1alpha1
+apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: mongodb
-  namespace: argocd  # Added to ensure it’s created in the argocd namespace
+  namespace: argocd
 spec:
-  project: default  # Added for clarity, optional if default project is fine
+  project: default
   source:
     repoURL: https://github.com/guymeltzer/PolybotInfra.git
     path: k8s/mongodb
