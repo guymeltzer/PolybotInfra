@@ -3,8 +3,8 @@ kind: StatefulSet
 metadata:
   name: mongodb
   namespace: mongodb
-  annotations:
-    argocd.argoproj.io/sync-wave: "2"
+  #annotations:
+    #rgocd.argoproj.io/sync-wave: "2"
 spec:
   serviceName: "mongodb"
   replicas: 3
