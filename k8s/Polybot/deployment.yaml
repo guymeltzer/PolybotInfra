@@ -31,18 +31,3 @@ spec:
             - name: polybot-certs
               mountPath: "/app/certs"
               readOnly: true
-          env:
-            - name: TELEGRAM_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: telegram-secret
-                  key: token
-            - name: MONGO_URI
-              value: "mongodb://mongodb-0.mongodb.mongodb.svc.cluster.local:27017,mongodb-1.mongodb.mongodb.svc.cluster.local:27017,mongodb-2.mongodb.mongodb.svc.cluster.local:27017/?replicaSet=rs0"
-
-            - name: TELEGRAM_APP_URL
-              valueFrom:
-                secretKeyRef:
-                  name: telegram-app-url-secret
-                  key: TELEGRAM_APP_URL
-            # AWS Secrets Manager will be used in the application code
