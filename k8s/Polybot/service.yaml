@@ -25,4 +25,4 @@ spec:
   selector:
     app: polybot
   sessionAffinity: None
-  type: ClusterIP
+  type: LoadBalancer
