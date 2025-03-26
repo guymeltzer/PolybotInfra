@@ -3,8 +3,6 @@ kind: Job
 metadata:
   name: mongodb-init
   namespace: mongodb
-  #annotations:
-    #argocd.argoproj.io/sync-wave: "3"
 spec:
   template:
     spec:
@@ -16,22 +14,36 @@ spec:
             - -c
             - |
               set -e
-              echo "Waiting for MongoDB to be ready..."
-              until mongo --host mongodb-0.mongodb --eval "print('waited for connection')" &>/dev/null
-              do
-                echo "Retrying connection to MongoDB..."
-                sleep 5
+              echo "Waiting for all MongoDB pods to be ready..."
+              for host in mongodb-0.mongodb.mongodb.svc.cluster.local mongodb-1.mongodb.mongodb.svc.cluster.local mongodb-2.mongodb.mongodb.svc.cluster.local; do
+                for i in {1..30}; do
+                  if mongo --host "$host" --eval "db.runCommand({ping: 1})" &>/dev/null; then
+                    echo "$host is ready"
+                    break
+                  fi
+                  echo "Retrying connection to $host... ($i/30)"
+                  sleep 5
+                  if [ $i -eq 30 ]; then
+                    echo "Timeout waiting for $host"
+                    exit 1
+                  fi
+                done
               done
-              echo "MongoDB is ready. Initializing replica set..."
-              mongo --host mongodb-0.mongodb --eval '
-                rs.initiate({
+              echo "All MongoDB pods are ready. Initializing replica set..."
+              mongo --host mongodb-0.mongodb.mongodb.svc.cluster.local --eval '
+                var result = rs.initiate({
                   _id: "rs0",
                   members: [
                     {_id: 0, host: "mongodb-0.mongodb.mongodb.svc.cluster.local:27017"},
                     {_id: 1, host: "mongodb-1.mongodb.mongodb.svc.cluster.local:27017"},
                     {_id: 2, host: "mongodb-2.mongodb.mongodb.svc.cluster.local:27017"}
                   ]
-                })
+                });
+                if (result.ok !== 1) {
+                  print("Initialization failed: " + result.errmsg);
+                  exit(1);
+                }
+                print("Replica set initialized successfully");
               '
               echo "Replica set initialization completed."
       restartPolicy: OnFailure
