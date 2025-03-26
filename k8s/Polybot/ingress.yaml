@@ -3,7 +3,7 @@ kind: Ingress
 metadata:
   name: polybot-ingress
 spec:
-  ingressClassName: nginx
+  ingressClassName: "nginx"
   rules:
     - host: guy-polybot-lg.devops-int-college.com
       http:
