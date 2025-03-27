@@ -12,8 +12,6 @@ spec:
       labels:
         app: yolo5
     spec:
-      imagePullSecrets:
-        - name: regcred
       volumes:
         - name: polybot-certs
           secret:
