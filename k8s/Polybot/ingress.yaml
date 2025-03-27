@@ -2,8 +2,15 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: polybot-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"  # Redirect HTTP to HTTPS
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"  # Force all traffic to HTTPS
 spec:
   ingressClassName: "nginx"
+  tls:
+    - hosts:
+        - guy-polybot-lg.devops-int-college.com
+      secretName: polybot-tls  # Replace with your actual TLS secret name
   rules:
     - host: guy-polybot-lg.devops-int-college.com
       http:
@@ -14,11 +21,11 @@ spec:
               service:
                 name: polybot-service
                 port:
-                  number: 31024  # Port of the Polybot service
+                  number: 31024
           - path: /health
             pathType: Prefix
             backend:
               service:
                 name: polybot-service
                 port:
-                  number: 31024  # Port of the Polybot service
+                  number: 31024
