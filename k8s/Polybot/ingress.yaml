@@ -14,11 +14,11 @@ spec:
               service:
                 name: polybot-service
                 port:
-                  number: 30619
+                  number: 31024  # Port of the Polybot service
           - path: /health
             pathType: Prefix
             backend:
               service:
                 name: polybot-service
                 port:
-                  number: 30619
+                  number: 31024  # Port of the Polybot service
