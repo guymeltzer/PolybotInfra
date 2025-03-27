@@ -24,7 +24,7 @@ spec:
         - name: polybot
           image: guymeltzer/polybot:1.0.130
           ports:
-            - containerPort: 30619
+            - containerPort: 31024
           volumeMounts:
             - name: polybot-certs
               mountPath: "/app/certs"
