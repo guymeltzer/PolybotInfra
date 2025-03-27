@@ -6,8 +6,8 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 31024
-      targetPort: 31024
+    - port: 31024       # Service port exposed in the cluster
+      targetPort: 31024 # Port on the pod
       protocol: TCP
   selector:
     app: polybot
