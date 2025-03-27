@@ -1,28 +1,19 @@
-apiVersion: v1
-kind: Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
-  annotations:
-    kubectl.kubernetes.io/last-applied-configuration: |
-      {"apiVersion":"v1","kind":"Service","metadata":{"annotations":{},"labels":{"app.kubernetes.io/instance":"polybot-app"},"name":"polybot-service","namespace":"default"},"spec":{"clusterIP":"10.97.15.96","clusterIPs":["10.97.15.96"],"externalTrafficPolicy":"Cluster","internalTrafficPolicy":"Cluster","ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","ports":[{"name":"https-port","port":30619,"protocol":"TCP","targetPort":30619}],"selector":{"app":"polybot"},"sessionAffinity":"None","type":"ClusterIP"}}
-  labels:
-    app.kubernetes.io/instance: polybot-app
-  name: polybot-service
+  name: polybot-ingress
   namespace: default
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
-  clusterIP: 10.97.15.96
-  clusterIPs:
-    - 10.97.15.96
-  externalTrafficPolicy: Cluster
-  internalTrafficPolicy: Cluster
-  ipFamilies:
-    - IPv4
-  ipFamilyPolicy: SingleStack
-  ports:
-    - name: https-port
-      port: 30619
-      protocol: TCP
-      targetPort: 30619
-  selector:
-    app: polybot
-  sessionAffinity: None
-  type: LoadBalancer
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: polybot-service
+                port:
+                  number: 30619
