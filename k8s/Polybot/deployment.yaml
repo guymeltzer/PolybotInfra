@@ -13,7 +13,7 @@ spec:
         app: polybot
     spec:
       tolerations:
-        - key: "node-role.kubernetes.io/control-plane"
+        - key: "node-role.kubernetes.io/master"
           operator: "Exists"
           effect: "NoSchedule"
       volumes:
