@@ -6,8 +6,8 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 30619
-      targetPort: 30619
+    - port: 31024
+      targetPort: 31024
       protocol: TCP
   selector:
     app: polybot
