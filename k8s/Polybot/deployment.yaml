@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: polybot
+  namespace: prod
 spec:
   replicas: 1
   selector:
@@ -24,8 +25,26 @@ spec:
         - name: polybot
           image: guymeltzer/polybot:1.0.131
           ports:
-            - containerPort: 31024
+            - containerPort: 30619
+          env:
+            - name: TELEGRAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: telegram_token
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: polybot-config
+                  key: sqs_queue_url
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: polybot-config
+                  key: s3_bucket
           volumeMounts:
             - name: polybot-certs
               mountPath: "/app/certs"
               readOnly: true
+      imagePullSecrets:
+        - name: docker-registry-credentials

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: polybot-config
+  namespace: prod
+data:
+  sqs_queue_url: "https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/guy-polybot-queue-prod"
+  s3_bucket: "guy-polybot-bucket-prod-${AWS_REGION}" 

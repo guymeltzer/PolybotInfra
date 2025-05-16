@@ -1,0 +1,23 @@
+name: Infra Provisioning
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region to deploy'
+        required: true
+        default: 'us-east-1'
+        type: choice
+        options:
+          - us-east-1
+          - eu-central-1
+
+jobs:
+  call-region-workflow:
+    uses: ./.github/workflows/infra-provisioning-region.yaml
+    with:
+      region: ${{ github.event.inputs.region }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TELEGRAM_TOKEN_DEV: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+      TELEGRAM_TOKEN_PROD: ${{ secrets.TELEGRAM_TOKEN_PROD }}

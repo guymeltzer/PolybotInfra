@@ -4,11 +4,31 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.23"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.11"
+    }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.9"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.4"
+    }
   }
   backend "s3" {
     bucket         = "polybot-tfstate-bucket"
     key            = "polybot/terraform.tfstate"
     region         = "us-east-1"
   }
-    required_version = ">= 1.7.0"
+  required_version = ">= 1.7.0"
 }

@@ -1,0 +1,73 @@
+name: Provision Infra Region
+on:
+  workflow_call:
+    inputs:
+      region:
+        description: 'Region to deploy'
+        required: true
+        type: string
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      TELEGRAM_TOKEN_DEV:
+        required: true
+      TELEGRAM_TOKEN_PROD:
+        required: true
+
+jobs:
+  provision-region:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./tf
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Workspace
+        run: terraform workspace select ${{ inputs.region }} || terraform workspace new ${{ inputs.region }}
+
+      - name: Terraform Plan
+        env:
+          TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+          TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+        run: terraform plan -var-file="region.${{ inputs.region }}.tfvars" -out=tfplan
+        id: plan
+
+      - name: Terraform Apply
+        env:
+          TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+          TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+        run: terraform apply -auto-approve tfplan
+        
+      - name: Extract Kubernetes Info
+        run: |
+          echo "Getting kubeconfig from control plane instance..."
+          CONTROL_PLANE_IP=$(terraform output -raw kubernetes_api_server_endpoint)
+          mkdir -p ~/.kube
+          aws s3 cp s3://polybot-tfstate-bucket/kubeconfig/config ~/.kube/config || echo "Kubeconfig not available in S3"
+          
+          echo "ArgoCD server URL: $(terraform output -raw argocd_url)"
+          echo "ArgoCD applications deployed: $(terraform output -raw argocd_applications)"
+          
+      - name: Check Application Status
+        run: |
+          kubectl get applications -n argocd
+          kubectl get deployments -n default 

@@ -1,0 +1,64 @@
+name: Destroy Infrastructure
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region to destroy'
+        required: true
+        default: 'us-east-1'
+        type: choice
+        options:
+          - us-east-1
+          - eu-central-1
+      confirmation:
+        description: 'Type "destroy" to confirm destruction'
+        required: true
+        type: string
+
+jobs:
+  terraform-destroy:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirmation == 'destroy'
+    defaults:
+      run:
+        working-directory: ./tf
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Workspace
+        run: terraform workspace select ${{ github.event.inputs.region }}
+
+      - name: Terraform Destroy Plan
+        env:
+          TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+          TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+        run: terraform plan -destroy -var-file="region.${{ github.event.inputs.region }}.tfvars" -out=tfdestroyplan
+        id: destroy-plan
+
+      - name: Terraform Destroy
+        env:
+          TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+          TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+        run: terraform apply -auto-approve tfdestroyplan
+      
+      - name: Cleanup Local Workspace
+        run: |
+          echo "Cleaning up workspace for ${{ github.event.inputs.region }}"
+          terraform workspace select default || echo "Default workspace not found"
+          terraform workspace delete ${{ github.event.inputs.region }} || echo "Could not delete workspace ${{ github.event.inputs.region }}" 

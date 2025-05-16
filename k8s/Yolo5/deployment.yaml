@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: yolo5
+  namespace: prod
 spec:
   replicas: 1
   selector:
@@ -24,6 +25,9 @@ spec:
           image: guymeltzer/yolo5:1.0.110
           ports:
             - containerPort: 5000
+          env:
+            - name: API_PORT
+              value: "5000"
           resources:
             requests:
               cpu: "500m"
@@ -38,3 +42,5 @@ spec:
             - name: polybot-ca
               mountPath: "/app/ca"
               readOnly: true
+      imagePullSecrets:
+        - name: docker-registry-credentials

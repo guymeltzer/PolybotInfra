@@ -1,11 +1,47 @@
+output "control_plane_public_ip" {
+  description = "Public IP of the control plane node"
+  value       = aws_instance.control_plane.public_ip
+}
+
+output "alb_dns_name" {
+  description = "DNS name of the Application Load Balancer"
+  value       = aws_lb.polybot_alb.dns_name
+}
+
+output "alb_zone_id" {
+  description = "Zone ID of the Application Load Balancer"
+  value       = aws_lb.polybot_alb.zone_id
+}
+
+output "cluster_ca_certificate" {
+  description = "Base64 encoded public certificate authority data for the cluster"
+  value       = fileexists("${path.module}/certs/ca.crt") ? base64encode(file("${path.module}/certs/ca.crt")) : ""
+  sensitive   = true
+}
+
+output "client_certificate" {
+  description = "Base64 encoded client certificate for authentication"
+  value       = fileexists("${path.module}/certs/client.crt") ? base64encode(file("${path.module}/certs/client.crt")) : ""
+  sensitive   = true
+}
+
+output "client_key" {
+  description = "Base64 encoded client key for authentication"
+  value       = fileexists("${path.module}/certs/client.key") ? base64encode(file("${path.module}/certs/client.key")) : ""
+  sensitive   = true
+}
+
 output "vpc_id" {
-  value = module.vpc.vpc_id
+  description = "ID of the VPC created for the cluster"
+  value       = module.vpc.vpc_id
 }
 
-output "public_subnet_ids" {
-  value = module.vpc.public_subnets
+output "subnet_ids" {
+  description = "IDs of the subnets created for the cluster"
+  value       = module.vpc.public_subnets
 }
 
-output "private_subnet_ids" {
-  value = module.vpc.private_subnets
+output "control_plane_iam_role_arn" {
+  description = "ARN of the IAM role for the control plane node"
+  value       = aws_iam_role.control_plane_role.arn
 }

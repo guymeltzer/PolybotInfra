@@ -1,0 +1,75 @@
+name: Infra Provisioning
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region to deploy'
+        required: true
+        default: 'us-east-1'
+        type: choice
+        options:
+          - us-east-1
+          - eu-central-1
+
+jobs:
+  call-region-workflow:
+    uses: ./.github/workflows/infra-provisioning-region.yaml
+    with:
+      region: ${{ github.event.inputs.region }}
+    secrets:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TELEGRAM_TOKEN_DEV: ${{ secrets.TELEGRAM_TOKEN_DEV }}
+      TELEGRAM_TOKEN_PROD: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./tf
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Workspace
+        run: terraform workspace select ${{ github.event.inputs.region }} || terraform workspace new ${{ github.event.inputs.region }}
+
+      - name: Terraform Plan
+        run: terraform plan -var-file="region.${{ github.event.inputs.region }}.tfvars" -out=tfplan
+        id: plan
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
+        
+      - name: Extract Kubernetes Info
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "Getting kubeconfig from control plane instance..."
+          CONTROL_PLANE_IP=$(terraform output -raw kubernetes_api_server_endpoint)
+          mkdir -p ~/.kube
+          aws s3 cp s3://polybot-tfstate-bucket/kubeconfig/config ~/.kube/config || echo "Kubeconfig not available in S3"
+          
+          echo "ArgoCD server URL: $(terraform output -raw argocd_url)"
+          echo "ArgoCD applications deployed: $(terraform output -raw argocd_applications)"
+          
+      - name: Check Application Status
+        if: github.ref == 'refs/heads/main'
+        run: |
+          kubectl get applications -n argocd
+          kubectl get deployments -n default 
