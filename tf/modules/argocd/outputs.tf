@@ -7,14 +7,14 @@ output "applications" {
   description = "List of deployed ArgoCD applications"
   value = {
     dev = [
-      jsondecode(kubectl_manifest.polybot_application_dev.yaml_body).metadata.name,
-      jsondecode(kubectl_manifest.yolo5_application_dev.yaml_body).metadata.name,
-      jsondecode(kubectl_manifest.mongodb_application_dev.yaml_body).metadata.name
+      yamldecode(kubectl_manifest.polybot_application_dev.yaml_body).metadata.name,
+      yamldecode(kubectl_manifest.yolo5_application_dev.yaml_body).metadata.name,
+      yamldecode(kubectl_manifest.mongodb_application_dev.yaml_body).metadata.name
     ],
     prod = [
-      jsondecode(kubectl_manifest.polybot_application_prod.yaml_body).metadata.name,
-      jsondecode(kubectl_manifest.yolo5_application_prod.yaml_body).metadata.name,
-      jsondecode(kubectl_manifest.mongodb_application_prod.yaml_body).metadata.name
+      yamldecode(kubectl_manifest.polybot_application_prod.yaml_body).metadata.name,
+      yamldecode(kubectl_manifest.yolo5_application_prod.yaml_body).metadata.name,
+      yamldecode(kubectl_manifest.mongodb_application_prod.yaml_body).metadata.name
     ]
   }
 } 
