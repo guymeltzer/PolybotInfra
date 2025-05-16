@@ -58,4 +58,5 @@ output "argocd_url" {
 output "argocd_applications" {
   description = "ArgoCD applications deployed"
   value       = module.argocd.applications
+  sensitive   = true
 }
