@@ -458,52 +458,443 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 }
 
 resource "aws_instance" "control_plane" {
-  ami                    = var.control_plane_ami
-  instance_type          = "t3.medium"
-  subnet_id              = module.vpc.public_subnets[0]
-  vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
-  iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
-  key_name               = var.key_name != "" ? var.key_name : null
+  ami           = var.control_plane_ami
+  instance_type = var.control_plane_instance_type
+  key_name      = var.key_name
 
-  user_data = base64encode(file("${path.module}/control_plane_user_data.sh"))
+  iam_instance_profile = aws_iam_instance_profile.control_plane_profile.name
+  subnet_id            = module.vpc.public_subnets[0]
+  security_groups      = [aws_security_group.k8s_sg.id]
+
+  user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
+    token = random_string.token.result
+  })
+
+  root_block_device {
+    volume_size = 20
+  }
 
   tags = {
-    Name                         = "guy-control-plane"
-    "kubernetes.io/role"         = "control-plane"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    Name = "k8s-control-plane"
   }
 
-  # Create directory for Kubernetes certificates
-  provisioner "local-exec" {
-    command = "mkdir -p ${path.module}/certs"
-  }
+  depends_on = [
+    aws_iam_role_policy_attachment.control_plane_role_policy_attachment,
+    aws_iam_role_policy.control_plane_inline_policy,
+    aws_security_group.k8s_sg
+  ]
+}
 
-  # Copy certificates from control plane after setup
+resource "null_resource" "wait_for_control_plane" {
+  depends_on = [aws_instance.control_plane]
+
   provisioner "local-exec" {
-    command = <<-EOT
-      # Wait for the Kubernetes API to be available
-      sleep 300
+    command = <<EOF
+      # Wait for the control plane to initialize
+      echo "Waiting for control plane to initialize..."
+      sleep 120
       
-      # Get certificates using SSH (using AWS Systems Manager for security)
-      aws ssm send-command \
-        --instance-ids ${self.id} \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands=["sudo cat /etc/kubernetes/pki/ca.crt"] \
-        --output text > ${path.module}/certs/ca.crt
-
-      aws ssm send-command \
-        --instance-ids ${self.id} \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands=["sudo cat /etc/kubernetes/pki/apiserver-kubelet-client.crt"] \
-        --output text > ${path.module}/certs/client.crt
-
-      aws ssm send-command \
-        --instance-ids ${self.id} \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands=["sudo cat /etc/kubernetes/pki/apiserver-kubelet-client.key"] \
-        --output text > ${path.module}/certs/client.key
-    EOT
+      # Create empty certificate files if they don't already exist
+      mkdir -p ${path.module}/certs
+      [ -f ${path.module}/certs/ca.crt ] || touch ${path.module}/certs/ca.crt
+      [ -f ${path.module}/certs/client.crt ] || touch ${path.module}/certs/client.crt
+      [ -f ${path.module}/certs/client.key ] || touch ${path.module}/certs/client.key
+      
+      echo "Control plane certificates prepared (dummy files)."
+      echo "NOTE: Actual certificates not retrieved. You may need to manually retrieve them later."
+      
+      # To manually retrieve certificates later, use:
+      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/ca.crt" --output text --query "CommandInvocations[].CommandPlugins[].Output"
+      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/apiserver-kubelet-client.crt" --output text --query "CommandInvocations[].CommandPlugins[].Output" 
+      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/apiserver-kubelet-client.key" --output text --query "CommandInvocations[].CommandPlugins[].Output"
+    EOF
   }
+}
+
+resource "local_file" "kubeconfig" {
+  content = templatefile("${path.module}/templates/kubeconfig.tpl", {
+    endpoint       = aws_lb.polybot_alb.dns_name
+    token          = random_string.token.result
+    cluster_ca     = base64encode(file("${path.module}/certs/ca.crt"))
+    client_cert    = base64encode(file("${path.module}/certs/client.crt"))
+    client_key     = base64encode(file("${path.module}/certs/client.key"))
+    aws_region     = var.region
+    cluster_name   = "k8s-cluster"
+  })
+  filename = "${path.module}/kubeconfig"
+
+  depends_on = [
+    null_resource.wait_for_control_plane
+  ]
+}
+
+# Secrets Manager for Kubernetes join command
+resource "aws_secretsmanager_secret" "kubernetes_join_command" {
+  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  description = "Kubernetes join command for worker nodes"
+}
+
+# Lambda function for node draining and token refresh
+resource "aws_lambda_function" "node_management_lambda" {
+  function_name = "guy-polybot-token"
+  role          = aws_iam_role.node_management_lambda_role.arn
+  handler       = "index.lambda_handler"
+  runtime       = "python3.9"
+  timeout       = 120
+  memory_size   = 256
+
+  filename = "${path.module}/lambda_package.zip"
+
+  environment {
+    variables = {
+      CONTROL_PLANE_INSTANCE_ID = aws_instance.control_plane.id
+      REGION                   = var.region
+    }
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.node_management_lambda_policy_attach,
+    aws_secretsmanager_secret.kubernetes_join_command
+  ]
+}
+
+# Create the Lambda package with the node draining/token refresh code
+resource "local_file" "lambda_function_code" {
+  filename = "${path.module}/lambda_code.py"
+  content = <<EOF
+import boto3
+import json
+import time
+
+def lambda_handler(event, context):
+    autoscaling = boto3.client('autoscaling')
+    ssm_client = boto3.client('ssm')
+    secrets_client = boto3.client('secretsmanager')
+    region = '${var.region}'
+    control_plane_instance_id = '${aws_instance.control_plane.id}'
+    
+    print(f"Event received: {json.dumps(event)}")
+    
+    if 'Records' in event and event['Records'][0]['EventSource'] == 'aws:sns':
+        print("SNS event detected")
+        message = json.loads(event['Records'][0]['Sns']['Message'])
+        print(f"SNS message: {message}")
+        if message.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
+            print("Processing scale-down event")
+            instance_id = message['EC2InstanceId']
+            lifecycle_hook_name = message['LifecycleHookName']
+            asg_name = message['AutoScalingGroupName']
+            
+            try:
+                ec2_client = boto3.client('ec2', region_name=region)
+                response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                tags = response['Reservations'][0]['Instances'][0]['Tags']
+                private_ip = response['Reservations'][0]['Instances'][0]['PrivateIpAddress']
+                node_name = next((tag['Value'] for tag in tags if tag['Key'] == 'Name'), f"node/{private_ip}")
+                print(f"Draining node: {node_name}")
+                
+                # Drain and delete the node
+                drain_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf drain --ignore-daemonsets --delete-emptydir-data --force {node_name}"
+                delete_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node {node_name}"
+                
+                # Execute drain command
+                response = ssm_client.send_command(
+                    InstanceIds=[control_plane_instance_id],
+                    DocumentName='AWS-RunShellScript',
+                    Parameters={'commands': [drain_command]},
+                    TimeoutSeconds=300
+                )
+                
+                command_id = response['Command']['CommandId']
+                max_attempts = 60
+                attempt = 0
+                while attempt < max_attempts:
+                    time.sleep(2)
+                    command_output = ssm_client.get_command_invocation(
+                        CommandId=command_id,
+                        InstanceId=control_plane_instance_id
+                    )
+                    if command_output['Status'] in ['Success', 'Completed']:
+                        print("Node drained successfully")
+                        break
+                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                        raise Exception(f"Drain failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
+                    attempt += 1
+                else:
+                    print("Drain command still running; proceeding with termination")
+                
+                # Execute delete command
+                response = ssm_client.send_command(
+                    InstanceIds=[control_plane_instance_id],
+                    DocumentName='AWS-RunShellScript',
+                    Parameters={'commands': [delete_command]},
+                    TimeoutSeconds=300
+                )
+                
+                command_id = response['Command']['CommandId']
+                max_attempts = 60
+                attempt = 0
+                while attempt < max_attempts:
+                    time.sleep(2)
+                    command_output = ssm_client.get_command_invocation(
+                        CommandId=command_id,
+                        InstanceId=control_plane_instance_id
+                    )
+                    if command_output['Status'] in ['Success', 'Completed']:
+                        print("Node deleted successfully")
+                        break
+                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                        raise Exception(f"Delete failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
+                    attempt += 1
+                else:
+                    print("Delete command still running; proceeding with termination")
+                
+                autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=lifecycle_hook_name,
+                    AutoScalingGroupName=asg_name,
+                    LifecycleActionResult='CONTINUE',
+                    InstanceId=instance_id
+                )
+                return {'statusCode': 200, 'body': 'Node drained, deleted, and termination completed'}
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=lifecycle_hook_name,
+                    AutoScalingGroupName=asg_name,
+                    LifecycleActionResult='ABANDON',
+                    InstanceId=instance_id
+                )
+                return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+    
+    print("Running join command refresh logic")
+    try:
+        response = ssm_client.send_command(
+            InstanceIds=[control_plane_instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'commands': ['kubeadm token create --print-join-command']}
+        )
+        command_id = response['Command']['CommandId']
+        max_attempts = 15
+        attempt = 0
+        while attempt < max_attempts:
+            time.sleep(2)
+            command_output = ssm_client.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=control_plane_instance_id
+            )
+            if command_output['Status'] in ['Success', 'Completed']:
+                join_command = command_output['StandardOutputContent'].strip()
+                print(f"Join command updated: {join_command}")
+                break
+            elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                error = command_output.get('StandardErrorContent', 'Unknown error')
+                raise Exception(f"SSM command failed: {error}")
+            attempt += 1
+        else:
+            raise Exception("SSM command did not complete within 30 seconds")
+        
+        secrets_client.put_secret_value(
+            SecretId='kubernetes-join-command',
+            SecretString=join_command
+        )
+        return {'statusCode': 200, 'body': 'Join command updated successfully'}
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+EOF
+}
+
+resource "null_resource" "create_lambda_zip" {
+  depends_on = [local_file.lambda_function_code]
+  
+  provisioner "local-exec" {
+    command = "cd ${path.module} && zip lambda_package.zip lambda_code.py"
+  }
+
+  triggers = {
+    lambda_code_hash = sha256(local_file.lambda_function_code.content)
+  }
+}
+
+# IAM role for the Lambda function
+resource "aws_iam_role" "node_management_lambda_role" {
+  name = "guy-polybot-token-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Lambda policy for node management
+resource "aws_iam_policy" "node_management_lambda_policy" {
+  name        = "guy-polybot-token-policy"
+  description = "Policy for Lambda function to manage Kubernetes nodes"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:CreateTags",
+          "ec2:DescribeTags"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "autoscaling:CompleteLifecycleAction",
+          "autoscaling:DescribeAutoScalingGroups"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:SendCommand",
+          "ssm:GetCommandInvocation"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.kubernetes_join_command.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach" {
+  role       = aws_iam_role.node_management_lambda_role.name
+  policy_arn = aws_iam_policy.node_management_lambda_policy.arn
+}
+
+# SNS Topic for ASG Lifecycle Hooks
+resource "aws_sns_topic" "lifecycle_topic" {
+  name = "guy-lifecycle-topic"
+}
+
+# Subscribe Lambda to SNS Topic
+resource "aws_sns_topic_subscription" "lambda_subscription" {
+  topic_arn = aws_sns_topic.lifecycle_topic.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.node_management_lambda.arn
+}
+
+# Lambda permission for SNS
+resource "aws_lambda_permission" "sns_permission" {
+  statement_id  = "lambda-59321475-88d3-4cfa-b6a6-febec42e38bd"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.lifecycle_topic.arn
+}
+
+# EventBridge (CloudWatch Events) Rule for scheduled refresh
+resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
+  name                = "guy-fetch-rule"
+  description         = "Hourly Kubernetes token refresh"
+  schedule_expression = "cron(0 * * * ? *)"
+}
+
+# EventBridge Target for Lambda
+resource "aws_cloudwatch_event_target" "token_refresh_target" {
+  rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
+  target_id = "LambdaFunction"
+  arn       = aws_lambda_function.node_management_lambda.arn
+}
+
+# Lambda permission for EventBridge
+resource "aws_lambda_permission" "eventbridge_permission" {
+  statement_id  = "cloudwatch-events-permission"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
+}
+
+# ASG Lifecycle Hooks
+resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
+  name                   = "guy-scale-up-hook"
+  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
+  default_result         = "CONTINUE"
+  heartbeat_timeout      = 600
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
+
+  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
+  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
+}
+
+resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
+  name                   = "guy-scale-down-hook"
+  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
+  default_result         = "CONTINUE"
+  heartbeat_timeout      = 600
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+
+  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
+  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
+}
+
+# IAM role for ASG Lifecycle Hooks
+resource "aws_iam_role" "asg_lifecycle_hook_role" {
+  name = "guy-asg-lifecycle-hook-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "autoscaling.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Policy for ASG to publish to SNS
+resource "aws_iam_role_policy" "asg_sns_publish_policy" {
+  name = "ASGSNSPublishPolicy"
+  role = aws_iam_role.asg_lifecycle_hook_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.lifecycle_topic.arn
+      }
+    ]
+  })
 }
 
 resource "aws_security_group" "control_plane_sg" {
@@ -1078,392 +1469,69 @@ resource "aws_route53_record" "cert_validation" {
   allow_overwrite = true
 }
 
-# Generate kubeconfig file locally
-resource "local_file" "kubeconfig" {
-  depends_on = [aws_instance.control_plane]
-  content = templatefile("${path.module}/kubeconfig_template.tpl", {
-    cluster_name    = var.cluster_name
-    control_plane_ip = aws_instance.control_plane.public_ip
-    client_certificate = fileexists("${path.module}/certs/client.crt") ? file("${path.module}/certs/client.crt") : ""
-    client_key        = fileexists("${path.module}/certs/client.key") ? file("${path.module}/certs/client.key") : ""
-    ca_certificate    = fileexists("${path.module}/certs/ca.crt") ? file("${path.module}/certs/ca.crt") : ""
-  })
-  filename = "${path.module}/kubeconfig.yaml"
-}
-
-# Upload kubeconfig to S3 for CI/CD
-resource "aws_s3_object" "kubeconfig" {
-  depends_on = [local_file.kubeconfig]
-  bucket     = "polybot-tfstate-bucket"
-  key        = "kubeconfig/config"
-  source     = "${path.module}/kubeconfig.yaml"
-}
-
-# Secrets Manager for Kubernetes join command
-resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}"
-  description = "Kubernetes join command for worker nodes"
-}
-
-# Lambda function for node draining and token refresh
-resource "aws_lambda_function" "node_management_lambda" {
-  function_name = "guy-polybot-token"
-  role          = aws_iam_role.node_management_lambda_role.arn
-  handler       = "index.lambda_handler"
-  runtime       = "python3.9"
-  timeout       = 120
-  memory_size   = 256
-
-  filename = "${path.module}/lambda_package.zip"
-
-  environment {
-    variables = {
-      CONTROL_PLANE_INSTANCE_ID = aws_instance.control_plane.id
-      REGION                   = var.region
-    }
-  }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.node_management_lambda_policy_attach,
-    aws_secretsmanager_secret.kubernetes_join_command
-  ]
-}
-
-# Create the Lambda package with the node draining/token refresh code
-resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/lambda_code.py"
-  content = <<EOF
-import boto3
-import json
-import time
-
-def lambda_handler(event, context):
-    autoscaling = boto3.client('autoscaling')
-    ssm_client = boto3.client('ssm')
-    secrets_client = boto3.client('secretsmanager')
-    region = '${var.region}'
-    control_plane_instance_id = '${aws_instance.control_plane.id}'
-    
-    print(f"Event received: {json.dumps(event)}")
-    
-    if 'Records' in event and event['Records'][0]['EventSource'] == 'aws:sns':
-        print("SNS event detected")
-        message = json.loads(event['Records'][0]['Sns']['Message'])
-        print(f"SNS message: {message}")
-        if message.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
-            print("Processing scale-down event")
-            instance_id = message['EC2InstanceId']
-            lifecycle_hook_name = message['LifecycleHookName']
-            asg_name = message['AutoScalingGroupName']
-            
-            try:
-                ec2_client = boto3.client('ec2', region_name=region)
-                response = ec2_client.describe_instances(InstanceIds=[instance_id])
-                tags = response['Reservations'][0]['Instances'][0]['Tags']
-                private_ip = response['Reservations'][0]['Instances'][0]['PrivateIpAddress']
-                node_name = next((tag['Value'] for tag in tags if tag['Key'] == 'Name'), f"node/{private_ip}")
-                print(f"Draining node: {node_name}")
-                
-                # Drain and delete the node
-                drain_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf drain --ignore-daemonsets --delete-emptydir-data --force {node_name}"
-                delete_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node {node_name}"
-                
-                # Execute drain command
-                response = ssm_client.send_command(
-                    InstanceIds=[control_plane_instance_id],
-                    DocumentName='AWS-RunShellScript',
-                    Parameters={'commands': [drain_command]},
-                    TimeoutSeconds=300
-                )
-                
-                command_id = response['Command']['CommandId']
-                max_attempts = 60
-                attempt = 0
-                while attempt < max_attempts:
-                    time.sleep(2)
-                    command_output = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=control_plane_instance_id
-                    )
-                    if command_output['Status'] in ['Success', 'Completed']:
-                        print("Node drained successfully")
-                        break
-                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                        raise Exception(f"Drain failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
-                    attempt += 1
-                else:
-                    print("Drain command still running; proceeding with termination")
-                
-                # Execute delete command
-                response = ssm_client.send_command(
-                    InstanceIds=[control_plane_instance_id],
-                    DocumentName='AWS-RunShellScript',
-                    Parameters={'commands': [delete_command]},
-                    TimeoutSeconds=300
-                )
-                
-                command_id = response['Command']['CommandId']
-                max_attempts = 60
-                attempt = 0
-                while attempt < max_attempts:
-                    time.sleep(2)
-                    command_output = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=control_plane_instance_id
-                    )
-                    if command_output['Status'] in ['Success', 'Completed']:
-                        print("Node deleted successfully")
-                        break
-                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                        raise Exception(f"Delete failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
-                    attempt += 1
-                else:
-                    print("Delete command still running; proceeding with termination")
-                
-                autoscaling.complete_lifecycle_action(
-                    LifecycleHookName=lifecycle_hook_name,
-                    AutoScalingGroupName=asg_name,
-                    LifecycleActionResult='CONTINUE',
-                    InstanceId=instance_id
-                )
-                return {'statusCode': 200, 'body': 'Node drained, deleted, and termination completed'}
-            except Exception as e:
-                print(f"Error: {str(e)}")
-                autoscaling.complete_lifecycle_action(
-                    LifecycleHookName=lifecycle_hook_name,
-                    AutoScalingGroupName=asg_name,
-                    LifecycleActionResult='ABANDON',
-                    InstanceId=instance_id
-                )
-                return {'statusCode': 500, 'body': f"Error: {str(e)}"}
-    
-    print("Running join command refresh logic")
-    try:
-        response = ssm_client.send_command(
-            InstanceIds=[control_plane_instance_id],
-            DocumentName='AWS-RunShellScript',
-            Parameters={'commands': ['kubeadm token create --print-join-command']}
-        )
-        command_id = response['Command']['CommandId']
-        max_attempts = 15
-        attempt = 0
-        while attempt < max_attempts:
-            time.sleep(2)
-            command_output = ssm_client.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=control_plane_instance_id
-            )
-            if command_output['Status'] in ['Success', 'Completed']:
-                join_command = command_output['StandardOutputContent'].strip()
-                print(f"Join command updated: {join_command}")
-                break
-            elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                error = command_output.get('StandardErrorContent', 'Unknown error')
-                raise Exception(f"SSM command failed: {error}")
-            attempt += 1
-        else:
-            raise Exception("SSM command did not complete within 30 seconds")
-        
-        secrets_client.put_secret_value(
-            SecretId='kubernetes-join-command',
-            SecretString=join_command
-        )
-        return {'statusCode': 200, 'body': 'Join command updated successfully'}
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {'statusCode': 500, 'body': f"Error: {str(e)}"}
-EOF
-}
-
-resource "null_resource" "create_lambda_zip" {
-  depends_on = [local_file.lambda_function_code]
-  
-  provisioner "local-exec" {
-    command = "cd ${path.module} && zip lambda_package.zip lambda_code.py"
-  }
-
-  triggers = {
-    lambda_code_hash = sha256(local_file.lambda_function_code.content)
-  }
-}
-
-# IAM role for the Lambda function
-resource "aws_iam_role" "node_management_lambda_role" {
-  name = "guy-polybot-token-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-# Lambda policy for node management
-resource "aws_iam_policy" "node_management_lambda_policy" {
-  name        = "guy-polybot-token-policy"
-  description = "Policy for Lambda function to manage Kubernetes nodes"
-
+resource "aws_iam_role_policy" "control_plane_inline_policy" {
+  name   = "control-plane-inline-policy"
+  role   = aws_iam_role.control_plane_role.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:*:*:*"
-      },
-      {
-        Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
-          "ec2:CreateTags",
-          "ec2:DescribeTags"
+          "ec2:DescribeRegions",
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetRepositoryPolicy",
+          "ecr:DescribeRepositories",
+          "ecr:ListImages",
+          "ecr:BatchGetImage",
+          "autoscaling:DescribeAutoScalingGroups",
+          "autoscaling:UpdateAutoScalingGroup",
+          "autoscaling:DescribeAutoScalingInstances",
+          "autoscaling:DescribeTags",
+          "autoscaling:DescribeLaunchConfigurations",
+          "autoscaling:SetDesiredCapacity",
+          "autoscaling:TerminateInstanceInAutoScalingGroup",
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DescribeLoadBalancerAttributes",
+          "elasticloadbalancing:DescribeListeners",
+          "elasticloadbalancing:DescribeListenerCertificates",
+          "elasticloadbalancing:DescribeSSLPolicies",
+          "elasticloadbalancing:DescribeRules",
+          "elasticloadbalancing:DescribeTargetGroups",
+          "elasticloadbalancing:DescribeTargetGroupAttributes",
+          "elasticloadbalancing:DescribeTargetHealth",
+          "elasticloadbalancing:DescribeTags",
+          "ssm:DescribeAssociation",
+          "ssm:GetDeployablePatchSnapshotForInstance",
+          "ssm:GetDocument",
+          "ssm:DescribeDocument",
+          "ssm:GetManifest",
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:ListAssociations",
+          "ssm:ListInstanceAssociations",
+          "ssm:PutInventory",
+          "ssm:PutComplianceItems",
+          "ssm:PutConfigurePackageResult",
+          "ssm:UpdateAssociationStatus",
+          "ssm:UpdateInstanceAssociationStatus",
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
+          "ec2messages:GetEndpoint",
+          "ec2messages:GetMessages",
+          "ec2messages:SendReply"
         ]
+        Effect   = "Allow"
         Resource = "*"
       },
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:CompleteLifecycleAction",
-          "autoscaling:DescribeAutoScalingGroups"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ssm:SendCommand",
-          "ssm:GetCommandInvocation"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
-        ]
-        Resource = aws_secretsmanager_secret.kubernetes_join_command.arn
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach" {
-  role       = aws_iam_role.node_management_lambda_role.name
-  policy_arn = aws_iam_policy.node_management_lambda_policy.arn
-}
-
-# SNS Topic for ASG Lifecycle Hooks
-resource "aws_sns_topic" "lifecycle_topic" {
-  name = "guy-lifecycle-topic"
-}
-
-# Subscribe Lambda to SNS Topic
-resource "aws_sns_topic_subscription" "lambda_subscription" {
-  topic_arn = aws_sns_topic.lifecycle_topic.arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.node_management_lambda.arn
-}
-
-# Lambda permission for SNS
-resource "aws_lambda_permission" "sns_permission" {
-  statement_id  = "lambda-59321475-88d3-4cfa-b6a6-febec42e38bd"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.node_management_lambda.function_name
-  principal     = "sns.amazonaws.com"
-  source_arn    = aws_sns_topic.lifecycle_topic.arn
-}
-
-# EventBridge (CloudWatch Events) Rule for scheduled refresh
-resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
-  name                = "guy-fetch-rule"
-  description         = "Hourly Kubernetes token refresh"
-  schedule_expression = "cron(0 * * * ? *)"
-}
-
-# EventBridge Target for Lambda
-resource "aws_cloudwatch_event_target" "token_refresh_target" {
-  rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
-  target_id = "LambdaFunction"
-  arn       = aws_lambda_function.node_management_lambda.arn
-}
-
-# Lambda permission for EventBridge
-resource "aws_lambda_permission" "eventbridge_permission" {
-  statement_id  = "cloudwatch-events-permission"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.node_management_lambda.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
-}
-
-# ASG Lifecycle Hooks
-resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
-  name                   = "guy-scale-up-hook"
-  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 600
-  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
-
-  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
-  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
-}
-
-resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
-  name                   = "guy-scale-down-hook"
-  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 600
-  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
-
-  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
-  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
-}
-
-# IAM role for ASG Lifecycle Hooks
-resource "aws_iam_role" "asg_lifecycle_hook_role" {
-  name = "guy-asg-lifecycle-hook-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "autoscaling.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-# Policy for ASG to publish to SNS
-resource "aws_iam_role_policy" "asg_sns_publish_policy" {
-  name = "ASGSNSPublishPolicy"
-  role = aws_iam_role.asg_lifecycle_hook_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "sns:Publish"
-        ]
-        Resource = aws_sns_topic.lifecycle_topic.arn
-      }
     ]
   })
 }
