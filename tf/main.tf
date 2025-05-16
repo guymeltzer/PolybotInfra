@@ -2,32 +2,12 @@ provider "aws" {
   region = var.region
 }
 
-# Create a data source to fetch the cluster details
-data "aws_instance" "control_plane" {
-  depends_on = [module.k8s-cluster]
-  
-  filter {
-    name   = "tag:Name"
-    values = ["k8s-control-plane"]
-  }
-  
-  filter {
-    name   = "instance-state-name"
-    values = ["running"]
-  }
-  
-  filter {
-    name   = "tag:kubernetes.io/cluster/kubernetes"
-    values = ["owned"]
-  }
-}
-
 # Define a local provider for first-time setup
 provider "local" {}
 
 # Configure the Kubernetes provider
 provider "kubernetes" {
-  host                   = "https://${data.aws_instance.control_plane.public_ip}:6443"
+  host                   = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
   cluster_ca_certificate = module.k8s-cluster.cluster_ca_certificate
   
   # Use client certificate authentication instead of EKS token
@@ -43,7 +23,7 @@ provider "kubernetes" {
 # Configure the Helm provider
 provider "helm" {
   kubernetes {
-    host                   = "https://${data.aws_instance.control_plane.public_ip}:6443"
+    host                   = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
     cluster_ca_certificate = module.k8s-cluster.cluster_ca_certificate
     
     # Use client certificate authentication instead of EKS token
@@ -54,7 +34,7 @@ provider "helm" {
 
 # Configure the kubectl provider
 provider "kubectl" {
-  host                   = "https://${data.aws_instance.control_plane.public_ip}:6443"
+  host                   = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
   cluster_ca_certificate = module.k8s-cluster.cluster_ca_certificate
   load_config_file       = false
   
@@ -137,7 +117,7 @@ resource "null_resource" "wait_for_kubernetes" {
       echo "Waiting for Kubernetes API to be available..."
       attempt=0
       max_attempts=30
-      until curl -k https://${data.aws_instance.control_plane.public_ip}:6443/healthz 2>/dev/null | grep -q ok; do
+      until curl -k https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz 2>/dev/null | grep -q ok; do
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
