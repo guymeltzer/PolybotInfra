@@ -1,3 +1,20 @@
+terraform {
+  required_providers {
+    kubernetes = {
+      source = "hashicorp/kubernetes"
+      configuration_aliases = [kubernetes]
+    }
+    helm = {
+      source = "hashicorp/helm"
+      configuration_aliases = [helm]
+    }
+    kubectl = {
+      source = "gavinbunney/kubectl"
+      configuration_aliases = [kubectl]
+    }
+  }
+}
+
 resource "kubernetes_namespace" "argocd" {
   metadata {
     name = "argocd"
@@ -53,9 +70,9 @@ resource "kubernetes_namespace" "prod" {
 }
 
 # Create ArgoCD application resources for each service in dev environment
-resource "kubernetes_manifest" "polybot_application_dev" {
+resource "kubectl_manifest" "polybot_application_dev" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -80,12 +97,12 @@ resource "kubernetes_manifest" "polybot_application_dev" {
         }
       }
     }
-  }
+  })
 }
 
-resource "kubernetes_manifest" "yolo5_application_dev" {
+resource "kubectl_manifest" "yolo5_application_dev" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -110,12 +127,12 @@ resource "kubernetes_manifest" "yolo5_application_dev" {
         }
       }
     }
-  }
+  })
 }
 
-resource "kubernetes_manifest" "mongodb_application_dev" {
+resource "kubectl_manifest" "mongodb_application_dev" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -140,13 +157,13 @@ resource "kubernetes_manifest" "mongodb_application_dev" {
         }
       }
     }
-  }
+  })
 }
 
 # Create ArgoCD application resources for each service in prod environment
-resource "kubernetes_manifest" "polybot_application_prod" {
+resource "kubectl_manifest" "polybot_application_prod" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -171,12 +188,12 @@ resource "kubernetes_manifest" "polybot_application_prod" {
         }
       }
     }
-  }
+  })
 }
 
-resource "kubernetes_manifest" "yolo5_application_prod" {
+resource "kubectl_manifest" "yolo5_application_prod" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -201,12 +218,12 @@ resource "kubernetes_manifest" "yolo5_application_prod" {
         }
       }
     }
-  }
+  })
 }
 
-resource "kubernetes_manifest" "mongodb_application_prod" {
+resource "kubectl_manifest" "mongodb_application_prod" {
   depends_on = [time_sleep.wait_for_argocd]
-  manifest = {
+  yaml_body = yamlencode({
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
@@ -231,5 +248,5 @@ resource "kubernetes_manifest" "mongodb_application_prod" {
         }
       }
     }
-  }
+  })
 } 

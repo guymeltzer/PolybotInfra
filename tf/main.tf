@@ -116,11 +116,42 @@ EOF
   depends_on = [module.k8s-cluster]
 }
 
+# Wait for Kubernetes API to be fully available
+resource "null_resource" "wait_for_kubernetes" {
+  depends_on = [module.k8s-cluster]
+  
+  provisioner "local-exec" {
+    command = <<EOT
+      # Wait for Kubernetes API to be available
+      echo "Waiting for Kubernetes API to be available..."
+      attempt=0
+      max_attempts=30
+      until curl -k https://${data.aws_instance.control_plane.public_ip}:6443/healthz 2>/dev/null | grep -q ok; do
+        attempt=$((attempt+1))
+        if [ $attempt -ge $max_attempts ]; then
+          echo "Timed out waiting for Kubernetes API"
+          exit 1
+        fi
+        echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
+        sleep 10
+      done
+      echo "Kubernetes API is available!"
+    EOT
+  }
+}
+
 # ArgoCD deployment
 module "argocd" {
   source         = "./modules/argocd"
   git_repo_url   = var.git_repo_url
-  depends_on     = [module.k8s-cluster]
+  
+  providers = {
+    kubernetes = kubernetes
+    helm       = helm
+    kubectl    = kubectl
+  }
+  
+  depends_on     = [module.k8s-cluster, null_resource.wait_for_kubernetes]
 }
 
 # Development environment resources
