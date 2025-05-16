@@ -25,6 +25,71 @@ module "vpc" {
   }
 }
 
+# Generate a random token for kubeadm
+resource "random_string" "token" {
+  length  = 16
+  special = false
+  upper   = false
+}
+
+# Security Group for Kubernetes Cluster Resources
+resource "aws_security_group" "k8s_sg" {
+  name        = "Guy-K8S-SG"
+  description = "Security group for Kubernetes control plane and workers"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "guy-k8s-sg"
+    "kubernetes.io/cluster/kubernetes" = "owned"
+  }
+}
+
+# IAM Role Policy Attachments for Control Plane
+resource "aws_iam_role_policy_attachment" "control_plane_role_policy_attachment" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonS3FullAccess",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    "arn:aws:iam::aws:policy/AmazonRoute53FullAccess",
+    "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess",
+    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
+    "arn:aws:iam::aws:policy/AmazonSSMFullAccess",
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    "arn:aws:iam::aws:policy/AWSCertificateManagerFullAccess"
+  ])
+
+  role       = aws_iam_role.control_plane_role.name
+  policy_arn = each.value
+}
+
 # IAM Role for Control Plane
 resource "aws_iam_role" "control_plane_role" {
   name = "Guy-K8S-ControlPlane-IAM-Role"
