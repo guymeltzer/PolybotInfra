@@ -34,14 +34,49 @@ spec:
                   key: telegram_token
             - name: SQS_QUEUE_URL
               valueFrom:
-                configMapKeyRef:
-                  name: polybot-config
+                secretKeyRef:
+                  name: polybot-secrets
                   key: sqs_queue_url
-            - name: S3_BUCKET
+            - name: S3_BUCKET_NAME
               valueFrom:
-                configMapKeyRef:
-                  name: polybot-config
-                  key: s3_bucket
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: s3_bucket_name
+            - name: TELEGRAM_APP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: telegram_app_url
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: aws_secret_access_key
+            - name: MONGO_COLLECTION
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: mongo_collection
+            - name: MONGO_DB
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: mongo_db
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: mongo_uri
+            - name: POLYBOT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: polybot-secrets
+                  key: polybot_url
           volumeMounts:
             - name: polybot-certs
               mountPath: "/app/certs"

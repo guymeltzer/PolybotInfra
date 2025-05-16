@@ -49,11 +49,39 @@ resource "aws_secretsmanager_secret" "polybot_secrets" {
   }
 }
 
-# Secret version that stores the Telegram token
+# Secret version that stores all Polybot credentials
 resource "aws_secretsmanager_secret_version" "polybot_secret_version" {
   secret_id     = aws_secretsmanager_secret.polybot_secrets.id
   secret_string = jsonencode({
-    telegram_token = var.telegram_token
+    telegram_token = var.telegram_token,
+    s3_bucket_name = aws_s3_bucket.polybot_bucket.bucket,
+    sqs_queue_url = aws_sqs_queue.polybot_queue.url,
+    telegram_app_url = "https://guy-polybot-${var.environment}.devops-int-college.com",
+    aws_access_key_id = var.aws_access_key_id,
+    aws_secret_access_key = var.aws_secret_access_key,
+    mongo_collection = "image_collection",
+    mongo_db = "config",
+    mongo_uri = "mongodb://mongodb-0.mongodb.mongodb.svc.cluster.local:27017,mongodb-1.mongodb.mongodb.svc.cluster.local:27017,mongodb-2.mongodb.mongodb.svc.cluster.local:27017/?replicaSet=rs0",
+    polybot_url = "https://polybot-service:31024/results"
+  })
+}
+
+# Docker Hub credentials
+resource "aws_secretsmanager_secret" "docker_hub_credentials" {
+  name = "docker-hub-credentials-${var.environment}"
+  recovery_window_in_days = 0  # Set to 0 for immediate deletion in dev/test
+
+  tags = {
+    Name = "DockerHubCredentials"
+    Environment = var.environment
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "docker_hub_credentials_version" {
+  secret_id     = aws_secretsmanager_secret.docker_hub_credentials.id
+  secret_string = jsonencode({
+    username = var.docker_username,
+    password = var.docker_password
   })
 }
 

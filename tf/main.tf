@@ -132,6 +132,10 @@ module "polybot_dev" {
   alb_zone_id     = module.k8s-cluster.alb_zone_id
   environment     = "dev"
   telegram_token  = var.telegram_token_dev
+  aws_access_key_id = var.aws_access_key_id
+  aws_secret_access_key = var.aws_secret_access_key
+  docker_username = var.docker_username
+  docker_password = var.docker_password
 }
 
 # Production environment resources
@@ -143,4 +147,8 @@ module "polybot_prod" {
   alb_zone_id     = module.k8s-cluster.alb_zone_id
   environment     = "prod"
   telegram_token  = var.telegram_token_prod
+  aws_access_key_id = var.aws_access_key_id
+  aws_secret_access_key = var.aws_secret_access_key
+  docker_username = var.docker_username
+  docker_password = var.docker_password
 }

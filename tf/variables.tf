@@ -65,3 +65,31 @@ variable "telegram_token_prod" {
   sensitive   = true
   default     = ""
 }
+
+variable "aws_access_key_id" {
+  description = "AWS Access Key ID to use in the Polybot application"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "aws_secret_access_key" {
+  description = "AWS Secret Access Key to use in the Polybot application"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "docker_username" {
+  description = "Docker Hub username for pulling private images"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "docker_password" {
+  description = "Docker Hub password for pulling private images"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
