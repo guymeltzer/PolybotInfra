@@ -46,7 +46,7 @@ resource "aws_iam_role" "control_plane_role" {
 # IAM Managed Policy Attachments for Control Plane
 resource "aws_iam_role_policy_attachment" "control_plane_policies" {
   for_each = toset([
-    "arn:aws:iam::aws:policy/AmazonECR-FullAccess",
+    "arn:aws:iam::aws:policy/AmazonECR-ReadOnly",
     "arn:aws:iam::aws:policy/AmazonS3FullAccess",
     "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
     "arn:aws:iam::aws:policy/AmazonRoute53FullAccess",
@@ -662,6 +662,10 @@ resource "aws_iam_role" "worker_role" {
       }
     ]
   })
+  
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "worker_policies" {
@@ -1072,6 +1076,7 @@ resource "aws_route53_record" "cert_validation" {
   type    = tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_type
   ttl     = 300
   records = [tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_value]
+  allow_overwrite = true
 }
 
 # Generate kubeconfig file locally

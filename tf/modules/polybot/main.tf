@@ -115,8 +115,13 @@ resource "aws_lambda_function" "scaling_lambda" {
 
 # Create dummy lambda zip file if it doesn't exist
 resource "null_resource" "lambda_package" {
+  triggers = {
+    lambda_package_exists = "create"
+  }
+
   provisioner "local-exec" {
-    command = <<EOT
+    command = <<-EOT
+      mkdir -p ${path.module}
       echo 'def handler(event, context):
           # Simple placeholder lambda function
           print("Polybot scaling lambda executed")
@@ -126,11 +131,6 @@ resource "null_resource" "lambda_package" {
       zip -r lambda_package.zip index.py
       mv lambda_package.zip ${path.module}/
     EOT
-  }
-
-  # Only run if the file doesn't exist
-  triggers = {
-    lambda_package_exists = fileexists("${path.module}/lambda_package.zip") ? "exists" : "create"
   }
 }
 
