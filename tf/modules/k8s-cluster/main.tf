@@ -46,7 +46,6 @@ resource "aws_iam_role" "control_plane_role" {
 # IAM Managed Policy Attachments for Control Plane
 resource "aws_iam_role_policy_attachment" "control_plane_policies" {
   for_each = toset([
-    "arn:aws:iam::aws:policy/AmazonECR-ReadOnly",
     "arn:aws:iam::aws:policy/AmazonS3FullAccess",
     "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
     "arn:aws:iam::aws:policy/AmazonRoute53FullAccess",
@@ -464,7 +463,7 @@ resource "aws_instance" "control_plane" {
   subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
-  key_name               = var.key_name
+  key_name               = var.key_name != "" ? var.key_name : null
 
   user_data = base64encode(file("${path.module}/control_plane_user_data.sh"))
 
@@ -648,7 +647,7 @@ resource "aws_security_group" "worker_sg" {
 }
 
 resource "aws_iam_role" "worker_role" {
-  name = "Guy-K8S-WorkerNode-IAM-Role"
+  name = "Guy-K8S-WorkerNode-Role-${formatdate("YYYYMMDDhhmmss", timestamp())}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -1102,7 +1101,7 @@ resource "aws_s3_object" "kubeconfig" {
 
 # Secrets Manager for Kubernetes join command
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command"
+  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}"
   description = "Kubernetes join command for worker nodes"
 }
 

@@ -121,7 +121,7 @@ resource "null_resource" "lambda_package" {
 
   provisioner "local-exec" {
     command = <<-EOT
-      mkdir -p ${path.module}
+      mkdir -p ${abspath(path.module)}
       echo 'def handler(event, context):
           # Simple placeholder lambda function
           print("Polybot scaling lambda executed")
@@ -129,7 +129,7 @@ resource "null_resource" "lambda_package" {
       ' > /tmp/index.py
       cd /tmp
       zip -r lambda_package.zip index.py
-      mv lambda_package.zip ${path.module}/
+      mv lambda_package.zip ${abspath(path.module)}/
     EOT
   }
 }
