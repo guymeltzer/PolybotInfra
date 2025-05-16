@@ -5,9 +5,20 @@ provider "aws" {
 # Create a data source to fetch the cluster details
 data "aws_instance" "control_plane" {
   depends_on = [module.k8s-cluster]
+  
   filter {
     name   = "tag:Name"
     values = ["k8s-control-plane"]
+  }
+  
+  filter {
+    name   = "instance-state-name"
+    values = ["running"]
+  }
+  
+  filter {
+    name   = "tag:kubernetes.io/cluster/kubernetes"
+    values = ["owned"]
   }
 }
 
