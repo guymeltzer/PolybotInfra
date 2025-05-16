@@ -7,7 +7,7 @@ data "aws_instance" "control_plane" {
   depends_on = [module.k8s-cluster]
   filter {
     name   = "tag:Name"
-    values = ["guy-control-plane"]
+    values = ["k8s-control-plane"]
   }
 }
 
