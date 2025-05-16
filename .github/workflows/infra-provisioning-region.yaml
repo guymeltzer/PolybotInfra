@@ -15,6 +15,10 @@ on:
         required: true
       TELEGRAM_TOKEN_PROD:
         required: true
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
 
 jobs:
   provision-region:
@@ -48,6 +52,8 @@ jobs:
         env:
           TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
           TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
+          TF_VAR_docker_password: ${{ secrets.DOCKER_PASSWORD }}
         run: terraform plan -var-file="region.${{ inputs.region }}.tfvars" -out=tfplan
         id: plan
 
@@ -55,6 +61,8 @@ jobs:
         env:
           TF_VAR_telegram_token_dev: ${{ secrets.TELEGRAM_TOKEN_DEV }}
           TF_VAR_telegram_token_prod: ${{ secrets.TELEGRAM_TOKEN_PROD }}
+          TF_VAR_docker_username: ${{ secrets.DOCKER_USERNAME }}
+          TF_VAR_docker_password: ${{ secrets.DOCKER_PASSWORD }}
         run: terraform apply -auto-approve tfplan
         
       - name: Extract Kubernetes Info

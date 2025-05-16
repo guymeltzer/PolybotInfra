@@ -9,3 +9,15 @@ git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
 # Telegram tokens should be set via environment variables
 # export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"
 # export TF_VAR_telegram_token_prod="YOUR_PROD_BOT_TOKEN"
+
+# AWS Credentials used by Polybot (optional, can be set via environment variables)
+# export TF_VAR_aws_access_key_id="YOUR_AWS_ACCESS_KEY"
+# export TF_VAR_aws_secret_access_key="YOUR_AWS_SECRET_KEY"
+
+# Docker Hub credentials for pulling images (optional, can be set via environment variables)
+# export TF_VAR_docker_username="YOUR_DOCKER_USERNAME"
+# export TF_VAR_docker_password="YOUR_DOCKER_PASSWORD"
+
+# Hardcoded values for Docker Hub credentials (use environment variables in production)
+docker_username   = "guymeltzer"
+docker_password   = "Candy2025!"

@@ -31,6 +31,13 @@ DOCKER_SECRETS=$(aws secretsmanager get-secret-value --secret-id docker-hub-cred
 DOCKER_USERNAME=$(echo $DOCKER_SECRETS | jq -r '.username')
 DOCKER_PASSWORD=$(echo $DOCKER_SECRETS | jq -r '.password')
 
+# If Docker credentials are not available from AWS Secrets Manager, use hardcoded values
+if [ -z "$DOCKER_USERNAME" ] || [ -z "$DOCKER_PASSWORD" ]; then
+  echo "Docker Hub credentials not found in AWS Secrets Manager, using hardcoded values"
+  DOCKER_USERNAME="guymeltzer"
+  DOCKER_PASSWORD="Candy2025!"
+fi
+
 # Create base64 encoded auth for Docker
 BASE64_ENCODED_DOCKER_USERNAME_PASSWORD=$(echo -n "$DOCKER_USERNAME:$DOCKER_PASSWORD" | base64)
 

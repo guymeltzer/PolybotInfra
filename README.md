@@ -9,6 +9,7 @@ This repository contains Terraform code to provision the Polybot service infrast
 - AWS CLI configured
 - Route53 hosted zone
 - SSH key pair in each target region
+- Docker Hub account (set up with provided credentials)
 
 ## Required AWS Permissions
 
@@ -35,19 +36,25 @@ The AWS user/role running Terraform needs the following permissions:
    export TF_VAR_telegram_token_prod="YOUR_PROD_BOT_TOKEN"
    ```
 
-3. Select your workspace for the target region:
+3. Set your Docker Hub credentials as environment variables (optional, configured by default in tfvars):
+   ```bash
+   export TF_VAR_docker_username="guymeltzer"
+   export TF_VAR_docker_password="Candy2025!"
+   ```
+
+4. Select your workspace for the target region:
    ```bash
    terraform workspace select us-east-1 || terraform workspace new us-east-1
    ```
 
-4. Initialize, plan, and apply Terraform:
+5. Initialize, plan, and apply Terraform:
    ```bash
    terraform init
    terraform plan -var-file=region.us-east-1.tfvars
    terraform apply -var-file=region.us-east-1.tfvars
    ```
 
-5. When finished, destroy all resources:
+6. When finished, destroy all resources:
    ```bash
    terraform destroy -var-file=region.us-east-1.tfvars
    ```
@@ -58,13 +65,17 @@ The repository includes GitHub Actions workflows for automated infrastructure pr
 
 - `infra-provisioning-main.yaml` - Main workflow triggered manually to provision infrastructure
 - `infra-provisioning-region.yaml` - Provisions infrastructure for a specific region
-- `infra-destroying.yaml` - Destroys infrastructure in a specified region
 
-To use these workflows, you need to set the following GitHub secrets:
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `TELEGRAM_TOKEN_DEV`
-- `TELEGRAM_TOKEN_PROD`
+## GitHub Actions Secrets
+
+For CI/CD pipelines to work correctly, set the following secrets in your GitHub repository:
+
+- `AWS_ACCESS_KEY_ID` - AWS access key for Terraform
+- `AWS_SECRET_ACCESS_KEY` - AWS secret key for Terraform  
+- `TELEGRAM_TOKEN_DEV` - Telegram dev bot token
+- `TELEGRAM_TOKEN_PROD` - Telegram production bot token
+- `DOCKER_USERNAME` - Docker Hub username (guymeltzer)
+- `DOCKER_PASSWORD` - Docker Hub password (Candy2025!)
 
 ## Project Structure
 
