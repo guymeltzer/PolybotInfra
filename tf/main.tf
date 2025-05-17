@@ -92,6 +92,7 @@ resource "null_resource" "wait_for_kubernetes" {
   }
   
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
@@ -102,7 +103,7 @@ resource "null_resource" "wait_for_kubernetes" {
       echo "Finding control plane instance by tag..."
       INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
       
-      if [[ "$INSTANCE_ID" == "None" || -z "$INSTANCE_ID" ]]; then
+      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
         echo "ERROR: Could not find control plane instance with tag 'Name=k8s-control-plane'"
         exit 1
       fi
@@ -113,7 +114,7 @@ resource "null_resource" "wait_for_kubernetes" {
       PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       PRIVATE_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
       
-      if [[ "$PUBLIC_IP" == "None" || -z "$PUBLIC_IP" ]]; then
+      if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
         echo "No public IP found, will use private IP: $PRIVATE_IP"
         CP_IP=$PRIVATE_IP
         IP_TYPE="private"
@@ -125,21 +126,40 @@ resource "null_resource" "wait_for_kubernetes" {
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
+      # Check instance console output for errors first
+      echo "Getting console output for troubleshooting..."
+      aws ec2 get-console-output --region us-east-1 --instance-id $INSTANCE_ID --output text || echo "Failed to get console output"
+      
       # Wait for SSH to be available first (proving network connectivity)
       echo "Checking SSH connectivity to control plane..."
       attempt=0
       max_attempts=10
-      while ! nc -z -w5 $CP_IP 22 2>/dev/null; do
-        attempt=$((attempt+1))
-        if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for SSH connectivity to control plane"
-          echo "This suggests a fundamental network or security group issue"
-          exit 1
+      SSH_READY=0
+      
+      while [ $attempt -lt $max_attempts ] && [ $SSH_READY -eq 0 ]; do
+        if nc -z -w5 $CP_IP 22 2>/dev/null; then
+          SSH_READY=1
+          echo "SSH connectivity confirmed."
+        else
+          attempt=$((attempt+1))
+          if [ $attempt -ge $max_attempts ]; then
+            echo "Timed out waiting for SSH connectivity to control plane"
+            echo "This suggests a fundamental network or security group issue"
+            exit 1
+          fi
+          echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
+          sleep 15
         fi
-        echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
-        sleep 15
       done
-      echo "SSH connectivity confirmed."
+      
+      # Try to get kubeadm init logs via SSM to see what's happening
+      echo "Checking kubeadm logs via SSM..."
+      aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
+        --parameters commands="cat /var/log/k8s-control-plane-init.log | tail -n 50" --output text
+      
+      echo "Checking kubelet status..."
+      aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
+        --parameters commands="systemctl status kubelet" --output text
       
       # Wait longer before checking for Kubernetes API - it takes time to initialize
       echo "Waiting 3 minutes for Kubernetes initialization..."
@@ -150,25 +170,36 @@ resource "null_resource" "wait_for_kubernetes" {
       
       attempt=0
       max_attempts=30
-      until curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; do
-        attempt=$((attempt+1))
-        if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for Kubernetes API"
-          echo "Debug info:"
-          echo "- Control plane instance ID: $INSTANCE_ID"
-          echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
-          
-          # Try to get logs from the kubelet service
-          echo "Checking for errors in Kubernetes initialization..."
-          aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" --parameters commands="systemctl status kubelet || journalctl -xeu kubelet" --output text || echo "Could not retrieve kubelet status"
-          
-          exit 1
-        fi
-        echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
-        sleep 20
-      done
+      API_READY=0
       
-      echo "Kubernetes API is available! Creating kubeconfig file..."
+      while [ $attempt -lt $max_attempts ] && [ $API_READY -eq 0 ]; do
+        if curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
+          API_READY=1
+          echo "Kubernetes API is available!"
+        else
+          attempt=$((attempt+1))
+          if [ $attempt -ge $max_attempts ]; then
+            echo "Timed out waiting for Kubernetes API"
+            echo "Debug info:"
+            echo "- Control plane instance ID: $INSTANCE_ID"
+            echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
+            
+            # Try to get logs from the kubelet service
+            echo "Checking for errors in Kubernetes initialization..."
+            aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
+              --parameters commands="systemctl status kubelet || journalctl -xeu kubelet" --output text
+            
+            # Check kubeadm logs
+            echo "Checking kubeadm logs..."
+            aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
+              --parameters commands="cat /var/log/cloud-init-output.log | tail -n 100" --output text
+            
+            exit 1
+          fi
+          echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
+          sleep 20
+        fi
+      done
       
       # Create kubeconfig file for subsequent operations
       cat > kubeconfig.yml <<EOF

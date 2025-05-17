@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -ex
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-control-plane-init.log"
@@ -37,8 +37,10 @@ sysctl --system
 
 # Set Kubernetes version
 KUBERNETES_VERSION="v1.32"
+echo "$$(date) - Using Kubernetes version: $KUBERNETES_VERSION"
 
 # Install CRI-O, kubelet, kubeadm, kubectl using modern repository approach
+echo "$$(date) - Installing CRI-O and Kubernetes components"
 curl -fsSL https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
@@ -50,9 +52,11 @@ apt-get install -y cri-o kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
 
 # Start the CRI-O container runtime and kubelet
-systemctl start crio.service
-systemctl enable --now crio.service
+echo "$$(date) - Starting CRI-O and kubelet services"
+systemctl enable --now crio
+systemctl status crio
 systemctl enable --now kubelet
+systemctl status kubelet
 
 # Disable swap memory
 swapoff -a
@@ -60,11 +64,17 @@ swapoff -a
 echo "@reboot /sbin/swapoff -a" | crontab -
 
 # Get the public and private IPs
+echo "$$(date) - Getting instance network details"
 PUBLIC_IP=$$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
-# Create kubeadm config file with placeholders
+echo "Public IP: $${PUBLIC_IP}"
+echo "Private IP: $${PRIVATE_IP}"
+echo "Hostname: $${HOSTNAME}"
+
+# Create kubeadm config file
+echo "$$(date) - Creating kubeadm configuration"
 cat <<EOF > /tmp/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
@@ -96,25 +106,42 @@ controllerManager:
     cloud-provider: external
 EOF
 
-# Initialize Kubernetes control plane with the config file
-echo "Starting kubeadm init with config at $(date)"
-kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5
+cat /tmp/kubeadm-config.yaml
 
-echo "Kubernetes control plane initialized with kubeadm"
+# Check that CRI-O is functioning properly
+echo "$$(date) - Verifying CRI-O status"
+crictl version || echo "CRI-O not responding properly"
+crictl info || echo "CRI-O information not available"
+
+# Initialize Kubernetes control plane with the config file
+echo "$$(date) - Starting kubeadm init with config"
+kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5 || {
+  echo "$$(date) - kubeadm init failed, checking errors"
+  journalctl -xeu kubelet
+  exit 1
+}
+
+echo "$$(date) - Kubernetes control plane initialized with kubeadm"
 
 # Setup kubeconfig for root user
 mkdir -p /root/.kube
 cp -i /etc/kubernetes/admin.conf /root/.kube/config
 chown root:root /root/.kube/config
 
+# Verify initial cluster status
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
+
 # Install Calico CNI (as per course instructions)
 echo "$$(date) - Installing Calico CNI networking..." | tee -a $${LOGFILE}
 kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
 
 # Verify Calico pods are running
-for i in {1..10}; do
+for i in {1..15}; do
   echo "$$(date) - Waiting for Calico pods to start (attempt $i)..." | tee -a $${LOGFILE}
-  if kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system | grep -q calico; then
+  kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system | grep -q calico
+  CALICO_RUNNING=$?
+  if [ $CALICO_RUNNING -eq 0 ]; then
     echo "$$(date) - Calico pods are starting" | tee -a $${LOGFILE}
     break
   fi
@@ -122,9 +149,11 @@ for i in {1..10}; do
 done
 
 # Install AWS SSM agent
+echo "$$(date) - Installing and configuring AWS SSM agent"
 snap install amazon-ssm-agent --classic
 systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
 systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service
 
 # Allow control plane to run pods (remove taint)
 kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes --all node-role.kubernetes.io/control-plane-
@@ -138,11 +167,14 @@ chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 echo "$${PRIVATE_IP} $${HOSTNAME}" >> /etc/hosts
 
 # Configure kubeconfig with public IP for remote access
+echo "$$(date) - Configuring kubeconfig for remote access"
+cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.bak
 sed -i "s/server: https:\/\/$${PRIVATE_IP}:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
 kubectl config set clusters.kubernetes.server https://$${PUBLIC_IP}:6443
 
 # Store join command in AWS Secrets Manager for workers to use
 JOIN_COMMAND=$$(kubeadm token create --print-join-command)
+echo "$$(date) - Generated join command: $${JOIN_COMMAND}"
 aws secretsmanager put-secret-value \
   --secret-id kubernetes-join-command-${token} \
   --secret-string "$${JOIN_COMMAND}" \
@@ -150,7 +182,39 @@ aws secretsmanager put-secret-value \
   --version-stage AWSCURRENT
 
 # Verify the API server is accessible
+echo "$$(date) - Verifying API server is accessible"
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
 kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
+
+# Open firewall rules for Kubernetes API
+echo "$$(date) - Configuring firewall rules"
+iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
+iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
+
+# Enable port forwarding on the API server
+echo "$$(date) - Configuring port forwarding"
+cat <<EOF | tee /etc/systemd/system/kube-apiserver-port-forward.service
+[Unit]
+Description=Kubernetes API Server Port Forward
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:6443,fork,reuseaddr TCP:127.0.0.1:6443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+apt-get install -y socat
+systemctl daemon-reload
+systemctl enable kube-apiserver-port-forward.service
+systemctl start kube-apiserver-port-forward.service
+
+# Final verification
+echo "$$(date) - Final verification of Kubernetes cluster"
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
+netstat -tulpn | grep 6443
 
 echo "$$(date) - Control plane initialization completed" | tee -a $${LOGFILE} 
