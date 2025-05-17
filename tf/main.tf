@@ -101,11 +101,17 @@ resource "null_resource" "wait_for_kubernetes" {
       
       # Find the control plane instance by tag
       echo "Finding control plane instance by tag..."
-      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text || echo "")
       
-      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+      if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
         echo "ERROR: Could not find control plane instance with tag 'Name=k8s-control-plane'"
-        exit 1
+        echo "Falling back to a direct query without filters..."
+        INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --query "Reservations[*].Instances[?State.Name=='running'].{Id:InstanceId,Name:Tags[?Key=='Name'].Value|[0]}" --output text | grep k8s-control-plane | awk '{print $1}')
+        
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "Still could not find the control plane instance. Exiting."
+          exit 1
+        fi
       fi
       
       echo "Found control plane instance: $INSTANCE_ID"
@@ -114,7 +120,7 @@ resource "null_resource" "wait_for_kubernetes" {
       PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       PRIVATE_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
       
-      if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+      if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
         echo "No public IP found, will use private IP: $PRIVATE_IP"
         CP_IP=$PRIVATE_IP
         IP_TYPE="private"
@@ -126,40 +132,53 @@ resource "null_resource" "wait_for_kubernetes" {
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
-      # Check instance console output for errors first
-      echo "Getting console output for troubleshooting..."
-      aws ec2 get-console-output --region us-east-1 --instance-id $INSTANCE_ID --output text || echo "Failed to get console output"
+      SSH_KEY=$(echo "$HOME/.ssh/id_rsa" | sed "s#^~#$HOME#")
+      if [ ! -f "$SSH_KEY" ]; then
+        echo "SSH key not found at $SSH_KEY, checking for other keys..."
+        SSH_KEY=$(find $HOME/.ssh -name "id_*" ! -name "*.pub" | head -1)
+        if [ -z "$SSH_KEY" ]; then
+          echo "No SSH key found, will rely on curl for health checks"
+        else
+          echo "Using SSH key: $SSH_KEY"
+        fi
+      fi
       
-      # Wait for SSH to be available first (proving network connectivity)
+      # Wait for SSH to be available (proving network connectivity)
       echo "Checking SSH connectivity to control plane..."
       attempt=0
-      max_attempts=10
-      SSH_READY=0
+      max_attempts=15
       
-      while [ $attempt -lt $max_attempts ] && [ $SSH_READY -eq 0 ]; do
+      while true; do
         if nc -z -w5 $CP_IP 22 2>/dev/null; then
-          SSH_READY=1
-          echo "SSH connectivity confirmed."
-        else
-          attempt=$((attempt+1))
-          if [ $attempt -ge $max_attempts ]; then
-            echo "Timed out waiting for SSH connectivity to control plane"
-            echo "This suggests a fundamental network or security group issue"
-            exit 1
+          echo "SSH port is open"
+          if [ -n "$SSH_KEY" ]; then
+            if ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 ubuntu@$CP_IP echo "SSH connection successful" 2>/dev/null; then
+              echo "SSH connectivity confirmed"
+              break
+            else
+              echo "SSH port is open but cannot authenticate yet, waiting..."
+            fi
+          else
+            echo "SSH port is open, continuing without SSH key authentication"
+            break
           fi
-          echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
-          sleep 15
         fi
+        
+        attempt=$((attempt+1))
+        if [ $attempt -ge $max_attempts ]; then
+          echo "Timed out waiting for SSH connectivity to control plane"
+          echo "This suggests a fundamental network or security group issue"
+          exit 1
+        fi
+        echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
+        sleep 15
       done
       
-      # Try to get kubeadm init logs via SSM to see what's happening
-      echo "Checking kubeadm logs via SSM..."
-      aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
-        --parameters commands="cat /var/log/k8s-control-plane-init.log | tail -n 50" --output text
-      
-      echo "Checking kubelet status..."
-      aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
-        --parameters commands="systemctl status kubelet" --output text
+      # Try to check status using SSH if possible
+      if [ -n "$SSH_KEY" ]; then
+        echo "Checking control plane status via SSH..."
+        ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo cat /var/log/k8s-control-plane-init.log | tail -n 50" || echo "Could not retrieve logs via SSH"
+      fi
       
       # Wait longer before checking for Kubernetes API - it takes time to initialize
       echo "Waiting 3 minutes for Kubernetes initialization..."
@@ -170,35 +189,39 @@ resource "null_resource" "wait_for_kubernetes" {
       
       attempt=0
       max_attempts=30
-      API_READY=0
       
-      while [ $attempt -lt $max_attempts ] && [ $API_READY -eq 0 ]; do
+      while true; do
         if curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
-          API_READY=1
           echo "Kubernetes API is available!"
-        else
-          attempt=$((attempt+1))
-          if [ $attempt -ge $max_attempts ]; then
-            echo "Timed out waiting for Kubernetes API"
-            echo "Debug info:"
-            echo "- Control plane instance ID: $INSTANCE_ID"
-            echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
-            
-            # Try to get logs from the kubelet service
-            echo "Checking for errors in Kubernetes initialization..."
-            aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
-              --parameters commands="systemctl status kubelet || journalctl -xeu kubelet" --output text
-            
-            # Check kubeadm logs
-            echo "Checking kubeadm logs..."
-            aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" \
-              --parameters commands="cat /var/log/cloud-init-output.log | tail -n 100" --output text
-            
-            exit 1
-          fi
-          echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
-          sleep 20
+          break
         fi
+        
+        attempt=$((attempt+1))
+        if [ $attempt -ge $max_attempts ]; then
+          echo "Timed out waiting for Kubernetes API"
+          
+          # Try SSH diagnostics if we have an SSH key
+          if [ -n "$SSH_KEY" ]; then
+            echo "Attempting to debug via SSH..."
+            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo systemctl status kubelet.service || sudo journalctl -xeu kubelet" || echo "Could not get kubelet status via SSH"
+            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo netstat -tulpn | grep 6443" || echo "Could not get netstat via SSH"
+            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo /home/ubuntu/check-api.sh" || echo "Could not run API check script via SSH"
+          else
+            echo "No SSH key available for debugging"
+          fi
+          
+          exit 1
+        fi
+        
+        echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
+        
+        # Try SSH diagnostics every 5 attempts if we have an SSH key
+        if [ $((attempt % 5)) -eq 0 ] && [ -n "$SSH_KEY" ]; then
+          echo "Checking status via SSH (attempt $attempt)..."
+          ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo /home/ubuntu/check-api.sh" || echo "Could not run API check via SSH"
+        fi
+        
+        sleep 20
       done
       
       # Create kubeconfig file for subsequent operations

@@ -6,6 +6,13 @@ LOGFILE="/var/log/k8s-control-plane-init.log"
 exec > >(tee -a $${LOGFILE}) 2>&1
 echo "$$(date) - Starting Kubernetes control plane initialization"
 
+# Add SSH key for direct access (bypassing AWS credential expiration issues)
+echo "$$(date) - Setting up SSH access"
+mkdir -p /home/ubuntu/.ssh
+echo "${ssh_pub_key}" >> /home/ubuntu/.ssh/authorized_keys
+chmod 600 /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+
 # Trap errors and exit the script with an error message
 trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; exit 1' ERR
 
@@ -15,6 +22,7 @@ apt-get update
 # Install required packages as per course instructions
 apt-get install -y jq unzip ebtables ethtool
 apt-get install -y software-properties-common apt-transport-https ca-certificates curl gpg
+apt-get install -y tcpdump net-tools telnet dnsutils iptables-persistent
 
 # Install AWS CLI
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -83,7 +91,7 @@ nodeRegistration:
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: $${PRIVATE_IP}
+  advertiseAddress: 0.0.0.0
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -96,8 +104,10 @@ apiServer:
   - $${HOSTNAME}
   - localhost
   - 127.0.0.1
+  - "*"
   extraArgs:
     bind-address: 0.0.0.0
+    advertise-address: $${PUBLIC_IP}
 networking:
   podSubnet: 10.244.0.0/16
   serviceSubnet: 10.96.0.0/12
@@ -108,10 +118,24 @@ EOF
 
 cat /tmp/kubeadm-config.yaml
 
+# Enable IP forwarding and allow port 6443 traffic
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
+iptables -A INPUT -p tcp --dport 179 -j ACCEPT
+iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+iptables-save > /etc/iptables/rules.v4
+
 # Check that CRI-O is functioning properly
 echo "$$(date) - Verifying CRI-O status"
 crictl version || echo "CRI-O not responding properly"
 crictl info || echo "CRI-O information not available"
+
+# Check network connectivity - dump interfaces and routes
+echo "$$(date) - Network configuration dump"
+ip a
+ip route
 
 # Initialize Kubernetes control plane with the config file
 echo "$$(date) - Starting kubeadm init with config"
@@ -123,14 +147,26 @@ kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --
 
 echo "$$(date) - Kubernetes control plane initialized with kubeadm"
 
-# Setup kubeconfig for root user
+# Setup kubeconfig for root user and ubuntu user
 mkdir -p /root/.kube
 cp -i /etc/kubernetes/admin.conf /root/.kube/config
 chown root:root /root/.kube/config
 
+mkdir -p /home/ubuntu/.kube
+cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
+
 # Verify initial cluster status
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
+
+# Open up kube-apiserver endpoint in /etc/kubernetes/manifests
+echo "$$(date) - Ensuring kube-apiserver is accessible"
+MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
+if [ -f "$MANIFEST" ]; then
+  sed -i "s/--bind-address=127.0.0.1/--bind-address=0.0.0.0/g" $MANIFEST
+  sed -i "s/--advertise-address=$${PRIVATE_IP}/--advertise-address=$${PUBLIC_IP}/g" $MANIFEST
+fi
 
 # Install Calico CNI (as per course instructions)
 echo "$$(date) - Installing Calico CNI networking..." | tee -a $${LOGFILE}
@@ -169,7 +205,7 @@ echo "$${PRIVATE_IP} $${HOSTNAME}" >> /etc/hosts
 # Configure kubeconfig with public IP for remote access
 echo "$$(date) - Configuring kubeconfig for remote access"
 cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.bak
-sed -i "s/server: https:\/\/$${PRIVATE_IP}:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
 kubectl config set clusters.kubernetes.server https://$${PUBLIC_IP}:6443
 
 # Store join command in AWS Secrets Manager for workers to use
@@ -190,8 +226,10 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
 echo "$$(date) - Configuring firewall rules"
 iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
 iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
+iptables-save > /etc/iptables/rules.v4
 
-# Enable port forwarding on the API server
+# Install socat to enable port forwarding
+apt-get install -y socat
 echo "$$(date) - Configuring port forwarding"
 cat <<EOF | tee /etc/systemd/system/kube-apiserver-port-forward.service
 [Unit]
@@ -206,10 +244,21 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-apt-get install -y socat
 systemctl daemon-reload
 systemctl enable kube-apiserver-port-forward.service
 systemctl start kube-apiserver-port-forward.service
+
+# Add a simple diagnostic endpoint to check API server status
+cat <<EOF > /home/ubuntu/check-api.sh
+#!/bin/bash
+echo "Testing Kubernetes API server access..."
+curl -k https://localhost:6443/healthz
+echo ""
+echo "API server status: \$?"
+netstat -tulpn | grep 6443
+echo "Done"
+EOF
+chmod +x /home/ubuntu/check-api.sh
 
 # Final verification
 echo "$$(date) - Final verification of Kubernetes cluster"
