@@ -108,16 +108,56 @@ resource "null_resource" "wait_for_kubernetes" {
       echo "Waiting for instance to be in running state..."
       aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
       
-      # Get the public IP of the control plane
-      CP_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-      echo "Control plane IP: $CP_IP"
+      # Function to get instance details
+      get_instance_details() {
+        aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID
+      }
       
-      if [ -z "$CP_IP" ]; then
-        echo "ERROR: Failed to get public IP for instance $INSTANCE_ID"
-        echo "Instance details:"
-        aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --output json
-        exit 1
+      # Get instance details
+      echo "Getting instance details..."
+      INSTANCE_DETAILS=$(get_instance_details)
+      
+      # Try to get the public IP with retries
+      echo "Attempting to get the IP address..."
+      
+      RETRY_COUNT=0
+      MAX_RETRIES=15
+      CP_IP=""
+      
+      while [ -z "$CP_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        echo "IP lookup attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
+        # Try public IP first
+        CP_IP=$(echo "$INSTANCE_DETAILS" | jq -r '.Reservations[0].Instances[0].PublicIpAddress')
+        
+        if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
+          echo "No public IP found, checking instance details again after a short wait..."
+          sleep 10
+          INSTANCE_DETAILS=$(get_instance_details)
+          RETRY_COUNT=$((RETRY_COUNT+1))
+        else
+          echo "Found public IP: $CP_IP"
+          IP_TYPE="public"
+          break
+        fi
+      done
+      
+      # Fall back to private IP if public IP isn't available
+      if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
+        echo "No public IP found after $MAX_RETRIES attempts, trying private IP..."
+        CP_IP=$(echo "$INSTANCE_DETAILS" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress')
+        
+        if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
+          echo "ERROR: Failed to get any IP address for instance $INSTANCE_ID"
+          echo "Instance details:"
+          echo "$INSTANCE_DETAILS"
+          exit 1
+        else
+          echo "Using private IP: $CP_IP"
+          IP_TYPE="private"
+        fi
       fi
+      
+      echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
       echo "Waiting for Kubernetes API at https://$CP_IP:6443 to become available..."
       
@@ -129,7 +169,7 @@ resource "null_resource" "wait_for_kubernetes" {
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
           echo "- Control plane instance status: $(aws ec2 describe-instance-status --region us-east-1 --instance-ids $INSTANCE_ID --output json)"
-          echo "- Control plane public IP: $CP_IP"
+          echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
           echo "- EC2 console output: $(aws ec2 get-console-output --region us-east-1 --instance-id $INSTANCE_ID --output text || echo 'Failed to get console output')"
           echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
