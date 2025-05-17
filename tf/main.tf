@@ -132,63 +132,36 @@ resource "null_resource" "wait_for_kubernetes" {
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
-      SSH_KEY=$(echo "$HOME/.ssh/id_rsa" | sed "s#^~#$HOME#")
-      if [ ! -f "$SSH_KEY" ]; then
-        echo "SSH key not found at $SSH_KEY, checking for other keys..."
-        SSH_KEY=$(find $HOME/.ssh -name "id_*" ! -name "*.pub" | head -1)
-        if [ -z "$SSH_KEY" ]; then
-          echo "No SSH key found, will rely on curl for health checks"
-        else
-          echo "Using SSH key: $SSH_KEY"
-        fi
-      fi
-      
-      # Wait for SSH to be available (proving network connectivity)
-      echo "Checking SSH connectivity to control plane..."
+      # Wait for TCP connectivity to port 22 (SSH) to verify the instance is accessible
+      echo "Checking TCP connectivity to control plane SSH port..."
       attempt=0
       max_attempts=15
       
       while true; do
         if nc -z -w5 $CP_IP 22 2>/dev/null; then
-          echo "SSH port is open"
-          if [ -n "$SSH_KEY" ]; then
-            if ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 ubuntu@$CP_IP echo "SSH connection successful" 2>/dev/null; then
-              echo "SSH connectivity confirmed"
-              break
-            else
-              echo "SSH port is open but cannot authenticate yet, waiting..."
-            fi
-          else
-            echo "SSH port is open, continuing without SSH key authentication"
-            break
-          fi
+          echo "SSH port is open, control plane is network-accessible"
+          break
         fi
         
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for SSH connectivity to control plane"
+          echo "Timed out waiting for SSH port to be accessible"
           echo "This suggests a fundamental network or security group issue"
           exit 1
         fi
-        echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
+        echo "Attempt $attempt/$max_attempts: TCP port 22 not available yet, waiting..."
         sleep 15
       done
       
-      # Try to check status using SSH if possible
-      if [ -n "$SSH_KEY" ]; then
-        echo "Checking control plane status via SSH..."
-        ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo cat /var/log/k8s-control-plane-init.log | tail -n 50" || echo "Could not retrieve logs via SSH"
-      fi
-      
       # Wait longer before checking for Kubernetes API - it takes time to initialize
-      echo "Waiting 3 minutes for Kubernetes initialization..."
-      sleep 180
+      echo "SSH port is accessible. Waiting 5 minutes for Kubernetes initialization..."
+      sleep 300
       
       # Now check for Kubernetes API
       echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
       
       attempt=0
-      max_attempts=30
+      max_attempts=60
       
       while true; do
         if curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
@@ -199,28 +172,14 @@ resource "null_resource" "wait_for_kubernetes" {
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
-          
-          # Try SSH diagnostics if we have an SSH key
-          if [ -n "$SSH_KEY" ]; then
-            echo "Attempting to debug via SSH..."
-            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo systemctl status kubelet.service || sudo journalctl -xeu kubelet" || echo "Could not get kubelet status via SSH"
-            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo netstat -tulpn | grep 6443" || echo "Could not get netstat via SSH"
-            ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo /home/ubuntu/check-api.sh" || echo "Could not run API check script via SSH"
-          else
-            echo "No SSH key available for debugging"
-          fi
+          echo "Debug info:"
+          echo "- Control plane instance ID: $INSTANCE_ID"
+          echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
           
           exit 1
         fi
         
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
-        
-        # Try SSH diagnostics every 5 attempts if we have an SSH key
-        if [ $((attempt % 5)) -eq 0 ] && [ -n "$SSH_KEY" ]; then
-          echo "Checking status via SSH (attempt $attempt)..."
-          ssh -i $SSH_KEY -o StrictHostKeyChecking=no ubuntu@$CP_IP "sudo /home/ubuntu/check-api.sh" || echo "Could not run API check via SSH"
-        fi
-        
         sleep 20
       done
       

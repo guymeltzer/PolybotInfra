@@ -525,7 +525,7 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 resource "aws_instance" "control_plane" {
   ami                    = var.control_plane_ami
   instance_type          = var.control_plane_instance_type
-  key_name               = var.key_name
+  key_name               = var.key_name != "" ? var.key_name : null
   subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
@@ -536,13 +536,13 @@ resource "aws_instance" "control_plane" {
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
   })
 
-  tags = {
-    Name = "k8s-control-plane"
-  }
-
   root_block_device {
     volume_size = 50
     volume_type = "gp2"
+  }
+
+  tags = {
+    Name = "k8s-control-plane"
   }
 
   depends_on = [
