@@ -537,7 +537,7 @@ resource "aws_instance" "control_plane" {
   })
 
   root_block_device {
-    volume_size = 50
+    volume_size = 20
     volume_type = "gp2"
   }
 
