@@ -86,21 +86,27 @@ module "k8s-cluster" {
 resource "null_resource" "wait_for_kubernetes" {
   depends_on = [module.k8s-cluster]
   
+  triggers = {
+    control_plane_id = module.k8s-cluster.aws_instance.control_plane.id
+  }
+  
   provisioner "local-exec" {
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
-      echo "Control plane IP: ${module.k8s-cluster.control_plane_public_ip}"
+      CP_IP=$(aws ec2 describe-instances --instance-ids ${module.k8s-cluster.aws_instance.control_plane.id} --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      echo "Control plane IP: $CP_IP"
+      
       attempt=0
       max_attempts=45
-      until curl -k https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz -v 2>/dev/null | grep -q ok; do
+      until curl -k https://$CP_IP:6443/healthz -v 2>/dev/null | grep -q ok; do
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
-          echo "- Control plane instance ID: $(aws ec2 describe-instances --filters "Name=tag:Name,Values=k8s-control-plane" --query "Reservations[].Instances[].InstanceId" --output text)"
-          echo "- Control plane public IP: ${module.k8s-cluster.control_plane_public_ip}"
-          echo "- Trying to ping control plane: $(ping -c 3 ${module.k8s-cluster.control_plane_public_ip} || echo 'Ping failed')"
+          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids ${module.k8s-cluster.aws_instance.control_plane.id} --output json)"
+          echo "- Control plane public IP: $CP_IP"
+          echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
         fi
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
@@ -115,13 +121,11 @@ kind: Config
 clusters:
 - name: default-cluster
   cluster:
-    server: https://${module.k8s-cluster.control_plane_public_ip}:6443
+    server: https://$CP_IP:6443
     insecure-skip-tls-verify: true
 users:
 - name: default-user
-  user:
-    client-certificate-data: ${module.k8s-cluster.client_certificate_data}
-    client-key-data: ${module.k8s-cluster.client_key_data}
+  user: {}
 contexts:
 - name: default-context
   context:

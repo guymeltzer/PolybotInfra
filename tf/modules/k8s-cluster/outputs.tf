@@ -3,6 +3,11 @@ output "control_plane_public_ip" {
   value       = aws_instance.control_plane.public_ip
 }
 
+output "aws_instance.control_plane" {
+  description = "Control plane EC2 instance resource"
+  value       = aws_instance.control_plane
+}
+
 output "alb_dns_name" {
   description = "DNS name of the Application Load Balancer"
   value       = aws_lb.polybot_alb.dns_name
