@@ -3,7 +3,7 @@ output "control_plane_public_ip" {
   value       = aws_instance.control_plane.public_ip
 }
 
-output "aws_instance.control_plane" {
+output "control_plane_instance" {
   description = "Control plane EC2 instance resource"
   value       = aws_instance.control_plane
 }

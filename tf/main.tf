@@ -87,14 +87,14 @@ resource "null_resource" "wait_for_kubernetes" {
   depends_on = [module.k8s-cluster]
   
   triggers = {
-    control_plane_id = module.k8s-cluster.aws_instance.control_plane.id
+    control_plane_id = module.k8s-cluster.control_plane_instance.id
   }
   
   provisioner "local-exec" {
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
-      CP_IP=$(aws ec2 describe-instances --instance-ids ${module.k8s-cluster.aws_instance.control_plane.id} --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      CP_IP=$(aws ec2 describe-instances --instance-ids ${module.k8s-cluster.control_plane_instance.id} --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       echo "Control plane IP: $CP_IP"
       
       attempt=0
@@ -104,7 +104,7 @@ resource "null_resource" "wait_for_kubernetes" {
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
-          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids ${module.k8s-cluster.aws_instance.control_plane.id} --output json)"
+          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids ${module.k8s-cluster.control_plane_instance.id} --output json)"
           echo "- Control plane public IP: $CP_IP"
           echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
