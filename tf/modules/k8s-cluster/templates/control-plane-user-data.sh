@@ -3,11 +3,11 @@ set -e
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-control-plane-init.log"
-exec > >(tee -a $LOGFILE) 2>&1
-echo "$(date) - Starting Kubernetes control plane initialization"
+exec > >(tee -a $${LOGFILE}) 2>&1
+echo "$$(date) - Starting Kubernetes control plane initialization"
 
 # Trap errors and exit the script with an error message
-trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; exit 1' ERR
+trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; exit 1' ERR
 
 # Update packages
 apt-get update
@@ -23,10 +23,10 @@ unzip -q awscliv2.zip
 rm -rf awscliv2.zip aws/
 
 # Add AWS CLI to PATH
-export PATH=$PATH:/usr/local/bin
+export PATH=$${PATH}:/usr/local/bin
 
 # Enable IPv4 packet forwarding. sysctl params required by setup, params persist across reboots
-cat <<'EOF' | tee /etc/sysctl.d/k8s.conf
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
 net.ipv4.ip_forward = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
@@ -39,8 +39,8 @@ sysctl --system
 KUBERNETES_VERSION="v1.32"
 
 # Install CRI-O, kubelet, kubeadm, kubectl using modern repository approach
-curl -fsSL https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+curl -fsSL https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
 curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
@@ -60,20 +60,20 @@ swapoff -a
 (crontab -l 2>/dev/null || echo "") | grep -v "@reboot /sbin/swapoff -a" | { cat; echo "@reboot /sbin/swapoff -a"; } | crontab -
 
 # Get the public and private IPs
-PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
-PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
+PUBLIC_IP=$$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+HOSTNAME=$$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
-# Create kubeadm config file - using quoted heredoc to prevent Terraform variable interpolation
-cat > /tmp/kubeadm-config.yaml <<'EOF'
+# Create kubeadm config file
+cat > /tmp/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: ${HOSTNAME}
+  name: $${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: ${PRIVATE_IP}
+  advertiseAddress: $${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - ${PUBLIC_IP}
-  - ${PRIVATE_IP}
-  - ${HOSTNAME}
+  - $${PUBLIC_IP}
+  - $${PRIVATE_IP}
+  - $${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -122,22 +122,22 @@ chmod 644 /etc/kubernetes/pki/ca.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 
-# Add a host entry for API server (using double quotes to allow Bash variable interpolation)
-echo "${PRIVATE_IP} ${HOSTNAME}" >> /etc/hosts
+# Add a host entry for API server
+echo "$${PRIVATE_IP} $${HOSTNAME}" >> /etc/hosts
 
-# Configure kubeconfig with public IP for remote access (using double quotes to allow Bash variable interpolation)
-sed -i "s/server: https:\/\/${PRIVATE_IP}:6443/server: https:\/\/${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
-kubectl config set clusters.kubernetes.server https://${PUBLIC_IP}:6443
+# Configure kubeconfig with public IP for remote access
+sed -i "s/server: https:\/\/$${PRIVATE_IP}:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+kubectl config set clusters.kubernetes.server https://$${PUBLIC_IP}:6443
 
 # Store join command in AWS Secrets Manager for workers to use
-JOIN_COMMAND=$(kubeadm token create --print-join-command)
+JOIN_COMMAND=$$(kubeadm token create --print-join-command)
 aws secretsmanager put-secret-value \
   --secret-id kubernetes-join-command-${token} \
-  --secret-string "$JOIN_COMMAND" \
+  --secret-string "$${JOIN_COMMAND}" \
   --version-stage AWSCURRENT
 
 # Verify the API server is accessible
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
 kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
 
-echo "$(date) - Control plane initialization completed" | tee -a $LOGFILE 
+echo "$$(date) - Control plane initialization completed" | tee -a $${LOGFILE} 
