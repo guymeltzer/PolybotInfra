@@ -87,14 +87,21 @@ resource "null_resource" "wait_for_kubernetes" {
   depends_on = [module.k8s-cluster]
   
   triggers = {
-    control_plane_id = module.k8s-cluster.control_plane_instance.id
+    # Use timestamp to always run this
+    timestamp = timestamp()
   }
   
   provisioner "local-exec" {
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
-      CP_IP=$(aws ec2 describe-instances --instance-ids ${module.k8s-cluster.control_plane_instance.id} --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      
+      # Find the control plane instance by tag
+      INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      echo "Found control plane instance: $INSTANCE_ID"
+      
+      # Get the public IP of the control plane
+      CP_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       echo "Control plane IP: $CP_IP"
       
       attempt=0
@@ -104,7 +111,7 @@ resource "null_resource" "wait_for_kubernetes" {
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
-          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids ${module.k8s-cluster.control_plane_instance.id} --output json)"
+          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --output json)"
           echo "- Control plane public IP: $CP_IP"
           echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
@@ -142,11 +149,9 @@ EOF
 resource "terraform_data" "kubectl_provider_config" {
   depends_on = [null_resource.wait_for_kubernetes]
   
-  # These trigger changes when the control plane is recreated or credentials change
+  # This ensures we rebuild when anything related to the API changes
   triggers_replace = {
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
-    client_cert_hash = sha256(module.k8s-cluster.client_certificate_data != "" ? module.k8s-cluster.client_certificate_data : "empty")
-    client_key_hash = sha256(module.k8s-cluster.client_key_data != "" ? module.k8s-cluster.client_key_data : "empty")
+    timestamp = timestamp()
   }
 }
 
