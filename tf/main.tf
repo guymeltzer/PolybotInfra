@@ -96,13 +96,47 @@ resource "null_resource" "wait_for_kubernetes" {
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
       
-      # Find the control plane instance by tag
-      INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      # Give AWS time to properly tag the instance and make it discoverable
+      echo "Sleeping 30 seconds to allow EC2 instance to be properly tagged..."
+      sleep 30
+      
+      # First list all instances to debug
+      echo "Available EC2 instances:"
+      aws ec2 describe-instances --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0],State.Name]" --output table
+      
+      # Try multiple ways to find the control plane
+      INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=*control-plane*" "Name=instance-state-name,Values=running,pending" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      
+      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+        echo "Trying alternate method to find control plane..."
+        INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag-key,Values=kubernetes.io/cluster/polybot-cluster" "Name=instance-state-name,Values=running,pending" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      fi
+      
+      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+        echo "ERROR: Could not find control plane instance"
+        echo "Available instances:"
+        aws ec2 describe-instances --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0],State.Name]" --output table
+        exit 1
+      fi
+      
       echo "Found control plane instance: $INSTANCE_ID"
+      
+      # Wait for the instance to be in running state
+      echo "Waiting for instance to be in running state..."
+      aws ec2 wait instance-running --instance-ids $INSTANCE_ID
       
       # Get the public IP of the control plane
       CP_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       echo "Control plane IP: $CP_IP"
+      
+      if [ -z "$CP_IP" ]; then
+        echo "ERROR: Failed to get public IP for instance $INSTANCE_ID"
+        echo "Instance details:"
+        aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
+        exit 1
+      fi
+      
+      echo "Waiting for Kubernetes API at https://$CP_IP:6443 to become available..."
       
       attempt=0
       max_attempts=45
@@ -113,6 +147,7 @@ resource "null_resource" "wait_for_kubernetes" {
           echo "Debug info:"
           echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --output json)"
           echo "- Control plane public IP: $CP_IP"
+          echo "- EC2 console output: $(aws ec2 get-console-output --instance-id $INSTANCE_ID --output text || echo 'Failed to get console output')"
           echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
         fi
@@ -141,6 +176,10 @@ contexts:
 current-context: default-context
 EOF
       echo "Created kubeconfig file"
+      
+      # Export KUBECONFIG to make it easier to debug
+      echo "export KUBECONFIG=$(pwd)/kubeconfig.yml" > k8s-env.sh
+      echo "Kubernetes environment file created at k8s-env.sh"
     EOT
   }
 }
