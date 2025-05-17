@@ -126,7 +126,7 @@ resource "null_resource" "wait_for_kubernetes" {
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
-      # Wait for the instance to boot up fully (check port 22 is open)
+      # First verify that the server is actually running
       echo "Checking basic connectivity to control plane..."
       attempt=0
       max_attempts=15
@@ -147,21 +147,45 @@ resource "null_resource" "wait_for_kubernetes" {
         sleep 15
       done
       
-      # Wait for the instance to fully boot and initialize Kubernetes (about 5 minutes)
-      echo "Instance is running. Waiting 5 minutes for Kubernetes initialization..."
-      sleep 300
+      # Wait 3 minutes for kubernetes initialization
+      echo "Instance is running. Waiting 3 minutes for Kubernetes initialization..."
+      sleep 180
       
-      # Now check for Kubernetes API (this can take a while, especially with DNS configuration)
+      # Check for Kubernetes API
       echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
       
       attempt=0
-      max_attempts=60
+      max_attempts=30
+      
+      # Try to get logs if needed
+      function get_logs {
+        echo "Attempting to retrieve kubelet logs from server..."
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "No instance ID available for logs."
+          return
+        fi
+        
+        echo "Checking kubelet status via AWS SSM..."
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="systemctl status kubelet; journalctl -xeu kubelet | tail -n 50" \
+          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet logs"
+      }
       
       # Keep trying until we get a response or timeout
       while true; do
-        if curl -k --connect-timeout 10 --max-time 15 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
-          echo "Kubernetes API is available!"
-          break
+        # First check if port 6443 is open
+        if nc -z -w5 $CP_IP 6443 2>/dev/null; then
+          echo "Port 6443 is open, testing API server..."
+          if curl -k --connect-timeout 10 --max-time 15 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
+            echo "Kubernetes API is available!"
+            break
+          else
+            echo "Port 6443 is open but API not responding correctly."
+          fi
+        else
+          echo "Port 6443 is not yet open."
         fi
         
         attempt=$((attempt+1))
@@ -172,11 +196,19 @@ resource "null_resource" "wait_for_kubernetes" {
           echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
           echo "- Attempting to connect to port 6443 to verify it's open..."
           nc -z -v $CP_IP 6443 || echo "Port 6443 appears to be closed"
+          
+          # Get logs
+          get_logs
           exit 1
         fi
         
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
         sleep 20
+        
+        # Every 5 attempts, try to get logs 
+        if [ $((attempt % 5)) -eq 0 ]; then
+          get_logs
+        fi
       done
       
       # Create kubeconfig file for subsequent operations

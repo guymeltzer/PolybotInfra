@@ -19,7 +19,7 @@ chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 # Trap errors and exit the script with an error message
-trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; exit 1' ERR
+trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
 
 # Update packages
 apt-get update
@@ -49,13 +49,13 @@ EOF
 sysctl --system
 
 # Set Kubernetes version
-KUBERNETES_VERSION="v1.32"
+KUBERNETES_VERSION="v1.32.0"  # Use specific patch version
 echo "$$(date) - Using Kubernetes version: $KUBERNETES_VERSION"
 
 # Install CRI-O, kubelet, kubeadm, kubectl using modern repository approach
 echo "$$(date) - Installing CRI-O and Kubernetes components"
-curl -fsSL https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/$${KUBERNETES_VERSION}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
 curl -fsSL https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
@@ -67,13 +67,13 @@ apt-mark hold kubelet kubeadm kubectl
 # Start the CRI-O container runtime and kubelet
 echo "$$(date) - Starting CRI-O and kubelet services"
 systemctl enable --now crio
-systemctl status crio
+systemctl status crio || { echo "CRI-O service failed to start"; journalctl -xeu crio; exit 1; }
 systemctl enable --now kubelet
-systemctl status kubelet
+systemctl status kubelet || { echo "Kubelet service failed to start"; journalctl -xeu kubelet; exit 1; }
 
 # Disable swap memory
 swapoff -a
-# Simple crontab addition to disable swap on reboot - fixed syntax error
+# Simple crontab addition to disable swap on reboot
 echo "@reboot /sbin/swapoff -a" | crontab -
 
 # Get the public and private IPs
@@ -96,12 +96,12 @@ nodeRegistration:
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: 0.0.0.0
+  advertiseAddress: $${PRIVATE_IP}  # Use private IP
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-kubernetesVersion: stable
+kubernetesVersion: $${KUBERNETES_VERSION}
 apiServer:
   certSANs:
   - $${PUBLIC_IP}
@@ -109,12 +109,11 @@ apiServer:
   - $${HOSTNAME}
   - localhost
   - 127.0.0.1
-  - "*"
   extraArgs:
     bind-address: 0.0.0.0
-    advertise-address: $${PUBLIC_IP}
+    advertise-address: $${PRIVATE_IP}  # Use private IP
 networking:
-  podSubnet: 10.244.0.0/16
+  podSubnet: 192.168.0.0/16  # Calico default subnet
   serviceSubnet: 10.96.0.0/12
 controllerManager:
   extraArgs:
@@ -134,8 +133,8 @@ iptables-save > /etc/iptables/rules.v4
 
 # Check that CRI-O is functioning properly
 echo "$$(date) - Verifying CRI-O status"
-crictl version || echo "CRI-O not responding properly"
-crictl info || echo "CRI-O information not available"
+crictl version || { echo "CRI-O not responding properly"; systemctl restart crio; sleep 5; }
+crictl info || { echo "CRI-O information not available"; systemctl restart crio; sleep 5; }
 
 # Check network connectivity - dump interfaces and routes
 echo "$$(date) - Network configuration dump"
@@ -165,27 +164,28 @@ chown -R ubuntu:ubuntu /home/ubuntu/.kube
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
 kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
 
-# Open up kube-apiserver endpoint in /etc/kubernetes/manifests
-echo "$$(date) - Ensuring kube-apiserver is accessible"
-MANIFEST="/etc/kubernetes/manifests/kube-apiserver.yaml"
-if [ -f "$MANIFEST" ]; then
-  sed -i "s/--bind-address=127.0.0.1/--bind-address=0.0.0.0/g" $MANIFEST
-  sed -i "s/--advertise-address=$${PRIVATE_IP}/--advertise-address=$${PUBLIC_IP}/g" $MANIFEST
-fi
-
-# Install Calico CNI (as per course instructions)
+# Install Calico CNI
 echo "$$(date) - Installing Calico CNI networking..." | tee -a $${LOGFILE}
-kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://docs.projectcalico.org/v3.25/manifests/calico.yaml
 
 # Verify Calico pods are running
-for i in {1..15}; do
-  echo "$$(date) - Waiting for Calico pods to start (attempt $i)..." | tee -a $${LOGFILE}
-  kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system | grep -q calico
-  CALICO_RUNNING=$?
-  if [ $CALICO_RUNNING -eq 0 ]; then
-    echo "$$(date) - Calico pods are starting" | tee -a $${LOGFILE}
+echo "$$(date) - Waiting for Calico pods to start..." | tee -a $${LOGFILE}
+for i in {1..30}; do
+  echo "$$(date) - Calico status check attempt $i/30" | tee -a $${LOGFILE}
+  RUNNING_PODS=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+  
+  if [ "$RUNNING_PODS" -gt 0 ]; then
+    echo "$$(date) - Calico node pod(s) are running" | tee -a $${LOGFILE}
     break
   fi
+  
+  if [ $i -eq 30 ]; then
+    echo "$$(date) - Calico pods failed to start in time. Checking pods..." | tee -a $${LOGFILE}
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -o wide | tee -a $${LOGFILE}
+    echo "$$(date) - Checking Calico pod logs..." | tee -a $${LOGFILE}
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf logs -n kube-system -l k8s-app=calico-node --tail=50 | tee -a $${LOGFILE}
+  fi
+  
   sleep 10
 done
 
@@ -224,46 +224,42 @@ aws secretsmanager put-secret-value \
 
 # Verify the API server is accessible
 echo "$$(date) - Verifying API server is accessible"
-kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
-kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
+for i in {1..10}; do
+  if kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes; then
+    echo "$$(date) - API server is accessible"
+    break
+  fi
+  
+  if [ $i -eq 10 ]; then
+    echo "$$(date) - API server is not accessible after 10 attempts"
+    echo "$$(date) - Checking API server status" | tee -a $${LOGFILE}
+    systemctl status kubelet | tee -a $${LOGFILE}
+    journalctl -xeu kubelet | tail -n 100 | tee -a $${LOGFILE}
+  fi
+  
+  echo "$$(date) - Attempt $i: API server not yet accessible, waiting..."
+  sleep 10
+done
 
-# Open firewall rules for Kubernetes API
-echo "$$(date) - Configuring firewall rules"
-iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
-iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
-iptables-save > /etc/iptables/rules.v4
-
-# Install socat to enable port forwarding
-apt-get install -y socat
-echo "$$(date) - Configuring port forwarding"
-cat <<EOF | tee /etc/systemd/system/kube-apiserver-port-forward.service
-[Unit]
-Description=Kubernetes API Server Port Forward
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:6443,fork,reuseaddr TCP:127.0.0.1:6443
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable kube-apiserver-port-forward.service
-systemctl start kube-apiserver-port-forward.service
-
-# Add a simple diagnostic endpoint to check API server status
-cat <<EOF > /home/ubuntu/check-api.sh
-#!/bin/bash
-echo "Testing Kubernetes API server access..."
-curl -k https://localhost:6443/healthz
-echo ""
-echo "API server status: \$?"
-netstat -tulpn | grep 6443
-echo "Done"
-EOF
-chmod +x /home/ubuntu/check-api.sh
+# Make sure API server is accessible from outside
+echo "$$(date) - Ensuring external API server access"
+for i in {1..10}; do
+  API_ACCESS=$(curl -k -s https://$${PUBLIC_IP}:6443/healthz)
+  if [ "$API_ACCESS" == "ok" ]; then
+    echo "$$(date) - API server is accessible from the outside"
+    break
+  fi
+  
+  if [ $i -eq 10 ]; then
+    echo "$$(date) - WARNING: API server is not accessible from the outside after 10 attempts"
+    echo "$$(date) - Setting up socat port forwarding as fallback"
+    apt-get install -y socat
+    nohup socat TCP-LISTEN:6443,fork,reuseaddr TCP:127.0.0.1:6443 &
+  fi
+  
+  echo "$$(date) - Attempt $i: External API access not yet working, waiting..."
+  sleep 10
+done
 
 # Final verification
 echo "$$(date) - Final verification of Kubernetes cluster"
