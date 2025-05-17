@@ -31,6 +31,16 @@ output "client_key" {
   sensitive   = true
 }
 
+output "client_certificate_data" {
+  description = "Base64 encoded client certificate for authentication (for kubeconfig)"
+  value       = fileexists("${path.module}/certs/client.crt") ? base64encode(file("${path.module}/certs/client.crt")) : ""
+}
+
+output "client_key_data" {
+  description = "Base64 encoded client key for authentication (for kubeconfig)"
+  value       = fileexists("${path.module}/certs/client.key") ? base64encode(file("${path.module}/certs/client.key")) : ""
+}
+
 output "vpc_id" {
   description = "ID of the VPC created for the cluster"
   value       = module.vpc.vpc_id
