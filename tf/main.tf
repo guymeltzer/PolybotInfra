@@ -89,8 +89,6 @@ resource "null_resource" "wait_for_kubernetes" {
   triggers = {
     # Use timestamp to always run this
     timestamp = timestamp()
-    # Also track the control plane ID
-    control_plane_id = module.k8s-cluster.control_plane_instance.id
   }
   
   provisioner "local-exec" {
@@ -100,84 +98,77 @@ resource "null_resource" "wait_for_kubernetes" {
       export AWS_REGION=us-east-1
       export AWS_DEFAULT_REGION=us-east-1
       
-      # Use the direct instance ID from Terraform output
-      INSTANCE_ID="${module.k8s-cluster.control_plane_instance.id}"
-      echo "Using control plane instance ID directly from Terraform: $INSTANCE_ID"
+      # Find the control plane instance by tag
+      echo "Finding control plane instance by tag..."
+      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
       
-      # Wait for the instance to be in running state
-      echo "Waiting for instance to be in running state..."
-      aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
+      if [[ "$INSTANCE_ID" == "None" || -z "$INSTANCE_ID" ]]; then
+        echo "ERROR: Could not find control plane instance with tag 'Name=k8s-control-plane'"
+        exit 1
+      fi
       
-      # Function to get instance details
-      get_instance_details() {
-        aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID
-      }
+      echo "Found control plane instance: $INSTANCE_ID"
       
-      # Get instance details
-      echo "Getting instance details..."
-      INSTANCE_DETAILS=$(get_instance_details)
+      # Get the instance's public IP address
+      PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      PRIVATE_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
       
-      # Try to get the public IP with retries
-      echo "Attempting to get the IP address..."
-      
-      RETRY_COUNT=0
-      MAX_RETRIES=15
-      CP_IP=""
-      
-      while [ -z "$CP_IP" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-        echo "IP lookup attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
-        # Try public IP first
-        CP_IP=$(echo "$INSTANCE_DETAILS" | jq -r '.Reservations[0].Instances[0].PublicIpAddress')
-        
-        if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
-          echo "No public IP found, checking instance details again after a short wait..."
-          sleep 10
-          INSTANCE_DETAILS=$(get_instance_details)
-          RETRY_COUNT=$((RETRY_COUNT+1))
-        else
-          echo "Found public IP: $CP_IP"
-          IP_TYPE="public"
-          break
-        fi
-      done
-      
-      # Fall back to private IP if public IP isn't available
-      if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
-        echo "No public IP found after $MAX_RETRIES attempts, trying private IP..."
-        CP_IP=$(echo "$INSTANCE_DETAILS" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress')
-        
-        if [ "$CP_IP" = "null" ] || [ -z "$CP_IP" ]; then
-          echo "ERROR: Failed to get any IP address for instance $INSTANCE_ID"
-          echo "Instance details:"
-          echo "$INSTANCE_DETAILS"
-          exit 1
-        else
-          echo "Using private IP: $CP_IP"
-          IP_TYPE="private"
-        fi
+      if [[ "$PUBLIC_IP" == "None" || -z "$PUBLIC_IP" ]]; then
+        echo "No public IP found, will use private IP: $PRIVATE_IP"
+        CP_IP=$PRIVATE_IP
+        IP_TYPE="private"
+      else
+        echo "Using public IP: $PUBLIC_IP"
+        CP_IP=$PUBLIC_IP
+        IP_TYPE="public"
       fi
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
-      echo "Waiting for Kubernetes API at https://$CP_IP:6443 to become available..."
+      # Wait for SSH to be available first (proving network connectivity)
+      echo "Checking SSH connectivity to control plane..."
+      attempt=0
+      max_attempts=10
+      while ! nc -z -w5 $CP_IP 22 2>/dev/null; do
+        attempt=$((attempt+1))
+        if [ $attempt -ge $max_attempts ]; then
+          echo "Timed out waiting for SSH connectivity to control plane"
+          echo "This suggests a fundamental network or security group issue"
+          exit 1
+        fi
+        echo "Attempt $attempt/$max_attempts: SSH not available yet, waiting..."
+        sleep 15
+      done
+      echo "SSH connectivity confirmed."
+      
+      # Wait longer before checking for Kubernetes API - it takes time to initialize
+      echo "Waiting 3 minutes for Kubernetes initialization..."
+      sleep 180
+      
+      # Now check for Kubernetes API
+      echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
       
       attempt=0
-      max_attempts=45
-      until curl -k https://$CP_IP:6443/healthz -v 2>/dev/null | grep -q ok; do
+      max_attempts=30
+      until curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; do
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
-          echo "- Control plane instance status: $(aws ec2 describe-instance-status --region us-east-1 --instance-ids $INSTANCE_ID --output json)"
+          echo "- Control plane instance ID: $INSTANCE_ID"
           echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
-          echo "- EC2 console output: $(aws ec2 get-console-output --region us-east-1 --instance-id $INSTANCE_ID --output text || echo 'Failed to get console output')"
-          echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
+          
+          # Try to get logs from the kubelet service
+          echo "Checking for errors in Kubernetes initialization..."
+          aws ssm send-command --region us-east-1 --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" --parameters commands="systemctl status kubelet || journalctl -xeu kubelet" --output text || echo "Could not retrieve kubelet status"
+          
           exit 1
         fi
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
         sleep 20
       done
-      echo "Kubernetes API is available!"
+      
+      echo "Kubernetes API is available! Creating kubeconfig file..."
       
       # Create kubeconfig file for subsequent operations
       cat > kubeconfig.yml <<EOF
@@ -198,11 +189,10 @@ contexts:
     user: default-user
 current-context: default-context
 EOF
-      echo "Created kubeconfig file"
       
-      # Export KUBECONFIG to make it easier to debug
+      echo "Created kubeconfig file at $(pwd)/kubeconfig.yml"
       echo "export KUBECONFIG=$(pwd)/kubeconfig.yml" > k8s-env.sh
-      echo "Kubernetes environment file created at k8s-env.sh"
+      echo "Kubernetes is ready! You can now use kubectl with the created kubeconfig."
     EOT
   }
 }
@@ -214,7 +204,6 @@ resource "terraform_data" "kubectl_provider_config" {
   # This ensures we rebuild when anything related to the API changes
   triggers_replace = {
     timestamp = timestamp()
-    control_plane_id = module.k8s-cluster.control_plane_instance.id
   }
 }
 

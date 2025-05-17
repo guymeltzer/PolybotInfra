@@ -56,8 +56,8 @@ systemctl enable --now kubelet
 
 # Disable swap memory
 swapoff -a
-# Add the command to crontab to make it persistent across reboots
-(crontab -l 2>/dev/null || echo "") | grep -v "@reboot /sbin/swapoff -a" | { cat; echo "@reboot /sbin/swapoff -a"; } | crontab -
+# Simple crontab addition to disable swap on reboot - fixed syntax error
+echo "@reboot /sbin/swapoff -a" | crontab -
 
 # Get the public and private IPs
 PUBLIC_IP=$$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
@@ -65,15 +65,15 @@ PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
 # Create kubeadm config file with placeholders
-cat > /tmp/kubeadm-config.yaml <<'EOF'
+cat <<EOF > /tmp/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: HOSTNAME_PLACEHOLDER
+  name: $${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: PRIVATE_IP_PLACEHOLDER
+  advertiseAddress: $${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - PUBLIC_IP_PLACEHOLDER
-  - PRIVATE_IP_PLACEHOLDER
-  - HOSTNAME_PLACEHOLDER
+  - $${PUBLIC_IP}
+  - $${PRIVATE_IP}
+  - $${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -96,12 +96,8 @@ controllerManager:
     cloud-provider: external
 EOF
 
-# Replace placeholders with actual values
-sed -i "s/HOSTNAME_PLACEHOLDER/$${HOSTNAME}/g" /tmp/kubeadm-config.yaml
-sed -i "s/PRIVATE_IP_PLACEHOLDER/$${PRIVATE_IP}/g" /tmp/kubeadm-config.yaml
-sed -i "s/PUBLIC_IP_PLACEHOLDER/$${PUBLIC_IP}/g" /tmp/kubeadm-config.yaml
-
 # Initialize Kubernetes control plane with the config file
+echo "Starting kubeadm init with config at $(date)"
 kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5
 
 echo "Kubernetes control plane initialized with kubeadm"
@@ -150,6 +146,7 @@ JOIN_COMMAND=$$(kubeadm token create --print-join-command)
 aws secretsmanager put-secret-value \
   --secret-id kubernetes-join-command-${token} \
   --secret-string "$${JOIN_COMMAND}" \
+  --region us-east-1 \
   --version-stage AWSCURRENT
 
 # Verify the API server is accessible
