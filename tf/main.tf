@@ -89,50 +89,33 @@ resource "null_resource" "wait_for_kubernetes" {
   triggers = {
     # Use timestamp to always run this
     timestamp = timestamp()
+    # Also track the control plane ID
+    control_plane_id = module.k8s-cluster.control_plane_instance.id
   }
   
   provisioner "local-exec" {
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
+      export AWS_REGION=us-east-1
+      export AWS_DEFAULT_REGION=us-east-1
       
-      # Give AWS time to properly tag the instance and make it discoverable
-      echo "Sleeping 30 seconds to allow EC2 instance to be properly tagged..."
-      sleep 30
-      
-      # First list all instances to debug
-      echo "Available EC2 instances:"
-      aws ec2 describe-instances --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0],State.Name]" --output table
-      
-      # Try multiple ways to find the control plane
-      INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=*control-plane*" "Name=instance-state-name,Values=running,pending" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      
-      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-        echo "Trying alternate method to find control plane..."
-        INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag-key,Values=kubernetes.io/cluster/polybot-cluster" "Name=instance-state-name,Values=running,pending" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      fi
-      
-      if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-        echo "ERROR: Could not find control plane instance"
-        echo "Available instances:"
-        aws ec2 describe-instances --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0],State.Name]" --output table
-        exit 1
-      fi
-      
-      echo "Found control plane instance: $INSTANCE_ID"
+      # Use the direct instance ID from Terraform output
+      INSTANCE_ID="${module.k8s-cluster.control_plane_instance.id}"
+      echo "Using control plane instance ID directly from Terraform: $INSTANCE_ID"
       
       # Wait for the instance to be in running state
       echo "Waiting for instance to be in running state..."
-      aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+      aws ec2 wait instance-running --region us-east-1 --instance-ids $INSTANCE_ID
       
       # Get the public IP of the control plane
-      CP_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      CP_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
       echo "Control plane IP: $CP_IP"
       
       if [ -z "$CP_IP" ]; then
         echo "ERROR: Failed to get public IP for instance $INSTANCE_ID"
         echo "Instance details:"
-        aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
+        aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --output json
         exit 1
       fi
       
@@ -145,9 +128,9 @@ resource "null_resource" "wait_for_kubernetes" {
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
           echo "Debug info:"
-          echo "- Control plane instance status: $(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --output json)"
+          echo "- Control plane instance status: $(aws ec2 describe-instance-status --region us-east-1 --instance-ids $INSTANCE_ID --output json)"
           echo "- Control plane public IP: $CP_IP"
-          echo "- EC2 console output: $(aws ec2 get-console-output --instance-id $INSTANCE_ID --output text || echo 'Failed to get console output')"
+          echo "- EC2 console output: $(aws ec2 get-console-output --region us-east-1 --instance-id $INSTANCE_ID --output text || echo 'Failed to get console output')"
           echo "- Trying to ping control plane: $(ping -c 3 $CP_IP || echo 'Ping failed')"
           exit 1
         fi
@@ -191,6 +174,7 @@ resource "terraform_data" "kubectl_provider_config" {
   # This ensures we rebuild when anything related to the API changes
   triggers_replace = {
     timestamp = timestamp()
+    control_plane_id = module.k8s-cluster.control_plane_instance.id
   }
 }
 
