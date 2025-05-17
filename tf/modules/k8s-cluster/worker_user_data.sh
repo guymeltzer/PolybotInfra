@@ -179,6 +179,17 @@ else
 fi
   echo "providerID set successfully" | tee -a $LOGFILE
 
+  # Verify Calico networking
+  echo "Verifying Calico networking" | tee -a $LOGFILE
+  for i in {1..10}; do
+    echo "Checking for Calico interfaces (attempt $i)" | tee -a $LOGFILE
+    if ip addr | grep -q cali; then
+      echo "Calico network interfaces detected" | tee -a $LOGFILE
+      break
+    fi
+    sleep 10
+  done
+
   # Signal lifecycle hook completion
   aws autoscaling complete-lifecycle-action \
     --lifecycle-hook-name "guy-scale-up-hook" \
