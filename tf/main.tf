@@ -147,31 +147,60 @@ resource "null_resource" "wait_for_kubernetes" {
         sleep 15
       done
       
-      # Wait 3 minutes for kubernetes initialization
-      echo "Instance is running. Waiting 3 minutes for Kubernetes initialization..."
-      sleep 180
+      # Wait longer for kubernetes initialization (8 minutes)
+      echo "Instance is running. Waiting 8 minutes for Kubernetes initialization..."
+      sleep 480
+      
+      # Try to get logs and debug info via SSM
+      function get_debug_info {
+        echo "=========== GATHERING DEBUG INFO ==========="
+        echo "Attempting to retrieve cluster state from server..."
+        
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "No instance ID available for logs."
+          return
+        fi
+        
+        # Get kubelet status
+        echo "Checking kubelet status via AWS SSM..."
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="systemctl status kubelet" \
+          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet status"
+        
+        # Get kubelet logs
+        echo "Checking kubelet logs via AWS SSM..."
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="journalctl -xeu kubelet | tail -n 50" \
+          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet logs"
+        
+        # Check API server pods
+        echo "Checking API server pods via AWS SSM..."
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="kubectl get pods -n kube-system -l component=kube-apiserver -o wide" \
+          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve API server pod status"
+        
+        # Check if port 6443 is listening
+        echo "Checking if port 6443 is listening via AWS SSM..."
+        aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="netstat -tulpn | grep 6443" \
+          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to check listening ports"
+        
+        echo "=========== END DEBUG INFO ==========="
+      }
       
       # Check for Kubernetes API
       echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
       
       attempt=0
       max_attempts=30
-      
-      # Try to get logs if needed
-      function get_logs {
-        echo "Attempting to retrieve kubelet logs from server..."
-        if [ -z "$INSTANCE_ID" ]; then
-          echo "No instance ID available for logs."
-          return
-        fi
-        
-        echo "Checking kubelet status via AWS SSM..."
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="systemctl status kubelet; journalctl -xeu kubelet | tail -n 50" \
-          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet logs"
-      }
       
       # Keep trying until we get a response or timeout
       while true; do
@@ -183,9 +212,15 @@ resource "null_resource" "wait_for_kubernetes" {
             break
           else
             echo "Port 6443 is open but API not responding correctly."
+            curl -k -v https://$CP_IP:6443/healthz 2>&1 | head -20
           fi
         else
           echo "Port 6443 is not yet open."
+          
+          # Check if the instance is definitely up (via port 22)
+          if ! nc -z -w5 $CP_IP 22 2>/dev/null; then
+            echo "WARNING: Instance is no longer accessible via SSH. It may have rebooted."
+          fi
         fi
         
         attempt=$((attempt+1))
@@ -197,17 +232,21 @@ resource "null_resource" "wait_for_kubernetes" {
           echo "- Attempting to connect to port 6443 to verify it's open..."
           nc -z -v $CP_IP 6443 || echo "Port 6443 appears to be closed"
           
-          # Get logs
-          get_logs
+          # Gather debug info
+          get_debug_info
+          
+          echo "SOLUTION: You may need to manually check the control plane instance."
+          echo "Try running: aws ssm start-session --target $INSTANCE_ID --region $AWS_REGION"
+          echo "Or run: ssh ubuntu@$CP_IP"
           exit 1
         fi
         
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
         sleep 20
         
-        # Every 5 attempts, try to get logs 
+        # Every 5 attempts, get more debug info
         if [ $((attempt % 5)) -eq 0 ]; then
-          get_logs
+          get_debug_info
         fi
       done
       
