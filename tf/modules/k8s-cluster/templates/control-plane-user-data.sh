@@ -69,11 +69,11 @@ cat > /tmp/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: ${HOSTNAME}
+  name: \${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: ${PRIVATE_IP}
+  advertiseAddress: \${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - ${PUBLIC_IP}
-  - ${PRIVATE_IP}
-  - ${HOSTNAME}
+  - \${PUBLIC_IP}
+  - \${PRIVATE_IP}
+  - \${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -123,11 +123,11 @@ chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 
 # Add a host entry for API server
-echo "${PRIVATE_IP} ${HOSTNAME}" >> /etc/hosts
+echo "\${PRIVATE_IP} \${HOSTNAME}" >> /etc/hosts
 
 # Configure kubeconfig with public IP for remote access
-sed -i "s/server: https:\/\/${PRIVATE_IP}:6443/server: https:\/\/${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
-kubectl config set clusters.kubernetes.server https://${PUBLIC_IP}:6443
+sed -i "s/server: https:\/\/\${PRIVATE_IP}:6443/server: https:\/\/\${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+kubectl config set clusters.kubernetes.server https://\${PUBLIC_IP}:6443
 
 # Store join command in AWS Secrets Manager for workers to use
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
