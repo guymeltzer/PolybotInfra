@@ -3,7 +3,7 @@ set -e
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-control-plane-init.log"
-exec > >(tee -a ${LOGFILE}) 2>&1
+exec > >(tee -a $LOGFILE) 2>&1
 echo "$(date) - Starting Kubernetes control plane initialization"
 
 # Trap errors and exit the script with an error message
