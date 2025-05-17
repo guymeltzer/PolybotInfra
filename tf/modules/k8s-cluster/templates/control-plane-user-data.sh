@@ -26,7 +26,7 @@ rm -rf awscliv2.zip aws/
 export PATH=$PATH:/usr/local/bin
 
 # Enable IPv4 packet forwarding. sysctl params required by setup, params persist across reboots
-cat <<EOF | tee /etc/sysctl.d/k8s.conf
+cat <<'EOF' | tee /etc/sysctl.d/k8s.conf
 net.ipv4.ip_forward = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
@@ -64,16 +64,16 @@ PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
-# Create kubeadm config file
-cat > /tmp/kubeadm-config.yaml <<EOF
+# Create kubeadm config file - using quoted heredoc to prevent Terraform variable interpolation
+cat > /tmp/kubeadm-config.yaml <<'EOF'
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: \${HOSTNAME}
+  name: ${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: \${PRIVATE_IP}
+  advertiseAddress: ${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - \${PUBLIC_IP}
-  - \${PRIVATE_IP}
-  - \${HOSTNAME}
+  - ${PUBLIC_IP}
+  - ${PRIVATE_IP}
+  - ${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -122,12 +122,12 @@ chmod 644 /etc/kubernetes/pki/ca.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 
-# Add a host entry for API server
-echo "\${PRIVATE_IP} \${HOSTNAME}" >> /etc/hosts
+# Add a host entry for API server (using double quotes to allow Bash variable interpolation)
+echo "${PRIVATE_IP} ${HOSTNAME}" >> /etc/hosts
 
-# Configure kubeconfig with public IP for remote access
-sed -i "s/server: https:\/\/\${PRIVATE_IP}:6443/server: https:\/\/\${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
-kubectl config set clusters.kubernetes.server https://\${PUBLIC_IP}:6443
+# Configure kubeconfig with public IP for remote access (using double quotes to allow Bash variable interpolation)
+sed -i "s/server: https:\/\/${PRIVATE_IP}:6443/server: https:\/\/${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+kubectl config set clusters.kubernetes.server https://${PUBLIC_IP}:6443
 
 # Store join command in AWS Secrets Manager for workers to use
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
