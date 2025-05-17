@@ -4,7 +4,7 @@ worker_ami        = "ami-07d9b9ddc6cd8dd30"  # Ubuntu 20.04 LTS (update regularl
 route53_zone_id   = "Z02842682SGSPDJQMJGFT"    # Update with the actual Route53 zone ID
 vpc_id            = ""  # Will be created by terraform
 subnet_ids        = []  # Will be created by terraform
-key_name          = "gmeltzers-key"  # Update with your SSH key name
+key_name          = ""  # Leave empty to skip SSH key requirement
 git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
 # Telegram tokens should be set via environment variables
 # export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"

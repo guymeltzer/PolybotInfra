@@ -105,13 +105,7 @@ resource "null_resource" "wait_for_kubernetes" {
       
       if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
         echo "ERROR: Could not find control plane instance with tag 'Name=k8s-control-plane'"
-        echo "Falling back to a direct query without filters..."
-        INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --query "Reservations[*].Instances[?State.Name=='running'].{Id:InstanceId,Name:Tags[?Key=='Name'].Value|[0]}" --output text | grep k8s-control-plane | awk '{print $1}')
-        
-        if [ -z "$INSTANCE_ID" ]; then
-          echo "Still could not find the control plane instance. Exiting."
-          exit 1
-        fi
+        exit 1
       fi
       
       echo "Found control plane instance: $INSTANCE_ID"
@@ -132,20 +126,20 @@ resource "null_resource" "wait_for_kubernetes" {
       
       echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
       
-      # Wait for TCP connectivity to port 22 (SSH) to verify the instance is accessible
-      echo "Checking TCP connectivity to control plane SSH port..."
+      # Wait for the instance to boot up fully (check port 22 is open)
+      echo "Checking basic connectivity to control plane..."
       attempt=0
       max_attempts=15
       
       while true; do
         if nc -z -w5 $CP_IP 22 2>/dev/null; then
-          echo "SSH port is open, control plane is network-accessible"
+          echo "SSH port is open, instance appears to be running"
           break
         fi
         
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for SSH port to be accessible"
+          echo "Timed out waiting for instance to be accessible"
           echo "This suggests a fundamental network or security group issue"
           exit 1
         fi
@@ -153,18 +147,19 @@ resource "null_resource" "wait_for_kubernetes" {
         sleep 15
       done
       
-      # Wait longer before checking for Kubernetes API - it takes time to initialize
-      echo "SSH port is accessible. Waiting 5 minutes for Kubernetes initialization..."
+      # Wait for the instance to fully boot and initialize Kubernetes (about 5 minutes)
+      echo "Instance is running. Waiting 5 minutes for Kubernetes initialization..."
       sleep 300
       
-      # Now check for Kubernetes API
+      # Now check for Kubernetes API (this can take a while, especially with DNS configuration)
       echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
       
       attempt=0
       max_attempts=60
       
+      # Keep trying until we get a response or timeout
       while true; do
-        if curl -k --connect-timeout 5 --max-time 10 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
+        if curl -k --connect-timeout 10 --max-time 15 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
           echo "Kubernetes API is available!"
           break
         fi
@@ -175,7 +170,8 @@ resource "null_resource" "wait_for_kubernetes" {
           echo "Debug info:"
           echo "- Control plane instance ID: $INSTANCE_ID"
           echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
-          
+          echo "- Attempting to connect to port 6443 to verify it's open..."
+          nc -z -v $CP_IP 6443 || echo "Port 6443 appears to be closed"
           exit 1
         fi
         
