@@ -64,16 +64,16 @@ PUBLIC_IP=$$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
-# Create kubeadm config file
-cat > /tmp/kubeadm-config.yaml <<EOF
+# Create kubeadm config file with placeholders
+cat > /tmp/kubeadm-config.yaml <<'EOF'
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: $${HOSTNAME}
+  name: HOSTNAME_PLACEHOLDER
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: $${PRIVATE_IP}
+  advertiseAddress: PRIVATE_IP_PLACEHOLDER
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - $${PUBLIC_IP}
-  - $${PRIVATE_IP}
-  - $${HOSTNAME}
+  - PUBLIC_IP_PLACEHOLDER
+  - PRIVATE_IP_PLACEHOLDER
+  - HOSTNAME_PLACEHOLDER
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -95,6 +95,11 @@ controllerManager:
   extraArgs:
     cloud-provider: external
 EOF
+
+# Replace placeholders with actual values
+sed -i "s/HOSTNAME_PLACEHOLDER/$${HOSTNAME}/g" /tmp/kubeadm-config.yaml
+sed -i "s/PRIVATE_IP_PLACEHOLDER/$${PRIVATE_IP}/g" /tmp/kubeadm-config.yaml
+sed -i "s/PUBLIC_IP_PLACEHOLDER/$${PUBLIC_IP}/g" /tmp/kubeadm-config.yaml
 
 # Initialize Kubernetes control plane with the config file
 kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5
