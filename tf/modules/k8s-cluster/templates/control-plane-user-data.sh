@@ -65,15 +65,15 @@ PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
 # Create kubeadm config file
-cat > /tmp/kubeadm-config.yaml <<'EOF'
+cat > /tmp/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: ${HOSTNAME}
+  name: \${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: ${PRIVATE_IP}
+  advertiseAddress: \${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - ${PUBLIC_IP}
-  - ${PRIVATE_IP}
-  - ${HOSTNAME}
+  - \${PUBLIC_IP}
+  - \${PRIVATE_IP}
+  - \${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -95,11 +95,6 @@ controllerManager:
   extraArgs:
     cloud-provider: external
 EOF
-
-# Fix the kubeadm config file by replacing placeholders with actual values
-sed -i "s|\${HOSTNAME}|$${HOSTNAME}|g" /tmp/kubeadm-config.yaml
-sed -i "s|\${PRIVATE_IP}|$${PRIVATE_IP}|g" /tmp/kubeadm-config.yaml
-sed -i "s|\${PUBLIC_IP}|$${PUBLIC_IP}|g" /tmp/kubeadm-config.yaml
 
 # Initialize Kubernetes control plane with the config file
 kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5
