@@ -523,13 +523,14 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 }
 
 resource "aws_instance" "control_plane" {
-  ami           = var.control_plane_ami
-  instance_type = var.control_plane_instance_type
-  key_name      = var.key_name
+  ami                         = var.control_plane_ami
+  instance_type               = var.control_plane_instance_type
+  key_name                    = var.key_name
+  associate_public_ip_address = true
 
   iam_instance_profile = aws_iam_instance_profile.control_plane_profile.name
   subnet_id            = module.vpc.public_subnets[0]
-  security_groups      = [aws_security_group.k8s_sg.id]
+  vpc_security_group_ids = [aws_security_group.k8s_sg.id]
 
   user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
     token = random_string.token.result
@@ -1014,6 +1015,7 @@ resource "aws_launch_template" "worker_lt" {
   network_interfaces {
     subnet_id       = module.vpc.public_subnets[0]
     security_groups = [aws_security_group.worker_sg.id]
+    associate_public_ip_address = true
   }
 
   iam_instance_profile {
