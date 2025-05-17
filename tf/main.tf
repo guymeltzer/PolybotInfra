@@ -17,7 +17,7 @@ provider "kubernetes" {
   # Increase timeout for cluster to become available
   ignore_annotations     = [".*"]
   ignore_labels          = [".*"]
-  insecure               = false
+  insecure               = true
 }
 
 # Configure the Helm provider
@@ -29,6 +29,9 @@ provider "helm" {
     # Use client certificate authentication instead of EKS token
     client_certificate     = module.k8s-cluster.client_certificate
     client_key             = module.k8s-cluster.client_key
+    
+    # Accept untrusted certificates initially
+    insecure               = true
   }
 }
 
@@ -41,6 +44,9 @@ provider "kubectl" {
   # Use client certificate authentication instead of EKS token
   client_certificate     = module.k8s-cluster.client_certificate
   client_key             = module.k8s-cluster.client_key
+  
+  # Accept untrusted certificates initially
+  insecure               = true
 }
 
 # Create Kubernetes namespaces for dev and prod
@@ -48,14 +54,14 @@ resource "kubernetes_namespace" "dev" {
   metadata {
     name = "dev"
   }
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes]
 }
 
 resource "kubernetes_namespace" "prod" {
   metadata {
     name = "prod"
   }
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes]
 }
 
 module "k8s-cluster" {
@@ -104,7 +110,8 @@ storageClasses:
 EOF
   ]
 
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes]
+  timeout    = 600
 }
 
 # Wait for Kubernetes API to be fully available
@@ -115,16 +122,21 @@ resource "null_resource" "wait_for_kubernetes" {
     command = <<EOT
       # Wait for Kubernetes API to be available
       echo "Waiting for Kubernetes API to be available..."
+      echo "Control plane IP: ${module.k8s-cluster.control_plane_public_ip}"
       attempt=0
-      max_attempts=30
-      until curl -k https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz 2>/dev/null | grep -q ok; do
+      max_attempts=45
+      until curl -k https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz -v 2>/dev/null | grep -q ok; do
         attempt=$((attempt+1))
         if [ $attempt -ge $max_attempts ]; then
           echo "Timed out waiting for Kubernetes API"
+          echo "Debug info:"
+          echo "- Control plane instance ID: $(aws ec2 describe-instances --filters "Name=tag:Name,Values=k8s-control-plane" --query "Reservations[].Instances[].InstanceId" --output text)"
+          echo "- Control plane public IP: ${module.k8s-cluster.control_plane_public_ip}"
+          echo "- Trying to ping control plane: $(ping -c 3 ${module.k8s-cluster.control_plane_public_ip} || echo 'Ping failed')"
           exit 1
         fi
         echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
-        sleep 10
+        sleep 20
       done
       echo "Kubernetes API is available!"
     EOT
