@@ -69,11 +69,11 @@ cat > /tmp/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: \${HOSTNAME}
+  name: $${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: \${PRIVATE_IP}
+  advertiseAddress: $${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -81,9 +81,9 @@ kind: ClusterConfiguration
 kubernetesVersion: stable
 apiServer:
   certSANs:
-  - \${PUBLIC_IP}
-  - \${PRIVATE_IP}
-  - \${HOSTNAME}
+  - $${PUBLIC_IP}
+  - $${PRIVATE_IP}
+  - $${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
