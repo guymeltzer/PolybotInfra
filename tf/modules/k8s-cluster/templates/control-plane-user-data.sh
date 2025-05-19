@@ -27,6 +27,24 @@ apt-get update && apt-get upgrade -y
 # Install required packages
 apt-get install -y jq unzip ebtables ethtool apt-transport-https 
 apt-get install -y ca-certificates curl gnupg lsb-release
+# Install AWS CLI (ensure this happens BEFORE iptables-persistent if not already)
+# curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+# unzip -q awscliv2.zip
+# ./aws/install --update
+# rm -rf awscliv2.zip aws/
+# export PATH=$${PATH}:/usr/local/bin
+
+# Pre-configure iptables-persistent to avoid interactive prompts
+echo "$$(date) - Pre-configuring iptables-persistent"
+echo iptables-persistent iptables-persistent/autosave_v4 boolean true | sudo debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean true | sudo debconf-set-selections
+echo netfilter-persistent netfilter-persistent/autosave_v4 boolean true | sudo debconf-set-selections
+echo netfilter-persistent netfilter-persistent/autosave_v6 boolean true | sudo debconf-set-selections
+
+# Ensure DEBIAN_FRONTEND is set for all apt-get calls if issues persist broadly
+# export DEBIAN_FRONTEND=noninteractive
+
+echo "$$(date) - Installing network utilities and iptables-persistent"
 apt-get install -y tcpdump net-tools telnet dnsutils iptables-persistent
 
 # Install AWS CLI
