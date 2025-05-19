@@ -19,7 +19,7 @@ chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 # Trap errors and exit the script with an error message
-trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> ${LOGFILE}; exit 1' ERR
+trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
 
 # Set non-interactive mode globally to avoid prompts
 export DEBIAN_FRONTEND=noninteractive
