@@ -6,6 +6,11 @@ LOGFILE="/var/log/k8s-control-plane-init.log"
 exec > >(tee -a /var/log/k8s-control-plane-init.log) 2>&1
 echo "$(date) - Starting Kubernetes control plane initialization"
 
+# Debug: Verify script integrity
+echo "$(date) - Verifying script integrity"
+cat $0 > /tmp/script-copy.sh
+sha256sum $0 /tmp/script-copy.sh
+
 # Add SSH key for direct access
 echo "$(date) - Setting up SSH access"
 mkdir -p /home/ubuntu/.ssh
@@ -22,17 +27,29 @@ trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo 
 # Set non-interactive mode
 export DEBIAN_FRONTEND=noninteractive
 
-# Update packages
-echo "$(date) - Updating package lists and upgrading installed packages"
-apt-get update && apt-get upgrade -y || {
-  echo "$(date) - ERROR: Failed to update/upgrade packages"
+# Update packages and ensure package manager consistency
+echo "$(date) - Updating package lists"
+apt-get update || {
+  echo "$(date) - ERROR: Failed to update package lists"
   exit 1
 }
+echo "$(date) - Fixing package manager state"
+apt-get install -f -y
+dpkg --configure -a
 
 # Install unzip explicitly (needed for AWS CLI)
 echo "$(date) - Installing unzip"
-apt-get install -y unzip || {
-  echo "$(date) - ERROR: Failed to install unzip"
+apt-get install -y unzip 2>&1 | tee -a $${LOGFILE}
+command -v unzip || {
+  echo "$(date) - ERROR: unzip not installed"
+  exit 1
+}
+unzip --version >> $${LOGFILE}
+
+# Upgrade packages
+echo "$(date) - Upgrading installed packages"
+apt-get upgrade -y || {
+  echo "$(date) - ERROR: Failed to upgrade packages"
   exit 1
 }
 
