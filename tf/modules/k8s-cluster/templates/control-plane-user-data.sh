@@ -19,7 +19,7 @@ chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 # Trap errors
 trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
 
-# Set non-interactive mode globally
+# Set non-interactive mode
 export DEBIAN_FRONTEND=noninteractive
 
 # Update packages
@@ -50,7 +50,7 @@ aws --version || {
   exit 1
 }
 
-# Install initial dependencies
+# Install initial dependencies (excluding iptables-persistent)
 echo "$(date) - Installing initial dependencies"
 apt-get install -y \
   jq unzip ebtables ethtool apt-transport-https \
@@ -60,13 +60,6 @@ apt-get install -y \
     echo "$(date) - ERROR: Failed to install initial dependencies"
     exit 1
   }
-
-# Install iptables-persistent non-interactively
-echo "$(date) - Installing iptables-persistent"
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables-persistent || {
-  echo "$(date) - ERROR: Failed to install iptables-persistent"
-  exit 1
-}
 
 # Disable swap
 swapoff -a
@@ -172,7 +165,7 @@ EOF
 
 cat /tmp/kubeadm-config.yaml
 
-# Configure firewall rules and save manually
+# Configure firewall rules
 echo "$(date) - Configuring firewall rules"
 iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
@@ -181,9 +174,24 @@ iptables -A INPUT -p tcp --dport 179 -j ACCEPT
 iptables -A INPUT -p tcp --dport 80 -j ACCEPT
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
-# Ensure netfilter-persistent loads rules at boot
-systemctl enable netfilter-persistent || {
-  echo "$(date) - ERROR: Failed to enable netfilter-persistent"
+
+# Create systemd service to restore iptables rules at boot
+cat <<EOF > /etc/systemd/system/iptables-restore.service
+[Unit]
+Description=Restore iptables rules
+Before=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable iptables-restore.service || {
+  echo "$(date) - ERROR: Failed to enable iptables-restore.service"
   exit 1
 }
 
