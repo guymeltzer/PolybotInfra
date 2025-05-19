@@ -17,7 +17,7 @@ chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 # Trap errors
-trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
+trap 'echo "Error occurred at line ${LINENO}. Command: ${BASH_COMMAND}"; echo "$(date) - ERROR at line ${LINENO}: ${BASH_COMMAND}" >> ${LOGFILE}; exit 1' ERR
 
 # Set non-interactive mode
 export DEBIAN_FRONTEND=noninteractive
@@ -44,13 +44,13 @@ unzip -q awscliv2.zip || {
   exit 1
 }
 rm -rf awscliv2.zip aws/
-export PATH=$${PATH}:/usr/local/bin
+export PATH=${PATH}:/usr/local/bin
 aws --version || {
   echo "$(date) - ERROR: AWS CLI not installed correctly"
   exit 1
 }
 
-# Install initial dependencies (excluding iptables-persistent)
+# Install initial dependencies
 echo "$(date) - Installing initial dependencies"
 apt-get install -y \
   jq unzip ebtables ethtool apt-transport-https \
@@ -90,12 +90,12 @@ PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
 HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
 
-echo "Public IP: $${PUBLIC_IP}"
-echo "Private IP: $${PRIVATE_IP}"
-echo "Hostname: $${HOSTNAME}"
+echo "Public IP: ${PUBLIC_IP}"
+echo "Private IP: ${PRIVATE_IP}"
+echo "Hostname: ${HOSTNAME}"
 
 # Add a host entry for API server
-echo "$${PRIVATE_IP} $${HOSTNAME}" >> /etc/hosts
+echo "${PRIVATE_IP} ${HOSTNAME}" >> /etc/hosts
 
 # Install containerd
 echo "$(date) - Installing containerd"
@@ -136,11 +136,11 @@ cat <<EOF > /tmp/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
-  name: $${HOSTNAME}
+  name: ${HOSTNAME}
   kubeletExtraArgs:
     cloud-provider: external
 localAPIEndpoint:
-  advertiseAddress: $${PRIVATE_IP}
+  advertiseAddress: ${PRIVATE_IP}
   bindPort: 6443
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -148,9 +148,9 @@ kind: ClusterConfiguration
 kubernetesVersion: v1.28.3
 apiServer:
   certSANs:
-  - $${PUBLIC_IP}
-  - $${PRIVATE_IP}
-  - $${HOSTNAME}
+  - ${PUBLIC_IP}
+  - ${PRIVATE_IP}
+  - ${HOSTNAME}
   - localhost
   - 127.0.0.1
   extraArgs:
@@ -228,7 +228,7 @@ for i in {1..30}; do
   echo "$(date) - Calico status check attempt $i/30"
   RUNNING_PODS=$(kubectl get pods -n kube-system -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
 
-  if [ "$${RUNNING_PODS}" -gt 0 ]; then
+  if [ "${RUNNING_PODS}" -gt 0 ]; then
     echo "$(date) - Calico node pod(s) are running"
     break
   fi
@@ -278,14 +278,14 @@ chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 # Configure kubeconfig with public IP
 echo "$(date) - Configuring kubeconfig for remote access"
 cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.bak
-sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+sed -i "s/server: https:\/\/.*:6443/server: https:\/\/${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
 
 # Store join command in AWS Secrets Manager
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
-echo "$(date) - Generated join command: $${JOIN_COMMAND}"
+echo "$(date) - Generated join command: ${JOIN_COMMAND}"
 aws secretsmanager put-secret-value \
   --secret-id kubernetes-join-command-${token} \
-  --secret-string "$${JOIN_COMMAND}" \
+  --secret-string "${JOIN_COMMAND}" \
   --region us-east-1 \
   --version-stage AWSCURRENT
 
