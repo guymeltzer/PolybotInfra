@@ -3,7 +3,7 @@ set -ex
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-control-plane-init.log"
-exec > >(tee -a ${LOGFILE}) 2>&1
+exec > >(tee -a /var/log/k8s-control-plane-init.log) 2>&1
 echo "$(date) - Starting Kubernetes control plane initialization"
 
 # Add SSH key for direct access (bypassing AWS credential expiration issues)
