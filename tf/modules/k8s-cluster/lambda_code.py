@@ -7,7 +7,7 @@ def lambda_handler(event, context):
     ssm_client = boto3.client('ssm')
     secrets_client = boto3.client('secretsmanager')
     region = 'us-east-1'
-    control_plane_instance_id = 'i-00f64256d7b913296'
+    control_plane_instance_id = 'i-0766ed787297ada3d'
     
     print(f"Event received: {json.dumps(event)}")
     

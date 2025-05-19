@@ -1,6 +1,6 @@
 region           = "us-east-1"
-control_plane_ami = "ami-0953476d60561c955"
-worker_ami        = "ami-0953476d60561c955"
+control_plane_ami = "ami-084568db4383264d4"
+worker_ami        = "ami-084568db4383264d4"
 route53_zone_id   = "Z02842682SGSPDJQMJGFT"    # Update with the actual Route53 zone ID
 vpc_id            = ""  # Will be created by terraform
 subnet_ids        = []  # Will be created by terraform
