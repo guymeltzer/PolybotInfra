@@ -29,6 +29,13 @@ apt-get update && apt-get upgrade -y || {
   exit 1
 }
 
+# Install unzip explicitly (needed for AWS CLI)
+echo "$(date) - Installing unzip"
+apt-get install -y unzip || {
+  echo "$(date) - ERROR: Failed to install unzip"
+  exit 1
+}
+
 # Install AWS CLI
 echo "$(date) - Installing AWS CLI"
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" || {
@@ -53,7 +60,7 @@ aws --version || {
 # Install initial dependencies
 echo "$(date) - Installing initial dependencies"
 apt-get install -y \
-  jq unzip ebtables ethtool apt-transport-https \
+  jq ebtables ethtool apt-transport-https \
   ca-certificates curl gnupg lsb-release \
   tcpdump net-tools telnet dnsutils \
   || {
