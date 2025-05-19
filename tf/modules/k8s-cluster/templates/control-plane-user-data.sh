@@ -45,7 +45,7 @@ echo netfilter-persistent netfilter-persistent/autosave_v6 boolean true | sudo d
 # export DEBIAN_FRONTEND=noninteractive
 
 echo "$$(date) - Installing network utilities and iptables-persistent"
-apt-get install -y tcpdump net-tools telnet dnsutils iptables-persistent
+DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump net-tools telnet dnsutils iptables-persistent
 
 # Install AWS CLI
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
