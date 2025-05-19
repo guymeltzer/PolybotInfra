@@ -1,6 +1,6 @@
 region           = "us-east-1"
-control_plane_ami = "ami-04b70f6745dd1b692"
-worker_ami        = "ami-04b70f6745dd1b692"
+control_plane_ami = "ami-0953476d60561c955"
+worker_ami        = "ami-0953476d60561c955"
 route53_zone_id   = "Z02842682SGSPDJQMJGFT"    # Update with the actual Route53 zone ID
 vpc_id            = ""  # Will be created by terraform
 subnet_ids        = []  # Will be created by terraform
@@ -21,3 +21,4 @@ git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
 # Hardcoded values for Docker Hub credentials (use environment variables in production)
 docker_username   = "guymeltzer"
 docker_password   = "Candy2025!"
+
