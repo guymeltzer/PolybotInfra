@@ -6,22 +6,20 @@ LOGFILE="/var/log/k8s-control-plane-init.log"
 exec > >(tee -a /var/log/k8s-control-plane-init.log) 2>&1
 echo "$(date) - Starting Kubernetes control plane initialization"
 
-# Add SSH key for direct access (bypassing AWS credential expiration issues)
+# Add SSH key for direct access
 echo "$(date) - Setting up SSH access"
 mkdir -p /home/ubuntu/.ssh
-# Use the SSH key specified in the template
 cat <<EOF >> /home/ubuntu/.ssh/authorized_keys
 ${ssh_pub_key}
 EOF
-# Also add additional public key if needed
 echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P/SVdCGlnxLkYJwYhAoI58xI7V5rpnbO3bDvXzKt/59B0ZVKu1xvvXVUBXGIcHHaWYi/IKO8G+vWgHDXVCGCq4HFG2fJPHwkRNDc5kkOEjthn4s+TlRIJZpvbXRXwHFDJbA/4zE5XuThUwpZROM/MwGEYUjWCnRwYS5bGAglHGnEEA8YGbnCRc9aAeRk8OFEEmSQGp9SSvOEKUiQ3lqMQZP1Qh3WI+GH8D+pHnRDLvQeYxBMwSgFwlILTvp0LMUx9N7hugtFg2FAHnKsD6fRTKwJfTgNLLMYlXqCWVUoJtY+M18YRrZ7niLMZFSSVVWbcJbHXPJ+g3I+n/4nkdxiXQOMYkYcPWCFrzYoZA8/FfHgODZ2Mxx48PR0LXIcj0nYnNY0bJ8+pU9ZPZUilfTQc5Mu5GXXCXe8KwKUxDjcS1JNUXyxTvn+mvMESR/AUFKQNzgXz15J6N0jNfRs5fLeZMNa/YJdkk= gmeltzer@gmeltzer-mbp" >> /home/ubuntu/.ssh/authorized_keys
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
-# Trap errors and exit the script with an error message
+# Trap errors
 trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
 
-# Set non-interactive mode globally to avoid prompts
+# Set non-interactive mode globally
 export DEBIAN_FRONTEND=noninteractive
 
 # Update packages
@@ -31,7 +29,7 @@ apt-get update && apt-get upgrade -y || {
   exit 1
 }
 
-# Install AWS CLI early to ensure availability
+# Install AWS CLI
 echo "$(date) - Installing AWS CLI"
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" || {
   echo "$(date) - ERROR: Failed to download AWS CLI"
@@ -63,16 +61,9 @@ apt-get install -y \
     exit 1
   }
 
-# Pre-configure iptables-persistent and netfilter-persistent to avoid interactive prompts
-echo "$(date) - Pre-configuring iptables-persistent and netfilter-persistent"
-echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
-echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
-echo "netfilter-persistent netfilter-persistent/autosave_v4 boolean false" | debconf-set-selections
-echo "netfilter-persistent netfilter-persistent/autosave_v6 boolean false" | debconf-set-selections
-
-# Install iptables-persistent with forced non-interactive options
+# Install iptables-persistent non-interactively
 echo "$(date) - Installing iptables-persistent"
-apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" iptables-persistent || {
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables-persistent || {
   echo "$(date) - ERROR: Failed to install iptables-persistent"
   exit 1
 }
@@ -181,14 +172,20 @@ EOF
 
 cat /tmp/kubeadm-config.yaml
 
-# Configure firewall rules
+# Configure firewall rules and save manually
 echo "$(date) - Configuring firewall rules"
 iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
 iptables -A INPUT -p tcp --dport 179 -j ACCEPT
 iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
+# Ensure netfilter-persistent loads rules at boot
+systemctl enable netfilter-persistent || {
+  echo "$(date) - ERROR: Failed to enable netfilter-persistent"
+  exit 1
+}
 
 # Initialize Kubernetes control plane
 echo "$(date) - Starting kubeadm init with config"
@@ -262,7 +259,7 @@ snap install amazon-ssm-agent --classic
 systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
 systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
 
-# Allow control plane to run pods (remove taint)
+# Allow control plane to run pods
 kubectl taint nodes --all node-role.kubernetes.io/control-plane-
 
 # Make certificates accessible for Terraform
@@ -270,12 +267,12 @@ chmod 644 /etc/kubernetes/pki/ca.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.crt
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 
-# Configure kubeconfig with public IP for remote access
+# Configure kubeconfig with public IP
 echo "$(date) - Configuring kubeconfig for remote access"
 cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.bak
 sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
 
-# Store join command in AWS Secrets Manager for workers to use
+# Store join command in AWS Secrets Manager
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 echo "$(date) - Generated join command: $${JOIN_COMMAND}"
 aws secretsmanager put-secret-value \
