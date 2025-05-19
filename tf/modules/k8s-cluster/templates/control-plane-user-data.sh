@@ -52,23 +52,30 @@ aws --version || {
   exit 1
 }
 
-# Pre-configure iptables-persistent and netfilter-persistent to avoid interactive prompts
-echo "$(date) - Pre-configuring iptables-persistent and netfilter-persistent"
-sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v4 boolean false"
-sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v6 boolean false"
-sudo debconf-set-selections <<< "netfilter-persistent netfilter-persistent/autosave_v4 boolean false"
-sudo debconf-set-selections <<< "netfilter-persistent netfilter-persistent/autosave_v6 boolean false"
-
-# Install required packages
-echo "$(date) - Installing required packages"
+# Install initial dependencies
+echo "$(date) - Installing initial dependencies"
 apt-get install -y \
   jq unzip ebtables ethtool apt-transport-https \
   ca-certificates curl gnupg lsb-release \
-  tcpdump net-tools telnet dnsutils iptables-persistent \
+  tcpdump net-tools telnet dnsutils \
   || {
-    echo "$(date) - ERROR: Failed to install required packages"
+    echo "$(date) - ERROR: Failed to install initial dependencies"
     exit 1
   }
+
+# Pre-configure iptables-persistent and netfilter-persistent to avoid interactive prompts
+echo "$(date) - Pre-configuring iptables-persistent and netfilter-persistent"
+echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
+echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+echo "netfilter-persistent netfilter-persistent/autosave_v4 boolean false" | debconf-set-selections
+echo "netfilter-persistent netfilter-persistent/autosave_v6 boolean false" | debconf-set-selections
+
+# Install iptables-persistent with forced non-interactive options
+echo "$(date) - Installing iptables-persistent"
+apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" iptables-persistent || {
+  echo "$(date) - ERROR: Failed to install iptables-persistent"
+  exit 1
+}
 
 # Disable swap
 swapoff -a
