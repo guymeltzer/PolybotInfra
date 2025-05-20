@@ -9,7 +9,7 @@ echo "$(date) - Starting Kubernetes control plane initialization"
 set -e
 trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> ${LOGFILE}; exit 1' ERR
 
-# Set up SSH access (using your existing key).
+# Set up SSH access (using your existing key)
 echo "$(date) - Setting up SSH access"
 mkdir -p /home/ubuntu/.ssh
 cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
