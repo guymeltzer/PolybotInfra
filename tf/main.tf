@@ -211,8 +211,14 @@ resource "null_resource" "wait_for_kubernetes" {
       tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
       mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
       
-      # Start fresh - create a new kubeconfig with basic auth
-      cat > "${path.module}/kubeconfig.yml" << 'KUBECONFIG'
+      # Start fresh - create a new kubeconfig using the control plane's generated one
+      # Get the module-generated kubeconfig if it exists
+      if [ -f "${path.module}/modules/k8s-cluster/kubeconfig" ]; then
+        echo "Using the module-generated kubeconfig..."
+        cp "${path.module}/modules/k8s-cluster/kubeconfig" "${path.module}/kubeconfig.yml"
+      else
+        echo "Module kubeconfig not found, creating placeholder..."
+        cat > "${path.module}/kubeconfig.yml" << KUBECONFIG
 apiVersion: v1
 kind: Config
 clusters:
@@ -229,14 +235,8 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: admin
   user:
-    username: admin
-    password: admin
+    token: placeholder
 KUBECONFIG
-      
-      # Update the server URL if needed
-      if grep -q "placeholder:6443" "${path.module}/kubeconfig.yml"; then
-        echo "Found placeholder server, fixing..."
-        sed -i.bak 's|server: https://placeholder:6443|server: https://kubernetes.default.svc:6443|g' "${path.module}/kubeconfig.yml"
       fi
       
       # Update permissions
@@ -273,37 +273,18 @@ resource "terraform_data" "kubectl_provider_config" {
         echo "Control plane public IP: $PUBLIC_IP"
       fi
       
-      # Create a kubeconfig with basic auth
+      # Retrieve the generated kubeconfig from the control plane's module output
+      echo "Using the control plane's generated kubeconfig..."
+      cp "${path.module}/modules/k8s-cluster/kubeconfig" "${path.module}/kubeconfig.yml"
+      chmod 600 "${path.module}/kubeconfig.yml"
+      
+      # Update the kubeconfig with the correct server address
       if [ "$PUBLIC_IP" != "placeholder" ]; then
-        SERVER_URL="https://$PUBLIC_IP:6443"
-      else
-        SERVER_URL="https://kubernetes.default.svc:6443"
+        echo "Updating the server address to use the public IP: $PUBLIC_IP"
+        sed -i.bak "s|server: .*|server: https://$PUBLIC_IP:6443|g" "${path.module}/kubeconfig.yml"
       fi
       
-      echo "Creating kubeconfig with basic auth..."
-      cat > "${path.module}/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: $SERVER_URL
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    username: admin
-    password: admin
-EOF
-      
-      chmod 600 "${path.module}/kubeconfig.yml"
-      echo "Created kubeconfig with server URL: $SERVER_URL"
+      echo "Kubeconfig updated successfully"
       echo "Script completed successfully"
     EOT
   }
@@ -319,38 +300,22 @@ locals {
 
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
-  # Don't use config_path since it might contain conflicting auth methods
-  host = "https://${local.control_plane_ip}:6443"
-  insecure = true
-  
-  # Use basic authentication
-  username = "admin"
-  password = "admin"
+  config_path    = "${path.module}/kubeconfig.yml"
+  # No need to specify explicit host/credentials, they're in the config
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
-    # Don't use config_path since it might contain conflicting auth methods
-    host = "https://${local.control_plane_ip}:6443"
-    insecure = true
-    
-    # Use basic authentication
-    username = "admin"
-    password = "admin"
+    config_path    = "${path.module}/kubeconfig.yml"
+    # No need to specify explicit host/credentials, they're in the config
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  # Use only load_config_file or host/token, not both
-  load_config_file = false
-  host             = "https://${local.control_plane_ip}:6443"
-  insecure         = true
-  
-  # Use basic authentication
-  username = "admin"
-  password = "admin"
+  config_path      = "${path.module}/kubeconfig.yml"
+  load_config_file = true
 }
 
 # Create Kubernetes namespaces for dev and prod
