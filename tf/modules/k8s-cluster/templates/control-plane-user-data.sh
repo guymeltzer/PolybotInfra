@@ -184,6 +184,9 @@ echo "$(date) - Starting kubelet service"
 systemctl enable --now kubelet
 systemctl status kubelet || { echo "Kubelet service failed to start"; journalctl -xeu kubelet || true; }
 
+# Use the pre-formatted token from Terraform
+echo "$(date) - Using bootstrap token: ${token_formatted}"
+
 # Create kubeadm config file - with token built in
 echo "$(date) - Creating kubeadm configuration"
 cat <<EOF > /tmp/kubeadm-config.yaml
@@ -197,9 +200,9 @@ localAPIEndpoint:
   advertiseAddress: $${PRIVATE_IP}
   bindPort: 6443
 bootstrapTokens:
-- token: "${token}"
+- token: "${token_formatted}"
   description: "default bootstrap token"
-  ttl: "0"
+  ttl: "0s"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
@@ -346,7 +349,7 @@ fi
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 echo "$(date) - Generated join command: $${JOIN_COMMAND}"
 aws secretsmanager put-secret-value \
-  --secret-id kubernetes-join-command-${token} \
+  --secret-id kubernetes-join-command-${token_formatted} \
   --secret-string "$${JOIN_COMMAND}" \
   --region us-east-1 \
   --version-stage AWSCURRENT
