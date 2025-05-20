@@ -5,6 +5,37 @@ provider "aws" {
 # Define a local provider for first-time setup
 provider "local" {}
 
+# Create a bootstrap kubeconfig file for Kubernetes provider initialization
+resource "local_file" "bootstrap_kubeconfig" {
+  count    = fileexists("${path.module}/kubeconfig.yml") ? 0 : 1
+  filename = "${path.module}/kubeconfig.yml"
+  content  = <<-EOT
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOT
+
+  # Only create this file if it doesn't already exist
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
@@ -35,6 +66,10 @@ resource "kubernetes_namespace" "dev" {
     name = "dev"
   }
   depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "kubernetes_namespace" "prod" {
@@ -42,6 +77,10 @@ resource "kubernetes_namespace" "prod" {
     name = "prod"
   }
   depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 module "k8s-cluster" {
@@ -66,7 +105,7 @@ module "k8s-cluster" {
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster, local_file.bootstrap_kubeconfig]
   
   triggers = {
     # Use formatdate instead of raw timestamp to avoid changing on every apply
@@ -419,6 +458,7 @@ resource "terraform_data" "kubectl_provider_config" {
 
 # Install EBS CSI Driver for persistent storage
 resource "helm_release" "aws_ebs_csi_driver" {
+  count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
   name       = "aws-ebs-csi-driver"
   repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
   chart      = "aws-ebs-csi-driver"
@@ -449,6 +489,7 @@ EOF
 
 # ArgoCD deployment
 module "argocd" {
+  count          = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
   source         = "./modules/argocd"
   git_repo_url   = var.git_repo_url
   
