@@ -26,18 +26,21 @@ module "vpc" {
 }
 
 # Generate a random token for kubeadm
-resource "random_string" "token" {
-  length  = 22
+resource "random_string" "token_part1" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+resource "random_string" "token_part2" {
+  length  = 16
   special = false
   upper   = false
 }
 
 # Format the token for kubeadm (must be in format AAAAAA.BBBBBBBBBBBBBBBB)
-# This is computed locally to avoid script handling errors
 locals {
-  kubeadm_token_part1 = substr(random_string.token.result, 0, 6)
-  kubeadm_token_part2 = substr(random_string.token.result, 6, 16)
-  kubeadm_token       = "${local.kubeadm_token_part1}.${local.kubeadm_token_part2}"
+  kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
 }
 
 # Security Group for Kubernetes Cluster Resources
@@ -549,7 +552,8 @@ resource "aws_instance" "control_plane" {
   associate_public_ip_address = true
 
   user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
-    token    = random_string.token.result,
+    token_part1 = random_string.token_part1.result,
+    token_part2 = random_string.token_part2.result,
     token_formatted = local.kubeadm_token,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
@@ -608,7 +612,7 @@ resource "null_resource" "wait_for_control_plane" {
 resource "local_file" "kubeconfig" {
   content = templatefile("${path.module}/templates/kubeconfig.tpl", {
     endpoint       = aws_lb.polybot_alb.dns_name
-    token          = random_string.token.result
+    token          = local.kubeadm_token
     cluster_ca     = base64encode(file("${path.module}/certs/ca.crt"))
     client_cert    = base64encode(file("${path.module}/certs/client.crt"))
     client_key     = base64encode(file("${path.module}/certs/client.key"))
