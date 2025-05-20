@@ -44,7 +44,7 @@ resource "aws_sqs_queue" "polybot_queue" {
 
 # Store Telegram token in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "telegram_token" {
-  name_prefix = "guy-polybot-${var.environment}-telegram-token-"
+  name        = "guy-polybot-${var.environment}-telegram-token"
   description = "Telegram Bot Token for Polybot ${var.environment} environment"
   recovery_window_in_days = 0  # Allow immediate reuse
   
@@ -60,7 +60,7 @@ resource "aws_secretsmanager_secret_version" "telegram_token_value" {
 
 # Store Docker Hub credentials in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "docker_credentials" {
-  name_prefix = "guy-polybot-${var.environment}-docker-credentials-"
+  name        = "guy-polybot-${var.environment}-docker-credentials"
   description = "Docker Hub credentials for Polybot ${var.environment} environment"
   recovery_window_in_days = 0  # Allow immediate reuse
   
@@ -104,7 +104,7 @@ resource "aws_route53_record" "polybot_record" {
 */
 
 resource "aws_secretsmanager_secret" "polybot_secrets" {
-  name_prefix = "${local.name_prefix}-secrets-"
+  name        = "${local.name_prefix}-secrets-${var.region}"
   description = "Various Polybot configuration secrets for ${var.environment} environment"
   recovery_window_in_days = 0  # Allow immediate reuse
   force_overwrite_replica_secret = true
