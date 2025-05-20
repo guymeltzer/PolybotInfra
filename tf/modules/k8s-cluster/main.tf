@@ -527,6 +527,10 @@ resource "terraform_data" "control_plane_script_hash" {
   input = filesha256("${path.module}/templates/control-plane-user-data.sh")
 }
 
+resource "terraform_data" "force_replace_control_plane" {
+  input = timestamp()
+}
+
 resource "aws_instance" "control_plane" {
   ami                    = var.control_plane_ami
   instance_type          = var.control_plane_instance_type
@@ -558,9 +562,10 @@ resource "aws_instance" "control_plane" {
 
   lifecycle {
     create_before_destroy = true
-    # Force replacement when the terraform_data resource changes instead of using filesha256 directly
+    # Force replacement when the terraform_data resource changes
     replace_triggered_by = [
-      terraform_data.control_plane_script_hash
+      terraform_data.control_plane_script_hash,
+      terraform_data.force_replace_control_plane
     ]
   }
 }

@@ -4,7 +4,7 @@ set -ex
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-control-plane-init.log"
-exec > >(tee -a /var/log/k8s-control-plane-init.log) 2>&1
+exec > >(tee -a $${LOGFILE}) 2>&1
 echo "$(date) - Starting Kubernetes control plane initialization"
 
 # Debug: Verify script integrity
@@ -47,13 +47,13 @@ command -v unzip || {
   exit 1
 }
 
-# Check if unzip exists and skip version check
+# Skip the version check and just verify the binary works
 if [ -x "$(command -v unzip)" ]; then
-  echo "$(date) - Unzip is installed successfully"
-  # Just add a log entry without failing on error
-  unzip -v 2>&1 | head -2 >> $${LOGFILE} || true
+  echo "$(date) - Unzip is available at $(command -v unzip)"
+  # Capture version info but don't fail if there are warnings
+  unzip -v 2>/dev/null || true
 else
-  echo "$(date) - ERROR: unzip is not available"
+  echo "$(date) - ERROR: Cannot execute unzip"
   exit 1
 fi
 
