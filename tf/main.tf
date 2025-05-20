@@ -120,8 +120,8 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
+    username: admin
+    password: admin
 EOF
 
       chmod 600 "${path.module}/kubeconfig.yml"
@@ -167,8 +167,8 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
+    username: admin
+    password: admin
 EOF
       fi
       
@@ -229,8 +229,8 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
+    username: admin
+    password: admin
 FALLBACK
       fi
       
@@ -316,25 +316,36 @@ resource "terraform_data" "kubectl_provider_config" {
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
-  # Don't specify a context - use the current-context from the kubeconfig
-  insecure       = true  # Allow connections to the API server without verifying the TLS certificate
+  host           = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+  insecure       = true
+  # Skip TLS verification entirely
+  client_certificate     = ""
+  client_key             = ""
+  cluster_ca_certificate = ""
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
     config_path    = "${path.module}/kubeconfig.yml"
-    # Use default context from the kubeconfig file
+    host           = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
     insecure       = true
+    # Skip TLS verification entirely
+    client_certificate     = ""
+    client_key             = ""
+    cluster_ca_certificate = ""
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
   config_path      = "${path.module}/kubeconfig.yml"
-  # Don't specify context - use the current-context from kubeconfig
+  host             = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
   load_config_file = true
   insecure         = true
+  client_certificate     = ""
+  client_key             = ""
+  cluster_ca_certificate = ""
   
   # Skip TLS verification completely to avoid certificate parsing
   exec {
