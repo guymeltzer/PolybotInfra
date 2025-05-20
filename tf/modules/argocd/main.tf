@@ -41,9 +41,9 @@ resource "helm_release" "argocd" {
     EOT
   ]
 
-  wait             = true
-  timeout          = 900  # 15 minutes
-  atomic           = true
+  wait             = false  # Don't wait for all resources to be ready
+  timeout          = 300    # 5 minutes timeout
+  atomic           = false  # Don't use atomic deployment to avoid failures
   cleanup_on_fail  = true
 }
 
@@ -53,21 +53,8 @@ resource "time_sleep" "wait_for_argocd" {
   create_duration = "60s"
 }
 
-# Create dev namespace if it doesn't exist
-resource "kubernetes_namespace" "dev" {
-  metadata {
-    name = "dev"
-  }
-  depends_on = [time_sleep.wait_for_argocd]
-}
-
-# Create prod namespace if it doesn't exist
-resource "kubernetes_namespace" "prod" {
-  metadata {
-    name = "prod"
-  }
-  depends_on = [time_sleep.wait_for_argocd]
-}
+# Remove namespace resources since they are managed by the parent module
+# This avoids conflicts when trying to create the same namespace twice
 
 # Create ArgoCD application resources for each service in dev environment
 resource "kubectl_manifest" "polybot_application_dev" {

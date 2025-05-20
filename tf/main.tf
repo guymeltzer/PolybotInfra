@@ -275,59 +275,97 @@ EOF
         PUBLIC_IP="placeholder"
       fi
       
-      # Get the admin.conf from the control plane
-      echo "Getting admin kubeconfig from control plane..."
-      ADMIN_KUBECONFIG=$(aws ssm send-command \
+      # Method 1: Try to directly copy the admin.conf file from the server and create a user with admin privileges
+      echo "Getting admin access via cluster-admin role binding..."
+      
+      # First, copy the admin.conf file to a readable location and set proper permissions
+      COPY_CMD=$(aws ssm send-command \
         --region ${var.region} \
         --instance-ids $INSTANCE_ID \
         --document-name "AWS-RunShellScript" \
-        --parameters commands="sudo cat /etc/kubernetes/admin.conf" \
+        --parameters commands="sudo cp /etc/kubernetes/admin.conf /tmp/admin.conf && sudo chmod 644 /tmp/admin.conf" \
         --output text --query "Command.CommandId")
+      
+      if [ -n "$COPY_CMD" ]; then
+        echo "Waiting for admin.conf copy command to complete..."
+        sleep 10
         
-      if [ -n "$ADMIN_KUBECONFIG" ]; then
-        echo "Waiting for admin kubeconfig command to complete..."
-        sleep 30
-        
-        # Get the command result
-        KUBECONFIG_CONTENT=$(aws ssm get-command-invocation \
+        # Now get the copied admin.conf file
+        ADMIN_CONF_CMD=$(aws ssm send-command \
           --region ${var.region} \
-          --command-id "$ADMIN_KUBECONFIG" \
-          --instance-id "$INSTANCE_ID" \
-          --query "StandardOutputContent" \
-          --output text)
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="cat /tmp/admin.conf" \
+          --output text --query "Command.CommandId")
           
-        if [ -n "$KUBECONFIG_CONTENT" ] && [[ "$KUBECONFIG_CONTENT" == *"apiVersion: v1"* ]]; then
-          echo "Successfully retrieved admin kubeconfig from control plane"
+        if [ -n "$ADMIN_CONF_CMD" ]; then
+          echo "Waiting for admin.conf content command to complete..."
+          sleep 10
           
-          # Save the kubeconfig and update the server address
-          KUBECONFIG_DIR="${path.module}"
-          echo "$KUBECONFIG_CONTENT" > "$KUBECONFIG_DIR/kubeconfig.yml"
-          
-          # Update the server URL to use the public IP
-          sed -i.bak "s|server:.*|server: https://$PUBLIC_IP:6443|g" "$KUBECONFIG_DIR/kubeconfig.yml"
-          
-          # Add insecure-skip-tls-verify
-          sed -i.bak "s|certificate-authority-data:.*|insecure-skip-tls-verify: true|g" "$KUBECONFIG_DIR/kubeconfig.yml"
-          
-          chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
-          echo "Created kubeconfig with server URL: https://$PUBLIC_IP:6443"
+          # Get the command result
+          KUBECONFIG_CONTENT=$(aws ssm get-command-invocation \
+            --region ${var.region} \
+            --command-id "$ADMIN_CONF_CMD" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text)
+            
+          if [ -n "$KUBECONFIG_CONTENT" ] && [[ "$KUBECONFIG_CONTENT" == *"apiVersion: v1"* ]]; then
+            echo "Successfully retrieved admin.conf from control plane"
+            
+            # Save the kubeconfig
+            KUBECONFIG_DIR="${path.module}"
+            echo "$KUBECONFIG_CONTENT" > "$KUBECONFIG_DIR/kubeconfig.yml.tmp"
+            
+            # Update the server URL to use the public IP
+            awk '{gsub(/server: https:\/\/[^:]+:6443/, "server: https://'$PUBLIC_IP':6443"); print}' "$KUBECONFIG_DIR/kubeconfig.yml.tmp" > "$KUBECONFIG_DIR/kubeconfig.yml"
+            
+            # Add insecure-skip-tls-verify only if it's not already present - preserves certificates
+            if ! grep -q "insecure-skip-tls-verify" "$KUBECONFIG_DIR/kubeconfig.yml"; then
+              awk '/server:/ {print; print "    insecure-skip-tls-verify: true"; next} {print}' "$KUBECONFIG_DIR/kubeconfig.yml" > "$KUBECONFIG_DIR/kubeconfig.yml.new"
+              mv "$KUBECONFIG_DIR/kubeconfig.yml.new" "$KUBECONFIG_DIR/kubeconfig.yml"
+            fi
+            
+            chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
+            rm -f "$KUBECONFIG_DIR/kubeconfig.yml.tmp"
+            echo "Created kubeconfig with server URL: https://$PUBLIC_IP:6443"
+            
+            # Test the kubeconfig
+            if command -v kubectl &> /dev/null; then
+              echo "Testing connection with admin kubeconfig..."
+              if KUBECONFIG="$KUBECONFIG_DIR/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
+                echo "Successfully connected to the Kubernetes cluster as admin"
+                KUBECONFIG="$KUBECONFIG_DIR/kubeconfig.yml" kubectl get nodes
+                echo "Cluster access confirmed"
+                return 0
+              else
+                echo "Warning: Failed to connect with admin.conf, trying alternative method"
+              fi
+            fi
+          else
+            echo "Failed to get admin.conf content, trying alternative method"
+          fi
         else
-          echo "Failed to retrieve valid admin kubeconfig, falling back to token-based config"
-          create_token_config "$PUBLIC_IP"
+          echo "Failed to execute command to get admin.conf content"
         fi
       else
-        echo "Failed to send command to retrieve admin kubeconfig, falling back to token-based config"
-        create_token_config "$PUBLIC_IP"
+        echo "Failed to copy admin.conf to accessible location"
       fi
       
-      # Test the connection
+      # Method 2: Fallback to token-based auth
+      echo "Falling back to token-based authentication..."
+      create_token_config "$PUBLIC_IP"
+      
+      # Test the connection with the fallback token
       if [ "$PUBLIC_IP" != "placeholder" ] && command -v kubectl &> /dev/null; then
-        echo "Testing connection to Kubernetes API server..."
+        echo "Testing connection to Kubernetes API server with token auth..."
         if KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
           echo "Successfully connected to Kubernetes API server"
+          echo "Checking permissions..."
+          KUBECONFIG="${path.module}/kubeconfig.yml" kubectl auth can-i create namespace --all-namespaces
           KUBECONFIG="${path.module}/kubeconfig.yml" kubectl get nodes
         else
-          echo "Warning: Failed to connect to Kubernetes API server"
+          echo "Warning: Failed to connect to Kubernetes API server with token auth"
         fi
       fi
       
@@ -420,35 +458,39 @@ module "k8s-cluster" {
 }
 
 # Install EBS CSI Driver for persistent storage
-resource "helm_release" "aws_ebs_csi_driver" {
-  count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
-  name       = "aws-ebs-csi-driver"
-  repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
-  chart      = "aws-ebs-csi-driver"
-  namespace  = "kube-system"
-  version    = "2.23.0"  # Use a specific stable version
-
-  set {
-    name  = "controller.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = module.k8s-cluster.control_plane_iam_role_arn
-  }
-
-  values = [<<EOF
-storageClasses:
-  - name: ebs-sc
-    annotations:
-      storageclass.kubernetes.io/is-default-class: "true"
-    volumeBindingMode: WaitForFirstConsumer
-    parameters:
-      csi.storage.k8s.io/fstype: xfs
-      type: gp2
-      encrypted: "true"
-EOF
-  ]
-
-  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
-  timeout    = 600
-}
+# Commented out temporarily to avoid hanging issues
+# resource "helm_release" "aws_ebs_csi_driver" {
+#   count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
+#   name       = "aws-ebs-csi-driver"
+#   repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
+#   chart      = "aws-ebs-csi-driver"
+#   namespace  = "kube-system"
+#   version    = "2.23.0"  # Use a specific stable version
+#   
+#   # Set shorter timeout to avoid long waits
+#   timeout    = 300
+#   wait       = false  # Don't wait for resources to be ready
+#   
+#   # Simplified values
+#   values = [<<EOF
+# controller:
+#   serviceAccount:
+#     annotations:
+#       eks.amazonaws.com/role-arn: ${module.k8s-cluster.control_plane_iam_role_arn}
+# storageClasses:
+#   - name: ebs-sc
+#     annotations:
+#       storageclass.kubernetes.io/is-default-class: "true"
+#     volumeBindingMode: WaitForFirstConsumer
+#     parameters:
+#       csi.storage.k8s.io/fstype: ext4
+#       type: gp2
+#       encrypted: "true"
+# EOF
+#   ]
+# 
+#   depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+# }
 
 # ArgoCD deployment
 module "argocd" {
