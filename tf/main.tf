@@ -317,18 +317,9 @@ resource "terraform_data" "kubectl_provider_config" {
 # Store the control plane IP locally so we can use it in provider configs
 locals {
   control_plane_ip = try(
-    data.aws_instance.control_plane.public_ip,
+    module.k8s-cluster.control_plane_public_ip,
     "kubernetes.default.svc"
   )
-}
-
-# Look up the control plane instance to get its IP
-data "aws_instance" "control_plane" {
-  instance_tags = {
-    Name = "k8s-control-plane"
-  }
-  
-  depends_on = [module.k8s-cluster]
 }
 
 # Configure the Kubernetes provider with proper authentication
