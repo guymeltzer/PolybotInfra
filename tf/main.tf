@@ -280,13 +280,25 @@ resource "terraform_data" "kubectl_provider_config" {
       echo "Waiting for token to be generated..."
       sleep 10
       
-      # Get the service account token
-      TOKEN=$$(kubectl --kubeconfig="$$MODIFIED_KUBECONFIG" -n kube-system get secret terraform-admin-token -o jsonpath='{.data.token}' | base64 --decode)
-      
-      if [ -z "$$TOKEN" ]; then
-        echo "ERROR: Failed to retrieve token. Exiting."
-        exit 1
-      fi
+      # Get the service account token with retry logic
+      MAX_RETRY=5
+      for ((i=1; i<=MAX_RETRY; i++)); do
+        echo "Attempt $i to retrieve token..."
+        TOKEN=$$(kubectl --kubeconfig="$$MODIFIED_KUBECONFIG" -n kube-system get secret terraform-admin-token -o jsonpath='{.data.token}' | base64 --decode)
+        
+        if [ -n "$$TOKEN" ] && [ $${#TOKEN} -gt 20 ]; then
+          echo "Successfully retrieved token on attempt $i"
+          break
+        else
+          echo "Token retrieval attempt $i failed"
+          if [ $$i -eq $$MAX_RETRY ]; then
+            echo "ERROR: Failed to retrieve token after $$MAX_RETRY attempts. Exiting."
+            exit 1
+          fi
+          echo "Waiting before retry..."
+          sleep 10
+        fi
+      done
       
       # Create a kubeconfig with the service account token for Terraform
       echo "Creating kubeconfig with service account token..."
@@ -313,12 +325,23 @@ resource "terraform_data" "kubectl_provider_config" {
       chmod 600 "${path.module}/kubeconfig.yml"
       echo "Successfully created kubeconfig with terraform-admin authentication"
       
+      # Add an explicit delay to ensure file is fully written and registered
+      sleep 5
+      
       # Test the connection
       if command -v kubectl &> /dev/null; then
         echo "Testing connection with terraform-admin token..."
         if KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
           echo "Successfully connected to the Kubernetes cluster as terraform-admin"
           KUBECONFIG="${path.module}/kubeconfig.yml" kubectl auth can-i '*' '*' --all-namespaces || echo "Warning: Could not verify all permissions"
+          
+          # Verify token works for namespaces
+          echo "Verifying access to namespaces..."
+          if ! KUBECONFIG="${path.module}/kubeconfig.yml" kubectl get namespace kube-system; then
+            echo "ERROR: Token does not have access to namespaces"
+            exit 1
+          fi
+          
           echo "Admin cluster access confirmed"
         else
           echo "ERROR: Failed to connect with terraform-admin token"
@@ -340,23 +363,29 @@ locals {
   )
 }
 
+# Add a data source to ensure kubeconfig is ready
+data "local_file" "kubeconfig" {
+  depends_on = [terraform_data.kubectl_provider_config]
+  filename   = "${path.module}/kubeconfig.yml"
+}
+
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
-  config_path = "${path.module}/kubeconfig.yml"
-  insecure = true # Explicitly skip TLS verification
+  config_path = data.local_file.kubeconfig.filename
+  insecure    = true # Explicitly skip TLS verification
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
-    config_path = "${path.module}/kubeconfig.yml"
-    insecure = true # Explicitly skip TLS verification
+    config_path = data.local_file.kubeconfig.filename
+    insecure    = true # Explicitly skip TLS verification
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path = "${path.module}/kubeconfig.yml"
+  config_path     = data.local_file.kubeconfig.filename
   load_config_file = true
 }
 
@@ -365,14 +394,19 @@ resource "kubernetes_namespace" "dev" {
   metadata {
     name = "dev"
   }
-  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  depends_on = [
+    module.k8s-cluster, 
+    null_resource.wait_for_kubernetes, 
+    terraform_data.kubectl_provider_config,
+    data.local_file.kubeconfig
+  ]
   
   lifecycle {
     create_before_destroy = true
     # Add retry logic via local-exec instead of failing the resource
     precondition {
-      condition     = fileexists("${path.module}/kubeconfig.yml")
-      error_message = "Kubeconfig file must exist at ${path.module}/kubeconfig.yml"
+      condition     = fileexists(data.local_file.kubeconfig.filename)
+      error_message = "Kubeconfig file must exist at ${data.local_file.kubeconfig.filename}"
     }
   }
 }
@@ -381,13 +415,18 @@ resource "kubernetes_namespace" "prod" {
   metadata {
     name = "prod"
   }
-  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  depends_on = [
+    module.k8s-cluster, 
+    null_resource.wait_for_kubernetes, 
+    terraform_data.kubectl_provider_config,
+    data.local_file.kubeconfig
+  ]
   
   lifecycle {
     create_before_destroy = true
     precondition {
-      condition     = fileexists("${path.module}/kubeconfig.yml")
-      error_message = "Kubeconfig file must exist at ${path.module}/kubeconfig.yml"
+      condition     = fileexists(data.local_file.kubeconfig.filename)
+      error_message = "Kubeconfig file must exist at ${data.local_file.kubeconfig.filename}"
     }
   }
 }
@@ -452,7 +491,7 @@ module "k8s-cluster" {
 
 # ArgoCD deployment
 module "argocd" {
-  count          = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
+  count          = fileexists(data.local_file.kubeconfig.filename) ? 1 : 0
   source         = "./modules/argocd"
   git_repo_url   = var.git_repo_url
   
@@ -462,7 +501,14 @@ module "argocd" {
     kubectl    = kubectl
   }
   
-  depends_on     = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  depends_on     = [
+    module.k8s-cluster, 
+    null_resource.wait_for_kubernetes, 
+    terraform_data.kubectl_provider_config,
+    data.local_file.kubeconfig,
+    kubernetes_namespace.dev,
+    kubernetes_namespace.prod
+  ]
 }
 
 # Development environment resources
