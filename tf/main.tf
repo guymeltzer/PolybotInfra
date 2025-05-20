@@ -41,36 +41,36 @@ resource "terraform_data" "manage_secrets" {
        check_duplicate_secrets() {
          local prefix=$1
          
-         echo -e "Checking for duplicates with prefix: $${YELLOW}$prefix$${NC}"
+         echo -e "Checking for duplicates with prefix: $${YELLOW}$$prefix$${NC}"
          
          SECRETS=$(aws secretsmanager list-secrets \
            --region ${var.region} \
-           --filters Key=name,Values=$prefix \
+           --filters Key=name,Values=$$prefix \
            --query "SecretList[*].{Name:Name,ARN:ARN}" \
            --output json 2>/dev/null) || {
              echo -e "$${RED}Failed to fetch secrets$${NC}"
              return 0
            }
          
-         COUNT=$(echo $SECRETS | jq -r 'length')
+         COUNT=$(echo $$SECRETS | jq -r 'length')
          
-         if [ "$COUNT" -le 1 ]; then
-           echo -e "$${GREEN}No duplicate secrets found for $prefix$${NC}"
+         if [ "$$COUNT" -le 1 ]; then
+           echo -e "$${GREEN}No duplicate secrets found for $$prefix$${NC}"
            return 0
          fi
          
-         echo -e "$${YELLOW}Found $COUNT secrets with prefix $prefix, cleaning up...$${NC}"
+         echo -e "$${YELLOW}Found $$COUNT secrets with prefix $$prefix, cleaning up...$${NC}"
          
          # Get all but the newest secret
-         SECRETS_TO_DELETE=$(echo $SECRETS | jq -r '.[0:-1] | .[].Name')
+         SECRETS_TO_DELETE=$(echo $$SECRETS | jq -r '.[0:-1] | .[].Name')
          
          # Delete the older secrets
-         for SECRET_NAME in $SECRETS_TO_DELETE; do
-           echo -e "Force deleting $${YELLOW}$SECRET_NAME$${NC}"
+         for SECRET_NAME in $$SECRETS_TO_DELETE; do
+           echo -e "Force deleting $${YELLOW}$$SECRET_NAME$${NC}"
            aws secretsmanager delete-secret \
-             --secret-id "$SECRET_NAME" \
+             --secret-id "$$SECRET_NAME" \
              --force-delete-without-recovery \
-             --region ${var.region} >/dev/null 2>&1 || echo -e "$${RED}Failed to delete $SECRET_NAME$${NC}"
+             --region ${var.region} >/dev/null 2>&1 || echo -e "$${RED}Failed to delete $$SECRET_NAME$${NC}"
          done
        }
        
@@ -144,16 +144,16 @@ EOF
       # Basic validation using grep
       MISSING_FIELDS=0
       
-      grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || { echo "Missing apiVersion"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
-      grep -q "clusters:" "${path.module}/kubeconfig.yml" || { echo "Missing clusters"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
-      grep -q "contexts:" "${path.module}/kubeconfig.yml" || { echo "Missing contexts"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
-      grep -q "current-context:" "${path.module}/kubeconfig.yml" || { echo "Missing current-context"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
-      grep -q "users:" "${path.module}/kubeconfig.yml" || { echo "Missing users"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || { echo "Missing apiVersion"; MISSING_FIELDS=$$((MISSING_FIELDS+1)); }
+      grep -q "clusters:" "${path.module}/kubeconfig.yml" || { echo "Missing clusters"; MISSING_FIELDS=$$((MISSING_FIELDS+1)); }
+      grep -q "contexts:" "${path.module}/kubeconfig.yml" || { echo "Missing contexts"; MISSING_FIELDS=$$((MISSING_FIELDS+1)); }
+      grep -q "current-context:" "${path.module}/kubeconfig.yml" || { echo "Missing current-context"; MISSING_FIELDS=$$((MISSING_FIELDS+1)); }
+      grep -q "users:" "${path.module}/kubeconfig.yml" || { echo "Missing users"; MISSING_FIELDS=$$((MISSING_FIELDS+1)); }
       
-      if [ $MISSING_FIELDS -eq 0 ]; then
+      if [ $$MISSING_FIELDS -eq 0 ]; then
           echo "All required fields are present"
       else
-          echo "$MISSING_FIELDS required fields are missing, recreating kubeconfig"
+          echo "$$MISSING_FIELDS required fields are missing, recreating kubeconfig"
           cat > "${path.module}/kubeconfig.yml" << EOF
 apiVersion: v1
 kind: Config
@@ -177,11 +177,11 @@ EOF
       fi
       
       # Check current-context
-      CONTEXT=$(grep "current-context:" "${path.module}/kubeconfig.yml" | awk '{print $2}')
-      echo "Current context is: $CONTEXT"
+      CONTEXT=$$(grep "current-context:" "${path.module}/kubeconfig.yml" | awk '{print $2}')
+      echo "Current context is: $$CONTEXT"
       
       # Ensure kubernetes-admin@kubernetes is the context
-      if [ "$CONTEXT" != "kubernetes-admin@kubernetes" ]; then
+      if [ "$$CONTEXT" != "kubernetes-admin@kubernetes" ]; then
           echo "Incorrect context, fixing..."
           sed -i.bak 's|current-context: .*|current-context: kubernetes-admin@kubernetes|g' "${path.module}/kubeconfig.yml"
           echo "Fixed current-context in kubeconfig.yml"
@@ -269,13 +269,13 @@ resource "terraform_data" "kubectl_provider_config" {
   provisioner "local-exec" {
     command = <<-EOT
       # Get the control plane's current IP
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      if [ -z "$INSTANCE_ID" ]; then
+      INSTANCE_ID=$$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      if [ -z "$$INSTANCE_ID" ]; then
         echo "WARNING: Could not find control plane instance. Will try to continue."
         PUBLIC_IP="placeholder"
       else
-        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-        echo "Control plane public IP: $PUBLIC_IP"
+        PUBLIC_IP=$$(aws ec2 describe-instances --region ${var.region} --instance-ids $$INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        echo "Control plane public IP: $$PUBLIC_IP"
       fi
       
       # Make sure the kubeconfig file exists
@@ -292,9 +292,9 @@ resource "terraform_data" "kubectl_provider_config" {
       
       # Update kubeconfig with current IP
       if [ -f "${path.module}/kubeconfig.yml" ]; then
-        if [ "$PUBLIC_IP" != "placeholder" ]; then
-          sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
-          echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+        if [ "$$PUBLIC_IP" != "placeholder" ]; then
+          sed -i.bak "s|server: https://[^:]*:|server: https://$$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
+          echo "Updated kubeconfig to use IP: $$PUBLIC_IP"
         else
           echo "Skipping kubeconfig IP update as no instance was found"
         fi
@@ -389,7 +389,7 @@ module "k8s-cluster" {
   ]
 
   # Start with the initialization resource that creates a valid kubeconfig
-  depends_on = [terraform_data.init_environment, null_resource.validate_kubeconfig, terraform_data.kubeconfig_preprocess]
+  depends_on = [terraform_data.init_environment]
 }
 
 # Install EBS CSI Driver for persistent storage
