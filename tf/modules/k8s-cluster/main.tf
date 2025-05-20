@@ -553,7 +553,6 @@ resource "aws_instance" "control_plane" {
     token_formatted = local.kubeadm_token,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
-    # Remove timestamp that forces recreation
   })
 
   root_block_device {
@@ -1087,13 +1086,12 @@ resource "aws_autoscaling_group" "worker_asg" {
     version = "$Latest"
   }
 
-  # Force instance refresh when launch template changes
+  # Force instance refresh when specific properties change
   instance_refresh {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
     }
-    triggers = ["launch_template"]
   }
 
   tag {
@@ -1155,7 +1153,7 @@ resource "aws_security_group" "worker_sg" {
 }
 
 resource "aws_iam_role" "worker_role" {
-  name = "Guy-K8S-WorkerNode-Role-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  name = "Guy-K8S-WorkerNode-Role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"

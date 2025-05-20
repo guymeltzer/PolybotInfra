@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script generated at: ${timestamp}
+# Script for Kubernetes control plane initialization
 set -e
 
 # Log file for debugging
