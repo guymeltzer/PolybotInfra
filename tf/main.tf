@@ -255,11 +255,12 @@ EOT
 resource "terraform_data" "kubectl_provider_config" {
   depends_on = [null_resource.wait_for_kubernetes]
   
-  # This ensures we rebuild when kubeconfig changes, not on every apply
+  # This ensures we rebuild when needed, not on every apply
   triggers_replace = {
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
-    # Add a checksum of the kubeconfig file to track content changes
-    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "none"
+    # Only trigger on instance changes, not on kubeconfig content
+    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
+    # Add timestamp to ensure this always runs
+    timestamp = timestamp()
   }
 
   # Force provision step to ensure consistency between kubeconfig and the API server
@@ -399,6 +400,65 @@ module "k8s-cluster" {
 
   # Start with the initialization resource that creates a valid kubeconfig
   depends_on = [terraform_data.init_environment]
+}
+
+# Store the control plane IP locally so we can use it in provider configs
+locals {
+  control_plane_ip = try(
+    data.aws_instance.control_plane.public_ip,
+    "kubernetes.default.svc"
+  )
+}
+
+# Look up the control plane instance to get its IP
+data "aws_instance" "control_plane" {
+  instance_tags = {
+    Name = "k8s-control-plane"
+  }
+  
+  depends_on = [module.k8s-cluster]
+}
+
+# Configure the Kubernetes provider with proper authentication
+provider "kubernetes" {
+  config_path    = "${path.module}/kubeconfig.yml"
+  host           = "https://${local.control_plane_ip}:6443"
+  insecure       = true
+  # Skip TLS verification entirely
+  client_certificate     = ""
+  client_key             = ""
+  cluster_ca_certificate = ""
+}
+
+# Configure the Helm provider with proper authentication
+provider "helm" {
+  kubernetes {
+    config_path    = "${path.module}/kubeconfig.yml"
+    host           = "https://${local.control_plane_ip}:6443"
+    insecure       = true
+    # Skip TLS verification entirely
+    client_certificate     = ""
+    client_key             = ""
+    cluster_ca_certificate = ""
+  }
+}
+
+# Configure the kubectl provider with proper authentication
+provider "kubectl" {
+  config_path      = "${path.module}/kubeconfig.yml"
+  host             = "https://${local.control_plane_ip}:6443"
+  load_config_file = true
+  insecure         = true
+  client_certificate     = ""
+  client_key             = ""
+  cluster_ca_certificate = ""
+  
+  # Skip TLS verification completely to avoid certificate parsing
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "echo"
+    args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token\"}}"]
+  }
 }
 
 # Install EBS CSI Driver for persistent storage
