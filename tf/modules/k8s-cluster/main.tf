@@ -1103,15 +1103,6 @@ resource "aws_autoscaling_group" "worker_asg" {
     version = "$Latest"
   }
 
-  # Force instance refresh when specific properties change
-  instance_refresh {
-    strategy = "Rolling"
-    preferences {
-      min_healthy_percentage = 50
-      instance_warmup = 300
-    }
-  }
-
   tag {
     key                 = "k8s.io/cluster-autoscaler/enabled"
     value               = "true"
