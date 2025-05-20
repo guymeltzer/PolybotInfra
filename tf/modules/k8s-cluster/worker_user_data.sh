@@ -134,6 +134,14 @@ JOIN_COMMAND=""
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
+  # First list all available secrets for debugging
+  echo "$(date) - Available kubernetes-join-command secrets:" >> "$LOGFILE"
+  aws secretsmanager list-secrets \
+    --region "$REGION" \
+    --filters Key=name,Values="kubernetes-join-command-*" \
+    --query "SecretList[*].{Name:Name,CreatedDate:CreatedDate}" \
+    --output json >> "$LOGFILE" || echo "Failed to list secrets" >> "$LOGFILE"
+  
   # Get the list of join command secrets, sorted by creation date (newest first)
   SECRETS=$(aws secretsmanager list-secrets \
     --region "$REGION" \
@@ -141,8 +149,26 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     --query "sort_by(SecretList, &CreatedDate)[-1].Name" \
     --output text 2>>"$LOGFILE" || echo "")
   
+  echo "$(date) - Found secrets: $SECRETS" >> "$LOGFILE"
+  
   if [ -z "$SECRETS" ] || [ "$SECRETS" == "None" ]; then
     echo "$(date) - No kubernetes-join-command secrets found. Waiting to retry..."
+    
+    # Check if we have network connectivity by pinging control plane
+    CONTROL_PLANE_IP="10.0.0.0/16"
+    if ping -c 1 -W 2 $CONTROL_PLANE_IP > /dev/null 2>&1; then
+      echo "$(date) - Network connectivity to VPC confirmed" >> "$LOGFILE"
+    else
+      echo "$(date) - WARNING: Cannot ping VPC CIDR $CONTROL_PLANE_IP" >> "$LOGFILE"
+    fi
+    
+    # Check AWS connectivity
+    if aws sts get-caller-identity --region "$REGION" > /dev/null 2>&1; then
+      echo "$(date) - AWS API connectivity confirmed" >> "$LOGFILE" 
+    else
+      echo "$(date) - WARNING: Cannot connect to AWS API" >> "$LOGFILE"
+    fi
+    
     sleep 30
     continue
   fi
@@ -244,4 +270,16 @@ fi
 aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
   --tags Key=node-role.kubernetes.io/worker,Value=true Key=k8s.io/autoscaled-node,Value=true Key=Name,Value="$NODE_NAME" 2>>"$LOGFILE"
 
-echo "$(date) - Worker node setup complete"
+echo "$(date) - Worker node setup complete. Uploading logs for debugging."
+
+# Create a unique log filename with the instance ID and timestamp
+LOG_FILENAME="worker-init-${INSTANCE_ID}-$(date +%Y%m%d-%H%M%S).log"
+
+# Create a unique S3 bucket name or use an existing bucket
+S3_BUCKET="guy-polybot-logs"
+
+# Copy the log file to S3
+aws s3 cp "$LOGFILE" "s3://${S3_BUCKET}/${LOG_FILENAME}" --region "$REGION" || \
+  echo "$(date) - Failed to upload logs to S3. You can view logs by SSHing to the node and checking $LOGFILE"
+
+echo "$(date) - Logs uploaded to s3://${S3_BUCKET}/${LOG_FILENAME} - Worker node setup complete."

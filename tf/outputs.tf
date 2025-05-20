@@ -1,6 +1,6 @@
 output "kubernetes_api_endpoint" {
   description = "Kubernetes API endpoint"
-  value       = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+  value       = module.k8s-cluster.kubernetes_api_endpoint
 }
 
 output "control_plane_public_ip" {
@@ -20,7 +20,7 @@ output "vpc_id" {
 
 output "load_balancer_address" {
   description = "DNS name of the application load balancer"
-  value       = try(module.k8s-cluster.alb_dns_name, "alb-disabled")
+  value       = module.k8s-cluster.load_balancer_address
 }
 
 output "kubeconfig_command" {
@@ -72,27 +72,39 @@ output "polybot_prod_domain" {
 
 output "polybot_alb_dns" {
   description = "Polybot ALB DNS name"
-  value       = try(module.k8s-cluster.alb_dns_name, "alb-disabled")
+  value       = module.k8s-cluster.load_balancer_address
 }
 
 output "subnet_ids" {
   description = "Subnet IDs created for the Kubernetes cluster"
-  value       = module.k8s-cluster.public_subnet_ids
+  value       = module.k8s-cluster.subnet_ids
 }
 
 # Conditional outputs for ArgoCD, using try() to handle potential errors
 output "argocd_url" {
   description = "URL of the ArgoCD server"
-  value       = try(module.argocd.argocd_url, "argocd-not-available")
+  value       = try(module.argocd.argocd_server_service_url, "argocd-not-available")
 }
 
 output "argocd_applications" {
   description = "ArgoCD applications deployed"
-  value       = try(module.argocd.applications, {})
+  value       = try(module.argocd.argocd_applications, null)
   sensitive   = true
 }
 
 output "ssh_key_name" {
-  value       = var.key_name
+  value       = module.k8s-cluster.ssh_key_name
   description = "SSH key name used for the instances"
+}
+
+output "ssh_private_key_path" {
+  value = module.k8s-cluster.ssh_private_key_path
+}
+
+output "ssh_command_control_plane" {
+  value = module.k8s-cluster.ssh_command_control_plane
+}
+
+output "worker_node_info" {
+  value = module.k8s-cluster.worker_node_info
 }

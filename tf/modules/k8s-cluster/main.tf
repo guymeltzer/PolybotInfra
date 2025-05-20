@@ -624,7 +624,7 @@ resource "local_file" "kubeconfig" {
 
 # Secrets Manager for Kubernetes join command
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}-${random_string.token_part1.result}"
   description = "Kubernetes join command for worker nodes"
   recovery_window_in_days = 0
   force_overwrite_replica_secret = true
@@ -1682,5 +1682,24 @@ resource "aws_key_pair" "generated_key" {
 locals {
   # Use provided key name if set, otherwise use the auto-generated key
   actual_key_name = var.key_name != "" ? var.key_name : aws_key_pair.generated_key[0].key_name
+}
+
+# S3 bucket for worker node logs
+resource "aws_s3_bucket" "worker_logs" {
+  bucket = "guy-polybot-logs"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "worker_logs" {
+  bucket = aws_s3_bucket.worker_logs.id
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "worker_logs" {
+  depends_on = [aws_s3_bucket_ownership_controls.worker_logs]
+  bucket = aws_s3_bucket.worker_logs.id
+  acl    = "private"
 }
 

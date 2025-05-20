@@ -2,6 +2,8 @@ import boto3
 import json
 import time
 import re
+import random
+import string
 
 def lambda_handler(event, context):
     autoscaling = boto3.client('autoscaling')
@@ -130,9 +132,10 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
-        # Create a new secret with timestamp
+        # Create a new secret with timestamp and random string
         timestamp = time.strftime("%Y%m%d%H%M%S")
-        new_secret_name = f"kubernetes-join-command-{timestamp}"
+        random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        new_secret_name = f"kubernetes-join-command-{timestamp}-{random_chars}"
         
         # Create the new secret
         try:

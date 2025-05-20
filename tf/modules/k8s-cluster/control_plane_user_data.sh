@@ -114,7 +114,10 @@ echo "$(date) - Creating cluster join command"
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
+
+# Generate a random string to add to the secret name
+RANDOM_STRING=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)
+SECRET_NAME="kubernetes-join-command-${TIMESTAMP}-${RANDOM_STRING}"
 
 # Create the secret with a timestamp in the name
 echo "$(date) - Storing join command in AWS Secrets Manager as ${SECRET_NAME}"

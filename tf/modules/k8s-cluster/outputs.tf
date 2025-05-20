@@ -80,3 +80,39 @@ output "control_plane_instance_id" {
   description = "The instance ID of the Kubernetes control plane"
   value       = aws_instance.control_plane.id
 }
+
+output "kubernetes_api_endpoint" {
+  value = "https://${aws_instance.control_plane.public_ip}:6443"
+}
+
+output "kubeconfig_filename" {
+  value = local_file.kubeconfig.filename
+}
+
+output "ssh_key_name" {
+  value = local.actual_key_name
+}
+
+output "ssh_private_key_path" {
+  value = var.key_name == "" ? local_file.private_key[0].filename : "Using your provided key: ${var.key_name}"
+}
+
+output "worker_asg_name" {
+  value = aws_autoscaling_group.worker_asg.name
+}
+
+output "worker_launch_template_id" {
+  value = aws_launch_template.worker_lt.id
+}
+
+output "ssh_command_control_plane" {
+  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip}"
+}
+
+output "worker_node_info" {
+  value = "To get worker node IPs: aws ec2 describe-instances --region ${var.region} --filters \"Name=tag:Name,Values=guy-worker-node*\" --query \"Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}\" --output table"
+}
+
+output "worker_logs_command" {
+  value = "aws s3 ls s3://guy-polybot-logs/ --region ${var.region} | grep worker-init"
+}
