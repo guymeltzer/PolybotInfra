@@ -790,7 +790,7 @@ def lambda_handler(event, context):
             raise Exception("SSM command did not complete within 30 seconds")
         
         secrets_client.put_secret_value(
-            SecretId='kubernetes-join-command',
+            SecretId='${aws_secretsmanager_secret.kubernetes_join_command.name}',
             SecretString=join_command
         )
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
@@ -1086,7 +1086,10 @@ resource "aws_autoscaling_group" "worker_asg" {
   desired_capacity    = 2
   vpc_zone_identifier = module.vpc.public_subnets
   target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
-
+  health_check_type   = "EC2"
+  health_check_grace_period = 300
+  default_cooldown    = 300
+  
   launch_template {
     id      = aws_launch_template.worker_lt.id
     version = "$Latest"
@@ -1097,6 +1100,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     strategy = "Rolling"
     preferences {
       min_healthy_percentage = 50
+      instance_warmup = 300
     }
   }
 
@@ -1347,13 +1351,20 @@ resource "aws_iam_role_policy" "worker_storage_policy" {
     Statement = [
       {
         Effect = "Allow"
-        Action = "secretsmanager:GetSecretValue"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:ListSecrets"
+        ]
         Resource = "*"
       },
       {
         Effect = "Allow"
-        Action = "secretsmanager:ListSecrets"
-        Resource = "*"
+        Action = "s3:*"
+        Resource = [
+          "${aws_s3_bucket.worker_logs.arn}",
+          "${aws_s3_bucket.worker_logs.arn}/*"
+        ]
       },
       {
         Effect = "Allow"
@@ -1364,9 +1375,7 @@ resource "aws_iam_role_policy" "worker_storage_policy" {
         ]
         Resource = [
           "arn:aws:s3:::guy-polybot-bucket",
-          "arn:aws:s3:::guy-polybot-bucket/*",
-          "${aws_s3_bucket.worker_logs.arn}",
-          "${aws_s3_bucket.worker_logs.arn}/*"
+          "arn:aws:s3:::guy-polybot-bucket/*"
         ]
       },
       {

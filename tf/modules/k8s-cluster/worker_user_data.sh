@@ -159,6 +159,9 @@ echo "$(date) - Fetching join command from Secrets Manager"
 MAX_SECRET_ATTEMPTS=10
 JOIN_COMMAND=""
 
+# Enable more verbosity for AWS commands for debugging
+export AWS_DEFAULT_REGION="$REGION"
+
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
@@ -182,6 +185,13 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   if [ -z "$SECRETS" ] || [ "$SECRETS" == "None" ]; then
     echo "$(date) - No kubernetes-join-command secrets found. Waiting to retry..."
     
+    # More extensive connectivity checks
+    echo "$(date) - Running connectivity checks..." >> "$LOGFILE"
+    
+    # Check instance IAM role permissions
+    echo "$(date) - Checking IAM identity..." >> "$LOGFILE"
+    aws sts get-caller-identity >> "$LOGFILE" 2>&1 || echo "Failed to get caller identity" >> "$LOGFILE"
+    
     # Check if we have network connectivity by pinging control plane
     CONTROL_PLANE_IP="10.0.0.0/16"
     if ping -c 1 -W 2 $CONTROL_PLANE_IP > /dev/null 2>&1; then
@@ -190,6 +200,10 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
       echo "$(date) - WARNING: Cannot ping VPC CIDR $CONTROL_PLANE_IP" >> "$LOGFILE"
     fi
     
+    # Verify secretsmanager list permission specifically
+    echo "$(date) - Testing secretsmanager ListSecrets permission..." >> "$LOGFILE"
+    aws secretsmanager list-secrets --max-items 1 >> "$LOGFILE" 2>&1 || echo "Failed to list any secrets" >> "$LOGFILE"
+    
     # Check AWS connectivity
     if aws sts get-caller-identity --region "$REGION" > /dev/null 2>&1; then
       echo "$(date) - AWS API connectivity confirmed" >> "$LOGFILE" 
@@ -197,6 +211,10 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
       echo "$(date) - WARNING: Cannot connect to AWS API" >> "$LOGFILE"
     fi
     
+    # Upload logs of the failure so far
+    upload_logs_to_s3 "SECRET_FETCH_ATTEMPT_${SECRET_ATTEMPT}"
+    
+    echo "$(date) - Waiting before retry..."
     sleep 30
     continue
   fi
@@ -215,12 +233,15 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     break
   else
     echo "$(date) - Join command not available yet. Waiting to retry..."
+    # Upload attempt logs
+    upload_logs_to_s3 "SECRET_VALUE_EMPTY_${SECRET_ATTEMPT}"
     sleep 30
   fi
 done
 
 if [ -z "$JOIN_COMMAND" ]; then
   echo "$(date) - Failed to retrieve join command from Secrets Manager after $MAX_SECRET_ATTEMPTS attempts" >> "$LOGFILE"
+  upload_logs_to_s3 "SECRET_FETCH_FAILED"
   exit 1
 fi
 
