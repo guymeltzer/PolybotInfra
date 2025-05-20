@@ -105,6 +105,14 @@ output "ssh_command_control_plane" {
   value = module.k8s-cluster.ssh_command_control_plane
 }
 
+output "ssh_command_worker_nodes" {
+  value = module.k8s-cluster.ssh_command_worker_nodes
+}
+
+output "worker_logs_command" {
+  value = module.k8s-cluster.worker_logs_command
+}
+
 output "worker_node_info" {
   value = module.k8s-cluster.worker_node_info
 }

@@ -116,3 +116,7 @@ output "worker_node_info" {
 output "worker_logs_command" {
   value = "aws s3 ls s3://guy-polybot-logs/ --region ${var.region} | grep worker-init"
 }
+
+output "ssh_command_worker_nodes" {
+  value = "SSH to worker nodes using: ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@WORKER_PUBLIC_IP (replace WORKER_PUBLIC_IP with values from the worker_node_info command)"
+}

@@ -44,11 +44,39 @@ if [ -z "$REGION" ]; then
   exit 1
 fi
 
-# Get instance metadata
+# Add logging with S3 upload function at the top of the script, after the LOGFILE and error handling setup
+# Function to upload logs to S3 even if script fails
+upload_logs_to_s3() {
+  LOG_STATUS=$1
+  echo "$(date) - $LOG_STATUS - Uploading logs to S3"
+  
+  # Only run if we have instance ID
+  if [ -n "$INSTANCE_ID" ]; then
+    # Create a unique log filename
+    LOG_FILENAME="worker-init-${INSTANCE_ID}-${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
+    
+    # Copy the log file to S3
+    if aws s3 cp "$LOGFILE" "s3://guy-polybot-logs/${LOG_FILENAME}" --region "$REGION" 2>/dev/null; then
+      echo "$(date) - Logs uploaded to s3://guy-polybot-logs/${LOG_FILENAME}"
+    else
+      echo "$(date) - Failed to upload logs to S3"
+    fi
+  else
+    echo "$(date) - Cannot upload logs: no instance ID yet"
+  fi
+}
+
+# Set up trap to upload logs on exit
+trap 'upload_logs_to_s3 "ERROR_TRAP"; echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> "$LOGFILE"; exit 1' ERR
+
+# After getting instance metadata, upload initial logs
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
+
+# Upload initialization logs
+upload_logs_to_s3 "INIT"
 
 # Update package lists
 echo "$(date) - Updating package lists"
@@ -221,6 +249,7 @@ done
 
 if [ "$JOIN_SUCCESS" = false ]; then
   echo "$(date) - Failed to join cluster after $MAX_ATTEMPTS attempts"
+  upload_logs_to_s3 "JOIN_FAILED"
   exit 1
 fi
 
@@ -270,16 +299,13 @@ fi
 aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
   --tags Key=node-role.kubernetes.io/worker,Value=true Key=k8s.io/autoscaled-node,Value=true Key=Name,Value="$NODE_NAME" 2>>"$LOGFILE"
 
-echo "$(date) - Worker node setup complete. Uploading logs for debugging."
+echo "$(date) - Worker node setup complete. Uploading final logs."
 
 # Create a unique log filename with the instance ID and timestamp
-LOG_FILENAME="worker-init-${INSTANCE_ID}-$(date +%Y%m%d-%H%M%S).log"
-
-# Create a unique S3 bucket name or use an existing bucket
-S3_BUCKET="guy-polybot-logs"
+LOG_FILENAME="worker-init-${INSTANCE_ID}-COMPLETE-$(date +%Y%m%d-%H%M%S).log"
 
 # Copy the log file to S3
-aws s3 cp "$LOGFILE" "s3://${S3_BUCKET}/${LOG_FILENAME}" --region "$REGION" || \
-  echo "$(date) - Failed to upload logs to S3. You can view logs by SSHing to the node and checking $LOGFILE"
+aws s3 cp "$LOGFILE" "s3://guy-polybot-logs/${LOG_FILENAME}" --region "$REGION" || \
+  echo "$(date) - Failed to upload logs to S3"
 
-echo "$(date) - Logs uploaded to s3://${S3_BUCKET}/${LOG_FILENAME} - Worker node setup complete."
+echo "$(date) - Logs uploaded to s3://guy-polybot-logs/${LOG_FILENAME} - Worker node setup complete."

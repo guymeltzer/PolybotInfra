@@ -1006,6 +1006,14 @@ resource "aws_security_group" "control_plane_sg" {
   }
 
   ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    security_groups = [aws_security_group.worker_sg.id]
+    description = "Allow worker nodes to connect to API server"
+  }
+
+  ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -1135,6 +1143,13 @@ resource "aws_security_group" "worker_sg" {
     to_port     = 6443
     protocol    = "tcp"
     security_groups = [aws_security_group.control_plane_sg.id]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
@@ -1349,6 +1364,11 @@ resource "aws_iam_role_policy" "worker_storage_policy" {
       },
       {
         Effect = "Allow"
+        Action = "secretsmanager:ListSecrets"
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
         Action = [
           "s3:GetObject",
           "s3:PutObject",
@@ -1356,7 +1376,9 @@ resource "aws_iam_role_policy" "worker_storage_policy" {
         ]
         Resource = [
           "arn:aws:s3:::guy-polybot-bucket",
-          "arn:aws:s3:::guy-polybot-bucket/*"
+          "arn:aws:s3:::guy-polybot-bucket/*",
+          "${aws_s3_bucket.worker_logs.arn}",
+          "${aws_s3_bucket.worker_logs.arn}/*"
         ]
       },
       {
