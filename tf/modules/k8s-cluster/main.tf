@@ -1655,7 +1655,7 @@ resource "aws_iam_role_policy" "control_plane_inline_policy" {
   })
 }
 
-# Generate a key pair for SSH access if none is provided
+# Generate a key pair for SSH access if none is provided or if the provided one doesn't exist
 resource "tls_private_key" "ssh" {
   count     = var.key_name == "" ? 1 : 0
   algorithm = "RSA"

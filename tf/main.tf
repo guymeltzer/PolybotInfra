@@ -198,6 +198,33 @@ resource "terraform_data" "kubectl_provider_config" {
     command = "aws ec2 describe-instances --region ${var.region} --instance-ids $(cat /tmp/instance_id.txt) --query Reservations[0].Instances[0].PublicIpAddress --output text > /tmp/public_ip.txt"
   }
 
+  # Wait for SSM to be ready - add a retry mechanism
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      echo "Waiting for SSM to be ready on the instance..."
+      MAX_ATTEMPTS=20
+      WAIT_SECONDS=30
+      
+      for ((i=1; i<=MAX_ATTEMPTS; i++)); do
+        echo "Attempt $i of $MAX_ATTEMPTS - Checking if SSM is ready..."
+        
+        if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$(cat /tmp/instance_id.txt)" --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+          echo "SSM is ready!"
+          break
+        else
+          echo "SSM not ready yet, waiting $WAIT_SECONDS seconds..."
+          sleep $WAIT_SECONDS
+        fi
+        
+        if [ $i -eq $MAX_ATTEMPTS ]; then
+          echo "WARNING: Reached maximum attempts. Will try to continue but may encounter errors."
+        fi
+      done
+    EOT
+  }
+
   # Step 3: Get the admin.conf from the control plane
   provisioner "local-exec" {
     command = "aws ssm send-command --region ${var.region} --document-name AWS-RunShellScript --instance-ids $(cat /tmp/instance_id.txt) --parameters commands=\"sudo cat /etc/kubernetes/admin.conf\" --output text --query Command.CommandId > /tmp/command_id.txt"
