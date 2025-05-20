@@ -388,6 +388,13 @@ provider "kubectl" {
   config_context   = "kubernetes-admin@kubernetes"
   load_config_file = true
   insecure         = true
+  
+  # Skip TLS verification completely to avoid certificate parsing
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "echo"
+    args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token\"}}"]
+  }
 }
 
 # Create Kubernetes namespaces for dev and prod
