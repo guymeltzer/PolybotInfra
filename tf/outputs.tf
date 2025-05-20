@@ -49,8 +49,8 @@ output "polybot_dev_sqs_queue_url" {
   value       = module.polybot_dev.sqs_queue_url
 }
 
-output "polybot_dev_url" {
-  description = "Polybot Dev URL"
+output "polybot_dev_domain" {
+  description = "Polybot Dev domain name"
   value       = "https://guy-polybot-dev.devops-int-college.com"
 }
 
@@ -65,8 +65,8 @@ output "polybot_prod_sqs_queue_url" {
   value       = module.polybot_prod.sqs_queue_url
 }
 
-output "polybot_prod_url" {
-  description = "Polybot Prod URL"
+output "polybot_prod_domain" {
+  description = "Polybot Prod domain name"
   value       = "https://guy-polybot-prod.devops-int-college.com"
 }
 
@@ -77,7 +77,7 @@ output "polybot_alb_dns" {
 
 output "subnet_ids" {
   description = "Subnet IDs created for the Kubernetes cluster"
-  value       = module.k8s-cluster.subnet_ids
+  value       = module.k8s-cluster.public_subnet_ids
 }
 
 output "argocd_url" {

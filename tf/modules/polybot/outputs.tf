@@ -33,15 +33,7 @@ output "docker_credentials_secret_arn" {
   value       = aws_secretsmanager_secret.docker_credentials.arn
 }
 
-output "secrets_manager_arn" {
-  description = "ARN of the Polybot Secrets Manager secret"
-  value       = aws_secretsmanager_secret.polybot_secrets.arn
-}
-
-output "lambda_function_arn" {
-  description = "ARN of the Polybot Lambda function"
-  value       = aws_lambda_function.scaling_lambda.arn
-}
+// These resources are not part of the current implementation
 
 output "sns_topic_arn" {
   description = "ARN of the Polybot lifecycle SNS topic"
