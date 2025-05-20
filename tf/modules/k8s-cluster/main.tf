@@ -553,7 +553,7 @@ resource "aws_instance" "control_plane" {
     token_formatted = local.kubeadm_token,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
-    timestamp = formatdate("YYYYMMDDhhmmss", timestamp()) # Use a consistent format for the timestamp
+    # Remove timestamp that forces recreation
   })
 
   root_block_device {
@@ -570,9 +570,9 @@ resource "aws_instance" "control_plane" {
   ]
 
   lifecycle {
-    # Don't create a new instance before destroying the old one
-    create_before_destroy = false
-    # Only replace when the script content changes
+    # Prevent replacement: Ignore changes to user_data since we want to preserve the control plane
+    ignore_changes = [user_data]
+    # Only replace when script content changes
     replace_triggered_by = [
       terraform_data.control_plane_script_hash
     ]

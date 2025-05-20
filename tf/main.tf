@@ -8,22 +8,25 @@ provider "local" {}
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
-  config_context = "default-context"
+  config_context = "kubernetes-admin@kubernetes"  # This is the default context name with kubeadm
+  insecure = true  # Allow connections to the API server without verifying the TLS certificate
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
     config_path    = "${path.module}/kubeconfig.yml"
-    config_context = "default-context"
+    config_context = "kubernetes-admin@kubernetes"
+    insecure       = true
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path    = "${path.module}/kubeconfig.yml"
-  config_context = "default-context"
+  config_path     = "${path.module}/kubeconfig.yml"
+  config_context  = "kubernetes-admin@kubernetes"
   load_config_file = true
+  insecure        = true
 }
 
 # Create Kubernetes namespaces for dev and prod
@@ -126,9 +129,26 @@ resource "null_resource" "wait_for_kubernetes" {
         sleep 15
       done
       
-      # Wait for kubernetes initialization (3 minutes instead of 8)
-      echo "Instance is running. Waiting 3 minutes for Kubernetes initialization..."
-      sleep 180
+      # Wait for kubernetes initialization with a more adaptive approach
+      echo "Instance is running. Waiting for Kubernetes initialization..."
+      INIT_WAIT=120
+      echo "Initial wait: $INIT_WAIT seconds"
+      sleep $INIT_WAIT
+      
+      # Check if kubelet is running before proceeding
+      echo "Checking if kubelet is running on control plane..."
+      KUBELET_CHECK=$(aws ssm send-command \
+        --instance-ids $INSTANCE_ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="systemctl status kubelet" \
+        --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed")
+      
+      if echo "$KUBELET_CHECK" | grep -q "active (running)"; then
+        echo "Kubelet is running. Proceeding with API check..."
+      else
+        echo "Kubelet not yet running, waiting an additional 60 seconds..."
+        sleep 60
+      fi
       
       # Try to get logs and debug info via SSM
       function get_debug_info {
@@ -245,8 +265,21 @@ resource "null_resource" "wait_for_kubernetes" {
       # Save the retrieved kubeconfig to a local file
       echo "$RESPONSE" > kubeconfig.yml
       
+      # Verify the kubeconfig format
+      if ! grep -q "apiVersion: v1" kubeconfig.yml; then
+        echo "WARNING: kubeconfig doesn't appear to be in the correct format"
+        # Try to fix common issues with SSM output formatting
+        sed -i 's/\\n/\n/g' kubeconfig.yml
+      fi
+      
       # Update the server address in the kubeconfig
-      sed -i.bak "s/server: https:\/\/[^:]*:/server: https:\/\/$CP_IP:/" kubeconfig.yml
+      sed -i.bak "s|server: https://[^:]*:|server: https://$CP_IP:|" kubeconfig.yml
+      
+      # Ensure proper YAML format
+      echo "Verifying kubeconfig format..."
+      if command -v python3 &> /dev/null; then
+        python3 -c "import yaml; yaml.safe_load(open('kubeconfig.yml')); print('Kubeconfig format is valid')" || echo "WARNING: kubeconfig may have format issues"
+      fi
       
       echo "Created kubeconfig file at $(pwd)/kubeconfig.yml"
       echo "export KUBECONFIG=$(pwd)/kubeconfig.yml" > k8s-env.sh
@@ -259,9 +292,8 @@ resource "null_resource" "wait_for_kubernetes" {
 resource "terraform_data" "kubectl_provider_config" {
   depends_on = [null_resource.wait_for_kubernetes]
   
-  # This ensures we rebuild when anything related to the API changes
+  # This ensures we rebuild when kubeconfig changes, not on every apply
   triggers_replace = {
-    timestamp = timestamp()
     kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
   }
 
