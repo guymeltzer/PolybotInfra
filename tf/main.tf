@@ -442,7 +442,7 @@ resource "null_resource" "wait_for_kubernetes" {
   
   triggers = {
     # Use formatdate instead of raw timestamp to avoid changing on every apply
-    timestamp = formatdate("YYYY-MM-DDThh:mm:ssZ", timestamp())
+    timestamp = formatdate("YYYY-MM-DD-hh:mm:ss", timestamp())
     # Add a checksum of the kubeconfig file if it exists
     kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "no-kubeconfig-yet"
   }
