@@ -2,11 +2,47 @@ provider "aws" {
   region = var.region
 }
 
+# Resource to clean problematic resources from Terraform state
+resource "terraform_data" "clean_kubernetes_state" {
+  # Always run on every apply
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  # Run a script to check for and remove problematic kubernetes_namespace resources
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      echo "Checking for kubernetes_namespace resources in Terraform state..."
+      NAMESPACE_RESOURCES=$$(terraform state list 2>/dev/null | grep kubernetes_namespace || echo "")
+
+      if [ -n "$$NAMESPACE_RESOURCES" ]; then
+        echo "Found kubernetes_namespace resources in state that might cause authentication issues:"
+        echo "$$NAMESPACE_RESOURCES"
+        echo "Removing these resources from state..."
+        
+        # Loop through each resource and remove it from state
+        echo "$$NAMESPACE_RESOURCES" | while read -r resource; do
+          echo "Removing $$resource from state..."
+          terraform state rm "$$resource" || echo "Failed to remove $$resource"
+        done
+        
+        echo "Resources successfully removed from state."
+      else
+        echo "No kubernetes_namespace resources found in state."
+      fi
+    EOT
+  }
+}
+
 # Define a local provider for first-time setup
 provider "local" {}
 
 # Resource to automate secrets management and cleanup
 resource "terraform_data" "manage_secrets" {
+  depends_on = [terraform_data.clean_kubernetes_state]
+  
   # Always run on every apply
   triggers_replace = {
     timestamp = timestamp()
@@ -361,7 +397,7 @@ locals {
     module.k8s-cluster.control_plane_public_ip,
     "kubernetes.default.svc"
   )
-  skip_argocd = false # Set to true to skip ArgoCD deployment temporarily
+  skip_argocd = true # Set to true to skip ArgoCD deployment temporarily
 }
 
 # Add a data source to ensure kubeconfig is ready
