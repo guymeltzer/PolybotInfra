@@ -20,7 +20,7 @@ output "vpc_id" {
 
 output "load_balancer_address" {
   description = "DNS name of the application load balancer"
-  value       = module.k8s-cluster.load_balancer_address
+  value       = module.k8s-cluster.alb_dns_name
 }
 
 output "kubeconfig_command" {
@@ -72,12 +72,12 @@ output "polybot_prod_domain" {
 
 output "polybot_alb_dns" {
   description = "Polybot ALB DNS name"
-  value       = module.k8s-cluster.load_balancer_address
+  value       = module.k8s-cluster.alb_dns_name
 }
 
 output "subnet_ids" {
   description = "Subnet IDs created for the Kubernetes cluster"
-  value       = module.k8s-cluster.subnet_ids
+  value       = module.k8s-cluster.public_subnet_ids
 }
 
 # Conditional outputs for ArgoCD, using try() to handle potential errors
