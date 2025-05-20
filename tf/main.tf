@@ -369,7 +369,7 @@ echo "Kubeconfig preprocessing complete"
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
-  config_context = "kubernetes-admin@kubernetes"  # This is the default context name with kubeadm
+  # Don't specify a context - use the current-context from the kubeconfig
   insecure       = true  # Allow connections to the API server without verifying the TLS certificate
 }
 
@@ -377,7 +377,7 @@ provider "kubernetes" {
 provider "helm" {
   kubernetes {
     config_path    = "${path.module}/kubeconfig.yml"
-    config_context = "kubernetes-admin@kubernetes"
+    # Use default context from the kubeconfig file
     insecure       = true
   }
 }
@@ -385,7 +385,7 @@ provider "helm" {
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
   config_path      = "${path.module}/kubeconfig.yml"
-  config_context   = "kubernetes-admin@kubernetes"
+  # Don't specify context - use the current-context from kubeconfig
   load_config_file = true
   insecure         = true
   
@@ -450,8 +450,8 @@ resource "null_resource" "wait_for_kubernetes" {
   triggers = {
     # Use formatdate instead of raw timestamp to avoid changing on every apply
     timestamp = formatdate("YYYY-MM-DD-hh:mm:ss", timestamp())
-    # Add a checksum of the kubeconfig file if it exists
-    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "no-kubeconfig-yet"
+    # Don't use file hash as a trigger since it changes during apply
+    instance_id = module.k8s-cluster.control_plane_instance_id
   }
   
   # Add a second provisioner to validate the kubeconfig after it's been created
