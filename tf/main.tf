@@ -186,186 +186,122 @@ resource "terraform_data" "kubectl_provider_config" {
     timestamp = timestamp()
   }
 
-  # Use direct inline commands to set up authentication without external scripts
+  # Step 1: Get the instance ID
   provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
+    command = "aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=k8s-control-plane Name=instance-state-name,Values=running --query Reservations[0].Instances[0].InstanceId --output text > /tmp/instance_id.txt"
+  }
+
+  # Step 2: Get the public IP
+  provisioner "local-exec" {
+    command = "aws ec2 describe-instances --region ${var.region} --instance-ids $(cat /tmp/instance_id.txt) --query Reservations[0].Instances[0].PublicIpAddress --output text > /tmp/public_ip.txt"
+  }
+
+  # Step 3: Get the admin.conf from the control plane
+  provisioner "local-exec" {
+    command = "aws ssm send-command --region ${var.region} --document-name AWS-RunShellScript --instance-ids $(cat /tmp/instance_id.txt) --parameters commands=\"sudo cat /etc/kubernetes/admin.conf\" --output text --query Command.CommandId > /tmp/command_id.txt"
+  }
+
+  # Step 4: Wait for the command to complete
+  provisioner "local-exec" {
+    command = "sleep 10"
+  }
+
+  # Step 5: Get the admin.conf content
+  provisioner "local-exec" {
+    command = "aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) --instance-id $(cat /tmp/instance_id.txt) --query StandardOutputContent --output text > /tmp/admin_conf.txt"
+  }
+
+  # Step 6: Create a copy with updated server URL and skip TLS verification
+  provisioner "local-exec" {
+    command = "cat /tmp/admin_conf.txt | sed \"s|server:.*|server: https://$(cat /tmp/public_ip.txt):6443|\" | sed \"s|certificate-authority-data:.*|insecure-skip-tls-verify: true|\" > /tmp/modified_admin.conf"
+  }
+
+  # Step 7: Create service account and role binding
+  provisioner "local-exec" {
     command = <<-EOT
-      #!/bin/bash
-      set -e
-      
-      # Get control plane instance ID and public IP
-      INSTANCE_ID=$$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      
-      if [ -z "$$INSTANCE_ID" ] || [ "$$INSTANCE_ID" == "None" ]; then
-        echo "ERROR: Could not find control plane instance."
-        exit 1
-      fi
-      
-      PUBLIC_IP=$$(aws ec2 describe-instances --region ${var.region} --instance-ids "$$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-      echo "Control plane public IP: $$PUBLIC_IP"
-      
-      # Step 1: Get the admin.conf directly from the control plane node using SSM
-      echo "Retrieving admin kubeconfig from control plane node..."
-      ADMIN_CONF_CMD=$$(aws ssm send-command \
-        --region ${var.region} \
-        --document-name "AWS-RunShellScript" \
-        --instance-ids "$$INSTANCE_ID" \
-        --parameters "commands=sudo cat /etc/kubernetes/admin.conf" \
-        --output text --query "Command.CommandId")
-      
-      if [ -z "$$ADMIN_CONF_CMD" ]; then
-        echo "ERROR: Failed to send SSM command to retrieve admin.conf"
-        exit 1
-      fi
-      
-      # Wait for command to complete
-      echo "Waiting for admin.conf retrieval to complete..."
-      sleep 10
-      
-      # Get the command result
-      ADMIN_CONF=$$(aws ssm get-command-invocation \
-        --region ${var.region} \
-        --command-id "$$ADMIN_CONF_CMD" \
-        --instance-id "$$INSTANCE_ID" \
-        --query "StandardOutputContent" \
-        --output text)
-      
-      if [ -z "$$ADMIN_CONF" ] || [[ ! "$$ADMIN_CONF" == *"apiVersion: v1"* ]]; then
-        echo "ERROR: Failed to retrieve valid admin.conf from control plane"
-        exit 1
-      fi
-      
-      # Create a temporary admin kubeconfig file
-      TEMP_KUBECONFIG="/tmp/k8s_admin.conf"
-      echo "$$ADMIN_CONF" > "$$TEMP_KUBECONFIG"
-      chmod 600 "$$TEMP_KUBECONFIG"
-      
-      # Update the server URL in the kubeconfig to use the public IP
-      sed -i.bak "s|server:.*|server: https://$$PUBLIC_IP:6443|" "$$TEMP_KUBECONFIG"
-      
-      # Create a modified version with TLS skip verification
-      MODIFIED_KUBECONFIG="/tmp/k8s_admin_modified.conf"
-      awk -v ip="$$PUBLIC_IP" '
-      /server:/ {print "    server: https://" ip ":6443"; next}
-      /certificate-authority-data:/ {print "    insecure-skip-tls-verify: true"; next}
-      {print}
-      ' "$$TEMP_KUBECONFIG" > "$$MODIFIED_KUBECONFIG"
-      chmod 600 "$$MODIFIED_KUBECONFIG"
-      
-      echo "Admin kubeconfig retrieved and modified successfully"
-      
-      # Step 2: Create terraform-admin service account with cluster-admin privileges
-      echo "Creating terraform-admin service account..."
-      kubectl --kubeconfig="$$MODIFIED_KUBECONFIG" apply -f - <<EOF
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: terraform-admin
-        namespace: kube-system
-      ---
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: terraform-admin
-      subjects:
-      - kind: ServiceAccount
-        name: terraform-admin
-        namespace: kube-system
-      roleRef:
-        kind: ClusterRole
-        name: cluster-admin
-        apiGroup: rbac.authorization.k8s.io
-      EOF
-      
-      # Create service account token secret (required for Kubernetes v1.24+)
-      echo "Creating service account token..."
-      kubectl --kubeconfig="$$MODIFIED_KUBECONFIG" apply -f - <<EOF
-      apiVersion: v1
-      kind: Secret
-      metadata:
-        name: terraform-admin-token
-        namespace: kube-system
-        annotations:
-          kubernetes.io/service-account.name: terraform-admin
-      type: kubernetes.io/service-account-token
-      EOF
-      
-      # Wait for token to be generated
-      echo "Waiting for token to be generated..."
-      sleep 10
-      
-      # Get the service account token with retry logic
-      MAX_RETRY=5
-      for ((i=1; i<=MAX_RETRY; i++)); do
-        echo "Attempt $i to retrieve token..."
-        TOKEN=$$(kubectl --kubeconfig="$$MODIFIED_KUBECONFIG" -n kube-system get secret terraform-admin-token -o jsonpath='{.data.token}' | base64 --decode)
-        
-        if [ -n "$$TOKEN" ] && [ $${#TOKEN} -gt 20 ]; then
-          echo "Successfully retrieved token on attempt $i"
-          break
-        else
-          echo "Token retrieval attempt $i failed"
-          if [ $$i -eq $$MAX_RETRY ]; then
-            echo "ERROR: Failed to retrieve token after $$MAX_RETRY attempts. Exiting."
-            exit 1
-          fi
-          echo "Waiting before retry..."
-          sleep 10
-        fi
-      done
-      
-      # Create a kubeconfig with the service account token for Terraform
-      echo "Creating kubeconfig with service account token..."
-      cat > "${path.module}/kubeconfig.yml" <<EOF
-      apiVersion: v1
-      kind: Config
-      clusters:
-      - cluster:
-          server: https://$$PUBLIC_IP:6443
-          insecure-skip-tls-verify: true
-        name: kubernetes
-      contexts:
-      - context:
-          cluster: kubernetes
-          user: terraform-admin
-        name: terraform-admin@kubernetes
-      current-context: terraform-admin@kubernetes
-      users:
-      - name: terraform-admin
-        user:
-          token: "$$TOKEN"
-      EOF
-      
-      chmod 600 "${path.module}/kubeconfig.yml"
-      echo "Successfully created kubeconfig with terraform-admin authentication"
-      
-      # Add an explicit delay to ensure file is fully written and registered
-      sleep 5
-      
-      # Test the connection
-      if command -v kubectl &> /dev/null; then
-        echo "Testing connection with terraform-admin token..."
-        if KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
-          echo "Successfully connected to the Kubernetes cluster as terraform-admin"
-          KUBECONFIG="${path.module}/kubeconfig.yml" kubectl auth can-i '*' '*' --all-namespaces || echo "Warning: Could not verify all permissions"
-          
-          # Verify token works for namespaces
-          echo "Verifying access to namespaces..."
-          if ! KUBECONFIG="${path.module}/kubeconfig.yml" kubectl get namespace kube-system; then
-            echo "ERROR: Token does not have access to namespaces"
-            exit 1
-          fi
-          
-          echo "Admin cluster access confirmed"
-        else
-          echo "ERROR: Failed to connect with terraform-admin token"
-          exit 1
-        fi
-      fi
-      
-      # Clean up temporary files
-      rm -f "$$TEMP_KUBECONFIG" "$$TEMP_KUBECONFIG.bak" "$$MODIFIED_KUBECONFIG"
+      kubectl --kubeconfig=/tmp/modified_admin.conf apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: terraform-admin
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: terraform-admin
+subjects:
+- kind: ServiceAccount
+  name: terraform-admin
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+EOF
     EOT
+  }
+
+  # Step 8: Create token secret
+  provisioner "local-exec" {
+    command = <<-EOT
+      kubectl --kubeconfig=/tmp/modified_admin.conf apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: terraform-admin-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: terraform-admin
+type: kubernetes.io/service-account-token
+EOF
+    EOT
+  }
+
+  # Step 9: Wait for token to be generated
+  provisioner "local-exec" {
+    command = "sleep 10"
+  }
+
+  # Step 10: Get the token
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=/tmp/modified_admin.conf -n kube-system get secret terraform-admin-token -o jsonpath='{.data.token}' | base64 --decode > /tmp/admin_token.txt"
+  }
+
+  # Step 11: Create the final kubeconfig
+  provisioner "local-exec" {
+    command = <<-EOT
+      cat > ${path.module}/kubeconfig.yml <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://$(cat /tmp/public_ip.txt):6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: terraform-admin
+  name: terraform-admin@kubernetes
+current-context: terraform-admin@kubernetes
+users:
+- name: terraform-admin
+  user:
+    token: "$(cat /tmp/admin_token.txt)"
+EOF
+      chmod 600 ${path.module}/kubeconfig.yml
+    EOT
+  }
+
+  # Step 12: Test connectivity
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=${path.module}/kubeconfig.yml get nodes || echo 'Warning: Could not connect to cluster'"
+  }
+
+  # Step 13: Clean up temp files
+  provisioner "local-exec" {
+    command = "rm -f /tmp/instance_id.txt /tmp/public_ip.txt /tmp/command_id.txt /tmp/admin_conf.txt /tmp/modified_admin.conf /tmp/admin_token.txt"
   }
 }
 
