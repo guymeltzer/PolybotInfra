@@ -1,14 +1,15 @@
 #!/bin/bash
-# Script generated at: ${timestamp}
+# Script generated with static content (timestamp will update when file changes)
 
-# Log file for debugging
-LOGFILE="/var/log/k8s-worker-init.log"
-exec > >(tee -a ${LOGFILE}) 2>&1
+# Log file for debugging - Define directly without using template variable syntax
+LOGFILE=/var/log/k8s-worker-init.log
+# Use single quotes to prevent Terraform template expansion for variables we don't want to expand
+exec > >(tee -a "$LOGFILE") 2>&1
 echo "$(date) - Starting Kubernetes worker node initialization"
 
 # Error handling
 set -e
-trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> ${LOGFILE}; exit 1' ERR
+trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> "$LOGFILE"; exit 1' ERR
 
 # Set up SSH access (using your existing key)
 echo "$(date) - Setting up SSH access"
@@ -32,14 +33,14 @@ done
 # Get metadata token
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 if [ -z "$TOKEN" ]; then
-  echo "Failed to retrieve metadata token" >> $LOGFILE
+  echo "Failed to retrieve metadata token" >> "$LOGFILE"
   exit 1
 fi
 
 # Get region
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 if [ -z "$REGION" ]; then
-  echo "Failed to retrieve region from metadata" >> $LOGFILE
+  echo "Failed to retrieve region from metadata" >> "$LOGFILE"
   exit 1
 fi
 
@@ -82,7 +83,7 @@ sysctl --system
 SSM_PARAM_NAME="/k8s/worker-node-counter"
 COUNTER=$(aws ssm get-parameter --name "$SSM_PARAM_NAME" --region "$REGION" --query "Parameter.Value" --output text 2>/dev/null || echo "0")
 NEXT_COUNTER=$((COUNTER + 1))
-aws ssm put-parameter --name "$SSM_PARAM_NAME" --value "$NEXT_COUNTER" --type String --overwrite --region "$REGION" 2>>$LOGFILE
+aws ssm put-parameter --name "$SSM_PARAM_NAME" --value "$NEXT_COUNTER" --type String --overwrite --region "$REGION" 2>>"$LOGFILE"
 NODE_NAME="guy-worker-node-$NEXT_COUNTER"
 hostnamectl set-hostname "$NODE_NAME"
 echo "127.0.0.1 $NODE_NAME" | tee -a /etc/hosts
@@ -127,10 +128,10 @@ systemctl restart kubelet
 
 # Fetch join command from Secrets Manager
 echo "$(date) - Fetching join command from Secrets Manager"
-JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id kubernetes-join-command --query SecretString --output text 2>>$LOGFILE)
+JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id kubernetes-join-command --query SecretString --output text 2>>"$LOGFILE")
 
 if [ -z "$JOIN_COMMAND" ]; then
-  echo "Failed to retrieve join command from Secrets Manager" >> $LOGFILE
+  echo "Failed to retrieve join command from Secrets Manager" >> "$LOGFILE"
   exit 1
 fi
 
@@ -144,7 +145,7 @@ RETRY_DELAY=30
 for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   echo "$(date) - Attempt $ATTEMPT/$MAX_ATTEMPTS to join cluster"
   
-  eval $JOIN_COMMAND --v=5 2>&1 | tee -a $LOGFILE
+  eval $JOIN_COMMAND --v=5 2>&1 | tee -a "$LOGFILE"
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     JOIN_SUCCESS=true
     echo "$(date) - Successfully joined cluster" 
@@ -179,7 +180,7 @@ if [ "$JOIN_SUCCESS" = true ]; then
   if [ ! -f "$KUBELET_CONF" ]; then
     echo "$(date) - kubelet.conf not found after waiting. This is unexpected but not fatal."
   else
-    kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=$KUBELET_CONF 2>>$LOGFILE
+    kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=$KUBELET_CONF 2>>"$LOGFILE"
     if [ $? -eq 0 ]; then
       echo "$(date) - providerID set successfully"
     else
@@ -193,19 +194,19 @@ if [ "$JOIN_SUCCESS" = true ]; then
     --auto-scaling-group-name "guy-polybot-asg" \
     --lifecycle-action-result "CONTINUE" \
     --instance-id "$INSTANCE_ID" \
-    --region "$REGION" 2>>$LOGFILE || {
+    --region "$REGION" 2>>"$LOGFILE" || {
       echo "$(date) - Failed to signal lifecycle hook"
       aws autoscaling complete-lifecycle-action \
         --lifecycle-hook-name "guy-scale-up-hook" \
         --auto-scaling-group-name "guy-polybot-asg" \
         --lifecycle-action-result "ABANDON" \
         --instance-id "$INSTANCE_ID" \
-        --region "$REGION" 2>>$LOGFILE
+        --region "$REGION" 2>>"$LOGFILE"
     }
 fi
 
 # Set EC2 tags
 aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
-  --tags Key=node-role.kubernetes.io/worker,Value=true Key=k8s.io/autoscaled-node,Value=true Key=Name,Value="$NODE_NAME" 2>>$LOGFILE
+  --tags Key=node-role.kubernetes.io/worker,Value=true Key=k8s.io/autoscaled-node,Value=true Key=Name,Value="$NODE_NAME" 2>>"$LOGFILE"
 
 echo "$(date) - Worker node setup complete"

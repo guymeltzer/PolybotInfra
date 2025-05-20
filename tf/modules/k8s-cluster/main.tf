@@ -1041,9 +1041,8 @@ resource "aws_launch_template" "worker_lt" {
     name = aws_iam_instance_profile.worker_profile.name
   }
 
-  user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", {
-    timestamp = timestamp() # Add timestamp to force update
-  }))
+  # Just use the file directly to avoid template expansion errors
+  user_data = base64encode(file("${path.module}/worker_user_data.sh"))
 
   tag_specifications {
     resource_type = "instance"
