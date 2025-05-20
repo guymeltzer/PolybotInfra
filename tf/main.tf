@@ -9,7 +9,7 @@ provider "local" {}
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
   config_context = "kubernetes-admin@kubernetes"  # This is the default context name with kubeadm
-  insecure = true  # Allow connections to the API server without verifying the TLS certificate
+  insecure       = true  # Allow connections to the API server without verifying the TLS certificate
 }
 
 # Configure the Helm provider with proper authentication
@@ -23,10 +23,10 @@ provider "helm" {
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path     = "${path.module}/kubeconfig.yml"
-  config_context  = "kubernetes-admin@kubernetes"
+  config_path      = "${path.module}/kubeconfig.yml"
+  config_context   = "kubernetes-admin@kubernetes"
   load_config_file = true
-  insecure        = true
+  insecure         = true
 }
 
 # Create Kubernetes namespaces for dev and prod
@@ -69,8 +69,8 @@ resource "null_resource" "wait_for_kubernetes" {
   depends_on = [module.k8s-cluster]
   
   triggers = {
-    # Use timestamp to always run this
-    timestamp = timestamp()
+    # Use formatdate instead of raw timestamp to avoid changing on every apply
+    timestamp = formatdate("YYYY-MM-DDThh:mm:ssZ", timestamp())
   }
   
   provisioner "local-exec" {
@@ -251,11 +251,49 @@ resource "null_resource" "wait_for_kubernetes" {
       
       # Retrieve the proper kubeconfig file from the control plane node
       echo "Retrieving kubeconfig file from control plane..."
-      RESPONSE=$(aws ssm send-command \
+      CMD_ID=$(aws ssm send-command \
         --instance-ids $INSTANCE_ID \
         --document-name "AWS-RunShellScript" \
         --parameters commands="cat /etc/kubernetes/admin.conf" \
-        --output text --query "CommandInvocations[].CommandPlugins[].Output")
+        --output text --query "CommandId")
+      
+      echo "Waiting for kubeconfig to be retrieved (Command ID: $CMD_ID)..."
+      sleep 5
+      
+      # Wait for command to complete and get the output
+      RESPONSE=""
+      MAX_WAIT=10
+      for i in $(seq 1 $MAX_WAIT); do
+        echo "Fetching kubeconfig, attempt $i of $MAX_WAIT..."
+        CMD_STATUS=$(aws ssm get-command-invocation \
+          --command-id "$CMD_ID" \
+          --instance-id "$INSTANCE_ID" \
+          --query "Status" \
+          --output text)
+          
+        if [[ "$CMD_STATUS" == "Success" ]]; then
+          RESPONSE=$(aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text)
+          break
+        elif [[ "$CMD_STATUS" == "Failed" || "$CMD_STATUS" == "Cancelled" || "$CMD_STATUS" == "TimedOut" ]]; then
+          echo "Command failed with status: $CMD_STATUS"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardErrorContent" \
+            --output text
+          break
+        fi
+        
+        if [ $i -eq $MAX_WAIT ]; then
+          echo "Timed out waiting for kubeconfig retrieval"
+        fi
+        
+        sleep 5
+      done
       
       if [ -z "$RESPONSE" ]; then
         echo "ERROR: Failed to retrieve kubeconfig from control plane"
@@ -263,14 +301,11 @@ resource "null_resource" "wait_for_kubernetes" {
       fi
       
       # Save the retrieved kubeconfig to a local file
-      echo "$RESPONSE" > kubeconfig.yml
+      echo "$RESPONSE" > kubeconfig.yml.tmp
       
-      # Verify the kubeconfig format
-      if ! grep -q "apiVersion: v1" kubeconfig.yml; then
-        echo "WARNING: kubeconfig doesn't appear to be in the correct format"
-        # Try to fix common issues with SSM output formatting
-        sed -i 's/\\n/\n/g' kubeconfig.yml
-      fi
+      # Process kubeconfig to ensure correct formatting
+      cat kubeconfig.yml.tmp | sed 's/\\n/\n/g' | sed 's/\\t/\t/g' > kubeconfig.yml
+      rm kubeconfig.yml.tmp
       
       # Update the server address in the kubeconfig
       sed -i.bak "s|server: https://[^:]*:|server: https://$CP_IP:|" kubeconfig.yml
@@ -278,7 +313,31 @@ resource "null_resource" "wait_for_kubernetes" {
       # Ensure proper YAML format
       echo "Verifying kubeconfig format..."
       if command -v python3 &> /dev/null; then
-        python3 -c "import yaml; yaml.safe_load(open('kubeconfig.yml')); print('Kubeconfig format is valid')" || echo "WARNING: kubeconfig may have format issues"
+        python3 -c "import yaml; yaml.safe_load(open('kubeconfig.yml')); print('Kubeconfig format is valid')" || {
+          echo "WARNING: kubeconfig has format issues, attempting to fix..."
+          # Try to fix common escaping issues
+          cat kubeconfig.yml | python3 -c "import sys, yaml; print(yaml.dump(yaml.safe_load(sys.stdin)))" > kubeconfig.yml.fixed
+          if [ $? -eq 0 ]; then
+            mv kubeconfig.yml.fixed kubeconfig.yml
+            echo "Fixed kubeconfig format"
+          else
+            echo "Could not fix kubeconfig format automatically"
+          fi
+        }
+      fi
+      
+      # Double check the file exists and has content
+      if [ ! -s kubeconfig.yml ]; then
+        echo "ERROR: kubeconfig.yml is empty or doesn't exist"
+        exit 1
+      fi
+      
+      # Verify file has apiVersion field
+      if ! grep -q "apiVersion:" kubeconfig.yml; then
+        echo "ERROR: kubeconfig.yml is missing apiVersion field"
+        echo "Content of the file:"
+        cat kubeconfig.yml
+        exit 1
       fi
       
       echo "Created kubeconfig file at $(pwd)/kubeconfig.yml"
@@ -295,6 +354,8 @@ resource "terraform_data" "kubectl_provider_config" {
   # This ensures we rebuild when kubeconfig changes, not on every apply
   triggers_replace = {
     kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
+    # Add a checksum of the kubeconfig file to track content changes
+    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "none"
   }
 
   # Force provision step to ensure consistency between kubeconfig and the API server
@@ -306,10 +367,51 @@ resource "terraform_data" "kubectl_provider_config" {
       
       echo "Control plane public IP: $PUBLIC_IP"
       
+      # Make sure the kubeconfig file exists
+      if [ ! -f "${path.module}/kubeconfig.yml" ]; then
+        echo "ERROR: kubeconfig.yml not found!"
+        exit 1
+      fi
+      
+      # Validate the kubeconfig format
+      if command -v python3 &> /dev/null; then
+        echo "Validating kubeconfig format with Python..."
+        python3 -c "import yaml; config = yaml.safe_load(open('${path.module}/kubeconfig.yml')); print('✅ Valid kubeconfig with version:', config.get('apiVersion'))" || {
+          echo "⚠️ Kubeconfig validation failed, attempting to fix..."
+          # Simple attempt to fix common issues
+          cat "${path.module}/kubeconfig.yml" | tr -d '\r' > "${path.module}/kubeconfig.fixed.yml"
+          mv "${path.module}/kubeconfig.fixed.yml" "${path.module}/kubeconfig.yml"
+          python3 -c "import yaml; yaml.safe_load(open('${path.module}/kubeconfig.yml')); print('✅ Fixed kubeconfig format')" || {
+            echo "❌ Could not fix kubeconfig format automatically"
+            echo "------- Current content of kubeconfig.yml -------"
+            cat "${path.module}/kubeconfig.yml" | head -20
+            echo "-----------------------------------------------"
+            exit 1
+          }
+        }
+      else
+        echo "Warning: Python not available for YAML validation"
+        # Simple validation with grep
+        grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || {
+          echo "ERROR: kubeconfig doesn't contain apiVersion field"
+          exit 1
+        }
+      fi
+      
       # Update kubeconfig with current IP
       if [ -f "${path.module}/kubeconfig.yml" ]; then
         sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
         echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+      fi
+      
+      # Verify we can connect using the kubeconfig
+      if command -v kubectl &> /dev/null; then
+        echo "Testing kubectl connectivity with the kubeconfig..."
+        KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info || {
+          echo "Warning: Could not connect to the cluster with kubectl"
+        }
+      else
+        echo "Warning: kubectl not available for connectivity testing"
       fi
     EOT
   }
