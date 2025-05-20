@@ -73,5 +73,5 @@ output "control_plane_instance" {
 
 output "control_plane_iam_role_arn" {
   description = "ARN of the IAM role for the control plane node"
-  value       = aws_iam_role.control_plane_profile.arn
+  value       = aws_iam_role.control_plane_role.arn
 }
