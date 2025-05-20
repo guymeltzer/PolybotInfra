@@ -1,6 +1,26 @@
-# Polybot Infrastructure
+# PolybotInfra
 
 This repository contains Terraform code to provision the Polybot service infrastructure on AWS in multiple regions.
+
+## Infrastructure Overview
+
+The infrastructure consists of:
+
+1. **Kubernetes Cluster**: A self-managed Kubernetes cluster using kubeadm
+   - Control plane node (t3.medium)
+   - Worker nodes in an Auto Scaling Group (t3.medium)
+   - Calico CNI for networking
+   - EBS CSI Driver for persistent storage
+   - AWS Load Balancer for ingress
+
+2. **Polybot AWS Resources**:
+   - S3 bucket for storage
+   - SQS queue for message processing
+   - SNS topics for notifications
+   - Route53 records for DNS
+   - Secrets Manager for sensitive data
+
+3. **ArgoCD**: For GitOps-based deployments of Polybot and Yolo5 services
 
 ## Prerequisites
 
@@ -26,35 +46,42 @@ The AWS user/role running Terraform needs the following permissions:
 
 ## Quick Start
 
-1. Update the region tfvars files with your specific values:
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/guymeltzer/PolybotInfra.git
+   cd PolybotInfra
+   ```
+
+2. Update the region tfvars files with your specific values:
    - `tf/region.us-east-1.tfvars`
    - `tf/region.eu-central-1.tfvars`
 
-2. Set your Telegram bot tokens as environment variables:
+3. Set your Telegram bot tokens as environment variables:
    ```bash
    export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"
    export TF_VAR_telegram_token_prod="YOUR_PROD_BOT_TOKEN"
    ```
 
-3. Set your Docker Hub credentials as environment variables (optional, configured by default in tfvars):
+4. Set your Docker Hub credentials as environment variables:
    ```bash
-   export TF_VAR_docker_username="guymeltzer"
-   export TF_VAR_docker_password="Candy2025!"
+   export TF_VAR_docker_username="YOUR_DOCKER_USERNAME"
+   export TF_VAR_docker_password="YOUR_DOCKER_PASSWORD"
    ```
 
-4. Select your workspace for the target region:
+5. Select your workspace for the target region:
    ```bash
+   cd tf
    terraform workspace select us-east-1 || terraform workspace new us-east-1
    ```
 
-5. Initialize, plan, and apply Terraform:
+6. Initialize, plan, and apply Terraform:
    ```bash
    terraform init
    terraform plan -var-file=region.us-east-1.tfvars
    terraform apply -var-file=region.us-east-1.tfvars
    ```
 
-6. When finished, destroy all resources:
+7. When finished, destroy all resources:
    ```bash
    terraform destroy -var-file=region.us-east-1.tfvars
    ```
@@ -63,8 +90,7 @@ The AWS user/role running Terraform needs the following permissions:
 
 The repository includes GitHub Actions workflows for automated infrastructure provisioning:
 
-- `infra-provisioning-main.yaml` - Main workflow triggered manually to provision infrastructure
-- `infra-provisioning-region.yaml` - Provisions infrastructure for a specific region
+- `infra-provisioning-main.yaml` - Main workflow triggered manually to provision/destroy infrastructure
 
 ## GitHub Actions Secrets
 
@@ -74,21 +100,65 @@ For CI/CD pipelines to work correctly, set the following secrets in your GitHub 
 - `AWS_SECRET_ACCESS_KEY` - AWS secret key for Terraform  
 - `TELEGRAM_TOKEN_DEV` - Telegram dev bot token
 - `TELEGRAM_TOKEN_PROD` - Telegram production bot token
-- `DOCKER_USERNAME` - Docker Hub username (guymeltzer)
-- `DOCKER_PASSWORD` - Docker Hub password (Candy2025!)
+- `DOCKER_USERNAME` - Docker Hub username
+- `DOCKER_PASSWORD` - Docker Hub password
 
 ## Project Structure
 
 ```
 tf/
 ├── modules/
-├───── k8s-cluster/                         # Module for k8s cluster resources
+├───── k8s-cluster/                         # Module for Kubernetes cluster resources
+│     ├── control_plane_user_data.sh        # Initialization script for control plane
+│     ├── worker_user_data.sh               # Initialization script for worker nodes
+│     ├── main.tf
+│     ├── variables.tf
+│     └── outputs.tf
 ├───── polybot/                             # Module for polybot related resources
+│     ├── main.tf
+│     ├── variables.tf
+│     └── outputs.tf
 ├───── argocd/                              # Module for ArgoCD deployment
+│     ├── main.tf
+│     ├── variables.tf
+│     └── outputs.tf
 ├── main.tf                                 # Main configuration file
-├── outputs.tf
-├── variables.tf
+├── outputs.tf                              # Output values
+├── variables.tf                            # Input variables
 ├── backend.tf                              # S3 backend configuration
 ├── region.us-east-1.tfvars                 # Values for us-east-1 region
 └── region.eu-central-1.tfvars              # Values for eu-central-1 region
+
+k8s/                                        # Kubernetes manifests
+├── Polybot/                                # Polybot service manifests
+├── Yolo5/                                  # Yolo5 service manifests
+└── MongoDB/                                # MongoDB manifests
+
+.github/workflows/                          # GitHub Actions workflows
+└── infra-provisioning-main.yaml            # Main infra provisioning workflow
+```
+
+## Accessing the Kubernetes Cluster
+
+After the infrastructure is provisioned, you can access the Kubernetes cluster using:
+
+```bash
+# The command below will be provided in the Terraform outputs
+ssh ubuntu@<control-plane-ip> 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml
+export KUBECONFIG=$(pwd)/kubeconfig.yaml
+kubectl get nodes
+```
+
+## Troubleshooting
+
+If you encounter issues with the control plane initialization, check the logs on the control plane instance:
+
+```bash
+ssh ubuntu@<control-plane-ip> 'sudo cat /var/log/k8s-control-plane-init.log'
+```
+
+For worker node issues:
+
+```bash
+ssh ubuntu@<worker-node-ip> 'sudo cat /var/log/k8s-worker-init.log'
 ```

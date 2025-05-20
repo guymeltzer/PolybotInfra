@@ -1,11 +1,31 @@
+output "vpc_id" {
+  description = "ID of the VPC created for the cluster"
+  value       = module.vpc.vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "IDs of the public subnets created for the cluster"
+  value       = module.vpc.public_subnets
+}
+
+output "private_subnet_ids" {
+  description = "IDs of the private subnets created for the cluster"
+  value       = module.vpc.private_subnets
+}
+
 output "control_plane_public_ip" {
   description = "Public IP of the control plane node"
   value       = aws_instance.control_plane.public_ip
 }
 
-output "control_plane_instance" {
-  description = "Control plane EC2 instance resource"
-  value       = aws_instance.control_plane
+output "control_plane_private_ip" {
+  description = "Private IP of the control plane node"
+  value       = aws_instance.control_plane.private_ip
+}
+
+output "kubeconfig_path" {
+  description = "Path to the kubeconfig file"
+  value       = "/root/.kube/config"
 }
 
 output "alb_dns_name" {
@@ -46,17 +66,12 @@ output "client_key_data" {
   value       = fileexists("${path.module}/certs/client.key") ? base64encode(file("${path.module}/certs/client.key")) : ""
 }
 
-output "vpc_id" {
-  description = "ID of the VPC created for the cluster"
-  value       = module.vpc.vpc_id
-}
-
-output "subnet_ids" {
-  description = "IDs of the subnets created for the cluster"
-  value       = module.vpc.public_subnets
+output "control_plane_instance" {
+  description = "Control plane EC2 instance resource"
+  value       = aws_instance.control_plane
 }
 
 output "control_plane_iam_role_arn" {
   description = "ARN of the IAM role for the control plane node"
-  value       = aws_iam_role.control_plane_role.arn
+  value       = aws_iam_role.control_plane_profile.arn
 }

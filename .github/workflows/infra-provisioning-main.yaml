@@ -1,25 +1,77 @@
-name: Infra Provisioning
+name: Infrastructure Provisioning
+
 on:
   workflow_dispatch:
     inputs:
       region:
-        description: 'Region to deploy'
+        description: 'AWS region to deploy to'
         required: true
         default: 'us-east-1'
         type: choice
         options:
           - us-east-1
           - eu-central-1
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.7.0'
+  WORKING_DIR: 'tf'
 
 jobs:
-  call-region-workflow:
-    uses: ./.github/workflows/infra-provisioning-region.yaml
-    with:
-      region: ${{ github.event.inputs.region }}
-    secrets:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      TELEGRAM_TOKEN_DEV: ${{ secrets.TELEGRAM_TOKEN_DEV }}
-      TELEGRAM_TOKEN_PROD: ${{ secrets.TELEGRAM_TOKEN_PROD }}
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ github.event.inputs.region }}
+      
+      - name: Set Terraform workspace
+        working-directory: ${{ env.WORKING_DIR }}
+        run: |
+          terraform init
+          terraform workspace select ${{ github.event.inputs.region }} || terraform workspace new ${{ github.event.inputs.region }}
+      
+      - name: Set environment variables
+        run: |
+          echo "TF_VAR_telegram_token_dev=${{ secrets.TELEGRAM_TOKEN_DEV }}" >> $GITHUB_ENV
+          echo "TF_VAR_telegram_token_prod=${{ secrets.TELEGRAM_TOKEN_PROD }}" >> $GITHUB_ENV
+          echo "TF_VAR_docker_username=${{ secrets.DOCKER_USERNAME }}" >> $GITHUB_ENV
+          echo "TF_VAR_docker_password=${{ secrets.DOCKER_PASSWORD }}" >> $GITHUB_ENV
+          echo "TF_VAR_aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "TF_VAR_aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+      
+      - name: Terraform Plan
+        if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform plan -var-file=region.${{ github.event.inputs.region }}.tfvars
+      
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform apply -var-file=region.${{ github.event.inputs.region }}.tfvars -auto-approve
+      
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ${{ env.WORKING_DIR }}
+        run: terraform destroy -var-file=region.${{ github.event.inputs.region }}.tfvars -auto-approve

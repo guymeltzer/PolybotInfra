@@ -1,206 +1,96 @@
+locals {
+  name_prefix = "guy-polybot-${var.environment}"
+  domain_name = var.environment == "prod" ? "polybot.${var.region}.devops-int-college.com" : "dev-polybot.${var.region}.devops-int-college.com"
+}
+
+# S3 bucket for storing polybot data
 resource "aws_s3_bucket" "polybot_bucket" {
-  bucket = "guy-polybot-bucket-${var.environment}-${var.region}"
+  bucket = "${local.name_prefix}-bucket-${var.region}"
   
   tags = {
-    Name = "PolybotBucket"
+    Name        = "${local.name_prefix}-bucket"
     Environment = var.environment
   }
 }
 
-resource "aws_s3_bucket_versioning" "bucket_versioning" {
-  bucket = aws_s3_bucket.polybot_bucket.id
-  
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "bucket_encryption" {
+# S3 bucket ACL
+resource "aws_s3_bucket_ownership_controls" "polybot_bucket_ownership" {
   bucket = aws_s3_bucket.polybot_bucket.id
 
   rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
+    object_ownership = "BucketOwnerPreferred"
   }
 }
 
+resource "aws_s3_bucket_acl" "polybot_bucket_acl" {
+  depends_on = [aws_s3_bucket_ownership_controls.polybot_bucket_ownership]
+  bucket     = aws_s3_bucket.polybot_bucket.id
+  acl        = "private"
+}
+
+# SQS queue for polybot messages
 resource "aws_sqs_queue" "polybot_queue" {
-  name = "guy-polybot-queue-${var.environment}"
-  
-  # SQS settings
+  name                      = "${local.name_prefix}-queue"
+  delay_seconds             = 0
+  max_message_size          = 262144
+  message_retention_seconds = 86400
   visibility_timeout_seconds = 30
-  message_retention_seconds = 345600 # 4 days
-  max_message_size = 262144 # 256 KB
   
   tags = {
-    Name = "PolybotQueue"
+    Name        = "${local.name_prefix}-queue"
     Environment = var.environment
   }
 }
 
-resource "aws_secretsmanager_secret" "polybot_secrets" {
-  name = "polybot-secrets-${var.environment}-${var.region}"
-  recovery_window_in_days = 0  # Set to 0 for immediate deletion in dev/test
-
+# Store Telegram token in AWS Secrets Manager
+resource "aws_secretsmanager_secret" "telegram_token" {
+  name        = "${local.name_prefix}-telegram-token"
+  description = "Telegram token for the ${var.environment} environment"
+  
   tags = {
-    Name = "PolybotSecrets"
+    Name        = "${local.name_prefix}-telegram-token"
     Environment = var.environment
   }
 }
 
-# Secret version that stores all Polybot credentials
-resource "aws_secretsmanager_secret_version" "polybot_secret_version" {
-  secret_id     = aws_secretsmanager_secret.polybot_secrets.id
-  secret_string = jsonencode({
-    telegram_token = var.telegram_token,
-    s3_bucket_name = aws_s3_bucket.polybot_bucket.bucket,
-    sqs_queue_url = aws_sqs_queue.polybot_queue.url,
-    telegram_app_url = "https://guy-polybot-${var.environment}.devops-int-college.com",
-    aws_access_key_id = var.aws_access_key_id,
-    aws_secret_access_key = var.aws_secret_access_key,
-    mongo_collection = "image_collection",
-    mongo_db = "config",
-    mongo_uri = "mongodb://mongodb-0.mongodb.mongodb.svc.cluster.local:27017,mongodb-1.mongodb.mongodb.svc.cluster.local:27017,mongodb-2.mongodb.mongodb.svc.cluster.local:27017/?replicaSet=rs0",
-    polybot_url = "https://polybot-service:31024/results"
-  })
+resource "aws_secretsmanager_secret_version" "telegram_token_value" {
+  secret_id     = aws_secretsmanager_secret.telegram_token.id
+  secret_string = var.telegram_token
 }
 
-# Docker Hub credentials
-resource "aws_secretsmanager_secret" "docker_hub_credentials" {
-  name = "docker-hub-credentials-${var.environment}"
-  recovery_window_in_days = 0  # Set to 0 for immediate deletion in dev/test
-
+# Store Docker Hub credentials in AWS Secrets Manager
+resource "aws_secretsmanager_secret" "docker_credentials" {
+  name        = "${local.name_prefix}-docker-credentials"
+  description = "Docker Hub credentials for pulling private images"
+  
   tags = {
-    Name = "DockerHubCredentials"
+    Name        = "${local.name_prefix}-docker-credentials"
     Environment = var.environment
   }
 }
 
-resource "aws_secretsmanager_secret_version" "docker_hub_credentials_version" {
-  secret_id     = aws_secretsmanager_secret.docker_hub_credentials.id
+resource "aws_secretsmanager_secret_version" "docker_credentials_value" {
+  secret_id = aws_secretsmanager_secret.docker_credentials.id
   secret_string = jsonencode({
-    username = var.docker_username,
+    username = var.docker_username
     password = var.docker_password
   })
 }
 
-resource "aws_lambda_function" "scaling_lambda" {
-  function_name = "guy-polybot-scaling-function-${var.environment}"
-  role          = aws_iam_role.lambda_role.arn
-  handler       = "index.handler"
-  runtime       = "python3.9"
-  timeout       = 60
-  
-  # Inline function code for simplicity - for real use, deploy from S3
-  filename      = "${path.module}/lambda_package.zip"
-  
-  environment {
-    variables = {
-      ASG_NAME = "guy-polybot-asg"
-      REGION   = var.region
-      ENV      = var.environment
-    }
-  }
-  
-  tags = {
-    Name = "PolybotScalingLambda"
-    Environment = var.environment
-  }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.lambda_policy
-  ]
-}
-
-# Create dummy lambda zip file if it doesn't exist
-resource "null_resource" "lambda_package" {
-  triggers = {
-    always_run = timestamp()
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      # Create the module directory if it doesn't exist
-      mkdir -p ${abspath(path.module)}
-
-      # Create a simple Lambda function
-      echo 'def lambda_handler(event, context):
-          return {"statusCode": 200, "body": "Hello from Lambda"}' > /tmp/index.py
-      
-      # Create the zip package
-      cd /tmp && zip -r lambda_package.zip index.py
-      
-      # Copy the zip file to the module directory
-      cp /tmp/lambda_package.zip ${abspath(path.module)}/lambda_package.zip
-      
-      # Verify the zip file exists
-      ls -la ${abspath(path.module)}/lambda_package.zip || echo "WARNING: lambda_package.zip not created successfully"
-    EOT
-  }
-}
-
-resource "aws_iam_role" "lambda_role" {
-  name = "lambda_execution_role_${var.environment}_${var.region}"
-  
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-    }]
-  })
-  
-  tags = {
-    Name = "PolybotLambdaRole"
-    Environment = var.environment
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_policy" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# Add autoscaling permissions for the lambda
-resource "aws_iam_policy" "lambda_asg_policy" {
-  name        = "lambda_asg_policy_${var.environment}_${var.region}"
-  description = "Allow Lambda to manage ASG"
-  
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "autoscaling:DescribeAutoScalingGroups",
-        "autoscaling:UpdateAutoScalingGroup",
-        "autoscaling:SetDesiredCapacity"
-      ]
-      Resource = "*"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_asg_policy_attach" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.lambda_asg_policy.arn
-}
-
+# SNS topic for lifecycle events
 resource "aws_sns_topic" "lifecycle_topic" {
-  name = "guy-lifecycle-topic-${var.environment}-${var.region}"
+  name = "${local.name_prefix}-lifecycle-topic"
   
   tags = {
-    Name = "PolybotLifecycleTopic"
+    Name        = "${local.name_prefix}-lifecycle-topic"
     Environment = var.environment
   }
 }
 
+# Route53 record for the polybot service
 resource "aws_route53_record" "polybot_record" {
   zone_id = var.route53_zone_id
-  name    = "guy-polybot-${var.environment}.devops-int-college.com"
+  name    = local.domain_name
   type    = "A"
   
   alias {

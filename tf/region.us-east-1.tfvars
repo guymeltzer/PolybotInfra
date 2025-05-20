@@ -1,10 +1,10 @@
 region           = "us-east-1"
-control_plane_ami = "ami-084568db4383264d4"
-worker_ami        = "ami-084568db4383264d4"
-route53_zone_id   = "Z02842682SGSPDJQMJGFT"    # Update with the actual Route53 zone ID
-vpc_id            = ""  # Will be created by terraform
-subnet_ids        = []  # Will be created by terraform
-key_name          = ""  # Leave empty to skip SSH key requirement
+control_plane_ami = "ami-052edda5de5f8e53b"  # Ubuntu 24.04 LTS
+worker_ami        = "ami-052edda5de5f8e53b"  # Ubuntu 24.04 LTS
+route53_zone_id   = "Z1234567890"            # Replace with your actual Route53 zone ID
+key_name          = "guy-key-pair"           # Replace with your SSH key name in this region
+vpc_id            = ""                       # Leave empty to create a new VPC
+subnet_ids        = []                       # Leave empty to create new subnets
 git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
 # Telegram tokens should be set via environment variables
 # export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"

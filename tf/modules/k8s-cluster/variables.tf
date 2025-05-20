@@ -34,9 +34,19 @@ variable "worker_instance_type" {
 }
 
 variable "worker_count" {
-  description = "Number of worker nodes"
+  description = "Number of worker nodes to create"
   type        = number
   default     = 2
+}
+
+variable "control_plane_ami" {
+  description = "AMI ID for control plane node"
+  type        = string
+}
+
+variable "worker_ami" {
+  description = "AMI ID for worker nodes"
+  type        = string
 }
 
 variable "route53_zone_id" {
@@ -50,18 +60,8 @@ variable "key_name" {
   default     = ""
 }
 
-variable "control_plane_ami" {
-  description = "AMI ID for control plane nodes"
-  type        = string
-}
-
-variable "worker_ami" {
-  description = "AMI ID for worker nodes"
-  type        = string
-}
-
 variable "addons" {
-  description = "List of Kubernetes addons to install"
+  description = "List of URLs to Kubernetes add-on manifests to apply"
   type        = list(string)
   default     = []
 }

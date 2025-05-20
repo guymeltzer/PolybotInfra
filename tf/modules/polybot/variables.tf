@@ -4,23 +4,28 @@ variable "region" {
 }
 
 variable "route53_zone_id" {
-  description = "Route53 hosted zone ID"
+  description = "Route53 zone ID for DNS records"
   type        = string
 }
 
 variable "alb_dns_name" {
-  description = "ALB DNS name for the Route53 record"
+  description = "DNS name of the application load balancer"
   type        = string
 }
 
 variable "alb_zone_id" {
-  description = "ALB zone ID for the Route53 record"
+  description = "Zone ID of the application load balancer"
   type        = string
 }
 
 variable "environment" {
-  description = "Environment name (dev or prod)"
+  description = "Environment (dev or prod)"
   type        = string
+  default     = "dev"
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "Environment must be either 'dev' or 'prod'."
+  }
 }
 
 variable "telegram_token" {
