@@ -314,10 +314,27 @@ resource "terraform_data" "kubectl_provider_config" {
   }
 }
 
+# Store the control plane IP locally so we can use it in provider configs
+locals {
+  control_plane_ip = try(
+    data.aws_instance.control_plane.public_ip,
+    "kubernetes.default.svc"
+  )
+}
+
+# Look up the control plane instance to get its IP
+data "aws_instance" "control_plane" {
+  instance_tags = {
+    Name = "k8s-control-plane"
+  }
+  
+  depends_on = [module.k8s-cluster]
+}
+
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
-  host           = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+  host           = "https://${local.control_plane_ip}:6443"
   insecure       = true
   # Skip TLS verification entirely
   client_certificate     = ""
@@ -329,7 +346,7 @@ provider "kubernetes" {
 provider "helm" {
   kubernetes {
     config_path    = "${path.module}/kubeconfig.yml"
-    host           = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+    host           = "https://${local.control_plane_ip}:6443"
     insecure       = true
     # Skip TLS verification entirely
     client_certificate     = ""
@@ -341,7 +358,7 @@ provider "helm" {
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
   config_path      = "${path.module}/kubeconfig.yml"
-  host             = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+  host             = "https://${local.control_plane_ip}:6443"
   load_config_file = true
   insecure         = true
   client_certificate     = ""
@@ -400,65 +417,6 @@ module "k8s-cluster" {
 
   # Start with the initialization resource that creates a valid kubeconfig
   depends_on = [terraform_data.init_environment]
-}
-
-# Store the control plane IP locally so we can use it in provider configs
-locals {
-  control_plane_ip = try(
-    data.aws_instance.control_plane.public_ip,
-    "kubernetes.default.svc"
-  )
-}
-
-# Look up the control plane instance to get its IP
-data "aws_instance" "control_plane" {
-  instance_tags = {
-    Name = "k8s-control-plane"
-  }
-  
-  depends_on = [module.k8s-cluster]
-}
-
-# Configure the Kubernetes provider with proper authentication
-provider "kubernetes" {
-  config_path    = "${path.module}/kubeconfig.yml"
-  host           = "https://${local.control_plane_ip}:6443"
-  insecure       = true
-  # Skip TLS verification entirely
-  client_certificate     = ""
-  client_key             = ""
-  cluster_ca_certificate = ""
-}
-
-# Configure the Helm provider with proper authentication
-provider "helm" {
-  kubernetes {
-    config_path    = "${path.module}/kubeconfig.yml"
-    host           = "https://${local.control_plane_ip}:6443"
-    insecure       = true
-    # Skip TLS verification entirely
-    client_certificate     = ""
-    client_key             = ""
-    cluster_ca_certificate = ""
-  }
-}
-
-# Configure the kubectl provider with proper authentication
-provider "kubectl" {
-  config_path      = "${path.module}/kubeconfig.yml"
-  host             = "https://${local.control_plane_ip}:6443"
-  load_config_file = true
-  insecure         = true
-  client_certificate     = ""
-  client_key             = ""
-  cluster_ca_certificate = ""
-  
-  # Skip TLS verification completely to avoid certificate parsing
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "echo"
-    args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token\"}}"]
-  }
 }
 
 # Install EBS CSI Driver for persistent storage
