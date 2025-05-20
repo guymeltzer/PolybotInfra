@@ -1,4 +1,5 @@
 #!/bin/bash
+# Script generated at: ${timestamp}
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-worker-init.log"

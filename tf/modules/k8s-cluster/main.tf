@@ -535,6 +535,7 @@ resource "aws_instance" "control_plane" {
     token    = random_string.token.result,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
+    timestamp = timestamp()
   })
 
   root_block_device {
@@ -552,6 +553,9 @@ resource "aws_instance" "control_plane" {
 
   lifecycle {
     create_before_destroy = true
+    replace_triggered_by = [
+      filesha256("${path.module}/templates/control-plane-user-data.sh")
+    ]
   }
 }
 
@@ -1026,7 +1030,9 @@ resource "aws_launch_template" "worker_lt" {
     name = aws_iam_instance_profile.worker_profile.name
   }
 
-  user_data = base64encode(file("${path.module}/worker_user_data.sh"))
+  user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", {
+    timestamp = timestamp()
+  }))
 
   tag_specifications {
     resource_type = "instance"
@@ -1034,6 +1040,10 @@ resource "aws_launch_template" "worker_lt" {
       Name                         = "guy-worker-node"
       "kubernetes.io/cluster/kubernetes" = "owned"
     }
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 

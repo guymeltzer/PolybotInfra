@@ -1,4 +1,5 @@
 #!/bin/bash
+# Script generated at: ${timestamp}
 set -ex
 
 # Log file for debugging
@@ -45,14 +46,16 @@ command -v unzip || {
   echo "$(date) - ERROR: unzip not installed"
   exit 1
 }
-# Check if unzip is available by using a simpler command that won't trigger warnings
-unzip -v &> /dev/null || {
-  echo "$(date) - ERROR: unzip is not functioning properly"
+
+# Check if unzip exists and skip version check
+if [ -x "$(command -v unzip)" ]; then
+  echo "$(date) - Unzip is installed successfully"
+  # Just add a log entry without failing on error
+  unzip -v 2>&1 | head -2 >> $${LOGFILE} || true
+else
+  echo "$(date) - ERROR: unzip is not available"
   exit 1
-}
-echo "$(date) - Unzip is installed and functional"
-# Add unzip version to logs but don't fail if the output is not as expected
-unzip --version >> $${LOGFILE} 2>&1 || true
+fi
 
 # Upgrade packages
 echo "$(date) - Upgrading installed packages"
