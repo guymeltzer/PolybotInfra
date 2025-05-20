@@ -4,7 +4,13 @@ import os
 
 try:
     # Get kubeconfig path from command line argument
-    kubeconfig_path = sys.argv[1]
+    if len(sys.argv) > 1:
+        kubeconfig_path = sys.argv[1]
+    else:
+        # Default fallback path if not specified
+        kubeconfig_path = "./kubeconfig.yml"
+        print(f"No path provided, using default: {kubeconfig_path}")
+    
     with open(kubeconfig_path, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -20,6 +26,11 @@ try:
 except Exception as e:
     print(f"Error: {e}")
     print("Creating a minimal valid kubeconfig")
+    
+    # Determine which path to use for the fallback config
+    if not 'kubeconfig_path' in locals():
+        kubeconfig_path = "./kubeconfig.yml"
+    
     minimal_config = """apiVersion: v1
 kind: Config
 clusters:
@@ -41,3 +52,4 @@ users:
 """
     with open(kubeconfig_path, 'w') as f:
         f.write(minimal_config)
+    print(f"Created fallback kubeconfig at {kubeconfig_path}")

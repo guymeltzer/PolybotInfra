@@ -7,13 +7,13 @@ clusters:
 contexts:
 - context:
     cluster: ${cluster_name}
-    user: admin
-  name: ${cluster_name}
-current-context: ${cluster_name}
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
 kind: Config
 preferences: {}
 users:
-- name: admin
+- name: kubernetes-admin
   user:
     client-certificate-data: ${base64encode(client_certificate)}
     client-key-data: ${base64encode(client_key)} 

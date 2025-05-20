@@ -90,7 +90,7 @@ EOT
         
               # Use yq or python if available to validate and fix
       if command -v python3 >/dev/null 2>&1; then
-        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
         python3 -c "
 import sys
 import yaml
@@ -98,6 +98,10 @@ import json
 import os
 
 kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
+if kubeconfig_path is None:
+    kubeconfig_path = '${path.module}/kubeconfig.yml'
+    print(f'Using hardcoded path: {kubeconfig_path}')
+
 try:
     with open(kubeconfig_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -287,7 +291,8 @@ PYTHONEOF
   # Run the Python script if available
   if command -v python3 &>/dev/null; then
     echo "Validating with Python script"
-    python3 "${path.module}/validate_kubeconfig.py" "${path.module}/kubeconfig.yml" || {
+    # Run the script with environment variables for better reliability
+    PYTHONIOENCODING=utf-8 python3 "${path.module}/validate_kubeconfig.py" "${path.module}/kubeconfig.yml" || {
       echo "Python validation failed, creating minimal kubeconfig"
       cat > "${path.module}/kubeconfig.yml" << EOF
 apiVersion: v1
@@ -449,9 +454,9 @@ resource "null_resource" "wait_for_kubernetes" {
   
   triggers = {
     # Use formatdate instead of raw timestamp to avoid changing on every apply
-    timestamp = formatdate("YYYY-MM-DD-hh:mm:ss", timestamp())
-    # Don't use file hash as a trigger since it changes during apply
-    instance_id = module.k8s-cluster.control_plane_instance_id
+    timestamp = formatdate("YYYY-MM-DD", timestamp())
+    # Only use instance_id and avoid any file hash references
+    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
   }
   
   # Add a second provisioner to validate the kubeconfig after it's been created
@@ -475,13 +480,17 @@ resource "null_resource" "wait_for_kubernetes" {
         
               # Verify the file is valid YAML
       if command -v python3 &> /dev/null; then
-        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
         python3 -c "
 import yaml
 import sys
 import os
 
 kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
+if kubeconfig_path is None:
+    kubeconfig_path = '${path.module}/kubeconfig.yml'
+    print(f'Using hardcoded path: {kubeconfig_path}')
+
 try:
     with open(kubeconfig_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -537,8 +546,21 @@ resource "terraform_data" "kubectl_provider_config" {
       # Validate the kubeconfig format
       if command -v python3 &> /dev/null; then
         echo "Validating kubeconfig format with Python..."
-        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
-        python3 -c "import yaml; import os; config = yaml.safe_load(open(os.environ.get('KUBECONFIG_PATH'))); print('✅ Valid kubeconfig with version:', config.get('apiVersion'))" || {
+        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        python3 -c "
+import yaml
+import os
+import sys
+
+kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
+if kubeconfig_path is None:
+    kubeconfig_path = '${path.module}/kubeconfig.yml'
+    print(f'Using hardcoded path: {kubeconfig_path}')
+
+with open(kubeconfig_path, 'r') as f:
+    config = yaml.safe_load(f)
+print('✅ Valid kubeconfig with version:', config.get('apiVersion'))
+" || {
           echo "⚠️ Kubeconfig validation failed, attempting to fix..."
           # Simple attempt to fix common issues
           cat "${path.module}/kubeconfig.yml" | tr -d '\r' > "${path.module}/kubeconfig.fixed.yml"
