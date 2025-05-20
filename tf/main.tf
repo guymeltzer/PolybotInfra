@@ -176,6 +176,73 @@ resource "terraform_data" "kubectl_provider_config" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
+      # Helper function to create token-based config as fallback
+      create_token_config() {
+        local PUBLIC_IP="$1"
+        
+        # Determine if we have a bootstrap token available
+        BOOTSTRAP_TOKEN="${try(module.k8s-cluster.kube_token, "")}"
+        if [ -z "$BOOTSTRAP_TOKEN" ]; then
+          # Generate a bootstrap token on the control plane if none exists
+          echo "Bootstrap token not available from module, attempting to generate one"
+          TOKEN_OUTPUT=$(aws ssm send-command \
+            --region ${var.region} \
+            --instance-ids $INSTANCE_ID \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands="sudo kubeadm token create --ttl 24h --print-join-command" \
+            --output text --query "Command.CommandId")
+            
+          if [ -n "$TOKEN_OUTPUT" ]; then
+            echo "Waiting for token generation command to complete..."
+            sleep 30
+            
+            TOKEN_RESULT=$(aws ssm get-command-invocation \
+              --region ${var.region} \
+              --command-id "$TOKEN_OUTPUT" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text)
+              
+            if [[ "$TOKEN_RESULT" == *"--token"* ]]; then
+              BOOTSTRAP_TOKEN=$(echo "$TOKEN_RESULT" | grep -o '\-\-token [^ ]*' | cut -d' ' -f2)
+              echo "Successfully generated bootstrap token"
+            else
+              echo "Failed to extract token from result, using fallback token"
+              BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
+            fi
+          else
+            echo "Failed to run token generation command, using fallback token"
+            BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
+          fi
+        fi
+        
+        # Create a kubeconfig with token-based auth and TLS skip
+        KUBECONFIG_DIR="${path.module}"
+        echo "Creating kubeconfig with token auth and TLS skip verification..."
+        cat > "$KUBECONFIG_DIR/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://$PUBLIC_IP:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: admin
+  user:
+    token: "$BOOTSTRAP_TOKEN"
+EOF
+        
+        chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
+        echo "Created token-based kubeconfig with server URL: https://$PUBLIC_IP:6443"
+      }
+
       # Wait for cluster to be ready with retry logic
       MAX_ATTEMPTS=10
       attempt=1
@@ -208,73 +275,57 @@ resource "terraform_data" "kubectl_provider_config" {
         PUBLIC_IP="placeholder"
       fi
       
-      # Determine if we have a bootstrap token available
-      BOOTSTRAP_TOKEN="${try(module.k8s-cluster.kube_token, "")}"
-      if [ -z "$BOOTSTRAP_TOKEN" ]; then
-        # Generate a bootstrap token on the control plane if none exists
-        echo "Bootstrap token not available from module, attempting to generate one"
-        TOKEN_OUTPUT=$(aws ssm send-command \
+      # Get the admin.conf from the control plane
+      echo "Getting admin kubeconfig from control plane..."
+      ADMIN_KUBECONFIG=$(aws ssm send-command \
+        --region ${var.region} \
+        --instance-ids $INSTANCE_ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="sudo cat /etc/kubernetes/admin.conf" \
+        --output text --query "Command.CommandId")
+        
+      if [ -n "$ADMIN_KUBECONFIG" ]; then
+        echo "Waiting for admin kubeconfig command to complete..."
+        sleep 30
+        
+        # Get the command result
+        KUBECONFIG_CONTENT=$(aws ssm get-command-invocation \
           --region ${var.region} \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="sudo kubeadm token create --ttl 24h --print-join-command" \
-          --output text --query "Command.CommandId")
+          --command-id "$ADMIN_KUBECONFIG" \
+          --instance-id "$INSTANCE_ID" \
+          --query "StandardOutputContent" \
+          --output text)
           
-        if [ -n "$TOKEN_OUTPUT" ]; then
-          echo "Waiting for token generation command to complete..."
-          sleep 30
+        if [ -n "$KUBECONFIG_CONTENT" ] && [[ "$KUBECONFIG_CONTENT" == *"apiVersion: v1"* ]]; then
+          echo "Successfully retrieved admin kubeconfig from control plane"
           
-          TOKEN_RESULT=$(aws ssm get-command-invocation \
-            --region ${var.region} \
-            --command-id "$TOKEN_OUTPUT" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" \
-            --output text)
-            
-          if [[ "$TOKEN_RESULT" == *"--token"* ]]; then
-            BOOTSTRAP_TOKEN=$(echo "$TOKEN_RESULT" | grep -o '\-\-token [^ ]*' | cut -d' ' -f2)
-            echo "Successfully generated bootstrap token"
-          else
-            echo "Failed to extract token from result, using fallback token"
-            BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
-          fi
+          # Save the kubeconfig and update the server address
+          KUBECONFIG_DIR="${path.module}"
+          echo "$KUBECONFIG_CONTENT" > "$KUBECONFIG_DIR/kubeconfig.yml"
+          
+          # Update the server URL to use the public IP
+          sed -i.bak "s|server:.*|server: https://$PUBLIC_IP:6443|g" "$KUBECONFIG_DIR/kubeconfig.yml"
+          
+          # Add insecure-skip-tls-verify
+          sed -i.bak "s|certificate-authority-data:.*|insecure-skip-tls-verify: true|g" "$KUBECONFIG_DIR/kubeconfig.yml"
+          
+          chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
+          echo "Created kubeconfig with server URL: https://$PUBLIC_IP:6443"
         else
-          echo "Failed to run token generation command, using fallback token"
-          BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
+          echo "Failed to retrieve valid admin kubeconfig, falling back to token-based config"
+          create_token_config "$PUBLIC_IP"
         fi
+      else
+        echo "Failed to send command to retrieve admin kubeconfig, falling back to token-based config"
+        create_token_config "$PUBLIC_IP"
       fi
-      
-      # Create a kubeconfig with token-based auth and TLS skip
-      KUBECONFIG_DIR="${path.module}"
-      echo "Creating kubeconfig with token auth and TLS skip verification..."
-      cat > "$KUBECONFIG_DIR/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://$PUBLIC_IP:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    token: "$BOOTSTRAP_TOKEN"
-EOF
-      
-      chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
-      echo "Created kubeconfig with server URL: https://$PUBLIC_IP:6443"
       
       # Test the connection
       if [ "$PUBLIC_IP" != "placeholder" ] && command -v kubectl &> /dev/null; then
         echo "Testing connection to Kubernetes API server..."
-        if KUBECONFIG="$KUBECONFIG_DIR/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
+        if KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
           echo "Successfully connected to Kubernetes API server"
+          KUBECONFIG="${path.module}/kubeconfig.yml" kubectl get nodes
         else
           echo "Warning: Failed to connect to Kubernetes API server"
         fi
