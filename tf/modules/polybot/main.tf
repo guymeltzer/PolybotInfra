@@ -44,11 +44,10 @@ resource "aws_sqs_queue" "polybot_queue" {
 
 # Store Telegram token in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "telegram_token" {
-  name        = "${local.name_prefix}-telegram-token"
-  description = "Telegram token for the ${var.environment} environment"
+  name        = "guy-polybot-${var.environment}-telegram-token-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  description = "Telegram Bot Token for Polybot ${var.environment} environment"
   
   tags = {
-    Name        = "${local.name_prefix}-telegram-token"
     Environment = var.environment
   }
 }
@@ -60,11 +59,10 @@ resource "aws_secretsmanager_secret_version" "telegram_token_value" {
 
 # Store Docker Hub credentials in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "docker_credentials" {
-  name        = "${local.name_prefix}-docker-credentials"
-  description = "Docker Hub credentials for pulling private images"
+  name        = "guy-polybot-${var.environment}-docker-credentials-${formatdate("YYYYMMDDhhmmss", timestamp())}"
+  description = "Docker Hub credentials for Polybot ${var.environment} environment"
   
   tags = {
-    Name        = "${local.name_prefix}-docker-credentials"
     Environment = var.environment
   }
 }
@@ -102,3 +100,28 @@ resource "aws_route53_record" "polybot_record" {
   }
 }
 */
+
+resource "aws_secretsmanager_secret" "polybot_secrets" {
+  name        = "${local.name_prefix}-secrets-${var.region}"
+  description = "Various Polybot configuration secrets for ${var.environment} environment"
+  
+  tags = {
+    Name        = "${local.name_prefix}-secrets"
+    Environment = var.environment
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "polybot_secrets_version" {
+  secret_id     = aws_secretsmanager_secret.polybot_secrets.id
+  secret_string = jsonencode({
+    telegram_token  = var.telegram_token
+    aws_access_key  = var.aws_access_key_id
+    aws_secret_key  = var.aws_secret_access_key
+    database_url    = "mongodb://polybot-mongodb.${var.environment}.svc.cluster.local:27017/polybot"
+    redis_host      = "polybot-redis.${var.environment}.svc.cluster.local"
+    queue_url       = aws_sqs_queue.polybot_queue.url
+    bucket_name     = aws_s3_bucket.polybot_bucket.bucket
+    docker_username = var.docker_username
+    docker_password = var.docker_password
+  })
+}

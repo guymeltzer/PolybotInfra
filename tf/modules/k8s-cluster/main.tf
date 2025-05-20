@@ -590,7 +590,7 @@ resource "null_resource" "wait_for_control_plane" {
     command = <<EOF
       # Wait for the control plane to initialize
       echo "Waiting for control plane to initialize..."
-      sleep 120
+      sleep 60
       
       # Create empty certificate files if they don't already exist
       mkdir -p ${path.module}/certs

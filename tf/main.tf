@@ -9,10 +9,7 @@ provider "local" {}
 provider "kubernetes" {
   # These values are placeholders that will be ignored during initial apply
   # The actual connection will happen in subsequent applies after the cluster is ready
-  host = "https://127.0.0.1:6443"  # Placeholder
-  client_certificate = ""
-  client_key = ""
-  cluster_ca_certificate = ""
+  host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
   
   # Skip validation during initial apply
   insecure = true
@@ -24,10 +21,7 @@ provider "kubernetes" {
 provider "helm" {
   kubernetes {
     # These values are placeholders that will be ignored during initial apply
-    host = "https://127.0.0.1:6443"  # Placeholder
-    client_certificate = ""
-    client_key = ""
-    cluster_ca_certificate = ""
+    host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
     
     # Skip validation during initial apply
     insecure = true
@@ -37,10 +31,7 @@ provider "helm" {
 # Configure the kubectl provider with safe defaults
 provider "kubectl" {
   # These values are placeholders that will be ignored during initial apply
-  host = "https://127.0.0.1:6443"  # Placeholder
-  client_certificate = ""
-  client_key = ""
-  cluster_ca_certificate = ""
+  host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
   
   # Skip validation during initial apply
   load_config_file = false
@@ -147,9 +138,9 @@ resource "null_resource" "wait_for_kubernetes" {
         sleep 15
       done
       
-      # Wait longer for kubernetes initialization (8 minutes)
-      echo "Instance is running. Waiting 8 minutes for Kubernetes initialization..."
-      sleep 480
+      # Wait for kubernetes initialization (3 minutes instead of 8)
+      echo "Instance is running. Waiting 3 minutes for Kubernetes initialization..."
+      sleep 180
       
       # Try to get logs and debug info via SSM
       function get_debug_info {

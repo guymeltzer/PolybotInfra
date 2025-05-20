@@ -14,7 +14,7 @@ output "private_subnet_ids" {
 }
 
 output "control_plane_public_ip" {
-  description = "Public IP of the control plane node"
+  description = "The public IP address of the Kubernetes control plane"
   value       = aws_instance.control_plane.public_ip
 }
 
@@ -74,4 +74,9 @@ output "control_plane_instance" {
 output "control_plane_iam_role_arn" {
   description = "ARN of the IAM role for the control plane node"
   value       = aws_iam_role.control_plane_role.arn
+}
+
+output "control_plane_instance_id" {
+  description = "The instance ID of the Kubernetes control plane"
+  value       = aws_instance.control_plane.id
 }
