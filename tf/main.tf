@@ -361,6 +361,7 @@ locals {
     module.k8s-cluster.control_plane_public_ip,
     "kubernetes.default.svc"
   )
+  skip_argocd = false # Set to true to skip ArgoCD deployment temporarily
 }
 
 # Add a data source to ensure kubeconfig is ready
@@ -503,7 +504,7 @@ module "k8s-cluster" {
 
 # ArgoCD deployment - only create after namespaces are ready
 module "argocd" {
-  count          = fileexists(data.local_file.kubeconfig.filename) ? 1 : 0
+  count          = local.skip_argocd ? 0 : (fileexists(data.local_file.kubeconfig.filename) ? 1 : 0)
   source         = "./modules/argocd"
   git_repo_url   = var.git_repo_url
   
