@@ -5,8 +5,102 @@ provider "aws" {
 # Define a local provider for first-time setup
 provider "local" {}
 
+# Resource to automate secrets management and cleanup
+resource "terraform_data" "manage_secrets" {
+  # Always run on every apply
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  # Run script to check and clean up secrets
+  provisioner "local-exec" {
+    command = <<-EOT
+      #!/bin/bash
+      
+             # Colors for output (escaped for Terraform)
+       RED="\\033[0;31m"
+       GREEN="\\033[0;32m"
+       YELLOW="\\033[0;33m"
+       NC="\\033[0m" # No Color
+      
+      echo -e "${YELLOW}Checking for stale AWS secrets...${NC}"
+      
+      # List of secret prefixes to check
+      DEV_PREFIXES=(
+        "guy-polybot-dev-telegram-token"
+        "guy-polybot-dev-docker-credentials" 
+        "guy-polybot-dev-secrets"
+      )
+      
+      PROD_PREFIXES=(
+        "guy-polybot-prod-telegram-token"
+        "guy-polybot-prod-docker-credentials"
+        "guy-polybot-prod-secrets"
+      )
+      
+      # Check if jq is installed
+      if ! command -v jq &> /dev/null; then
+        echo -e "${YELLOW}jq not found, skipping secret cleanup${NC}"
+        exit 0
+      fi
+      
+      # Check if AWS CLI is available
+      if ! command -v aws &> /dev/null; then
+        echo -e "${YELLOW}AWS CLI not found, skipping secret cleanup${NC}"
+        exit 0
+      fi
+      
+      # Function to check for duplicate secrets
+      check_duplicate_secrets() {
+        local prefix=$1
+        
+        echo -e "Checking for duplicates with prefix: ${YELLOW}$prefix${NC}"
+        
+        SECRETS=$(aws secretsmanager list-secrets \
+          --region ${var.region} \
+          --filters Key=name,Values=$prefix \
+          --query "SecretList[*].{Name:Name,ARN:ARN}" \
+          --output json 2>/dev/null) || {
+            echo -e "${RED}Failed to fetch secrets${NC}"
+            return 0
+          }
+        
+        COUNT=$(echo $SECRETS | jq -r 'length')
+        
+        if [ "$COUNT" -le 1 ]; then
+          echo -e "${GREEN}No duplicate secrets found for $prefix${NC}"
+          return 0
+        fi
+        
+        echo -e "${YELLOW}Found $COUNT secrets with prefix $prefix, cleaning up...${NC}"
+        
+        # Get all but the newest secret
+        SECRETS_TO_DELETE=$(echo $SECRETS | jq -r '.[0:-1] | .[].Name')
+        
+        # Delete the older secrets
+        for SECRET_NAME in $SECRETS_TO_DELETE; do
+          echo -e "Force deleting ${YELLOW}$SECRET_NAME${NC}"
+          aws secretsmanager delete-secret \
+            --secret-id "$SECRET_NAME" \
+            --force-delete-without-recovery \
+            --region ${var.region} >/dev/null 2>&1 || echo -e "${RED}Failed to delete $SECRET_NAME${NC}"
+        done
+      }
+      
+      # Check each prefix
+      for prefix in "${DEV_PREFIXES[@]}" "${PROD_PREFIXES[@]}"; do
+        check_duplicate_secrets "$prefix"
+      done
+      
+      echo -e "${GREEN}Secret cleanup complete${NC}"
+    EOT
+  }
+}
+
 # Resource to ensure proper initialization before anything else runs
 resource "terraform_data" "init_environment" {
+  depends_on = [terraform_data.manage_secrets]
+  
   # This will run on every apply
   triggers_replace = {
     # Always run at the beginning of every terraform apply
@@ -25,7 +119,7 @@ apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://placeholder:6443
+    server: https://kubernetes.default.svc:6443
     insecure-skip-tls-verify: true
   name: kubernetes
 contexts:
@@ -43,135 +137,97 @@ EOF
 
       chmod 600 "${path.module}/kubeconfig.yml"
       echo "Valid kubeconfig created successfully"
+      
+      # Validate the kubeconfig
+      echo "Validating kubeconfig.yml..."
+      
+      # Check for placeholder server
+      if grep -q "placeholder:6443" "${path.module}/kubeconfig.yml"; then
+          echo "Found placeholder server, fixing..."
+          sed -i.bak 's|server: https://placeholder:6443|server: https://kubernetes.default.svc:6443|g' "${path.module}/kubeconfig.yml"
+          echo "Fixed server URL in kubeconfig.yml"
+      fi
+      
+      # Basic validation using grep
+      MISSING_FIELDS=0
+      
+      grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || { echo "Missing apiVersion"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      grep -q "clusters:" "${path.module}/kubeconfig.yml" || { echo "Missing clusters"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      grep -q "contexts:" "${path.module}/kubeconfig.yml" || { echo "Missing contexts"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      grep -q "current-context:" "${path.module}/kubeconfig.yml" || { echo "Missing current-context"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      grep -q "users:" "${path.module}/kubeconfig.yml" || { echo "Missing users"; MISSING_FIELDS=$((MISSING_FIELDS+1)); }
+      
+      if [ $MISSING_FIELDS -eq 0 ]; then
+          echo "All required fields are present"
+      else
+          echo "$MISSING_FIELDS required fields are missing, recreating kubeconfig"
+          cat > "${path.module}/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://kubernetes.default.svc:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOF
+      fi
+      
+      # Check current-context
+      CONTEXT=$(grep "current-context:" "${path.module}/kubeconfig.yml" | awk '{print $2}')
+      echo "Current context is: $CONTEXT"
+      
+      # Ensure kubernetes-admin@kubernetes is the context
+      if [ "$CONTEXT" != "kubernetes-admin@kubernetes" ]; then
+          echo "Incorrect context, fixing..."
+          sed -i.bak 's|current-context: .*|current-context: kubernetes-admin@kubernetes|g' "${path.module}/kubeconfig.yml"
+          echo "Fixed current-context in kubeconfig.yml"
+      fi
+      
+      echo "kubeconfig.yml is ready for use"
     EOT
   }
 }
 
-# Create a bootstrap kubeconfig file for Kubernetes provider initialization
-resource "local_file" "bootstrap_kubeconfig" {
-  # Always create/update the kubeconfig file to ensure it's valid
-  count    = 1
-  filename = "${path.module}/kubeconfig.yml"
-  content  = <<-EOT
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-EOT
-
-  # Use provisioner to run a script that checks and fixes the kubeconfig
-  provisioner "local-exec" {
-    command = <<-EOF
-      #!/bin/bash
-      # Verify the kubeconfig file is valid YAML
-      if [ -f "${path.module}/kubeconfig.yml" ]; then
-        echo "Checking kubeconfig format..."
-        
-        # Make a backup copy first
-        cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.bak" 2>/dev/null || true
-        
-        # Clean the file of any Windows line endings or other strange characters
-        tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
-        mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
-        
-              # Use yq or python if available to validate and fix
-      if command -v python3 >/dev/null 2>&1; then
-        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
-        python3 -c "
-import sys
-import yaml
-import json
-import os
-
-kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
-if kubeconfig_path is None:
-    kubeconfig_path = '${path.module}/kubeconfig.yml'
-    print(f'Using hardcoded path: {kubeconfig_path}')
-
-try:
-    with open(kubeconfig_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    if not isinstance(config, dict) or 'apiVersion' not in config:
-        print('Invalid kubeconfig - missing apiVersion')
-        sys.exit(1)
-        
-    # Rewrite with clean formatting
-    with open(kubeconfig_path, 'w') as f:
-        yaml.dump(config, f)
-    print('kubeconfig validated and reformatted')
-except Exception as e:
-    print(f'Error parsing kubeconfig: {e}')
-    # Create a minimal valid kubeconfig
-    with open(kubeconfig_path, 'w') as f:
-        f.write('''apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-''')
-    print('Created fallback kubeconfig due to invalid format')
-" || echo "Python validation failed, using fallback"
-        fi
-      fi
-    EOF
-  }
-
-  # Only create this file if it doesn't already exist
-  lifecycle {
-    prevent_destroy = false
-  }
-}
-
-# Specific resource to validate the kubeconfig before the providers run
-resource "null_resource" "validate_kubeconfig" {
-  depends_on = [local_file.bootstrap_kubeconfig]
+# Wait for Kubernetes API to be fully available
+resource "null_resource" "wait_for_kubernetes" {
+  depends_on = [module.k8s-cluster, terraform_data.init_environment]
   
-  # Run this every time to ensure the kubeconfig is valid
   triggers = {
-    always_run = timestamp()
+    # Use formatdate instead of raw timestamp to avoid changing on every apply
+    timestamp = formatdate("YYYY-MM-DD", timestamp())
+    # Only use instance_id and avoid any file hash references
+    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
   }
   
+  # Add a simplified provisioner to validate the kubeconfig
   provisioner "local-exec" {
-    command = <<-EOF
-      #!/bin/bash
+    command = <<EOT
+      echo "Validating generated kubeconfig..."
       
-      # If kubeconfig doesn't exist, create a minimal valid one
-      if [ ! -f "${path.module}/kubeconfig.yml" ]; then
-        echo "kubeconfig.yml not found, creating minimal valid config"
-        cat > "${path.module}/kubeconfig.yml" << 'KUBECFG'
+      # Clean any Windows line endings
+      tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
+      mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
+      
+      # Validate kubeconfig format using basic checks
+      if ! grep -q "apiVersion: v1" "${path.module}/kubeconfig.yml"; then
+        echo "Invalid kubeconfig, recreating..."
+        cat > "${path.module}/kubeconfig.yml" << 'FALLBACK'
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://placeholder:6443
+    server: https://kubernetes.default.svc:6443
     insecure-skip-tls-verify: true
   name: kubernetes
 contexts:
@@ -185,188 +241,83 @@ users:
   user:
     client-certificate-data: cGxhY2Vob2xkZXI=
     client-key-data: cGxhY2Vob2xkZXI=
-KUBECFG
+FALLBACK
       fi
       
-      # Verify the kubeconfig file has the required fields
-      grep -q "apiVersion" "${path.module}/kubeconfig.yml" || {
-        echo "apiVersion not found in kubeconfig, recreating file"
-        cat > "${path.module}/kubeconfig.yml" << 'KUBECFG'
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-KUBECFG
-      }
+      # Update the server URL if needed
+      if grep -q "placeholder:6443" "${path.module}/kubeconfig.yml"; then
+        echo "Found placeholder server, fixing..."
+        sed -i.bak 's|server: https://placeholder:6443|server: https://kubernetes.default.svc:6443|g' "${path.module}/kubeconfig.yml"
+      fi
       
-      echo "kubeconfig.yml validation complete"
-    EOF
+      # Ensure current-context is correct
+      if ! grep -q "current-context: kubernetes-admin@kubernetes" "${path.module}/kubeconfig.yml"; then
+        echo "Incorrect context, fixing..."
+        sed -i.bak 's|current-context: .*|current-context: kubernetes-admin@kubernetes|g' "${path.module}/kubeconfig.yml"
+      fi
+      
+      echo "Kubeconfig validation complete"
+EOT
   }
 }
 
-# Add a preprocess step that ensures Kubernetes providers have valid config to start with
-resource "terraform_data" "kubeconfig_preprocess" {
-  depends_on = [null_resource.validate_kubeconfig]
+# Configure kubectl provider with credentials after waiting for the API to be ready
+resource "terraform_data" "kubectl_provider_config" {
+  depends_on = [null_resource.wait_for_kubernetes]
   
-  # Run this before any Kubernetes provider operations
+  # This ensures we rebuild when kubeconfig changes, not on every apply
+  triggers_replace = {
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
+    # Add a checksum of the kubeconfig file to track content changes
+    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "none"
+  }
+
+  # Force provision step to ensure consistency between kubeconfig and the API server
   provisioner "local-exec" {
     command = <<-EOT
-#!/bin/bash
-echo "Running kubeconfig preprocessing..."
-
-# Ensure the file exists and has proper permissions
-touch "${path.module}/kubeconfig.yml"
-chmod 600 "${path.module}/kubeconfig.yml"
-
-# Clean the file to ensure it's proper YAML
-if [ -s "${path.module}/kubeconfig.yml" ]; then
-  # Make a backup
-  cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.bak" 2>/dev/null || true
-  
-  # Remove any BOM characters, Windows line endings, and other problematic characters
-  cat "${path.module}/kubeconfig.yml" | tr -d '\r' | sed 's/^\xEF\xBB\xBF//' > "${path.module}/kubeconfig.tmp.yml"
-  mv "${path.module}/kubeconfig.tmp.yml" "${path.module}/kubeconfig.yml"
-  
-  # Create a Python script file for validation
-  cat > "${path.module}/validate_kubeconfig.py" << 'PYTHONEOF'
-import sys
-import yaml
-import os
-
-try:
-    # Get kubeconfig path from command line argument
-    kubeconfig_path = sys.argv[1]
-    with open(kubeconfig_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Ensure it has the required fields
-    if not isinstance(config, dict) or "apiVersion" not in config:
-        raise ValueError("Invalid kubeconfig structure")
-    
-    # Write it back in clean format
-    with open(kubeconfig_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    print("Kubeconfig validated and cleaned")
-    
-except Exception as e:
-    print(f"Error: {e}")
-    print("Creating a minimal valid kubeconfig")
-    minimal_config = """apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-"""
-    with open(kubeconfig_path, 'w') as f:
-        f.write(minimal_config)
-PYTHONEOF
-
-  # Run the Python script if available
-  if command -v python3 &>/dev/null; then
-    echo "Validating with Python script"
-    # Run the script with environment variables for better reliability
-    PYTHONIOENCODING=utf-8 python3 "${path.module}/validate_kubeconfig.py" "${path.module}/kubeconfig.yml" || {
-      echo "Python validation failed, creating minimal kubeconfig"
-      cat > "${path.module}/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-EOF
-    }
-  else
-    echo "Python not available, manually verifying kubeconfig"
-    # Manual verification - ensure it has apiVersion at minimum
-    if ! grep -q "apiVersion" "${path.module}/kubeconfig.yml"; then
-      echo "Creating minimal valid kubeconfig"
-      cat > "${path.module}/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-EOF
-    fi
-  fi
-else
-  echo "Empty kubeconfig, creating minimal valid file"
-  cat > "${path.module}/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: cGxhY2Vob2xkZXI=
-    client-key-data: cGxhY2Vob2xkZXI=
-EOF
-fi
-
-echo "Kubeconfig preprocessing complete"
+      # Get the control plane's current IP
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      if [ -z "$INSTANCE_ID" ]; then
+        echo "WARNING: Could not find control plane instance. Will try to continue."
+        PUBLIC_IP="placeholder"
+      else
+        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        echo "Control plane public IP: $PUBLIC_IP"
+      fi
+      
+      # Make sure the kubeconfig file exists
+      if [ ! -f "${path.module}/kubeconfig.yml" ]; then
+        echo "ERROR: kubeconfig.yml not found!"
+        exit 1
+      fi
+      
+      # Validate the kubeconfig format with basic checks
+      if ! grep -q "apiVersion:" "${path.module}/kubeconfig.yml"; then
+        echo "ERROR: kubeconfig doesn't contain apiVersion field"
+        exit 1
+      fi
+      
+      # Update kubeconfig with current IP
+      if [ -f "${path.module}/kubeconfig.yml" ]; then
+        if [ "$PUBLIC_IP" != "placeholder" ]; then
+          sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
+          echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+        else
+          echo "Skipping kubeconfig IP update as no instance was found"
+        fi
+      fi
+      
+      # Verify we can connect using the kubeconfig
+      if command -v kubectl &> /dev/null; then
+        echo "Testing kubectl connectivity with the kubeconfig..."
+        KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s || {
+          echo "Warning: Could not connect to the cluster with kubectl"
+        }
+      else
+        echo "Warning: kubectl not available for connectivity testing"
+      fi
+      
+      echo "Script completed successfully"
     EOT
   }
 }
@@ -446,166 +397,6 @@ module "k8s-cluster" {
 
   # Start with the initialization resource that creates a valid kubeconfig
   depends_on = [terraform_data.init_environment, null_resource.validate_kubeconfig, terraform_data.kubeconfig_preprocess]
-}
-
-# Wait for Kubernetes API to be fully available
-resource "null_resource" "wait_for_kubernetes" {
-  depends_on = [module.k8s-cluster, local_file.bootstrap_kubeconfig, null_resource.validate_kubeconfig]
-  
-  triggers = {
-    # Use formatdate instead of raw timestamp to avoid changing on every apply
-    timestamp = formatdate("YYYY-MM-DD", timestamp())
-    # Only use instance_id and avoid any file hash references
-    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
-  }
-  
-  # Add a second provisioner to validate the kubeconfig after it's been created
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      # Set a timeout for the entire script (300 seconds = 5 minutes)
-      trap 'echo "Script timed out after 5 minutes"; exit 1' ALRM
-      perl -e 'alarm(300); exec @ARGV' "$SHELL" -c '
-      
-      # Wait for the kubeconfig file to be created first
-      if [ -f "${path.module}/kubeconfig.yml" ]; then
-        echo "Validating generated kubeconfig..."
-        
-        # Make a backup of the file
-        cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.original" || true
-        
-        # Clean any Windows line endings
-        tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
-        mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
-        
-              # Verify the file is valid YAML
-      if command -v python3 &> /dev/null; then
-        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
-        python3 -c "
-import yaml
-import sys
-import os
-
-kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
-if kubeconfig_path is None:
-    kubeconfig_path = '${path.module}/kubeconfig.yml'
-    print(f'Using hardcoded path: {kubeconfig_path}')
-
-try:
-    with open(kubeconfig_path, 'r') as f:
-        config = yaml.safe_load(f)
-    print('Valid YAML in kubeconfig')
-    # Write back with clean formatting
-    with open(kubeconfig_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-except Exception as e:
-    print(f'Error validating kubeconfig: {e}')
-    sys.exit(1)
-"
-      fi
-    else
-      echo "kubeconfig.yml not found, script did not create it"
-    fi
-    
-    # End of timeout-managed command
-    '
-    EOT
-  }
-}
-
-# Configure kubectl provider with credentials after waiting for the API to be ready
-resource "terraform_data" "kubectl_provider_config" {
-  depends_on = [null_resource.wait_for_kubernetes]
-  
-  # This ensures we rebuild when kubeconfig changes, not on every apply
-  triggers_replace = {
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
-    # Add a checksum of the kubeconfig file to track content changes
-    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "none"
-  }
-
-  # Force provision step to ensure consistency between kubeconfig and the API server
-  provisioner "local-exec" {
-    command = <<-EOT
-      # Get the control plane's current IP
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      if [ -z "$INSTANCE_ID" ]; then
-        echo "WARNING: Could not find control plane instance. Will try to continue."
-        PUBLIC_IP="placeholder"
-      else
-        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-        echo "Control plane public IP: $PUBLIC_IP"
-      fi
-      
-      # Make sure the kubeconfig file exists
-      if [ ! -f "${path.module}/kubeconfig.yml" ]; then
-        echo "ERROR: kubeconfig.yml not found!"
-        exit 1
-      fi
-      
-      # Validate the kubeconfig format
-      if command -v python3 &> /dev/null; then
-        echo "Validating kubeconfig format with Python..."
-        export KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
-        python3 -c "
-import yaml
-import os
-import sys
-
-kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
-if kubeconfig_path is None:
-    kubeconfig_path = '${path.module}/kubeconfig.yml'
-    print(f'Using hardcoded path: {kubeconfig_path}')
-
-with open(kubeconfig_path, 'r') as f:
-    config = yaml.safe_load(f)
-print('✅ Valid kubeconfig with version:', config.get('apiVersion'))
-" || {
-          echo "⚠️ Kubeconfig validation failed, attempting to fix..."
-          # Simple attempt to fix common issues
-          cat "${path.module}/kubeconfig.yml" | tr -d '\r' > "${path.module}/kubeconfig.fixed.yml"
-          mv "${path.module}/kubeconfig.fixed.yml" "${path.module}/kubeconfig.yml"
-          python3 -c "import yaml; import os; yaml.safe_load(open(os.environ.get('KUBECONFIG_PATH'))); print('✅ Fixed kubeconfig format')" || {
-            echo "❌ Could not fix kubeconfig format automatically"
-            echo "------- Current content of kubeconfig.yml -------"
-            cat "${path.module}/kubeconfig.yml" | head -20
-            echo "-----------------------------------------------"
-            exit 1
-          }
-        }
-      else
-        echo "Warning: Python not available for YAML validation"
-        # Simple validation with grep
-        grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || {
-          echo "ERROR: kubeconfig doesn't contain apiVersion field"
-          exit 1
-        }
-      fi
-      
-      # Update kubeconfig with current IP
-      if [ -f "${path.module}/kubeconfig.yml" ]; then
-        if [ "$PUBLIC_IP" != "placeholder" ]; then
-          sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
-          echo "Updated kubeconfig to use IP: $PUBLIC_IP"
-        else
-          echo "Skipping kubeconfig IP update as no instance was found"
-        fi
-      fi
-      
-      # Verify we can connect using the kubeconfig
-      if command -v kubectl &> /dev/null; then
-        echo "Testing kubectl connectivity with the kubeconfig..."
-        KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s || {
-          echo "Warning: Could not connect to the cluster with kubectl"
-        }
-      else
-        echo "Warning: kubectl not available for connectivity testing"
-      fi
-      
-      # Add timeout handling in bash instead
-      echo "Script completed successfully"
-    EOT
-  }
 }
 
 # Install EBS CSI Driver for persistent storage
