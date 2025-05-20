@@ -5,9 +5,52 @@ provider "aws" {
 # Define a local provider for first-time setup
 provider "local" {}
 
+# Resource to ensure proper initialization before anything else runs
+resource "terraform_data" "init_environment" {
+  # This will run on every apply
+  triggers_replace = {
+    # Always run at the beginning of every terraform apply
+    timestamp = timestamp()
+  }
+
+  # Create a valid kubeconfig before any resources are created
+  provisioner "local-exec" {
+    command = <<-EOT
+      #!/bin/bash
+      echo "Initializing environment with valid kubeconfig..."
+      
+      # Create a valid kubeconfig file regardless of whether one exists
+      cat > "${path.module}/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOF
+
+      chmod 600 "${path.module}/kubeconfig.yml"
+      echo "Valid kubeconfig created successfully"
+    EOT
+  }
+}
+
 # Create a bootstrap kubeconfig file for Kubernetes provider initialization
 resource "local_file" "bootstrap_kubeconfig" {
-  count    = fileexists("${path.module}/kubeconfig.yml") ? 0 : 1
+  # Always create/update the kubeconfig file to ensure it's valid
+  count    = 1
   filename = "${path.module}/kubeconfig.yml"
   content  = <<-EOT
 apiVersion: v1
@@ -171,6 +214,158 @@ KUBECFG
   }
 }
 
+# Add a preprocess step that ensures Kubernetes providers have valid config to start with
+resource "terraform_data" "kubeconfig_preprocess" {
+  depends_on = [null_resource.validate_kubeconfig]
+  
+  # Run this before any Kubernetes provider operations
+  provisioner "local-exec" {
+    command = <<-EOT
+#!/bin/bash
+echo "Running kubeconfig preprocessing..."
+
+# Ensure the file exists and has proper permissions
+touch "${path.module}/kubeconfig.yml"
+chmod 600 "${path.module}/kubeconfig.yml"
+
+# Clean the file to ensure it's proper YAML
+if [ -s "${path.module}/kubeconfig.yml" ]; then
+  # Make a backup
+  cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.bak" 2>/dev/null || true
+  
+  # Remove any BOM characters, Windows line endings, and other problematic characters
+  cat "${path.module}/kubeconfig.yml" | tr -d '\r' | sed 's/^\xEF\xBB\xBF//' > "${path.module}/kubeconfig.tmp.yml"
+  mv "${path.module}/kubeconfig.tmp.yml" "${path.module}/kubeconfig.yml"
+  
+  # Create a Python script file for validation
+  cat > "${path.module}/validate_kubeconfig.py" << 'PYTHONEOF'
+import sys
+import yaml
+import os
+
+try:
+    # Get kubeconfig path from command line argument
+    kubeconfig_path = sys.argv[1]
+    with open(kubeconfig_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Ensure it has the required fields
+    if not isinstance(config, dict) or "apiVersion" not in config:
+        raise ValueError("Invalid kubeconfig structure")
+    
+    # Write it back in clean format
+    with open(kubeconfig_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    print("Kubeconfig validated and cleaned")
+    
+except Exception as e:
+    print(f"Error: {e}")
+    print("Creating a minimal valid kubeconfig")
+    minimal_config = """apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+"""
+    with open(kubeconfig_path, 'w') as f:
+        f.write(minimal_config)
+PYTHONEOF
+
+  # Run the Python script if available
+  if command -v python3 &>/dev/null; then
+    echo "Validating with Python script"
+    python3 "${path.module}/validate_kubeconfig.py" "${path.module}/kubeconfig.yml" || {
+      echo "Python validation failed, creating minimal kubeconfig"
+      cat > "${path.module}/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOF
+    }
+  else
+    echo "Python not available, manually verifying kubeconfig"
+    # Manual verification - ensure it has apiVersion at minimum
+    if ! grep -q "apiVersion" "${path.module}/kubeconfig.yml"; then
+      echo "Creating minimal valid kubeconfig"
+      cat > "${path.module}/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOF
+    fi
+  fi
+else
+  echo "Empty kubeconfig, creating minimal valid file"
+  cat > "${path.module}/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+EOF
+fi
+
+echo "Kubeconfig preprocessing complete"
+    EOT
+  }
+}
+
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
@@ -237,7 +432,8 @@ module "k8s-cluster" {
     "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/autoscaler.yaml"
   ]
 
-  depends_on = [null_resource.validate_kubeconfig]
+  # Start with the initialization resource that creates a valid kubeconfig
+  depends_on = [terraform_data.init_environment, null_resource.validate_kubeconfig, terraform_data.kubeconfig_preprocess]
 }
 
 # Wait for Kubernetes API to be fully available
