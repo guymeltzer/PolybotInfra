@@ -1,12 +1,3 @@
-terraform {
-  backend "s3" {
-    bucket  = "guy-terraform-state"
-    key     = "polybot-infra/terraform.tfstate"
-    region  = "us-east-1"
-    encrypt = true
-  }
-}
-
 provider "aws" {
   region = var.region
 }
