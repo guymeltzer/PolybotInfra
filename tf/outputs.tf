@@ -91,3 +91,8 @@ output "argocd_applications" {
   value       = try(module.argocd.applications, {})
   sensitive   = true
 }
+
+output "ssh_key_name" {
+  value       = var.key_name
+  description = "SSH key name used for the instances"
+}
