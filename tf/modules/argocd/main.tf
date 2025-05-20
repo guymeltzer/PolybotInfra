@@ -15,17 +15,18 @@ terraform {
   }
 }
 
-resource "kubernetes_namespace" "argocd" {
-  metadata {
-    name = "argocd"
-  }
-}
+# The argocd namespace is now created in the parent module using kubectl directly
+# resource "kubernetes_namespace" "argocd" {
+#   metadata {
+#     name = "argocd"
+#   }
+# }
 
 resource "helm_release" "argocd" {
   name       = "argocd"
   repository = "https://argoproj.github.io/argo-helm"
   chart      = "argo-cd"
-  namespace  = kubernetes_namespace.argocd.metadata[0].name
+  namespace  = "argocd"  # Use string directly instead of referencing the removed resource
   version    = "5.51.4"  # Specify a stable version
 
   values = [
