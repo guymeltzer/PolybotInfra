@@ -311,7 +311,6 @@ provider "helm" {
 provider "kubectl" {
   config_path = "${path.module}/kubeconfig.yml"
   load_config_file = true
-  insecure_skip_tls_verify = true # Explicitly skip TLS verification
 }
 
 # Create Kubernetes namespaces for dev and prod
