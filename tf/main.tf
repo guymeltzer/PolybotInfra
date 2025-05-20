@@ -120,8 +120,7 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    username: admin
-    password: admin
+    token: "dummy-token-for-testing"
 EOF
 
       chmod 600 "${path.module}/kubeconfig.yml"
@@ -167,8 +166,7 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    username: admin
-    password: admin
+    token: "dummy-token-for-testing"
 EOF
       fi
       
@@ -229,8 +227,7 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: kubernetes-admin
   user:
-    username: admin
-    password: admin
+    token: "dummy-token-for-testing"
 FALLBACK
       fi
       
@@ -244,6 +241,14 @@ FALLBACK
       if ! grep -q "current-context: kubernetes-admin@kubernetes" "${path.module}/kubeconfig.yml"; then
         echo "Incorrect context, fixing..."
         sed -i.bak 's|current-context: .*|current-context: kubernetes-admin@kubernetes|g' "${path.module}/kubeconfig.yml"
+      fi
+      
+      # Ensure token-based authentication
+      if grep -q "username:" "${path.module}/kubeconfig.yml"; then
+        echo "Found username/password auth, switching to token-based auth..."
+        sed -i.bak '/username:/d' "${path.module}/kubeconfig.yml"
+        sed -i.bak '/password:/d' "${path.module}/kubeconfig.yml"
+        sed -i.bak '/user:/a\\    token: "dummy-token-for-testing"' "${path.module}/kubeconfig.yml"
       fi
       
       echo "Kubeconfig validation complete"
@@ -299,6 +304,14 @@ resource "terraform_data" "kubectl_provider_config" {
         fi
       fi
       
+      # Ensure we're using token-based auth
+      if grep -q "username:" "${path.module}/kubeconfig.yml"; then
+        echo "Converting username/password auth to token-based auth..."
+        sed -i.bak '/username:/d' "${path.module}/kubeconfig.yml"
+        sed -i.bak '/password:/d' "${path.module}/kubeconfig.yml"
+        sed -i.bak '/user:/a\\    token: "dummy-token-for-testing"' "${path.module}/kubeconfig.yml"
+      fi
+      
       # Verify we can connect using the kubeconfig
       if command -v kubectl &> /dev/null; then
         echo "Testing kubectl connectivity with the kubeconfig..."
@@ -327,6 +340,8 @@ provider "kubernetes" {
   config_path    = "${path.module}/kubeconfig.yml"
   host           = "https://${local.control_plane_ip}:6443"
   insecure       = true
+  # Use token-based authentication
+  token          = "dummy-token-for-testing"
   # Skip TLS verification entirely
   client_certificate     = ""
   client_key             = ""
@@ -339,6 +354,8 @@ provider "helm" {
     config_path    = "${path.module}/kubeconfig.yml"
     host           = "https://${local.control_plane_ip}:6443"
     insecure       = true
+    # Use token-based authentication
+    token          = "dummy-token-for-testing"
     # Skip TLS verification entirely
     client_certificate     = ""
     client_key             = ""
@@ -352,15 +369,16 @@ provider "kubectl" {
   host             = "https://${local.control_plane_ip}:6443"
   load_config_file = true
   insecure         = true
+  token            = "dummy-token-for-testing"
   client_certificate     = ""
   client_key             = ""
   cluster_ca_certificate = ""
   
-  # Skip TLS verification completely to avoid certificate parsing
+  # Token-based authentication
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "echo"
-    args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token\"}}"]
+    args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token-for-testing\"}}"]
   }
 }
 
