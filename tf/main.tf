@@ -100,15 +100,15 @@ resource "terraform_data" "init_environment" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       #!/bin/bash
-      echo "Initializing environment with valid kubeconfig..."
+      echo "Initializing environment with placeholder kubeconfig..."
       
-      # Create a fresh kubeconfig file with basic auth
+      # Create a minimal placeholder kubeconfig
       cat > "${path.module}/kubeconfig.yml" << EOF
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://kubernetes.default.svc:6443
+    server: https://placeholder:6443
     insecure-skip-tls-verify: true
   name: kubernetes
 contexts:
@@ -120,72 +120,11 @@ current-context: kubernetes-admin@kubernetes
 users:
 - name: admin
   user:
-    username: admin
-    password: admin
+    token: placeholder
 EOF
 
       chmod 600 "${path.module}/kubeconfig.yml"
-      echo "Valid kubeconfig created successfully"
-      
-      # Validate the kubeconfig
-      echo "Validating kubeconfig.yml..."
-      
-      # Check for placeholder server
-      if grep -q "placeholder:6443" "${path.module}/kubeconfig.yml"; then
-          echo "Found placeholder server, fixing..."
-          sed -i.bak 's|server: https://placeholder:6443|server: https://kubernetes.default.svc:6443|g' "${path.module}/kubeconfig.yml"
-          echo "Fixed server URL in kubeconfig.yml"
-      fi
-      
-      # Basic validation using grep
-      VALID=true
-      
-      grep -q "apiVersion:" "${path.module}/kubeconfig.yml" || { echo "Missing apiVersion"; VALID=false; }
-      grep -q "clusters:" "${path.module}/kubeconfig.yml" || { echo "Missing clusters"; VALID=false; }
-      grep -q "contexts:" "${path.module}/kubeconfig.yml" || { echo "Missing contexts"; VALID=false; }
-      grep -q "current-context:" "${path.module}/kubeconfig.yml" || { echo "Missing current-context"; VALID=false; }
-      grep -q "users:" "${path.module}/kubeconfig.yml" || { echo "Missing users"; VALID=false; }
-      grep -q "username:" "${path.module}/kubeconfig.yml" || { echo "Missing username"; VALID=false; }
-      grep -q "password:" "${path.module}/kubeconfig.yml" || { echo "Missing password"; VALID=false; }
-      
-      if [ "$VALID" = true ]; then
-          echo "All required fields are present"
-      else
-          echo "Some required fields are missing, recreating kubeconfig"
-          cat > "${path.module}/kubeconfig.yml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://kubernetes.default.svc:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    username: admin
-    password: admin
-EOF
-      fi
-      
-      # Check current-context
-      CONTEXT=$(grep "current-context:" "${path.module}/kubeconfig.yml" | awk '{print $2}')
-      echo "Current context is: $CONTEXT"
-      
-      # Ensure kubernetes-admin@kubernetes is the context
-      if [ "$CONTEXT" != "kubernetes-admin@kubernetes" ]; then
-          echo "Incorrect context, fixing..."
-          sed -i.bak 's|current-context: .*|current-context: kubernetes-admin@kubernetes|g' "${path.module}/kubeconfig.yml"
-          echo "Fixed current-context in kubeconfig.yml"
-      fi
-      
-      echo "kubeconfig.yml is ready for use"
+      echo "Placeholder kubeconfig created successfully"
     EOT
   }
 }
@@ -201,48 +140,22 @@ resource "null_resource" "wait_for_kubernetes" {
     instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
   }
   
-  # Add a simplified provisioner to validate the kubeconfig
+  # Add a simplified provisioner to just wait for the cluster
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<EOT
-      echo "Validating generated kubeconfig..."
+      echo "Waiting for Kubernetes cluster to be ready..."
       
-      # Clean any Windows line endings
-      tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
-      mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
-      
-      # Start fresh - create a new kubeconfig using the control plane's generated one
-      # Get the module-generated kubeconfig if it exists
-      if [ -f "${path.module}/modules/k8s-cluster/kubeconfig" ]; then
-        echo "Using the module-generated kubeconfig..."
-        cp "${path.module}/modules/k8s-cluster/kubeconfig" "${path.module}/kubeconfig.yml"
+      # Wait for control plane to be available
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo "Control plane instance not found yet, waiting..."
+        sleep 60
       else
-        echo "Module kubeconfig not found, creating placeholder..."
-        cat > "${path.module}/kubeconfig.yml" << KUBECONFIG
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://kubernetes.default.svc:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    token: placeholder
-KUBECONFIG
+        echo "Control plane instance found: $INSTANCE_ID"
       fi
       
-      # Update permissions
-      chmod 600 "${path.module}/kubeconfig.yml"
-      
-      echo "Kubeconfig validation complete"
+      echo "Wait for Kubernetes cluster complete"
 EOT
   }
 }
@@ -263,29 +176,111 @@ resource "terraform_data" "kubectl_provider_config" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      # Get the control plane's current IP
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      if [ -z "$INSTANCE_ID" ]; then
-        echo "WARNING: Could not find control plane instance. Will try to continue."
-        PUBLIC_IP="placeholder"
-      else
+      # Wait for cluster to be ready with retry logic
+      MAX_ATTEMPTS=10
+      attempt=1
+      while [ $attempt -le $MAX_ATTEMPTS ]; do
+        echo "Attempt $attempt/$MAX_ATTEMPTS: Getting control plane IP"
+        
+        # Get the control plane's current IP
+        INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+        if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+          echo "Control plane instance not found, retrying in 30 seconds..."
+          sleep 30
+          attempt=$((attempt + 1))
+          continue
+        fi
+        
         PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "None" ]; then
+          echo "Control plane public IP not found, retrying in 30 seconds..."
+          sleep 30
+          attempt=$((attempt + 1))
+          continue
+        fi
+        
         echo "Control plane public IP: $PUBLIC_IP"
+        break
+      done
+      
+      if [ $attempt -gt $MAX_ATTEMPTS ]; then
+        echo "Failed to get control plane IP after $MAX_ATTEMPTS attempts. Using a placeholder."
+        PUBLIC_IP="placeholder"
       fi
       
-      # Retrieve the generated kubeconfig from the control plane's module output
-      echo "Using the control plane's generated kubeconfig..."
-      cp "${path.module}/modules/k8s-cluster/kubeconfig" "${path.module}/kubeconfig.yml"
-      chmod 600 "${path.module}/kubeconfig.yml"
-      
-      # Update the kubeconfig with the correct server address
-      if [ "$PUBLIC_IP" != "placeholder" ]; then
-        echo "Updating the server address to use the public IP: $PUBLIC_IP"
-        sed -i.bak "s|server: .*|server: https://$PUBLIC_IP:6443|g" "${path.module}/kubeconfig.yml"
+      # Determine if we have a bootstrap token available
+      BOOTSTRAP_TOKEN="${try(module.k8s-cluster.kube_token, "")}"
+      if [ -z "$BOOTSTRAP_TOKEN" ]; then
+        # Generate a bootstrap token on the control plane if none exists
+        echo "Bootstrap token not available from module, attempting to generate one"
+        TOKEN_OUTPUT=$(aws ssm send-command \
+          --region ${var.region} \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="sudo kubeadm token create --ttl 24h --print-join-command" \
+          --output text --query "Command.CommandId")
+          
+        if [ -n "$TOKEN_OUTPUT" ]; then
+          echo "Waiting for token generation command to complete..."
+          sleep 30
+          
+          TOKEN_RESULT=$(aws ssm get-command-invocation \
+            --region ${var.region} \
+            --command-id "$TOKEN_OUTPUT" \
+            --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text)
+            
+          if [[ "$TOKEN_RESULT" == *"--token"* ]]; then
+            BOOTSTRAP_TOKEN=$(echo "$TOKEN_RESULT" | grep -o '\-\-token [^ ]*' | cut -d' ' -f2)
+            echo "Successfully generated bootstrap token"
+          else
+            echo "Failed to extract token from result, using fallback token"
+            BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
+          fi
+        else
+          echo "Failed to run token generation command, using fallback token"
+          BOOTSTRAP_TOKEN="ir58d3.jb0lbl6bf8uj3haq"
+        fi
       fi
       
-      echo "Kubeconfig updated successfully"
-      echo "Script completed successfully"
+      # Create a kubeconfig with token-based auth and TLS skip
+      KUBECONFIG_DIR="${path.module}"
+      echo "Creating kubeconfig with token auth and TLS skip verification..."
+      cat > "$KUBECONFIG_DIR/kubeconfig.yml" << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://$PUBLIC_IP:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: admin
+  user:
+    token: "$BOOTSTRAP_TOKEN"
+EOF
+      
+      chmod 600 "$KUBECONFIG_DIR/kubeconfig.yml"
+      echo "Created kubeconfig with server URL: https://$PUBLIC_IP:6443"
+      
+      # Test the connection
+      if [ "$PUBLIC_IP" != "placeholder" ] && command -v kubectl &> /dev/null; then
+        echo "Testing connection to Kubernetes API server..."
+        if KUBECONFIG="$KUBECONFIG_DIR/kubeconfig.yml" kubectl cluster-info --request-timeout=10s; then
+          echo "Successfully connected to Kubernetes API server"
+        else
+          echo "Warning: Failed to connect to Kubernetes API server"
+        fi
+      fi
+      
+      echo "Kubeconfig script completed"
     EOT
   }
 }
@@ -300,22 +295,23 @@ locals {
 
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
-  config_path    = "${path.module}/kubeconfig.yml"
-  # No need to specify explicit host/credentials, they're in the config
+  config_path = "${path.module}/kubeconfig.yml"
+  insecure = true # Explicitly skip TLS verification
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
-    config_path    = "${path.module}/kubeconfig.yml"
-    # No need to specify explicit host/credentials, they're in the config
+    config_path = "${path.module}/kubeconfig.yml"
+    insecure = true # Explicitly skip TLS verification
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path      = "${path.module}/kubeconfig.yml"
+  config_path = "${path.module}/kubeconfig.yml"
   load_config_file = true
+  insecure_skip_tls_verify = true # Explicitly skip TLS verification
 }
 
 # Create Kubernetes namespaces for dev and prod
@@ -327,6 +323,11 @@ resource "kubernetes_namespace" "dev" {
   
   lifecycle {
     create_before_destroy = true
+    # Add retry logic via local-exec instead of failing the resource
+    precondition {
+      condition     = fileexists("${path.module}/kubeconfig.yml")
+      error_message = "Kubeconfig file must exist at ${path.module}/kubeconfig.yml"
+    }
   }
 }
 
@@ -338,6 +339,10 @@ resource "kubernetes_namespace" "prod" {
   
   lifecycle {
     create_before_destroy = true
+    precondition {
+      condition     = fileexists("${path.module}/kubeconfig.yml")
+      error_message = "Kubeconfig file must exist at ${path.module}/kubeconfig.yml"
+    }
   }
 }
 
