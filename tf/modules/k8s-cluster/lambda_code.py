@@ -129,10 +129,23 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
-        secrets_client.put_secret_value(
-            SecretId='kubernetes-join-command',
-            SecretString=join_command
-        )
+        try:
+            # Try to update the existing secret
+            secrets_client.put_secret_value(
+                SecretId='kubernetes-join-command',
+                SecretString=join_command
+            )
+        except:
+            # If it doesn't exist, create it
+            try:
+                secrets_client.create_secret(
+                    Name='kubernetes-join-command',
+                    Description='Kubernetes join command for worker nodes',
+                    SecretString=join_command
+                )
+            except Exception as sec_err:
+                print(f"Error creating secret: {str(sec_err)}")
+                raise
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
     except Exception as e:
         print(f"Error: {str(e)}")

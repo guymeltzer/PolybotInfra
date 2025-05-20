@@ -126,12 +126,27 @@ sed -i '/swap/d' /etc/fstab
 systemctl daemon-reload
 systemctl restart kubelet
 
-# Fetch join command from Secrets Manager
+# Fetch join command from Secrets Manager with retry logic
 echo "$(date) - Fetching join command from Secrets Manager"
-JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id kubernetes-join-command --query SecretString --output text 2>>"$LOGFILE")
+MAX_SECRET_ATTEMPTS=10
+JOIN_COMMAND=""
+
+for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
+  echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
+  
+  JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id kubernetes-join-command --query SecretString --output text 2>>"$LOGFILE" || echo "")
+  
+  if [ -n "$JOIN_COMMAND" ]; then
+    echo "$(date) - Successfully retrieved join command"
+    break
+  else
+    echo "$(date) - Join command not available yet. Waiting to retry..."
+    sleep 30
+  fi
+done
 
 if [ -z "$JOIN_COMMAND" ]; then
-  echo "Failed to retrieve join command from Secrets Manager" >> "$LOGFILE"
+  echo "$(date) - Failed to retrieve join command from Secrets Manager after $MAX_SECRET_ATTEMPTS attempts" >> "$LOGFILE"
   exit 1
 fi
 

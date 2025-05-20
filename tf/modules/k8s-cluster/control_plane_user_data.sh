@@ -114,8 +114,38 @@ echo "$(date) - Creating cluster join command"
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
 
-# Create the secret if it doesn't exist
-aws secretsmanager create-secret --name kubernetes-join-command --region $REGION --secret-string "$JOIN_COMMAND" || \
-  aws secretsmanager put-secret-value --secret-id kubernetes-join-command --secret-string "$JOIN_COMMAND" --region $REGION
+# Create the secret if it doesn't exist, with retry logic
+echo "$(date) - Storing join command in AWS Secrets Manager"
+MAX_SECRET_ATTEMPTS=5
+SECRET_SUCCESS=false
+
+for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
+  echo "$(date) - Secret creation/update attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
+  
+  # Try to create the secret first
+  if aws secretsmanager create-secret --name kubernetes-join-command --region $REGION --secret-string "$JOIN_COMMAND" 2>/dev/null; then
+    echo "$(date) - Successfully created secret"
+    SECRET_SUCCESS=true
+    break
+  else
+    echo "$(date) - Secret may already exist, trying to update it"
+    # If creation fails, try to update it
+    if aws secretsmanager put-secret-value --secret-id kubernetes-join-command --secret-string "$JOIN_COMMAND" --region $REGION 2>/dev/null; then
+      echo "$(date) - Successfully updated secret"
+      SECRET_SUCCESS=true
+      break
+    else
+      echo "$(date) - Failed to update secret. Waiting to retry..."
+      # Delete the secret if it exists but can't be updated
+      aws secretsmanager delete-secret --secret-id kubernetes-join-command --force-delete-without-recovery --region $REGION 2>/dev/null || true
+      sleep 10
+    fi
+  fi
+done
+
+if [ "$SECRET_SUCCESS" != "true" ]; then
+  echo "$(date) - Failed to store join command in AWS Secrets Manager after $MAX_SECRET_ATTEMPTS attempts" >> $LOGFILE
+  # Continue anyway, as this is not fatal to the control plane startup
+fi
 
 echo "$(date) - Kubernetes control plane setup complete!"

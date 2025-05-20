@@ -624,8 +624,10 @@ resource "local_file" "kubeconfig" {
 
 # Secrets Manager for Kubernetes join command
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command-${local.kubeadm_token}"
+  name        = "kubernetes-join-command"
   description = "Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0
+  force_overwrite_replica_secret = true
 }
 
 # Lambda function for node draining and token refresh
