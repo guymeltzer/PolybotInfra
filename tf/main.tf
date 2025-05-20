@@ -25,72 +25,65 @@ resource "terraform_data" "manage_secrets" {
       
       echo -e "${YELLOW}Checking for stale AWS secrets...${NC}"
       
-      # List of secret prefixes to check
-      DEV_PREFIXES=(
-        "guy-polybot-dev-telegram-token"
-        "guy-polybot-dev-docker-credentials" 
-        "guy-polybot-dev-secrets"
-      )
-      
-      PROD_PREFIXES=(
-        "guy-polybot-prod-telegram-token"
-        "guy-polybot-prod-docker-credentials"
-        "guy-polybot-prod-secrets"
-      )
-      
-      # Check if jq is installed
-      if ! command -v jq &> /dev/null; then
-        echo -e "${YELLOW}jq not found, skipping secret cleanup${NC}"
-        exit 0
-      fi
-      
-      # Check if AWS CLI is available
-      if ! command -v aws &> /dev/null; then
-        echo -e "${YELLOW}AWS CLI not found, skipping secret cleanup${NC}"
-        exit 0
-      fi
-      
-      # Function to check for duplicate secrets
-      check_duplicate_secrets() {
-        local prefix=$1
-        
-        echo -e "Checking for duplicates with prefix: ${YELLOW}$prefix${NC}"
-        
-        SECRETS=$(aws secretsmanager list-secrets \
-          --region ${var.region} \
-          --filters Key=name,Values=$prefix \
-          --query "SecretList[*].{Name:Name,ARN:ARN}" \
-          --output json 2>/dev/null) || {
-            echo -e "${RED}Failed to fetch secrets${NC}"
-            return 0
-          }
-        
-        COUNT=$(echo $SECRETS | jq -r 'length')
-        
-        if [ "$COUNT" -le 1 ]; then
-          echo -e "${GREEN}No duplicate secrets found for $prefix${NC}"
-          return 0
-        fi
-        
-        echo -e "${YELLOW}Found $COUNT secrets with prefix $prefix, cleaning up...${NC}"
-        
-        # Get all but the newest secret
-        SECRETS_TO_DELETE=$(echo $SECRETS | jq -r '.[0:-1] | .[].Name')
-        
-        # Delete the older secrets
-        for SECRET_NAME in $SECRETS_TO_DELETE; do
-          echo -e "Force deleting ${YELLOW}$SECRET_NAME${NC}"
-          aws secretsmanager delete-secret \
-            --secret-id "$SECRET_NAME" \
-            --force-delete-without-recovery \
-            --region ${var.region} >/dev/null 2>&1 || echo -e "${RED}Failed to delete $SECRET_NAME${NC}"
-        done
-      }
-      
-      # Check each prefix
-      for prefix in "${DEV_PREFIXES[@]}" "${PROD_PREFIXES[@]}"; do
-        check_duplicate_secrets "$prefix"
-      done
+             # Check if jq is installed
+       if ! command -v jq &> /dev/null; then
+         echo -e "${YELLOW}jq not found, skipping secret cleanup${NC}"
+         exit 0
+       fi
+       
+       # Check if AWS CLI is available
+       if ! command -v aws &> /dev/null; then
+         echo -e "${YELLOW}AWS CLI not found, skipping secret cleanup${NC}"
+         exit 0
+       fi
+       
+       # Function to check for duplicate secrets
+       check_duplicate_secrets() {
+         local prefix=$1
+         
+         echo -e "Checking for duplicates with prefix: ${YELLOW}$prefix${NC}"
+         
+         SECRETS=$(aws secretsmanager list-secrets \
+           --region ${var.region} \
+           --filters Key=name,Values=$prefix \
+           --query "SecretList[*].{Name:Name,ARN:ARN}" \
+           --output json 2>/dev/null) || {
+             echo -e "${RED}Failed to fetch secrets${NC}"
+             return 0
+           }
+         
+         COUNT=$(echo $SECRETS | jq -r 'length')
+         
+         if [ "$COUNT" -le 1 ]; then
+           echo -e "${GREEN}No duplicate secrets found for $prefix${NC}"
+           return 0
+         fi
+         
+         echo -e "${YELLOW}Found $COUNT secrets with prefix $prefix, cleaning up...${NC}"
+         
+         # Get all but the newest secret
+         SECRETS_TO_DELETE=$(echo $SECRETS | jq -r '.[0:-1] | .[].Name')
+         
+         # Delete the older secrets
+         for SECRET_NAME in $SECRETS_TO_DELETE; do
+           echo -e "Force deleting ${YELLOW}$SECRET_NAME${NC}"
+           aws secretsmanager delete-secret \
+             --secret-id "$SECRET_NAME" \
+             --force-delete-without-recovery \
+             --region ${var.region} >/dev/null 2>&1 || echo -e "${RED}Failed to delete $SECRET_NAME${NC}"
+         done
+       }
+       
+       # Check each prefix directly instead of using arrays
+       echo -e "${YELLOW}Checking dev environment secrets...${NC}"
+       check_duplicate_secrets "guy-polybot-dev-telegram-token"
+       check_duplicate_secrets "guy-polybot-dev-docker-credentials"
+       check_duplicate_secrets "guy-polybot-dev-secrets"
+       
+       echo -e "${YELLOW}Checking prod environment secrets...${NC}"
+       check_duplicate_secrets "guy-polybot-prod-telegram-token"
+       check_duplicate_secrets "guy-polybot-prod-docker-credentials"
+       check_duplicate_secrets "guy-polybot-prod-secrets"
       
       echo -e "${GREEN}Secret cleanup complete${NC}"
     EOT
