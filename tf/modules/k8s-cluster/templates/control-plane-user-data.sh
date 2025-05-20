@@ -231,9 +231,14 @@ done
 # Allow control plane to run pods (remove taint)
 kubectl taint nodes --all node-role.kubernetes.io/control-plane-
 
-# Create the join command and store it in AWS Secrets Manager
-JOIN_COMMAND=$(kubeadm token create --print-join-command)
-echo "$(date) - Generated join command: $${JOIN_COMMAND}"
+# Create the join command with appropriate IP address
+if [ -n "$${PUBLIC_IP}" ]; then
+  JOIN_COMMAND=$(kubeadm token create --print-join-command --description "Kubernetes bootstrap token" | sed "s/join .* --/join $${PUBLIC_IP}:6443 --/")
+  echo "$(date) - Generated join command with public IP: $${JOIN_COMMAND}"
+else
+  JOIN_COMMAND=$(kubeadm token create --print-join-command --description "Kubernetes bootstrap token")
+  echo "$(date) - Generated join command with private IP: $${JOIN_COMMAND}"
+fi
 
 # Verify secret ID exists or can be created before attempting to use it
 SECRET_NAME="kubernetes-join-command-${token_formatted}"
@@ -313,3 +318,21 @@ aws ec2 create-tags \
 
 echo "$(date) - Kubernetes control plane initialization completed successfully"
 echo "$(date) - You can check the cluster status using: kubectl get nodes"
+
+# Also set up KUBECONFIG in bash profile for all users
+echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> /home/ubuntu/.bashrc
+echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> /root/.bashrc
+
+# Set up KUBECONFIG for ssm-user
+mkdir -p /var/snap/amazon-ssm-agent/common/
+cat << EOF > /var/snap/amazon-ssm-agent/common/.bashrc
+export KUBECONFIG=/etc/kubernetes/admin.conf
+EOF
+
+# Add explicit permissions to allow non-root users to read the kubeconfig
+chmod 644 /etc/kubernetes/admin.conf
+
+# Verify kubectl works with updated kubeconfig
+echo "$(date) - Verifying kubectl works with updated kubeconfig"
+export KUBECONFIG=/etc/kubernetes/admin.conf
+kubectl get nodes

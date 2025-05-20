@@ -267,6 +267,23 @@ resource "terraform_data" "kubectl_provider_config" {
     timestamp = timestamp()
     kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
   }
+
+  # Force provision step to ensure consistency between kubeconfig and the API server
+  provisioner "local-exec" {
+    command = <<-EOT
+      # Get the control plane's current IP
+      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      
+      echo "Control plane public IP: $PUBLIC_IP"
+      
+      # Update kubeconfig with current IP
+      if [ -f "${path.module}/kubeconfig.yml" ]; then
+        sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
+        echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+      fi
+    EOT
+  }
 }
 
 # Install EBS CSI Driver for persistent storage
