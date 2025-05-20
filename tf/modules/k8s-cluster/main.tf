@@ -514,7 +514,7 @@ resource "aws_iam_role_policy" "control_plane_secrets_manager_policy" {
       }
     ]
   })
-})
+}
 
 # IAM Instance Profile for Control Plane
 resource "aws_iam_instance_profile" "control_plane_profile" {
@@ -1607,6 +1607,5 @@ resource "aws_iam_role_policy" "control_plane_inline_policy" {
       },
     ]
   })
-}
 }
 
