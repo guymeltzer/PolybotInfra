@@ -7,11 +7,7 @@ provider "local" {}
 
 # Configure the Kubernetes provider with safe defaults
 provider "kubernetes" {
-  # These values are placeholders that will be ignored during initial apply
-  # The actual connection will happen in subsequent applies after the cluster is ready
-  host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
-  
-  # Skip validation during initial apply
+  config_path = "${path.module}/kubeconfig.yml"
   insecure = true
   ignore_annotations = [".*"]
   ignore_labels = [".*"]
@@ -20,21 +16,15 @@ provider "kubernetes" {
 # Configure the Helm provider with safe defaults
 provider "helm" {
   kubernetes {
-    # These values are placeholders that will be ignored during initial apply
-    host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
-    
-    # Skip validation during initial apply
+    config_path = "${path.module}/kubeconfig.yml"
     insecure = true
   }
 }
 
 # Configure the kubectl provider with safe defaults
 provider "kubectl" {
-  # These values are placeholders that will be ignored during initial apply
-  host = try(module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : "https://127.0.0.1:6443", "https://127.0.0.1:6443")
-  
-  # Skip validation during initial apply
-  load_config_file = false
+  config_path = "${path.module}/kubeconfig.yml"
+  load_config_file = true
   insecure = true
 }
 
@@ -275,6 +265,7 @@ resource "terraform_data" "kubectl_provider_config" {
   # This ensures we rebuild when anything related to the API changes
   triggers_replace = {
     timestamp = timestamp()
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yml") ? "true" : "false"
   }
 }
 
