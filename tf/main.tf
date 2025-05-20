@@ -218,6 +218,7 @@ resource "terraform_data" "kubectl_provider_config" {
         
         # Create a kubeconfig with token-based auth and TLS skip
         KUBECONFIG_DIR="${path.module}"
+        alias k='kubectl'
         echo "Creating kubeconfig with token auth and TLS skip verification..."
         cat > "$KUBECONFIG_DIR/kubeconfig.yml" << EOF
 apiVersion: v1
