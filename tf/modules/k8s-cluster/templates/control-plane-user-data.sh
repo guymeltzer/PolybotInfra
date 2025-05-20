@@ -115,6 +115,15 @@ systemctl start crio.service
 systemctl enable crio.service
 systemctl enable --now kubelet
 
+# Verify services are running
+echo "$(date) - Verifying CRI-O and kubelet services"
+systemctl status crio.service --no-pager
+systemctl status kubelet.service --no-pager || {
+  echo "$(date) - ERROR: kubelet service failed to start, checking logs"
+  journalctl -xeu kubelet --no-pager | tail -n 50
+  exit 1
+}
+
 # Configure firewall rules (keep this for security)
 iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
 iptables -A INPUT -p tcp --dport 443 -j ACCEPT
@@ -186,6 +195,21 @@ mkdir -p /home/ubuntu/.kube
 cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
 
+# Explicitly set KUBECONFIG for the current shell
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+# Verify kubectl can connect to the API server
+echo "$(date) - Verifying kubectl connectivity to API server"
+kubectl get nodes || {
+  echo "$(date) - ERROR: kubectl cannot connect to API server, checking component status"
+  kubectl get componentstatuses
+  echo "$(date) - Checking API server pods"
+  crictl ps | grep kube-apiserver
+  echo "$(date) - Checking API server logs"
+  crictl logs $(crictl ps -q --name kube-apiserver) | tail -n 50
+  exit 1
+}
+
 # Install Calico CNI (like in the guide)
 echo "$(date) - Installing Calico CNI"
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
@@ -211,34 +235,54 @@ kubectl taint nodes --all node-role.kubernetes.io/control-plane-
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 echo "$(date) - Generated join command: $${JOIN_COMMAND}"
 
-# Store the join command in Secrets Manager for worker nodes to retrieve
-echo "$(date) - Storing join command in AWS Secrets Manager"
-aws secretsmanager put-secret-value \
-  --secret-id kubernetes-join-command-${token_formatted} \
-  --secret-string "$${JOIN_COMMAND}" \
-  --region $${AWS_REGION} \
-  --version-stage AWSCURRENT || {
-    echo "$(date) - Failed to store join command in AWS Secrets Manager, creating the secret"
-    aws secretsmanager create-secret \
-      --name kubernetes-join-command-${token_formatted} \
-      --description "Kubernetes join command for worker nodes" \
-      --secret-string "$${JOIN_COMMAND}" \
-      --region $${AWS_REGION}
-  }
+# Verify secret ID exists or can be created before attempting to use it
+SECRET_NAME="kubernetes-join-command-${token_formatted}"
+echo "$(date) - Checking if Secret Manager secret $SECRET_NAME exists"
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" 2>/dev/null; then
+  # Secret exists, update it
+  echo "$(date) - Updating existing Secret Manager secret"
+  aws secretsmanager put-secret-value \
+    --secret-id "$SECRET_NAME" \
+    --secret-string "$${JOIN_COMMAND}" \
+    --region $${AWS_REGION} \
+    --version-stage AWSCURRENT
+else
+  # Secret doesn't exist, create it
+  echo "$(date) - Creating new Secret Manager secret"
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME" \
+    --description "Kubernetes join command for worker nodes" \
+    --secret-string "$${JOIN_COMMAND}" \
+    --region $${AWS_REGION}
+fi
 
 # Configure kubeconfig with the appropriate IP for external access
 if [ -n "$${PUBLIC_IP}" ]; then
   echo "$(date) - Configuring kubeconfig with public IP"
-  sed -i "s/server: https:\/\/[^:]*:/server: https:\/\/$${PUBLIC_IP}:/g" /etc/kubernetes/admin.conf
+  for config_file in /etc/kubernetes/admin.conf /root/.kube/config /home/ubuntu/.kube/config; do
+    if [ -f "$config_file" ]; then
+      sed -i "s/server: https:\/\/[^:]*:/server: https:\/\/$${PUBLIC_IP}:/g" "$config_file"
+    fi
+  done
 else
   echo "$(date) - Configuring kubeconfig with private IP"
-  sed -i "s/server: https:\/\/[^:]*:/server: https:\/\/$${PRIVATE_IP}:/g" /etc/kubernetes/admin.conf
+  for config_file in /etc/kubernetes/admin.conf /root/.kube/config /home/ubuntu/.kube/config; do
+    if [ -f "$config_file" ]; then
+      sed -i "s/server: https:\/\/[^:]*:/server: https:\/\/$${PRIVATE_IP}:/g" "$config_file"
+    fi
+  done
 fi
 
-# Make certificates accessible for remote administration
+# Set secure permissions on certificates (tighten security)
+echo "$(date) - Setting secure permissions on Kubernetes certificates"
 chmod 644 /etc/kubernetes/pki/ca.crt
+chmod 600 /etc/kubernetes/pki/ca.key
 chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.crt
-chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
+chmod 600 /etc/kubernetes/pki/apiserver-kubelet-client.key
+
+# Verify kubectl works with updated kubeconfig
+echo "$(date) - Verifying kubectl works with updated kubeconfig"
+kubectl get nodes
 
 # Install and configure AWS SSM agent for remote management
 echo "$(date) - Installing and configuring AWS SSM agent"
