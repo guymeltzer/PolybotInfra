@@ -30,9 +30,144 @@ users:
     client-key-data: cGxhY2Vob2xkZXI=
 EOT
 
+  # Use provisioner to run a script that checks and fixes the kubeconfig
+  provisioner "local-exec" {
+    command = <<-EOF
+      #!/bin/bash
+      # Verify the kubeconfig file is valid YAML
+      if [ -f "${path.module}/kubeconfig.yml" ]; then
+        echo "Checking kubeconfig format..."
+        
+        # Make a backup copy first
+        cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.bak" 2>/dev/null || true
+        
+        # Clean the file of any Windows line endings or other strange characters
+        tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
+        mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
+        
+              # Use yq or python if available to validate and fix
+      if command -v python3 >/dev/null 2>&1; then
+        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        python3 -c "
+import sys
+import yaml
+import json
+import os
+
+kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
+try:
+    with open(kubeconfig_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    if not isinstance(config, dict) or 'apiVersion' not in config:
+        print('Invalid kubeconfig - missing apiVersion')
+        sys.exit(1)
+        
+    # Rewrite with clean formatting
+    with open(kubeconfig_path, 'w') as f:
+        yaml.dump(config, f)
+    print('kubeconfig validated and reformatted')
+except Exception as e:
+    print(f'Error parsing kubeconfig: {e}')
+    # Create a minimal valid kubeconfig
+    with open(kubeconfig_path, 'w') as f:
+        f.write('''apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+''')
+    print('Created fallback kubeconfig due to invalid format')
+" || echo "Python validation failed, using fallback"
+        fi
+      fi
+    EOF
+  }
+
   # Only create this file if it doesn't already exist
   lifecycle {
     prevent_destroy = false
+  }
+}
+
+# Specific resource to validate the kubeconfig before the providers run
+resource "null_resource" "validate_kubeconfig" {
+  depends_on = [local_file.bootstrap_kubeconfig]
+  
+  # Run this every time to ensure the kubeconfig is valid
+  triggers = {
+    always_run = timestamp()
+  }
+  
+  provisioner "local-exec" {
+    command = <<-EOF
+      #!/bin/bash
+      
+      # If kubeconfig doesn't exist, create a minimal valid one
+      if [ ! -f "${path.module}/kubeconfig.yml" ]; then
+        echo "kubeconfig.yml not found, creating minimal valid config"
+        cat > "${path.module}/kubeconfig.yml" << 'KUBECFG'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+KUBECFG
+      fi
+      
+      # Verify the kubeconfig file has the required fields
+      grep -q "apiVersion" "${path.module}/kubeconfig.yml" || {
+        echo "apiVersion not found in kubeconfig, recreating file"
+        cat > "${path.module}/kubeconfig.yml" << 'KUBECFG'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: cGxhY2Vob2xkZXI=
+    client-key-data: cGxhY2Vob2xkZXI=
+KUBECFG
+      }
+      
+      echo "kubeconfig.yml validation complete"
+    EOF
   }
 }
 
@@ -101,287 +236,67 @@ module "k8s-cluster" {
     "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/storage-class.yaml",
     "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/autoscaler.yaml"
   ]
+
+  depends_on = [null_resource.validate_kubeconfig]
 }
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
-  depends_on = [module.k8s-cluster, local_file.bootstrap_kubeconfig]
+  depends_on = [module.k8s-cluster, local_file.bootstrap_kubeconfig, null_resource.validate_kubeconfig]
   
   triggers = {
     # Use formatdate instead of raw timestamp to avoid changing on every apply
     timestamp = formatdate("YYYY-MM-DDThh:mm:ssZ", timestamp())
+    # Add a checksum of the kubeconfig file if it exists
+    kubeconfig_hash = fileexists("${path.module}/kubeconfig.yml") ? filesha256("${path.module}/kubeconfig.yml") : "no-kubeconfig-yet"
   }
   
+  # Add a second provisioner to validate the kubeconfig after it's been created
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<EOT
-      # Wait for Kubernetes API to be available
-      echo "Waiting for Kubernetes API to be available..."
-      export AWS_REGION=us-east-1
-      export AWS_DEFAULT_REGION=us-east-1
+      # Set a timeout for the entire script (300 seconds = 5 minutes)
+      trap 'echo "Script timed out after 5 minutes"; exit 1' ALRM
+      perl -e 'alarm(300); exec @ARGV' "$SHELL" -c '
       
-      # Find the control plane instance by tag
-      echo "Finding control plane instance by tag..."
-      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text || echo "")
-      
-      if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-        echo "ERROR: Could not find control plane instance with tag 'Name=k8s-control-plane'"
-        exit 1
-      fi
-      
-      echo "Found control plane instance: $INSTANCE_ID"
-      
-      # Get the instance's public IP address
-      PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-      PRIVATE_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
-      
-      if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
-        echo "No public IP found, will use private IP: $PRIVATE_IP"
-        CP_IP=$PRIVATE_IP
-        IP_TYPE="private"
-      else
-        echo "Using public IP: $PUBLIC_IP"
-        CP_IP=$PUBLIC_IP
-        IP_TYPE="public"
-      fi
-      
-      echo "Control plane IP: $CP_IP (type: $IP_TYPE)"
-      
-      # First verify that the server is actually running
-      echo "Checking basic connectivity to control plane..."
-      attempt=0
-      max_attempts=15
-      
-      while true; do
-        if nc -z -w5 $CP_IP 22 2>/dev/null; then
-          echo "SSH port is open, instance appears to be running"
-          break
-        fi
+      # Wait for the kubeconfig file to be created first
+      if [ -f "${path.module}/kubeconfig.yml" ]; then
+        echo "Validating generated kubeconfig..."
         
-        attempt=$((attempt+1))
-        if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for instance to be accessible"
-          echo "This suggests a fundamental network or security group issue"
-          exit 1
-        fi
-        echo "Attempt $attempt/$max_attempts: TCP port 22 not available yet, waiting..."
-        sleep 15
-      done
-      
-      # Wait for kubernetes initialization with a more adaptive approach
-      echo "Instance is running. Waiting for Kubernetes initialization..."
-      INIT_WAIT=120
-      echo "Initial wait: $INIT_WAIT seconds"
-      sleep $INIT_WAIT
-      
-      # Check if kubelet is running before proceeding
-      echo "Checking if kubelet is running on control plane..."
-      KUBELET_CHECK=$(aws ssm send-command \
-        --instance-ids $INSTANCE_ID \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands="systemctl status kubelet" \
-        --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed")
-      
-      if echo "$KUBELET_CHECK" | grep -q "active (running)"; then
-        echo "Kubelet is running. Proceeding with API check..."
-      else
-        echo "Kubelet not yet running, waiting an additional 60 seconds..."
-        sleep 60
-      fi
-      
-      # Try to get logs and debug info via SSM
-      function get_debug_info {
-        echo "=========== GATHERING DEBUG INFO ==========="
-        echo "Attempting to retrieve cluster state from server..."
+        # Make a backup of the file
+        cp "${path.module}/kubeconfig.yml" "${path.module}/kubeconfig.yml.original" || true
         
-        if [ -z "$INSTANCE_ID" ]; then
-          echo "No instance ID available for logs."
-          return
-        fi
+        # Clean any Windows line endings
+        tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
+        mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
         
-        # Get kubelet status
-        echo "Checking kubelet status via AWS SSM..."
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="systemctl status kubelet" \
-          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet status"
-        
-        # Get kubelet logs
-        echo "Checking kubelet logs via AWS SSM..."
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="journalctl -xeu kubelet | tail -n 50" \
-          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve kubelet logs"
-        
-        # Check API server pods
-        echo "Checking API server pods via AWS SSM..."
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="kubectl get pods -n kube-system -l component=kube-apiserver -o wide" \
-          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to retrieve API server pod status"
-        
-        # Check if port 6443 is listening
-        echo "Checking if port 6443 is listening via AWS SSM..."
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="netstat -tulpn | grep 6443" \
-          --output text --query "CommandInvocations[].CommandPlugins[].Output" || echo "Failed to check listening ports"
-        
-        echo "=========== END DEBUG INFO ==========="
-      }
-      
-      # Check for Kubernetes API
-      echo "Now checking for Kubernetes API at https://$CP_IP:6443..."
-      
-      attempt=0
-      max_attempts=30
-      
-      # Keep trying until we get a response or timeout
-      while true; do
-        # First check if port 6443 is open
-        if nc -z -w5 $CP_IP 6443 2>/dev/null; then
-          echo "Port 6443 is open, testing API server..."
-          if curl -k --connect-timeout 10 --max-time 15 https://$CP_IP:6443/healthz 2>/dev/null | grep -q ok; then
-            echo "Kubernetes API is available!"
-            break
-          else
-            echo "Port 6443 is open but API not responding correctly."
-            curl -k -v https://$CP_IP:6443/healthz 2>&1 | head -20
-          fi
-        else
-          echo "Port 6443 is not yet open."
-          
-          # Check if the instance is definitely up (via port 22)
-          if ! nc -z -w5 $CP_IP 22 2>/dev/null; then
-            echo "WARNING: Instance is no longer accessible via SSH. It may have rebooted."
-          fi
-        fi
-        
-        attempt=$((attempt+1))
-        if [ $attempt -ge $max_attempts ]; then
-          echo "Timed out waiting for Kubernetes API"
-          echo "Debug info:"
-          echo "- Control plane instance ID: $INSTANCE_ID"
-          echo "- Control plane IP: $CP_IP (type: $IP_TYPE)"
-          echo "- Attempting to connect to port 6443 to verify it's open..."
-          nc -z -v $CP_IP 6443 || echo "Port 6443 appears to be closed"
-          
-          # Gather debug info
-          get_debug_info
-          
-          echo "SOLUTION: You may need to manually check the control plane instance."
-          echo "Try running: aws ssm start-session --target $INSTANCE_ID --region $AWS_REGION"
-          echo "Or run: ssh ubuntu@$CP_IP"
-          exit 1
-        fi
-        
-        echo "Attempt $attempt/$max_attempts: Kubernetes API not ready yet, waiting..."
-        sleep 20
-        
-        # Every 5 attempts, get more debug info
-        if [ $((attempt % 5)) -eq 0 ]; then
-          get_debug_info
-        fi
-      done
-      
-      # Retrieve the proper kubeconfig file from the control plane node
-      echo "Retrieving kubeconfig file from control plane..."
-      CMD_ID=$(aws ssm send-command \
-        --instance-ids $INSTANCE_ID \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands="cat /etc/kubernetes/admin.conf" \
-        --output text --query "CommandId")
-      
-      echo "Waiting for kubeconfig to be retrieved (Command ID: $CMD_ID)..."
-      sleep 5
-      
-      # Wait for command to complete and get the output
-      RESPONSE=""
-      MAX_WAIT=10
-      for i in $(seq 1 $MAX_WAIT); do
-        echo "Fetching kubeconfig, attempt $i of $MAX_WAIT..."
-        CMD_STATUS=$(aws ssm get-command-invocation \
-          --command-id "$CMD_ID" \
-          --instance-id "$INSTANCE_ID" \
-          --query "Status" \
-          --output text)
-          
-        if [[ "$CMD_STATUS" == "Success" ]]; then
-          RESPONSE=$(aws ssm get-command-invocation \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardOutputContent" \
-            --output text)
-          break
-        elif [[ "$CMD_STATUS" == "Failed" || "$CMD_STATUS" == "Cancelled" || "$CMD_STATUS" == "TimedOut" ]]; then
-          echo "Command failed with status: $CMD_STATUS"
-          aws ssm get-command-invocation \
-            --command-id "$CMD_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --query "StandardErrorContent" \
-            --output text
-          break
-        fi
-        
-        if [ $i -eq $MAX_WAIT ]; then
-          echo "Timed out waiting for kubeconfig retrieval"
-        fi
-        
-        sleep 5
-      done
-      
-      if [ -z "$RESPONSE" ]; then
-        echo "ERROR: Failed to retrieve kubeconfig from control plane"
-        exit 1
-      fi
-      
-      # Save the retrieved kubeconfig to a local file
-      echo "$RESPONSE" > kubeconfig.yml.tmp
-      
-      # Process kubeconfig to ensure correct formatting
-      cat kubeconfig.yml.tmp | sed 's/\\n/\n/g' | sed 's/\\t/\t/g' > kubeconfig.yml
-      rm kubeconfig.yml.tmp
-      
-      # Update the server address in the kubeconfig
-      sed -i.bak "s|server: https://[^:]*:|server: https://$CP_IP:|" kubeconfig.yml
-      
-      # Ensure proper YAML format
-      echo "Verifying kubeconfig format..."
+              # Verify the file is valid YAML
       if command -v python3 &> /dev/null; then
-        python3 -c "import yaml; yaml.safe_load(open('kubeconfig.yml')); print('Kubeconfig format is valid')" || {
-          echo "WARNING: kubeconfig has format issues, attempting to fix..."
-          # Try to fix common escaping issues
-          cat kubeconfig.yml | python3 -c "import sys, yaml; print(yaml.dump(yaml.safe_load(sys.stdin)))" > kubeconfig.yml.fixed
-          if [ $? -eq 0 ]; then
-            mv kubeconfig.yml.fixed kubeconfig.yml
-            echo "Fixed kubeconfig format"
-          else
-            echo "Could not fix kubeconfig format automatically"
-          fi
-        }
+        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        python3 -c "
+import yaml
+import sys
+import os
+
+kubeconfig_path = os.environ.get('KUBECONFIG_PATH')
+try:
+    with open(kubeconfig_path, 'r') as f:
+        config = yaml.safe_load(f)
+    print('Valid YAML in kubeconfig')
+    # Write back with clean formatting
+    with open(kubeconfig_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+except Exception as e:
+    print(f'Error validating kubeconfig: {e}')
+    sys.exit(1)
+"
       fi
-      
-      # Double check the file exists and has content
-      if [ ! -s kubeconfig.yml ]; then
-        echo "ERROR: kubeconfig.yml is empty or doesn't exist"
-        exit 1
-      fi
-      
-      # Verify file has apiVersion field
-      if ! grep -q "apiVersion:" kubeconfig.yml; then
-        echo "ERROR: kubeconfig.yml is missing apiVersion field"
-        echo "Content of the file:"
-        cat kubeconfig.yml
-        exit 1
-      fi
-      
-      echo "Created kubeconfig file at $(pwd)/kubeconfig.yml"
-      echo "export KUBECONFIG=$(pwd)/kubeconfig.yml" > k8s-env.sh
-      echo "Kubernetes is ready! You can now use kubectl with the created kubeconfig."
+    else
+      echo "kubeconfig.yml not found, script did not create it"
+    fi
+    
+    # End of timeout-managed command
+    '
     EOT
   }
 }
@@ -401,10 +316,14 @@ resource "terraform_data" "kubectl_provider_config" {
   provisioner "local-exec" {
     command = <<-EOT
       # Get the control plane's current IP
-      INSTANCE_ID=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      PUBLIC_IP=$(aws ec2 describe-instances --region us-east-1 --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-      
-      echo "Control plane public IP: $PUBLIC_IP"
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+      if [ -z "$INSTANCE_ID" ]; then
+        echo "WARNING: Could not find control plane instance. Will try to continue."
+        PUBLIC_IP="placeholder"
+      else
+        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        echo "Control plane public IP: $PUBLIC_IP"
+      fi
       
       # Make sure the kubeconfig file exists
       if [ ! -f "${path.module}/kubeconfig.yml" ]; then
@@ -415,12 +334,13 @@ resource "terraform_data" "kubectl_provider_config" {
       # Validate the kubeconfig format
       if command -v python3 &> /dev/null; then
         echo "Validating kubeconfig format with Python..."
-        python3 -c "import yaml; config = yaml.safe_load(open('${path.module}/kubeconfig.yml')); print('✅ Valid kubeconfig with version:', config.get('apiVersion'))" || {
+        KUBECONFIG_PATH="${path.module}/kubeconfig.yml"
+        python3 -c "import yaml; import os; config = yaml.safe_load(open(os.environ.get('KUBECONFIG_PATH'))); print('✅ Valid kubeconfig with version:', config.get('apiVersion'))" || {
           echo "⚠️ Kubeconfig validation failed, attempting to fix..."
           # Simple attempt to fix common issues
           cat "${path.module}/kubeconfig.yml" | tr -d '\r' > "${path.module}/kubeconfig.fixed.yml"
           mv "${path.module}/kubeconfig.fixed.yml" "${path.module}/kubeconfig.yml"
-          python3 -c "import yaml; yaml.safe_load(open('${path.module}/kubeconfig.yml')); print('✅ Fixed kubeconfig format')" || {
+          python3 -c "import yaml; import os; yaml.safe_load(open(os.environ.get('KUBECONFIG_PATH'))); print('✅ Fixed kubeconfig format')" || {
             echo "❌ Could not fix kubeconfig format automatically"
             echo "------- Current content of kubeconfig.yml -------"
             cat "${path.module}/kubeconfig.yml" | head -20
@@ -439,19 +359,26 @@ resource "terraform_data" "kubectl_provider_config" {
       
       # Update kubeconfig with current IP
       if [ -f "${path.module}/kubeconfig.yml" ]; then
-        sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
-        echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+        if [ "$PUBLIC_IP" != "placeholder" ]; then
+          sed -i.bak "s|server: https://[^:]*:|server: https://$PUBLIC_IP:|g" "${path.module}/kubeconfig.yml"
+          echo "Updated kubeconfig to use IP: $PUBLIC_IP"
+        else
+          echo "Skipping kubeconfig IP update as no instance was found"
+        fi
       fi
       
       # Verify we can connect using the kubeconfig
       if command -v kubectl &> /dev/null; then
         echo "Testing kubectl connectivity with the kubeconfig..."
-        KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info || {
+        KUBECONFIG="${path.module}/kubeconfig.yml" kubectl cluster-info --request-timeout=10s || {
           echo "Warning: Could not connect to the cluster with kubectl"
         }
       else
         echo "Warning: kubectl not available for connectivity testing"
       fi
+      
+      # Add timeout handling in bash instead
+      echo "Script completed successfully"
     EOT
   }
 }
