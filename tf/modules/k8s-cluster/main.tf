@@ -522,6 +522,11 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
   role = aws_iam_role.control_plane_role.name
 }
 
+# Create a terraform_data resource that tracks changes to the script file
+resource "terraform_data" "control_plane_script_hash" {
+  input = filesha256("${path.module}/templates/control-plane-user-data.sh")
+}
+
 resource "aws_instance" "control_plane" {
   ami                    = var.control_plane_ami
   instance_type          = var.control_plane_instance_type
@@ -535,7 +540,7 @@ resource "aws_instance" "control_plane" {
     token    = random_string.token.result,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
-    timestamp = timestamp()
+    timestamp = timestamp() # Add timestamp to force update
   })
 
   root_block_device {
@@ -553,8 +558,9 @@ resource "aws_instance" "control_plane" {
 
   lifecycle {
     create_before_destroy = true
+    # Force replacement when the terraform_data resource changes instead of using filesha256 directly
     replace_triggered_by = [
-      filesha256("${path.module}/templates/control-plane-user-data.sh")
+      terraform_data.control_plane_script_hash
     ]
   }
 }
@@ -1015,6 +1021,11 @@ resource "aws_iam_instance_profile" "worker_profile" {
   role = aws_iam_role.worker_role.name
 }
 
+# Also create a terraform_data resource for worker script
+resource "terraform_data" "worker_script_hash" {
+  input = filesha256("${path.module}/worker_user_data.sh")
+}
+
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
@@ -1031,7 +1042,7 @@ resource "aws_launch_template" "worker_lt" {
   }
 
   user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", {
-    timestamp = timestamp()
+    timestamp = timestamp() # Add timestamp to force update
   }))
 
   tag_specifications {
@@ -1044,6 +1055,9 @@ resource "aws_launch_template" "worker_lt" {
 
   lifecycle {
     create_before_destroy = true
+    replace_triggered_by = [
+      terraform_data.worker_script_hash
+    ]
   }
 }
 
@@ -1058,6 +1072,15 @@ resource "aws_autoscaling_group" "worker_asg" {
   launch_template {
     id      = aws_launch_template.worker_lt.id
     version = "$Latest"
+  }
+
+  # Force instance refresh when launch template changes
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
+    triggers = ["launch_template"]
   }
 
   tag {
