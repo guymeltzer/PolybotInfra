@@ -1003,13 +1003,6 @@ resource "aws_security_group" "control_plane_sg" {
     to_port     = 6443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    security_groups = [aws_security_group.worker_sg.id]
     description = "Allow worker nodes to connect to API server"
   }
 
@@ -1024,7 +1017,8 @@ resource "aws_security_group" "control_plane_sg" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic"
   }
 
   egress {
@@ -1139,13 +1133,6 @@ resource "aws_security_group" "worker_sg" {
   }
 
   ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    security_groups = [aws_security_group.control_plane_sg.id]
-  }
-
-  ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -1157,6 +1144,7 @@ resource "aws_security_group" "worker_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic"
   }
 
   egress {
