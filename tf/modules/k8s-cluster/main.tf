@@ -534,6 +534,7 @@ resource "aws_instance" "control_plane" {
   user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
     token    = random_string.token.result,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
+    script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
   })
 
   root_block_device {

@@ -10,6 +10,7 @@ echo "$(date) - Starting Kubernetes control plane initialization"
 echo "$(date) - Verifying script integrity"
 cat $0 > /tmp/script-copy.sh
 sha256sum $0 /tmp/script-copy.sh
+echo "$(date) - Script hash: ${script_hash}" >> $${LOGFILE}
 
 # Add SSH key for direct access
 echo "$(date) - Setting up SSH access"
