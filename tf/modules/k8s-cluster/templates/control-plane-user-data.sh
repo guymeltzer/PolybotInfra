@@ -45,12 +45,14 @@ command -v unzip || {
   echo "$(date) - ERROR: unzip not installed"
   exit 1
 }
-# Explicitly call the binary to avoid inherited options
-/usr/bin/unzip --version >> $${LOGFILE} || {
-  echo "$(date) - ERROR: Failed to verify unzip version"
+# Check if unzip is available by using a simpler command that won't trigger warnings
+unzip -v &> /dev/null || {
+  echo "$(date) - ERROR: unzip is not functioning properly"
   exit 1
 }
-unzip --version >> $${LOGFILE}
+echo "$(date) - Unzip is installed and functional"
+# Add unzip version to logs but don't fail if the output is not as expected
+unzip --version >> $${LOGFILE} 2>&1 || true
 
 # Upgrade packages
 echo "$(date) - Upgrading installed packages"
