@@ -11,15 +11,6 @@ echo "$(date) - Starting Kubernetes worker node initialization"
 set -e
 trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> "$LOGFILE"; exit 1' ERR
 
-# Set up SSH access (using your existing key)
-echo "$(date) - Setting up SSH access"
-mkdir -p /home/ubuntu/.ssh
-cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P/SVdCGlnxLkYJwYhAoI58xI7V5rpnbO3bDvXzKt/59B0ZVKu1xvvXVUBXGIcHHaWYi/IKO8G+vWgHDXVCGCq4HFG2fJPHwkRNDc5kkOEjthn4s+TlRIJZpvbXRXwHFDJbA/4zE5XuThUwpZROM/MwGEYUjWCnRwYS5bGAglHGnEEA8YGbnCRc9aAeRk8OFEEmSQGp9SSvOEKUiQ3lqMQZP1Qh3WI+GH8D+pHnRDLvQeYxBMwSgFwlILTvp0LMUx9N7hugtFg2FAHnKsD6fRTKwJfTgNLLMYlXqCWVUoJtY+M18YRrZ7niLMZFSSVVWbcJbHXPJ+g3I+n/4nkdxiXQOMYkYcPWCFrzYoZA8/FfHgODZ2Mxx48PR0LXIcj0nYnNY0bJ8+pU9ZPZUilfTQc5Mu5GXXCXe8KwKUxDjcS1JNUXyxTvn+mvMESR/AUFKQNzgXz15J6N0jNfRs5fLeZMNa/YJdkk= gmeltzer@gmeltzer-mbp
-EOF
-chmod 600 /home/ubuntu/.ssh/authorized_keys
-chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-
 # Set non-interactive frontend
 export DEBIAN_FRONTEND=noninteractive
 
@@ -43,6 +34,38 @@ if [ -z "$REGION" ]; then
   echo "Failed to retrieve region from metadata" >> "$LOGFILE"
   exit 1
 fi
+
+# After getting instance metadata
+PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
+
+# Update package lists
+echo "$(date) - Updating package lists"
+apt-get update
+echo "$(date) - Fixing package manager state"
+apt-get install -f -y
+dpkg --configure -a
+
+# Install base packages first
+echo "$(date) - Installing base packages"
+apt-get install -y apt-transport-https ca-certificates curl gnupg software-properties-common jq unzip
+
+# Install AWS CLI early before using any AWS commands
+echo "$(date) - Installing AWS CLI"
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+export PATH=$PATH:/usr/local/bin
+rm -rf awscliv2.zip aws/
+
+# Configure AWS CLI with region
+export AWS_DEFAULT_REGION="$REGION"
+
+# Verify AWS CLI installation
+echo "$(date) - Verifying AWS CLI installation"
+aws --version
 
 # Add logging with S3 upload function at the top of the script, after the LOGFILE and error handling setup
 # Function to upload logs to S3 even if script fails
@@ -69,25 +92,17 @@ upload_logs_to_s3() {
 # Set up trap to upload logs on exit
 trap 'upload_logs_to_s3 "ERROR_TRAP"; echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> "$LOGFILE"; exit 1' ERR
 
-# After getting instance metadata, upload initial logs
-PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
-INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
-AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
-PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
+# Set up SSH access (using your existing key)
+echo "$(date) - Setting up SSH access"
+mkdir -p /home/ubuntu/.ssh
+cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P/SVdCGlnxLkYJwYhAoI58xI7V5rpnbO3bDvXzKt/59B0ZVKu1xvvXVUBXGIcHHaWYi/IKO8G+vWgHDXVCGCq4HFG2fJPHwkRNDc5kkOEjthn4s+TlRIJZpvbXRXwHFDJbA/4zE5XuThUwpZROM/MwGEYUjWCnRwYS5bGAglHGnEEA8YGbnCRc9aAeRk8OFEEmSQGp9SSvOEKUiQ3lqMQZP1Qh3WI+GH8D+pHnRDLvQeYxBMwSgFwlILTvp0LMUx9N7hugtFg2FAHnKsD6fRTKwJfTgNLLMYlXqCWVUoJtY+M18YRrZ7niLMZFSSVVWbcJbHXPJ+g3I+n/4nkdxiXQOMYkYcPWCFrzYoZA8/FfHgODZ2Mxx48PR0LXIcj0nYnNY0bJ8+pU9ZPZUilfTQc5Mu5GXXCXe8KwKUxDjcS1JNUXyxTvn+mvMESR/AUFKQNzgXz15J6N0jNfRs5fLeZMNa/YJdkk= gmeltzer@gmeltzer-mbp
+EOF
+chmod 600 /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 # Upload initialization logs
 upload_logs_to_s3 "INIT"
-
-# Update package lists
-echo "$(date) - Updating package lists"
-apt-get update
-echo "$(date) - Fixing package manager state"
-apt-get install -f -y
-dpkg --configure -a
-
-# Install base packages
-echo "$(date) - Installing base packages"
-apt-get install -y apt-transport-https ca-certificates curl gnupg software-properties-common jq unzip
 
 # Configure kernel modules for Kubernetes
 echo "$(date) - Configuring kernel modules"
@@ -158,9 +173,6 @@ systemctl restart kubelet
 echo "$(date) - Fetching join command from Secrets Manager"
 MAX_SECRET_ATTEMPTS=10
 JOIN_COMMAND=""
-
-# Enable more verbosity for AWS commands for debugging
-export AWS_DEFAULT_REGION="$REGION"
 
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"

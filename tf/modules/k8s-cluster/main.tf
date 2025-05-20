@@ -525,7 +525,7 @@ resource "aws_iam_role_policy" "control_plane_secrets_manager_policy" {
       }
     ]
   })
-}
+})
 
 # IAM Instance Profile for Control Plane
 resource "aws_iam_instance_profile" "control_plane_profile" {
@@ -789,8 +789,16 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
+        # Update the latest secret with the new join command
+        latest_secret = secrets_client.list_secrets(
+            Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}],
+            SortOrder='desc'
+        )['SecretList'][0]['Name']
+        
+        print(f"Updating secret: {latest_secret}")
+        
         secrets_client.put_secret_value(
-            SecretId='${aws_secretsmanager_secret.kubernetes_join_command.name}',
+            SecretId=latest_secret,
             SecretString=join_command
         )
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
