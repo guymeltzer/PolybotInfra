@@ -389,11 +389,29 @@ provider "kubectl" {
   load_config_file = true
 }
 
+# This is a workaround to ensure the providers are properly loaded with the kubeconfig
+# We can't use depends_on in provider blocks, so we use this resource to simulate that
+resource "null_resource" "providers_ready" {
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    data.local_file.kubeconfig
+  ]
+  
+  triggers = {
+    kubeconfig_hash = fileexists(data.local_file.kubeconfig.filename) ? filemd5(data.local_file.kubeconfig.filename) : "not-found"
+  }
+  
+  provisioner "local-exec" {
+    command = "echo 'Kubernetes providers ready with kubeconfig ${data.local_file.kubeconfig.filename}'"
+  }
+}
+
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
   depends_on = [
     terraform_data.kubectl_provider_config,
-    data.local_file.kubeconfig
+    data.local_file.kubeconfig,
+    null_resource.providers_ready
   ]
 
   # Use local-exec to create namespaces directly with kubectl
@@ -500,7 +518,8 @@ module "argocd" {
     null_resource.wait_for_kubernetes, 
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig,
-    null_resource.create_namespaces
+    null_resource.create_namespaces,
+    null_resource.providers_ready
   ]
 }
 

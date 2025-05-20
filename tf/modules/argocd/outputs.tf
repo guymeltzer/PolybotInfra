@@ -1,6 +1,6 @@
 output "argocd_url" {
   description = "The URL of the ArgoCD server"
-  value       = "https://${kubernetes_namespace.argocd.metadata[0].name}-server.${kubernetes_namespace.argocd.metadata[0].name}:443"
+  value       = "https://argocd-server.argocd:443"
 }
 
 output "applications" {
