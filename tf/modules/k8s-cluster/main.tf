@@ -624,7 +624,7 @@ resource "local_file" "kubeconfig" {
 
 # Secrets Manager for Kubernetes join command
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command"
+  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}"
   description = "Kubernetes join command for worker nodes"
   recovery_window_in_days = 0
   force_overwrite_replica_secret = true

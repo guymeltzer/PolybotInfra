@@ -113,33 +113,39 @@ done
 echo "$(date) - Creating cluster join command"
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
 
-# Create the secret if it doesn't exist, with retry logic
-echo "$(date) - Storing join command in AWS Secrets Manager"
+# Create the secret with a timestamp in the name
+echo "$(date) - Storing join command in AWS Secrets Manager as ${SECRET_NAME}"
 MAX_SECRET_ATTEMPTS=5
 SECRET_SUCCESS=false
 
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
-  echo "$(date) - Secret creation/update attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
+  echo "$(date) - Secret creation attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
-  # Try to create the secret first
-  if aws secretsmanager create-secret --name kubernetes-join-command --region $REGION --secret-string "$JOIN_COMMAND" 2>/dev/null; then
-    echo "$(date) - Successfully created secret"
+  # Create the secret with timestamped name
+  if aws secretsmanager create-secret --name ${SECRET_NAME} --region $REGION --secret-string "$JOIN_COMMAND" 2>/dev/null; then
+    echo "$(date) - Successfully created secret: ${SECRET_NAME}"
     SECRET_SUCCESS=true
+    
+    # Clean up old secrets, keeping the 2 newest ones
+    echo "$(date) - Cleaning up older join command secrets"
+    OLD_SECRETS=$(aws secretsmanager list-secrets --region $REGION --filters Key=name,Values="kubernetes-join-command-*" \
+      --query "sort_by(SecretList, &CreatedDate)[:-2].Name" --output text 2>/dev/null || echo "")
+    
+    for OLD_SECRET in $OLD_SECRETS; do
+      echo "$(date) - Deleting old secret: $OLD_SECRET"
+      aws secretsmanager delete-secret --secret-id $OLD_SECRET --force-delete-without-recovery --region $REGION 2>/dev/null || true
+    done
+    
     break
   else
-    echo "$(date) - Secret may already exist, trying to update it"
-    # If creation fails, try to update it
-    if aws secretsmanager put-secret-value --secret-id kubernetes-join-command --secret-string "$JOIN_COMMAND" --region $REGION 2>/dev/null; then
-      echo "$(date) - Successfully updated secret"
-      SECRET_SUCCESS=true
-      break
-    else
-      echo "$(date) - Failed to update secret. Waiting to retry..."
-      # Delete the secret if it exists but can't be updated
-      aws secretsmanager delete-secret --secret-id kubernetes-join-command --force-delete-without-recovery --region $REGION 2>/dev/null || true
-      sleep 10
-    fi
+    echo "$(date) - Failed to create secret. Waiting to retry..."
+    # Try with a different timestamp
+    TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+    SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
+    sleep 5
   fi
 done
 

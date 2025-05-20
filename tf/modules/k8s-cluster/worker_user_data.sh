@@ -134,7 +134,27 @@ JOIN_COMMAND=""
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
-  JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id kubernetes-join-command --query SecretString --output text 2>>"$LOGFILE" || echo "")
+  # Get the list of join command secrets, sorted by creation date (newest first)
+  SECRETS=$(aws secretsmanager list-secrets \
+    --region "$REGION" \
+    --filters Key=name,Values="kubernetes-join-command-*" \
+    --query "sort_by(SecretList, &CreatedDate)[-1].Name" \
+    --output text 2>>"$LOGFILE" || echo "")
+  
+  if [ -z "$SECRETS" ] || [ "$SECRETS" == "None" ]; then
+    echo "$(date) - No kubernetes-join-command secrets found. Waiting to retry..."
+    sleep 30
+    continue
+  fi
+  
+  LATEST_SECRET=$(echo "$SECRETS" | head -1)
+  echo "$(date) - Found latest secret: $LATEST_SECRET"
+  
+  JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+    --region "$REGION" \
+    --secret-id "$LATEST_SECRET" \
+    --query SecretString \
+    --output text 2>>"$LOGFILE" || echo "")
   
   if [ -n "$JOIN_COMMAND" ]; then
     echo "$(date) - Successfully retrieved join command"

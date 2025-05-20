@@ -1,6 +1,7 @@
 import boto3
 import json
 import time
+import re
 
 def lambda_handler(event, context):
     autoscaling = boto3.client('autoscaling')
@@ -129,23 +130,46 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
+        # Create a new secret with timestamp
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        new_secret_name = f"kubernetes-join-command-{timestamp}"
+        
+        # Create the new secret
         try:
-            # Try to update the existing secret
-            secrets_client.put_secret_value(
-                SecretId='kubernetes-join-command',
+            secrets_client.create_secret(
+                Name=new_secret_name,
+                Description='Kubernetes join command for worker nodes',
                 SecretString=join_command
             )
-        except:
-            # If it doesn't exist, create it
-            try:
-                secrets_client.create_secret(
-                    Name='kubernetes-join-command',
-                    Description='Kubernetes join command for worker nodes',
-                    SecretString=join_command
-                )
-            except Exception as sec_err:
-                print(f"Error creating secret: {str(sec_err)}")
-                raise
+            print(f"Created new secret: {new_secret_name}")
+            
+            # List existing join command secrets to clean up old ones
+            response = secrets_client.list_secrets(
+                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}]
+            )
+            
+            # Sort secrets by creation date, newest first
+            if 'SecretList' in response:
+                secrets = sorted(response['SecretList'], 
+                                key=lambda x: x.get('CreatedDate', ''), 
+                                reverse=True)
+                
+                # Keep the newest 2 secrets, delete the rest
+                for secret in secrets[2:]:
+                    name = secret.get('Name', '')
+                    if re.match(r'kubernetes-join-command-\d+', name):
+                        try:
+                            print(f"Deleting old secret: {name}")
+                            secrets_client.delete_secret(
+                                SecretId=name,
+                                ForceDeleteWithoutRecovery=True
+                            )
+                        except Exception as del_err:
+                            print(f"Failed to delete secret {name}: {str(del_err)}")
+        except Exception as sec_err:
+            print(f"Error creating/managing secrets: {str(sec_err)}")
+            raise
+            
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
     except Exception as e:
         print(f"Error: {str(e)}")
