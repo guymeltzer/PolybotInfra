@@ -9,30 +9,8 @@ resource "terraform_data" "clean_kubernetes_state" {
     timestamp = timestamp()
   }
 
-  # Run a script to check for and remove problematic kubernetes_namespace resources
   provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
-      #!/bin/bash
-      echo "Checking for kubernetes_namespace resources in Terraform state..."
-      NAMESPACE_RESOURCES=$$(terraform state list 2>/dev/null | grep kubernetes_namespace || echo "")
-
-      if [ -n "$$NAMESPACE_RESOURCES" ]; then
-        echo "Found kubernetes_namespace resources in state that might cause authentication issues:"
-        echo "$$NAMESPACE_RESOURCES"
-        echo "Removing these resources from state..."
-        
-        # Loop through each resource and remove it from state
-        echo "$$NAMESPACE_RESOURCES" | while read -r resource; do
-          echo "Removing $$resource from state..."
-          terraform state rm "$$resource" || echo "Failed to remove $$resource"
-        done
-        
-        echo "Resources successfully removed from state."
-      else
-        echo "No kubernetes_namespace resources found in state."
-      fi
-    EOT
+    command = "bash -c 'RESOURCES=$(terraform state list 2>/dev/null | grep kubernetes_namespace || true); if [ -n \"$RESOURCES\" ]; then for resource in $RESOURCES; do echo \"Removing $resource from state...\"; terraform state rm \"$resource\" || echo \"Failed to remove $resource\"; done; else echo \"No kubernetes_namespace resources found in state.\"; fi'"
   }
 }
 
