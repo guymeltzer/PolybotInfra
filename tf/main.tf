@@ -349,7 +349,10 @@ resource "null_resource" "providers_ready" {
   ]
   
   triggers = {
-    kubeconfig_hash = fileexists(data.local_file.kubeconfig.filename) ? filemd5(data.local_file.kubeconfig.filename) : "not-found"
+    # Use the instance_id instead of file hash to avoid inconsistency during apply
+    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
+    # Add a timestamp component to ensure this runs when needed
+    config_timestamp = terraform_data.kubectl_provider_config.id
   }
   
   provisioner "local-exec" {
