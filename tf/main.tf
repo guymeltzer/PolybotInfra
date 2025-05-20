@@ -1,3 +1,12 @@
+terraform {
+  backend "s3" {
+    bucket  = "guy-terraform-state"
+    key     = "polybot-infra/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
+  }
+}
+
 provider "aws" {
   region = var.region
 }
@@ -5,27 +14,25 @@ provider "aws" {
 # Define a local provider for first-time setup
 provider "local" {}
 
-# Configure the Kubernetes provider with safe defaults
+# Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
-  config_path = "${path.module}/kubeconfig.yml"
-  insecure = true
-  ignore_annotations = [".*"]
-  ignore_labels = [".*"]
+  config_path    = "${path.module}/kubeconfig.yml"
+  config_context = "default-context"
 }
 
-# Configure the Helm provider with safe defaults
+# Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
-    config_path = "${path.module}/kubeconfig.yml"
-    insecure = true
+    config_path    = "${path.module}/kubeconfig.yml"
+    config_context = "default-context"
   }
 }
 
-# Configure the kubectl provider with safe defaults
+# Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path = "${path.module}/kubeconfig.yml"
+  config_path    = "${path.module}/kubeconfig.yml"
+  config_context = "default-context"
   load_config_file = true
-  insecure = true
 }
 
 # Create Kubernetes namespaces for dev and prod
@@ -231,25 +238,24 @@ resource "null_resource" "wait_for_kubernetes" {
         fi
       done
       
-      # Create kubeconfig file for subsequent operations
-      cat > kubeconfig.yml <<EOF
-apiVersion: v1
-kind: Config
-clusters:
-- name: default-cluster
-  cluster:
-    server: https://$CP_IP:6443
-    insecure-skip-tls-verify: true
-users:
-- name: default-user
-  user: {}
-contexts:
-- name: default-context
-  context:
-    cluster: default-cluster
-    user: default-user
-current-context: default-context
-EOF
+      # Retrieve the proper kubeconfig file from the control plane node
+      echo "Retrieving kubeconfig file from control plane..."
+      RESPONSE=$(aws ssm send-command \
+        --instance-ids $INSTANCE_ID \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="cat /etc/kubernetes/admin.conf" \
+        --output text --query "CommandInvocations[].CommandPlugins[].Output")
+      
+      if [ -z "$RESPONSE" ]; then
+        echo "ERROR: Failed to retrieve kubeconfig from control plane"
+        exit 1
+      fi
+      
+      # Save the retrieved kubeconfig to a local file
+      echo "$RESPONSE" > kubeconfig.yml
+      
+      # Update the server address in the kubeconfig
+      sed -i.bak "s/server: https:\/\/[^:]*:/server: https:\/\/$CP_IP:/" kubeconfig.yml
       
       echo "Created kubeconfig file at $(pwd)/kubeconfig.yml"
       echo "export KUBECONFIG=$(pwd)/kubeconfig.yml" > k8s-env.sh

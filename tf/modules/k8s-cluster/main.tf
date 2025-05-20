@@ -538,10 +538,6 @@ resource "terraform_data" "control_plane_script_hash" {
   input = filesha256("${path.module}/templates/control-plane-user-data.sh")
 }
 
-resource "terraform_data" "force_replace_control_plane" {
-  input = timestamp()
-}
-
 resource "aws_instance" "control_plane" {
   ami                    = var.control_plane_ami
   instance_type          = var.control_plane_instance_type
@@ -557,7 +553,7 @@ resource "aws_instance" "control_plane" {
     token_formatted = local.kubeadm_token,
     ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp"
     script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh")
-    timestamp = timestamp() # Add timestamp to force update
+    timestamp = formatdate("YYYYMMDDhhmmss", timestamp()) # Use a consistent format for the timestamp
   })
 
   root_block_device {
@@ -574,11 +570,11 @@ resource "aws_instance" "control_plane" {
   ]
 
   lifecycle {
-    create_before_destroy = true
-    # Force replacement when the terraform_data resource changes
+    # Don't create a new instance before destroying the old one
+    create_before_destroy = false
+    # Only replace when the script content changes
     replace_triggered_by = [
-      terraform_data.control_plane_script_hash,
-      terraform_data.force_replace_control_plane
+      terraform_data.control_plane_script_hash
     ]
   }
 }
