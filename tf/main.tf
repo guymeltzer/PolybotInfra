@@ -14,6 +14,7 @@ resource "terraform_data" "manage_secrets" {
 
   # Run script to check and clean up secrets
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       #!/bin/bash
       
@@ -102,6 +103,7 @@ resource "terraform_data" "init_environment" {
 
   # Create a valid kubeconfig before any resources are created
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       #!/bin/bash
       echo "Initializing environment with valid kubeconfig..."
@@ -205,6 +207,7 @@ resource "null_resource" "wait_for_kubernetes" {
   
   # Add a simplified provisioner to validate the kubeconfig
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<EOT
       echo "Validating generated kubeconfig..."
       
@@ -267,6 +270,7 @@ resource "terraform_data" "kubectl_provider_config" {
 
   # Force provision step to ensure consistency between kubeconfig and the API server
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       # Get the control plane's current IP
       INSTANCE_ID=$$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
