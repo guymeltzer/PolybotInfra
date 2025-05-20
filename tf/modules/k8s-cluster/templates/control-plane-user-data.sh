@@ -44,6 +44,11 @@ command -v unzip || {
   echo "$(date) - ERROR: unzip not installed"
   exit 1
 }
+# Explicitly call the binary to avoid inherited options
+/usr/bin/unzip --version >> $${LOGFILE} || {
+  echo "$(date) - ERROR: Failed to verify unzip version"
+  exit 1
+}
 unzip --version >> $${LOGFILE}
 
 # Upgrade packages
