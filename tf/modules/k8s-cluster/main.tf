@@ -514,7 +514,7 @@ resource "aws_iam_role_policy" "control_plane_secrets_manager_policy" {
       }
     ]
   })
-}
+})
 
 # IAM Instance Profile for Control Plane
 resource "aws_iam_instance_profile" "control_plane_profile" {
@@ -1470,15 +1470,13 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTP"
 
   default_action {
-    type = "redirect"
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.http_tg.arn
   }
 }
 
+# Commented out HTTPS listener until proper certificate is available
+/* 
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.polybot_alb.arn
   port              = 443
@@ -1490,6 +1488,7 @@ resource "aws_lb_listener" "https" {
     target_group_arn = aws_lb_target_group.https_tg.arn
   }
 }
+*/
 
 resource "aws_security_group" "alb_sg" {
   name        = "guy-LB-SG"
@@ -1522,6 +1521,8 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
+# Commented out until proper domain and route53 setup
+/*
 resource "aws_acm_certificate" "polybot_cert" {
   domain_name       = "guy-polybot-lg.devops-int-college.com"
   validation_method = "DNS"
@@ -1539,6 +1540,7 @@ resource "aws_route53_record" "cert_validation" {
   records = [tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_value]
   allow_overwrite = true
 }
+*/
 
 resource "aws_iam_role_policy" "control_plane_inline_policy" {
   name   = "control-plane-inline-policy"
@@ -1605,5 +1607,6 @@ resource "aws_iam_role_policy" "control_plane_inline_policy" {
       },
     ]
   })
+}
 }
 

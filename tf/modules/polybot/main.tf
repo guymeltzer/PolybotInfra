@@ -55,7 +55,7 @@ resource "aws_secretsmanager_secret" "telegram_token" {
 
 resource "aws_secretsmanager_secret_version" "telegram_token_value" {
   secret_id     = aws_secretsmanager_secret.telegram_token.id
-  secret_string = var.telegram_token
+  secret_string = var.telegram_token != "" ? var.telegram_token : "placeholder-token-please-update"
 }
 
 # Store Docker Hub credentials in AWS Secrets Manager
@@ -88,6 +88,8 @@ resource "aws_sns_topic" "lifecycle_topic" {
 }
 
 # Route53 record for the polybot service
+# Commented out until Route53 zone is properly set up
+/*
 resource "aws_route53_record" "polybot_record" {
   zone_id = var.route53_zone_id
   name    = local.domain_name
@@ -99,3 +101,4 @@ resource "aws_route53_record" "polybot_record" {
     evaluate_target_health = true
   }
 }
+*/

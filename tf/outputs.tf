@@ -20,7 +20,7 @@ output "vpc_id" {
 
 output "load_balancer_address" {
   description = "DNS name of the application load balancer"
-  value       = module.k8s-cluster.alb_dns_name
+  value       = try(module.k8s-cluster.alb_dns_name, "alb-disabled")
 }
 
 output "kubeconfig_command" {
@@ -51,7 +51,7 @@ output "polybot_dev_sqs_queue_url" {
 
 output "polybot_dev_domain" {
   description = "Polybot Dev domain name"
-  value       = "https://guy-polybot-dev.devops-int-college.com"
+  value       = module.polybot_dev.domain_name
 }
 
 # Production Environment Outputs
@@ -67,12 +67,12 @@ output "polybot_prod_sqs_queue_url" {
 
 output "polybot_prod_domain" {
   description = "Polybot Prod domain name"
-  value       = "https://guy-polybot-prod.devops-int-college.com"
+  value       = module.polybot_prod.domain_name
 }
 
 output "polybot_alb_dns" {
   description = "Polybot ALB DNS name"
-  value       = module.k8s-cluster.alb_dns_name
+  value       = try(module.k8s-cluster.alb_dns_name, "alb-disabled")
 }
 
 output "subnet_ids" {
@@ -80,13 +80,14 @@ output "subnet_ids" {
   value       = module.k8s-cluster.public_subnet_ids
 }
 
+# Conditional outputs for ArgoCD, using try() to handle potential errors
 output "argocd_url" {
   description = "URL of the ArgoCD server"
-  value       = module.argocd.argocd_url
+  value       = try(module.argocd.argocd_url, "argocd-not-available")
 }
 
 output "argocd_applications" {
   description = "ArgoCD applications deployed"
-  value       = module.argocd.applications
+  value       = try(module.argocd.applications, {})
   sensitive   = true
 }

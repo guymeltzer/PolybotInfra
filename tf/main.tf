@@ -336,8 +336,8 @@ module "polybot_dev" {
   source          = "./modules/polybot"
   region          = var.region
   route53_zone_id = var.route53_zone_id
-  alb_dns_name    = module.k8s-cluster.alb_dns_name
-  alb_zone_id     = module.k8s-cluster.alb_zone_id
+  alb_dns_name    = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id     = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
   environment     = "dev"
   telegram_token  = var.telegram_token_dev
   aws_access_key_id = var.aws_access_key_id
@@ -351,8 +351,8 @@ module "polybot_prod" {
   source          = "./modules/polybot"
   region          = var.region
   route53_zone_id = var.route53_zone_id
-  alb_dns_name    = module.k8s-cluster.alb_dns_name
-  alb_zone_id     = module.k8s-cluster.alb_zone_id
+  alb_dns_name    = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id     = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
   environment     = "prod"
   telegram_token  = var.telegram_token_prod
   aws_access_key_id = var.aws_access_key_id

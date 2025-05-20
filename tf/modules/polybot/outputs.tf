@@ -20,7 +20,7 @@ output "sqs_queue_arn" {
 
 output "domain_name" {
   description = "Domain name for the Polybot service"
-  value       = aws_route53_record.polybot_record.name
+  value       = local.domain_name
 }
 
 output "telegram_token_secret_arn" {

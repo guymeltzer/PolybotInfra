@@ -1,11 +1,19 @@
 region           = "us-east-1"
-control_plane_ami = "ami-052edda5de5f8e53b"  # Ubuntu 24.04 LTS
-worker_ami        = "ami-052edda5de5f8e53b"  # Ubuntu 24.04 LTS
-route53_zone_id   = "Z1234567890"            # Replace with your actual Route53 zone ID
-key_name          = "guy-key-pair"           # Replace with your SSH key name in this region
+control_plane_ami = "ami-084568db4383264d4"  # Ubuntu AMI in us-east-1
+worker_ami        = "ami-084568db4383264d4"  # Ubuntu AMI in us-east-1
+route53_zone_id   = "Z02842682SGSPDJQMJGFT"  # Your actual Route53 zone ID
+key_name          = "guy-key-pair"           # Your SSH key name
 vpc_id            = ""                       # Leave empty to create a new VPC
 subnet_ids        = []                       # Leave empty to create new subnets
 git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
+
+# Telegram token values (replace with your actual tokens)
+telegram_token_dev  = "YOUR_DEV_TELEGRAM_TOKEN"
+telegram_token_prod = "YOUR_PROD_TELEGRAM_TOKEN"
+
+# Docker Hub credentials
+docker_username   = "guymeltzer"  # Your Docker Hub username
+docker_password   = "Candy2025!"  # Your Docker Hub password
 
 # These variables should be set via environment variables for security
 # export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"
@@ -17,6 +25,4 @@ git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
 
 # These credentials should NEVER be hardcoded in production
 # For development/testing only
-docker_username   = ""  # Replace with your Docker Hub username or use environment variables
-docker_password   = ""  # Replace with your Docker Hub password or use environment variables
 
