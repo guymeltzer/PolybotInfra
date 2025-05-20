@@ -541,7 +541,7 @@ resource "terraform_data" "control_plane_script_hash" {
 resource "aws_instance" "control_plane" {
   ami                    = var.control_plane_ami
   instance_type          = var.control_plane_instance_type
-  key_name               = var.key_name != "" ? var.key_name : null
+  key_name               = local.actual_key_name
   subnet_id              = module.vpc.public_subnets[0]
   vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
@@ -1044,6 +1044,7 @@ resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
   instance_type = "t3.medium"
+  key_name      = local.actual_key_name
 
   network_interfaces {
     subnet_id       = module.vpc.public_subnets[0]
@@ -1652,5 +1653,32 @@ resource "aws_iam_role_policy" "control_plane_inline_policy" {
       },
     ]
   })
+}
+
+# Generate a key pair for SSH access if none is provided
+resource "tls_private_key" "ssh" {
+  count     = var.key_name == "" ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+# Save the private key locally
+resource "local_file" "private_key" {
+  count           = var.key_name == "" ? 1 : 0
+  content         = tls_private_key.ssh[0].private_key_pem
+  filename        = "${path.root}/generated-ssh-key.pem"
+  file_permission = "0400"
+}
+
+# Create the key pair in AWS
+resource "aws_key_pair" "generated_key" {
+  count      = var.key_name == "" ? 1 : 0
+  key_name   = "k8s-cluster-auto-key"
+  public_key = tls_private_key.ssh[0].public_key_openssh
+}
+
+locals {
+  # Use provided key name if set, otherwise use the auto-generated key
+  actual_key_name = var.key_name != "" ? var.key_name : aws_key_pair.generated_key[0].key_name
 }
 

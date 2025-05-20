@@ -2,6 +2,8 @@ provider "aws" {
   region = var.region
 }
 
+provider "tls" {}
+
 # Resource to clean problematic resources from Terraform state
 resource "terraform_data" "clean_kubernetes_state" {
   # Always run on every apply
