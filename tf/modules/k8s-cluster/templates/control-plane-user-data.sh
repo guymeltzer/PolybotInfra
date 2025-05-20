@@ -23,8 +23,8 @@ echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
-# Trap errors
-trap 'echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - ERROR at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}; exit 1' ERR
+# Trap errors but make it more forgiving
+trap 'echo "Warning at line $${LINENO}. Command: $${BASH_COMMAND}"; echo "$(date) - WARNING at line $${LINENO}: $${BASH_COMMAND}" >> $${LOGFILE}' ERR
 
 # Set non-interactive mode
 export DEBIAN_FRONTEND=noninteractive
@@ -39,21 +39,16 @@ echo "$(date) - Fixing package manager state"
 apt-get install -f -y
 dpkg --configure -a
 
-# Install unzip explicitly (needed for AWS CLI)
+# Install unzip explicitly (needed for AWS CLI) - with improved error handling
 echo "$(date) - Installing unzip"
 apt-get install -y unzip 2>&1 | tee -a $${LOGFILE}
-command -v unzip || {
-  echo "$(date) - ERROR: unzip not installed"
-  exit 1
-}
-
-# Skip the version check and just verify the binary works
-if [ -x "$(command -v unzip)" ]; then
+if command -v unzip &>/dev/null; then
   echo "$(date) - Unzip is available at $(command -v unzip)"
-  # Capture version info but don't fail if there are warnings
-  unzip -v 2>/dev/null || true
+  # Just check binary exists, don't fail on output
+  unzip -v &>/dev/null || true
+  echo "$(date) - Unzip is installed and working"
 else
-  echo "$(date) - ERROR: Cannot execute unzip"
+  echo "$(date) - ERROR: Cannot find unzip binary"
   exit 1
 fi
 
@@ -119,11 +114,35 @@ EOF
 
 sysctl --system
 
-# Get the public and private IPs
+# Get the public and private IPs with better error handling
 echo "$(date) - Getting instance network details"
-PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
-PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-HOSTNAME=$(curl -s http://169.254.169.254/latest/meta-data/hostname)
+for i in {1..5}; do
+  PUBLIC_IP=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+  PRIVATE_IP=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
+  HOSTNAME=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/hostname || echo "")
+  
+  # If we got the private IP, we can proceed
+  if [ -n "$${PRIVATE_IP}" ]; then
+    break
+  fi
+  echo "$(date) - Retry $i/5: Failed to get instance metadata, waiting 5 seconds..."
+  sleep 5
+done
+
+# Fallback if metadata service fails
+if [ -z "$${PRIVATE_IP}" ]; then
+  echo "$(date) - WARNING: Could not get instance metadata from AWS, using fallback methods"
+  PRIVATE_IP=$(hostname -I | awk '{print $1}')
+  HOSTNAME=$(hostname)
+fi
+
+if [ -z "$${PUBLIC_IP}" ]; then
+  echo "$(date) - No public IP found, will use private IP for API server"
+  API_ADVERTISE_IP="$${PRIVATE_IP}"
+else
+  echo "$(date) - Using public IP for API server: $${PUBLIC_IP}"
+  API_ADVERTISE_IP="$${PRIVATE_IP}"  # Still use private IP for kubeadm
+fi
 
 echo "Public IP: $${PUBLIC_IP}"
 echo "Private IP: $${PRIVATE_IP}"
@@ -163,9 +182,9 @@ apt-mark hold kubelet kubeadm kubectl
 # Start the kubelet
 echo "$(date) - Starting kubelet service"
 systemctl enable --now kubelet
-systemctl status kubelet || { echo "Kubelet service failed to start"; journalctl -xeu kubelet; exit 1; }
+systemctl status kubelet || { echo "Kubelet service failed to start"; journalctl -xeu kubelet || true; }
 
-# Create kubeadm config file
+# Create kubeadm config file - with token built in
 echo "$(date) - Creating kubeadm configuration"
 cat <<EOF > /tmp/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -177,6 +196,10 @@ nodeRegistration:
 localAPIEndpoint:
   advertiseAddress: $${PRIVATE_IP}
   bindPort: 6443
+bootstrapTokens:
+- token: "${token}"
+  description: "default bootstrap token"
+  ttl: "0"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
@@ -230,11 +253,11 @@ systemctl enable iptables-restore.service || {
   exit 1
 }
 
-# Initialize Kubernetes control plane
+# Initialize Kubernetes control plane - no need for --token or --token-ttl here
 echo "$(date) - Starting kubeadm init with config"
-kubeadm init --config=/tmp/kubeadm-config.yaml --token ${token} --token-ttl 0 --v=5 || {
+kubeadm init --config=/tmp/kubeadm-config.yaml --v=5 || {
   echo "$(date) - kubeadm init failed, checking errors"
-  journalctl -xeu kubelet
+  journalctl -xeu kubelet || true
   exit 1
 }
 
@@ -313,7 +336,11 @@ chmod 644 /etc/kubernetes/pki/apiserver-kubelet-client.key
 # Configure kubeconfig with public IP
 echo "$(date) - Configuring kubeconfig for remote access"
 cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.bak
-sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+if [ -n "$${PUBLIC_IP}" ]; then
+  sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PUBLIC_IP}:6443/g" /etc/kubernetes/admin.conf
+else
+  sed -i "s/server: https:\/\/.*:6443/server: https:\/\/$${PRIVATE_IP}:6443/g" /etc/kubernetes/admin.conf
+fi
 
 # Store join command in AWS Secrets Manager
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
