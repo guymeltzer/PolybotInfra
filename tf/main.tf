@@ -102,7 +102,7 @@ resource "terraform_data" "init_environment" {
       #!/bin/bash
       echo "Initializing environment with valid kubeconfig..."
       
-      # Create a fresh kubeconfig file with only token-based auth
+      # Create a fresh kubeconfig file with basic auth
       cat > "${path.module}/kubeconfig.yml" << EOF
 apiVersion: v1
 kind: Config
@@ -114,13 +114,14 @@ clusters:
 contexts:
 - context:
     cluster: kubernetes
-    user: kubernetes-admin
+    user: admin
   name: kubernetes-admin@kubernetes
 current-context: kubernetes-admin@kubernetes
 users:
-- name: kubernetes-admin
+- name: admin
   user:
-    token: "dummy-token-for-testing"
+    username: admin
+    password: admin
 EOF
 
       chmod 600 "${path.module}/kubeconfig.yml"
@@ -136,19 +137,6 @@ EOF
           echo "Fixed server URL in kubeconfig.yml"
       fi
       
-      # Ensure no username/password auth exists
-      if grep -q "username:" "${path.module}/kubeconfig.yml" || grep -q "password:" "${path.module}/kubeconfig.yml"; then
-          echo "Found username/password auth, removing..."
-          # Make a clean copy without the username/password lines
-          grep -v "username:" "${path.module}/kubeconfig.yml" | grep -v "password:" > "${path.module}/kubeconfig.clean.yml"
-          mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
-          # Ensure token auth is present
-          if ! grep -q "token:" "${path.module}/kubeconfig.yml"; then
-              echo "Adding token-based auth..."
-              sed -i.bak '/user:/a\\    token: "dummy-token-for-testing"' "${path.module}/kubeconfig.yml"
-          fi
-      fi
-      
       # Basic validation using grep
       VALID=true
       
@@ -157,7 +145,8 @@ EOF
       grep -q "contexts:" "${path.module}/kubeconfig.yml" || { echo "Missing contexts"; VALID=false; }
       grep -q "current-context:" "${path.module}/kubeconfig.yml" || { echo "Missing current-context"; VALID=false; }
       grep -q "users:" "${path.module}/kubeconfig.yml" || { echo "Missing users"; VALID=false; }
-      grep -q "token:" "${path.module}/kubeconfig.yml" || { echo "Missing token auth"; VALID=false; }
+      grep -q "username:" "${path.module}/kubeconfig.yml" || { echo "Missing username"; VALID=false; }
+      grep -q "password:" "${path.module}/kubeconfig.yml" || { echo "Missing password"; VALID=false; }
       
       if [ "$VALID" = true ]; then
           echo "All required fields are present"
@@ -174,13 +163,14 @@ clusters:
 contexts:
 - context:
     cluster: kubernetes
-    user: kubernetes-admin
+    user: admin
   name: kubernetes-admin@kubernetes
 current-context: kubernetes-admin@kubernetes
 users:
-- name: kubernetes-admin
+- name: admin
   user:
-    token: "dummy-token-for-testing"
+    username: admin
+    password: admin
 EOF
       fi
       
@@ -221,8 +211,7 @@ resource "null_resource" "wait_for_kubernetes" {
       tr -d '\r' < "${path.module}/kubeconfig.yml" > "${path.module}/kubeconfig.clean.yml"
       mv "${path.module}/kubeconfig.clean.yml" "${path.module}/kubeconfig.yml"
       
-      # Start fresh - create a new kubeconfig with only token auth
-      # This avoids any potential mixed auth methods
+      # Start fresh - create a new kubeconfig with basic auth
       cat > "${path.module}/kubeconfig.yml" << 'KUBECONFIG'
 apiVersion: v1
 kind: Config
@@ -234,13 +223,14 @@ clusters:
 contexts:
 - context:
     cluster: kubernetes
-    user: kubernetes-admin
+    user: admin
   name: kubernetes-admin@kubernetes
 current-context: kubernetes-admin@kubernetes
 users:
-- name: kubernetes-admin
+- name: admin
   user:
-    token: "dummy-token-for-testing"
+    username: admin
+    password: admin
 KUBECONFIG
       
       # Update the server URL if needed
@@ -283,14 +273,14 @@ resource "terraform_data" "kubectl_provider_config" {
         echo "Control plane public IP: $PUBLIC_IP"
       fi
       
-      # Create a completely fresh kubeconfig with token auth only
+      # Create a kubeconfig with basic auth
       if [ "$PUBLIC_IP" != "placeholder" ]; then
         SERVER_URL="https://$PUBLIC_IP:6443"
       else
         SERVER_URL="https://kubernetes.default.svc:6443"
       fi
       
-      echo "Creating fresh kubeconfig with token auth only..."
+      echo "Creating kubeconfig with basic auth..."
       cat > "${path.module}/kubeconfig.yml" << EOF
 apiVersion: v1
 kind: Config
@@ -302,18 +292,18 @@ clusters:
 contexts:
 - context:
     cluster: kubernetes
-    user: kubernetes-admin
+    user: admin
   name: kubernetes-admin@kubernetes
 current-context: kubernetes-admin@kubernetes
 users:
-- name: kubernetes-admin
+- name: admin
   user:
-    token: "dummy-token-for-testing"
+    username: admin
+    password: admin
 EOF
       
       chmod 600 "${path.module}/kubeconfig.yml"
-      echo "Created fresh kubeconfig with server URL: $SERVER_URL"
-      
+      echo "Created kubeconfig with server URL: $SERVER_URL"
       echo "Script completed successfully"
     EOT
   }
@@ -332,12 +322,10 @@ provider "kubernetes" {
   # Don't use config_path since it might contain conflicting auth methods
   host = "https://${local.control_plane_ip}:6443"
   insecure = true
-  token = "dummy-token-for-testing"
   
-  # Explicitly disable other auth methods
-  client_certificate = ""
-  client_key = ""
-  cluster_ca_certificate = ""
+  # Use basic authentication
+  username = "admin"
+  password = "admin"
 }
 
 # Configure the Helm provider with proper authentication
@@ -346,12 +334,10 @@ provider "helm" {
     # Don't use config_path since it might contain conflicting auth methods
     host = "https://${local.control_plane_ip}:6443"
     insecure = true
-    token = "dummy-token-for-testing"
     
-    # Explicitly disable other auth methods
-    client_certificate = ""
-    client_key = ""
-    cluster_ca_certificate = ""
+    # Use basic authentication
+    username = "admin"
+    password = "admin"
   }
 }
 
@@ -361,19 +347,10 @@ provider "kubectl" {
   load_config_file = false
   host             = "https://${local.control_plane_ip}:6443"
   insecure         = true
-  token            = "dummy-token-for-testing"
   
-  # Explicitly disable other auth methods
-  client_certificate     = ""
-  client_key             = ""
-  cluster_ca_certificate = ""
-  
-  # Remove exec since we're explicitly providing a token
-  # exec {
-  #   api_version = "client.authentication.k8s.io/v1beta1"
-  #   command     = "echo"
-  #   args        = ["{\"apiVersion\": \"client.authentication.k8s.io/v1beta1\", \"kind\": \"ExecCredential\", \"status\": {\"token\": \"dummy-token-for-testing\"}}"]
-  # }
+  # Use basic authentication
+  username = "admin"
+  password = "admin"
 }
 
 # Create Kubernetes namespaces for dev and prod
