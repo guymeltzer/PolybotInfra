@@ -319,7 +319,8 @@ EOF
   }
 }
 
-# Store the control plane IP locally so we can use it in provider configs
+# Add a data source to ensure kubeconfig is ready - use a different pattern to avoid errors
+# We'll use the file() function directly in a local value instead of a data source
 locals {
   control_plane_ip = try(
     module.k8s-cluster.control_plane_public_ip,
@@ -327,31 +328,27 @@ locals {
   )
   skip_argocd     = false # Enable ArgoCD deployment
   skip_namespaces = false # Enable namespace creation
-}
-
-# Add a data source to ensure kubeconfig is ready
-data "local_file" "kubeconfig" {
-  depends_on = [terraform_data.kubectl_provider_config]
-  filename   = "${path.module}/kubeconfig.yaml"
+  k8s_ready       = fileexists("${path.module}/kubeconfig.yaml") # Simple check for kubeconfig existence
+  kubeconfig_path = "${path.module}/kubeconfig.yaml"
 }
 
 # Configure the Kubernetes provider with proper authentication
 provider "kubernetes" {
-  config_path = data.local_file.kubeconfig.filename
+  config_path = local.kubeconfig_path
   insecure    = true # Explicitly skip TLS verification
 }
 
 # Configure the Helm provider with proper authentication
 provider "helm" {
   kubernetes {
-    config_path = data.local_file.kubeconfig.filename
+    config_path = local.kubeconfig_path
     insecure    = true # Explicitly skip TLS verification
   }
 }
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path      = data.local_file.kubeconfig.filename
+  config_path      = local.kubeconfig_path
   load_config_file = true
 }
 
@@ -359,8 +356,7 @@ provider "kubectl" {
 # We can't use depends_on in provider blocks, so we use this resource to simulate that
 resource "null_resource" "providers_ready" {
   depends_on = [
-    terraform_data.kubectl_provider_config,
-    data.local_file.kubeconfig
+    terraform_data.kubectl_provider_config
   ]
 
   triggers = {
@@ -371,7 +367,7 @@ resource "null_resource" "providers_ready" {
   }
 
   provisioner "local-exec" {
-    command = "echo 'Kubernetes providers ready with kubeconfig ${data.local_file.kubeconfig.filename}'"
+    command = "echo 'Kubernetes providers ready with kubeconfig ${local.kubeconfig_path}'"
   }
 }
 
@@ -381,7 +377,6 @@ resource "null_resource" "create_namespaces" {
 
   depends_on = [
     terraform_data.kubectl_provider_config,
-    data.local_file.kubeconfig,
     null_resource.providers_ready,
     null_resource.wait_for_kubernetes
   ]
@@ -510,7 +505,7 @@ module "k8s-cluster" {
 
 # Install EBS CSI Driver for persistent storage
 resource "helm_release" "aws_ebs_csi_driver" {
-  count      = fileexists("${path.module}/kubeconfig.yaml") && try(module.k8s-cluster.control_plane_public_ip, "") != "" ? 1 : 0
+  count      = local.k8s_ready ? 1 : 0
   name       = "aws-ebs-csi-driver"
   repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
   chart      = "aws-ebs-csi-driver"
@@ -549,7 +544,7 @@ EOF
 
 # ArgoCD deployment - only create after namespaces are ready
 module "argocd" {
-  count        = local.skip_argocd ? 0 : (fileexists("${path.module}/kubeconfig.yaml") && try(module.k8s-cluster.control_plane_public_ip, "") != "" ? 1 : 0)
+  count        = local.skip_argocd ? 0 : (local.k8s_ready ? 1 : 0)
   source       = "./modules/argocd"
   git_repo_url = var.git_repo_url
   
@@ -563,7 +558,6 @@ module "argocd" {
     module.k8s-cluster,
     null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
-    data.local_file.kubeconfig,
     null_resource.create_namespaces,
     null_resource.providers_ready,
     helm_release.aws_ebs_csi_driver
