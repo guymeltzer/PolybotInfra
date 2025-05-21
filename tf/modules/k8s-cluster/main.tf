@@ -1134,7 +1134,7 @@ resource "terraform_data" "worker_script_hash" {
 
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
-  image_id      = "ami-0d7a0a6a6f9a66ea2" # Ubuntu 24.04 LTS for us-east-1
+  image_id      = "ami-0c7217cdde317cfec" # Ubuntu 24.04 LTS for us-east-1
   instance_type = "t3.medium"
   
   user_data = base64encode(replace(
