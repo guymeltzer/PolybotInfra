@@ -731,4 +731,26 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
+# Add these dummy providers to prevent connection errors
+provider "kubernetes" {
+  # Empty configuration prevents connection attempts
+  host = ""
+  config_path = ""
+}
+
+provider "helm" {
+  # Empty configuration prevents connection attempts
+  kubernetes {
+    host = ""
+    config_path = ""
+  }
+}
+
+provider "kubectl" {
+  # Empty configuration prevents connection attempts
+  host = ""
+  config_path = ""
+  load_config_file = false
+}
+
 

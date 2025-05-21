@@ -4,21 +4,19 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    # Commenting out Kubernetes-related providers to avoid connection errors
-    # kubernetes = {
-    #   source  = "hashicorp/kubernetes"
-    #   version = "~> 2.23"
-    # }
-    #
-    # helm = {
-    #   source  = "hashicorp/helm"
-    #   version = "~> 2.11"
-    # }
-    #
-    # kubectl = {
-    #   source  = "gavinbunney/kubectl"
-    #   version = "~> 1.14"
-    # }
+    # Restore Kubernetes providers with explicit source information
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.23"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.11"
+    }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
+    }
     time = {
       source  = "hashicorp/time"
       version = "~> 0.9"
