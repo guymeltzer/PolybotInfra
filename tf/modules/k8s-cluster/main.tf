@@ -547,7 +547,8 @@ resource "aws_instance" "control_plane" {
   iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
   associate_public_ip_address = true
 
-  user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
+  # Compress the user data with gzip to stay under the 16KB limit
+  user_data_base64 = base64gzip(templatefile("${path.module}/templates/control-plane-user-data.sh", {
     token_part1 = random_string.token_part1.result,
     token_part2 = random_string.token_part2.result,
     token_formatted = local.kubeadm_token,
@@ -557,7 +558,7 @@ resource "aws_instance" "control_plane" {
     region = var.region,
     worker_logs_bucket = aws_s3_bucket.worker_logs.id,
     kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name
-  })
+  }))
 
   root_block_device {
     volume_size = 20
@@ -574,7 +575,7 @@ resource "aws_instance" "control_plane" {
 
   lifecycle {
     # Prevent replacement: Ignore changes to user_data since we want to preserve the control plane
-    ignore_changes = [user_data]
+    ignore_changes = [user_data_base64]
     # Only replace when script content changes
     replace_triggered_by = [
       terraform_data.control_plane_script_hash
