@@ -535,7 +535,7 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 
 # Create a terraform_data resource that tracks changes to the script file
 resource "terraform_data" "control_plane_script_hash" {
-  input = filesha256("${path.module}/templates/control-plane-user-data.sh")
+  input = filesha256("${path.module}/control_plane_user_data.sh")
 }
 
 resource "aws_instance" "control_plane" {
@@ -548,18 +548,31 @@ resource "aws_instance" "control_plane" {
   associate_public_ip_address = true
 
   # Compress the user data with gzip to stay under the 16KB limit
-  user_data_base64 = base64gzip(templatefile("${path.module}/templates/control-plane-user-data.sh", {
-    token_part1 = random_string.token_part1.result,
-    token_part2 = random_string.token_part2.result,
-    token_formatted = local.kubeadm_token,
-    ssh_pub_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFvZpN6Jzf4o62Cj+0G5sDRxBF0kQKq0g0Dlk2L3OM3Og8oYRWKV1KHlWjPQnOfqm4aJ9imvYI/Wt8w86kP/tOmeUU0BPr+07s2oL5I1qtk2JDcM2W+9CuWQzH3+EwNJd1NZOQeEmxPtZZcLw3zowFNPk1J5iDmvKi4LRn0x/fsKRO0vHDXh+KBnGoZcJ9rJZpCPNXnJ9qB7/vM+6C7xA96vQV+ZeuZ9Mb5HIFmOsF0I5JQn9a4gZBkmYR/G4BuEUqnBMKCIQmQsZL/BxK0v/U3t7+E7WlcgKzRl07AJD+z8Mtp6jB2i9fKEKXW1IUfEJcjp3OJCWQ9I1NlZ9Bf7D1 gmeltzer@gmeltzer-mbp",
-    script_hash = filebase64sha256("${path.module}/templates/control-plane-user-data.sh"),
-    timestamp = formatdate("YYYYMMDDhhmmss", timestamp()),
-    region = var.region,
-    worker_logs_bucket = aws_s3_bucket.worker_logs.id,
-    kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name,
-    kubernetes_join_command_latest_secret = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-  }))
+  user_data_base64 = base64gzip(replace(
+    replace(
+      replace(
+        replace(
+          replace(
+            replace(
+              file("${path.module}/control_plane_user_data.sh"),
+              "##KUBERNETES_JOIN_COMMAND_SECRET##", 
+              aws_secretsmanager_secret.kubernetes_join_command.name
+            ),
+            "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
+            aws_secretsmanager_secret.kubernetes_join_command_latest.name
+          ),
+          "##REGION##",
+          var.region
+        ),
+        "##TOKEN_FORMATTED##",
+        local.kubeadm_token
+      ),
+      "##WORKER_LOGS_BUCKET##",
+      aws_s3_bucket.worker_logs.id
+    ),
+    "##TIMESTAMP##",
+    formatdate("YYYYMMDDhhmmss", timestamp())
+  ))
 
   root_block_device {
     volume_size = 20
@@ -1124,10 +1137,15 @@ resource "aws_launch_template" "worker_lt" {
   image_id      = "ami-0d7a0a6a6f9a66ea2" # Ubuntu 24.04 LTS for us-east-1
   instance_type = "t3.medium"
   
-  user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", {
-    kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name,
-    kubernetes_join_command_latest_secret = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-  }))
+  user_data = base64encode(replace(
+    replace(
+      file("${path.module}/worker_user_data.sh"),
+      "##KUBERNETES_JOIN_COMMAND_SECRET##", 
+      aws_secretsmanager_secret.kubernetes_join_command.name
+    ),
+    "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
+    aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  ))
   
   iam_instance_profile {
     name = aws_iam_instance_profile.worker_profile.name

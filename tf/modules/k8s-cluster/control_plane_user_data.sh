@@ -171,10 +171,10 @@ echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; \\
 DISCOVERY_HASH=\$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed "s/^.* //"); \\
 JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
 echo "Join command: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
-aws secretsmanager update-secret --secret-id "${kubernetes_join_command_secret}" --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
-aws secretsmanager update-secret --secret-id "${kubernetes_join_command_latest_secret}" --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_SECRET## --secret-string "\$JOIN_COMMAND" --region ##REGION## || true; \\
+aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_LATEST_SECRET## --secret-string "\$JOIN_COMMAND" --region ##REGION## || true; \\
 TIMESTAMP=\$(date +"%Y%m%d%H%M%S"); \\
-aws secretsmanager create-secret --name "${kubernetes_join_command_secret}-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region '${REGION}' || true;'
+aws secretsmanager create-secret --name "##KUBERNETES_JOIN_COMMAND_SECRET##-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region ##REGION## || true;'
 User=root
 Group=root
 EOF
@@ -253,8 +253,12 @@ ALT_JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --disc
 echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name
-MAIN_SECRET="${kubernetes_join_command_secret}"
-LATEST_SECRET="${kubernetes_join_command_latest_secret}"
+MAIN_SECRET="##KUBERNETES_JOIN_COMMAND_SECRET##"
+LATEST_SECRET="##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##"
+REGION="##REGION##"
+TOKEN_FORMATTED="##TOKEN_FORMATTED##"
+WORKER_LOGS_BUCKET="##WORKER_LOGS_BUCKET##"
+TIMESTAMP="##TIMESTAMP##"
 
 echo "$(date) - Creating Secret Manager secret $MAIN_SECRET"
 aws secretsmanager describe-secret --secret-id "$MAIN_SECRET" --region "$REGION" > /dev/null 2>&1

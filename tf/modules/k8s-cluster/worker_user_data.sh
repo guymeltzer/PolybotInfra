@@ -226,9 +226,9 @@ validate_and_fix_join_command() {
 # Fetch join command from Secrets Manager - using direct approach
 echo "$(date) - Fetching join command from Secrets Manager"
 MAX_ATTEMPTS=30
-# Define the secret names to try - templated from Terraform
-MAIN_SECRET="${kubernetes_join_command_secret}"
-LATEST_SECRET="${kubernetes_join_command_latest_secret}"
+# Define the secret names to try - using placeholder markers
+MAIN_SECRET="##KUBERNETES_JOIN_COMMAND_SECRET##"
+LATEST_SECRET="##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##"
 SECRET_NAMES=("$MAIN_SECRET" "$LATEST_SECRET")
 JOIN_COMMAND=""
 
