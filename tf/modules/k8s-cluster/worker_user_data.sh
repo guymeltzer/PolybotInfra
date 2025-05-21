@@ -41,11 +41,11 @@ setup_ssh() {
   if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then
     echo "Configuring sshd to disallow password authentication"
     sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-    systemctl restart sshd
+    systemctl restart ssh
   fi
   
   # Ensure sshd is running
-  systemctl status sshd
+  systemctl status ssh
   
   echo "SSH setup completed"
 }
