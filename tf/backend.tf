@@ -4,18 +4,21 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    # Restore Kubernetes providers with explicit source information
+    # Only include Kubernetes providers when NOT in destroy mode
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 2.23"
+      configuration_aliases = []
     }
     helm = {
       source  = "hashicorp/helm"
       version = "~> 2.11"
+      configuration_aliases = []
     }
     kubectl = {
       source  = "gavinbunney/kubectl"
       version = "~> 1.14"
+      configuration_aliases = []
     }
     time = {
       source  = "hashicorp/time"

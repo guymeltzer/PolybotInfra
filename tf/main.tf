@@ -764,27 +764,42 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Configure Kubernetes providers with intentionally invalid/unusable configurations
-# This block only appears in main.tf for reference but isn't actually used during destroy
+# Configure providers to use the generated kubeconfig
 provider "kubernetes" {
-  # Never actually used - just to avoid provider errors without attempting connections
-  host = "https://127.0.0.1:1"
-  insecure = true
+  config_path = "${path.module}/kubeconfig.yaml"
 }
 
 provider "helm" {
-  # Never actually used - just to avoid provider errors without attempting connections
   kubernetes {
-    host = "https://127.0.0.1:1"
-    insecure = true
+    config_path = "${path.module}/kubeconfig.yaml"
   }
 }
 
 provider "kubectl" {
-  # Never actually used - just to avoid provider errors without attempting connections
-  host = "https://127.0.0.1:1"
-  insecure = true
-  load_config_file = false
+  config_path = "${path.module}/kubeconfig.yaml"
+}
+
+# Special resource to remove Kubernetes objects from state
+resource "terraform_data" "kubernetes_state_clean" {
+  count = var.destroy_mode ? 1 : 0
+  
+  # Always run during destroy operations
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Removing Kubernetes-dependent resources from state..."
+      terraform state rm null_resource.wait_for_kubernetes[0] || true
+      terraform state rm null_resource.install_ebs_csi_driver[0] || true
+      terraform state rm null_resource.install_argocd[0] || true
+      terraform state rm null_resource.create_namespaces[0] || true
+      terraform state rm null_resource.providers_ready[0] || true
+      terraform state rm terraform_data.kubectl_provider_config[0] || true
+      echo "Kubernetes resources removed from state."
+    EOT
+  }
 }
 
 
