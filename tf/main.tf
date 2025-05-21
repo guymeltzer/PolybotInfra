@@ -761,12 +761,7 @@ provider "kubernetes" {
   ignore_annotations = [".*"]
   ignore_labels      = [".*"]
   
-  # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
-  client_certificate     = "invalid"
-  client_key             = "invalid"
-  cluster_ca_certificate = "invalid"
-  
-  # These settings completely prevent connection attempts
+  # Only use insecure flag without certificates
   insecure = true
   token    = "no-connect"
 }
@@ -777,12 +772,7 @@ provider "helm" {
     # Configure a deliberately invalid configuration that won't attempt connections
     host = "https://example.invalid"
     
-    # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
-    client_certificate     = "invalid"
-    client_key             = "invalid" 
-    cluster_ca_certificate = "invalid"
-    
-    # These settings completely prevent connection attempts
+    # Only use insecure flag without certificates
     insecure = true
     token    = "no-connect"
   }
@@ -792,15 +782,10 @@ provider "kubectl" {
   # Configure a deliberately invalid configuration that won't attempt connections
   host = "https://example.invalid"
   
-  # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
-  client_certificate     = "invalid"
-  client_key             = "invalid"
-  cluster_ca_certificate = "invalid"
-  
-  # These settings completely prevent connection attempts
-  insecure          = true
-  token             = "no-connect"
-  load_config_file  = false
+  # Only use insecure flag without certificates
+  insecure        = true
+  token           = "no-connect"
+  load_config_file = false
 }
 
 
