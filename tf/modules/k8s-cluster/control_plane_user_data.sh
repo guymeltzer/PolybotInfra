@@ -405,6 +405,81 @@ if [ -n "$TOPIC_ARN" ]; then
   aws sns publish --topic-arn "$TOPIC_ARN" --message "Kubernetes control plane is ready at $PUBLIC_IP" --region "$REGION"
 fi
 
+# Create a helper script to regenerate join tokens for troubleshooting
+echo "$(date) - Creating join token helper script"
+cat > /usr/local/bin/refresh-join-token.sh << 'EOF'
+#!/bin/bash
+set -e
+
+# Get latest instance metadata
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || echo "")
+if [ -n "$TOKEN" ]; then
+  PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
+  PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "")
+  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "")
+else
+  PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
+  PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || echo "")
+  REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region || echo "")
+fi
+
+# Fallback to hostname-based IP if metadata service failed
+if [ -z "$PRIVATE_IP" ]; then
+  HOSTNAME=$(hostname -f)
+  if [[ $HOSTNAME =~ ip-([0-9]+-[0-9]+-[0-9]+-[0-9]+) ]]; then
+    # Convert from ip-10-0-0-99 format to 10.0.0.99
+    PRIVATE_IP=$(echo ${BASH_REMATCH[1]} | tr '-' '.')
+    echo "Extracted private IP $PRIVATE_IP from hostname"
+  fi
+fi
+
+if [ -z "$REGION" ]; then
+  REGION="us-east-1"  # Default to us-east-1 if we couldn't detect the region
+fi
+
+# Determine which IP to use (prefer public if available)
+API_SERVER_IP="${PRIVATE_IP}"
+if [ -n "${PUBLIC_IP}" ]; then
+  API_SERVER_IP="${PUBLIC_IP}"
+  echo "Using public IP ${PUBLIC_IP} for join command"
+else
+  echo "Using private IP ${PRIVATE_IP} for join command"
+fi
+
+# Create new token
+TOKEN=$(kubeadm token create --ttl 24h)
+echo "Created token: $TOKEN"
+
+# Get hash
+DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
+echo "Discovery hash: $DISCOVERY_HASH"
+
+# Generate join command
+JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
+echo -e "\nJOIN COMMAND:\n$JOIN_COMMAND\n"
+
+# Update secrets
+echo "Updating secrets manager..."
+aws secretsmanager list-secrets --filters Key=name,Values=kubernetes-join-command --query "SecretList[*].Name" --output text | tr "\t" "\n" | while read SECRET_NAME; do
+  echo "Updating $SECRET_NAME"
+  aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --region "$REGION" || echo "Failed to update $SECRET_NAME"
+done
+
+# Create a new timestamped secret for redundancy
+TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+NEW_SECRET="kubernetes-join-command-$TIMESTAMP"
+echo "Creating new secret: $NEW_SECRET"
+aws secretsmanager create-secret --name "$NEW_SECRET" --secret-string "$JOIN_COMMAND" --description "Manual refresh join command" --region "$REGION" || echo "Failed to create $NEW_SECRET"
+
+echo -e "\nYou can now run the following on a worker node to join the cluster:\n$JOIN_COMMAND\n"
+echo "The join command has also been updated in AWS Secrets Manager."
+EOF
+
+chmod +x /usr/local/bin/refresh-join-token.sh
+echo "$(date) - Created join token helper script at /usr/local/bin/refresh-join-token.sh"
+
 echo "$(date) - Kubernetes control plane initialization completed successfully"
 echo "$(date) - You can check the cluster status using: kubectl get nodes"
 

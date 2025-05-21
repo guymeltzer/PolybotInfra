@@ -698,192 +698,251 @@ resource "local_file" "lambda_function_code" {
 import boto3
 import json
 import time
+import logging
+import traceback
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def lambda_handler(event, context):
     autoscaling = boto3.client('autoscaling')
     ssm_client = boto3.client('ssm')
     secrets_client = boto3.client('secretsmanager')
+    ec2_client = boto3.client('ec2')
     region = '${var.region}'
     control_plane_instance_id = '${aws_instance.control_plane.id}'
     
-    print(f"Event received: {json.dumps(event)}")
+    logger.info(f"Event received: {json.dumps(event)}")
     
-    if 'Records' in event and event['Records'][0]['EventSource'] == 'aws:sns':
-        print("SNS event detected")
-        message = json.loads(event['Records'][0]['Sns']['Message'])
-        print(f"SNS message: {message}")
-        if message.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
-            print("Processing scale-down event")
-            instance_id = message['EC2InstanceId']
-            lifecycle_hook_name = message['LifecycleHookName']
-            asg_name = message['AutoScalingGroupName']
-            
-            try:
-                ec2_client = boto3.client('ec2', region_name=region)
-                response = ec2_client.describe_instances(InstanceIds=[instance_id])
-                tags = response['Reservations'][0]['Instances'][0]['Tags']
-                private_ip = response['Reservations'][0]['Instances'][0]['PrivateIpAddress']
-                node_name = next((tag['Value'] for tag in tags if tag['Key'] == 'Name'), f"node/{private_ip}")
-                print(f"Draining node: {node_name}")
+    # Handle SNS events (node termination)
+    if 'Records' in event and len(event['Records']) > 0:
+        try:
+            record = event['Records'][0]
+            if record.get('EventSource') == 'aws:sns' or record.get('EventSource') == 'aws:sqs' or record.get('Source') == 'aws:sns':
+                logger.info("Processing SNS/SQS event")
                 
-                # Drain and delete the node
-                drain_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf drain --ignore-daemonsets --delete-emptydir-data --force {node_name}"
-                delete_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node {node_name}"
+                # Parse the message - handle both direct JSON or string-encoded JSON
+                message_text = record.get('Sns', {}).get('Message', '{}')
+                try:
+                    message = json.loads(message_text)
+                except Exception:
+                    logger.warning(f"Failed to parse message as JSON: {message_text}")
+                    message = {}
                 
-                # Execute drain command
-                response = ssm_client.send_command(
-                    InstanceIds=[control_plane_instance_id],
-                    DocumentName='AWS-RunShellScript',
-                    Parameters={'commands': [drain_command]},
-                    TimeoutSeconds=300
-                )
+                logger.info(f"Parsed message: {json.dumps(message)}")
                 
-                command_id = response['Command']['CommandId']
-                max_attempts = 60
-                attempt = 0
-                while attempt < max_attempts:
-                    time.sleep(2)
-                    command_output = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=control_plane_instance_id
-                    )
-                    if command_output['Status'] in ['Success', 'Completed']:
-                        print("Node drained successfully")
-                        break
-                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                        raise Exception(f"Drain failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
-                    attempt += 1
-                else:
-                    print("Drain command still running; proceeding with termination")
-                
-                # Execute delete command
-                response = ssm_client.send_command(
-                    InstanceIds=[control_plane_instance_id],
-                    DocumentName='AWS-RunShellScript',
-                    Parameters={'commands': [delete_command]},
-                    TimeoutSeconds=300
-                )
-                
-                command_id = response['Command']['CommandId']
-                max_attempts = 60
-                attempt = 0
-                while attempt < max_attempts:
-                    time.sleep(2)
-                    command_output = ssm_client.get_command_invocation(
-                        CommandId=command_id,
-                        InstanceId=control_plane_instance_id
-                    )
-                    if command_output['Status'] in ['Success', 'Completed']:
-                        print("Node deleted successfully")
-                        break
-                    elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                        raise Exception(f"Delete failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
-                    attempt += 1
-                else:
-                    print("Delete command still running; proceeding with termination")
-                
-                autoscaling.complete_lifecycle_action(
-                    LifecycleHookName=lifecycle_hook_name,
-                    AutoScalingGroupName=asg_name,
-                    LifecycleActionResult='CONTINUE',
-                    InstanceId=instance_id
-                )
-                return {'statusCode': 200, 'body': 'Node drained, deleted, and termination completed'}
-            except Exception as e:
-                print(f"Error: {str(e)}")
-                autoscaling.complete_lifecycle_action(
-                    LifecycleHookName=lifecycle_hook_name,
-                    AutoScalingGroupName=asg_name,
-                    LifecycleActionResult='ABANDON',
-                    InstanceId=instance_id
-                )
-                return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+                # Check if this is an ASG lifecycle event
+                if message.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
+                    logger.info("Processing scale-down event")
+                    instance_id = message.get('EC2InstanceId')
+                    lifecycle_hook_name = message.get('LifecycleHookName')
+                    asg_name = message.get('AutoScalingGroupName')
+                    
+                    if not instance_id or not lifecycle_hook_name or not asg_name:
+                        logger.error(f"Missing required fields in message: {json.dumps(message)}")
+                        return {'statusCode': 400, 'body': 'Missing required fields in SNS message'}
+                    
+                    try:
+                        # Get instance details
+                        ec2_response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                        if not ec2_response.get('Reservations') or not ec2_response['Reservations'][0].get('Instances'):
+                            logger.warning(f"No instance data found for {instance_id}")
+                            return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 'CONTINUE', 
+                                                    f"No instance data found for {instance_id}")
+                        
+                        instance = ec2_response['Reservations'][0]['Instances'][0]
+                        tags = instance.get('Tags', [])
+                        private_ip = instance.get('PrivateIpAddress', '')
+                        
+                        # Find node name from tags or use IP
+                        node_name = None
+                        for tag in tags:
+                            if tag.get('Key') == 'Name':
+                                node_name = tag.get('Value')
+                                break
+                        
+                        # Fall back to IP-based node name if tag not found
+                        if not node_name:
+                            node_name = f"ip-{private_ip.replace('.', '-')}.ec2.internal"
+                        
+                        logger.info(f"Draining node: {node_name}")
+                        
+                        # Drain node with 3 retries
+                        success = False
+                        for attempt in range(3):
+                            try:
+                                # Drain the node
+                                drain_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf drain --ignore-daemonsets --delete-emptydir-data --force {node_name}"
+                                logger.info(f"Running drain command: {drain_command}")
+                                
+                                response = ssm_client.send_command(
+                                    InstanceIds=[control_plane_instance_id],
+                                    DocumentName='AWS-RunShellScript',
+                                    Parameters={'commands': [drain_command]},
+                                    TimeoutSeconds=300
+                                )
+                                
+                                command_id = response['Command']['CommandId']
+                                wait_for_command(ssm_client, command_id, control_plane_instance_id)
+                                
+                                # Delete the node
+                                delete_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node {node_name}"
+                                logger.info(f"Running delete command: {delete_command}")
+                                
+                                response = ssm_client.send_command(
+                                    InstanceIds=[control_plane_instance_id],
+                                    DocumentName='AWS-RunShellScript',
+                                    Parameters={'commands': [delete_command]},
+                                    TimeoutSeconds=300
+                                )
+                                
+                                command_id = response['Command']['CommandId']
+                                wait_for_command(ssm_client, command_id, control_plane_instance_id)
+                                
+                                success = True
+                                break
+                            except Exception as e:
+                                logger.error(f"Attempt {attempt+1} failed: {str(e)}")
+                                if attempt < 2:  # Only sleep if we're going to retry
+                                    time.sleep(10)
+                        
+                        return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 
+                                                'CONTINUE', "Node drained and deleted successfully")
+                    
+                    except Exception as e:
+                        logger.error(f"Error handling scale-down event: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 
+                                                'ABANDON', f"Error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error processing SNS record: {str(e)}")
+            logger.error(traceback.format_exc())
+            return {'statusCode': 500, 'body': f"Error: {str(e)}"}
     
-    print("Running join command refresh logic")
+    # Default action: token refresh
+    logger.info("Running join command refresh logic")
     try:
+        # Get join command from control plane
         response = ssm_client.send_command(
             InstanceIds=[control_plane_instance_id],
             DocumentName='AWS-RunShellScript',
             Parameters={'commands': ['kubeadm token create --print-join-command']}
         )
+        
         command_id = response['Command']['CommandId']
-        max_attempts = 15
-        attempt = 0
-        while attempt < max_attempts:
-            time.sleep(2)
+        join_command = wait_for_command(ssm_client, command_id, control_plane_instance_id)
+        
+        if not join_command:
+            raise Exception("Failed to get join command from control plane")
+            
+        logger.info(f"Join command retrieved: {join_command}")
+        
+        # Update secrets with the new join command
+        update_secrets(secrets_client, join_command)
+        
+        return {'statusCode': 200, 'body': 'Join command updated successfully'}
+        
+    except Exception as e:
+        logger.error(f"Error in token refresh: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+
+def wait_for_command(ssm_client, command_id, instance_id):
+    """Wait for SSM command to complete and return its output"""
+    max_attempts = 30
+    attempt = 0
+    
+    while attempt < max_attempts:
+        time.sleep(2)
+        try:
             command_output = ssm_client.get_command_invocation(
                 CommandId=command_id,
-                InstanceId=control_plane_instance_id
+                InstanceId=instance_id
             )
-            if command_output['Status'] in ['Success', 'Completed']:
-                join_command = command_output['StandardOutputContent'].strip()
-                print(f"Join command updated: {join_command}")
-                break
-            elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+            
+            status = command_output['Status']
+            
+            if status in ['Success', 'Completed']:
+                return command_output.get('StandardOutputContent', '').strip()
+            elif status in ['Failed', 'Cancelled', 'TimedOut']:
                 error = command_output.get('StandardErrorContent', 'Unknown error')
                 raise Exception(f"SSM command failed: {error}")
-            attempt += 1
-        else:
-            raise Exception("SSM command did not complete within 30 seconds")
+                
+        except ssm_client.exceptions.InvocationDoesNotExist:
+            # Command not yet registered, wait and retry
+            pass
+            
+        attempt += 1
+    
+    raise Exception("SSM command did not complete within 60 seconds")
+
+def update_secrets(secrets_client, join_command):
+    """Update all join command secrets with the new command"""
+    # Get all secrets with 'kubernetes-join-command' in the name
+    try:
+        response = secrets_client.list_secrets(
+            Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command']}]
+        )
         
-        # Find the current latest -latest secret
-        try:
-            latest_secrets = secrets_client.list_secrets(
-                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-latest-']}]
-            )['SecretList']
+        secrets = response.get('SecretList', [])
+        
+        if not secrets:
+            raise Exception("No kubernetes-join-command secrets found")
             
-            if latest_secrets:
-                latest_secret = sorted(latest_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]['Name']
-                print(f"Updating latest secret: {latest_secret}")
-                
-                secrets_client.put_secret_value(
-                    SecretId=latest_secret,
-                    SecretString=join_command
-                )
-                
-                # Also update the base secret if it exists
-                try:
-                    base_secrets = secrets_client.list_secrets(
-                        Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-']}],
-                        MaxResults=10
-                    )['SecretList']
-                    
-                    # Filter out the -latest secrets
-                    base_secrets = [s for s in base_secrets if not s['Name'].endswith('-latest')]
-                    
-                    if base_secrets:
-                        base_secret = sorted(base_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]['Name']
-                        print(f"Also updating base secret: {base_secret}")
-                        
-                        secrets_client.put_secret_value(
-                            SecretId=base_secret,
-                            SecretString=join_command
-                        )
-                except Exception as e:
-                    print(f"Warning: Could not update base secret: {str(e)}")
-                
-                return {'statusCode': 200, 'body': 'Join command updated successfully'}
-            else:
-                raise Exception("No kubernetes-join-command-latest secrets found")
-                
-        except Exception as e:
-            print(f"Error finding latest secrets: {str(e)}")
-            # Create a timestamp in case we need to create a new secret
-            timestamp = int(time.time())
-            new_secret_name = f"kubernetes-join-command-{timestamp}"
+        # Update the -latest secret first (highest priority)
+        latest_secrets = [s for s in secrets if '-latest' in s['Name']]
+        if latest_secrets:
+            latest_secret = sorted(latest_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]
+            logger.info(f"Updating latest secret: {latest_secret['Name']}")
             
-            # Create a new secret as fallback
-            print(f"Creating new secret: {new_secret_name}")
-            secrets_client.create_secret(
-                Name=new_secret_name,
-                Description="Kubernetes join command created by Lambda",
+            secrets_client.put_secret_value(
+                SecretId=latest_secret['Name'],
                 SecretString=join_command
             )
-            return {'statusCode': 200, 'body': f'Created new secret: {new_secret_name}'}
+        
+        # Then update the base secrets
+        base_secrets = [s for s in secrets if '-latest' not in s['Name'] and not s['Name'].endswith(('-INIT', '-COMPLETE'))]
+        if base_secrets:
+            base_secret = sorted(base_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]
+            logger.info(f"Updating base secret: {base_secret['Name']}")
             
+            secrets_client.put_secret_value(
+                SecretId=base_secret['Name'],
+                SecretString=join_command
+            )
+        
+        # Create a new timestamped secret as backup
+        timestamp = int(time.time())
+        new_secret_name = f"kubernetes-join-command-{timestamp}"
+        
+        secrets_client.create_secret(
+            Name=new_secret_name,
+            Description="Kubernetes join command created by Lambda",
+            SecretString=join_command
+        )
+        
+        return True
     except Exception as e:
-        print(f"Error: {str(e)}")
-        return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+        logger.error(f"Error updating secrets: {str(e)}")
+        raise
+
+def complete_lifecycle(autoscaling, hook_name, asg_name, instance_id, result, message):
+    """Complete a lifecycle action and return a response"""
+    try:
+        logger.info(f"Completing lifecycle action: {hook_name}, ASG: {asg_name}, Instance: {instance_id}, Result: {result}")
+        
+        autoscaling.complete_lifecycle_action(
+            LifecycleHookName=hook_name,
+            AutoScalingGroupName=asg_name,
+            LifecycleActionResult=result,
+            InstanceId=instance_id
+        )
+        
+        return {'statusCode': 200, 'body': message}
+    except Exception as e:
+        logger.error(f"Error completing lifecycle action: {str(e)}")
+        return {'statusCode': 500, 'body': f"Error completing lifecycle action: {str(e)}"}
 EOF
 }
 
@@ -1158,6 +1217,16 @@ resource "aws_launch_template" "worker_lt" {
     associate_public_ip_address = true
   }
   
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "guy-worker-node"
+      "kubernetes.io/cluster/kubernetes" = "owned"
+      "k8s.io/cluster-autoscaler/enabled" = "true"
+      "k8s.io/role/node" = "true"
+    }
+  }
+  
   lifecycle {
     create_before_destroy = true
   }
@@ -1207,6 +1276,24 @@ resource "aws_autoscaling_group" "worker_asg" {
     propagate_at_launch = true
   }
   
+  tag {
+    key                 = "Name"
+    value               = "guy-worker-node"
+    propagate_at_launch = true
+  }
+  
+  tag {
+    key                 = "kubernetes.io/cluster/kubernetes"
+    value               = "owned"
+    propagate_at_launch = true
+  }
+  
+  tag {
+    key                 = "k8s.io/role/node"
+    value               = "true"
+    propagate_at_launch = true
+  }
+  
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
@@ -1228,10 +1315,35 @@ resource "aws_security_group" "worker_sg" {
   vpc_id      = module.vpc.vpc_id
 
   ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow SSH access from anywhere"
+  }
+
+  ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP traffic"
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS traffic"
+  }
+  
+  ingress {
+    from_port   = 10250
+    to_port     = 10250
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow kubelet API"
   }
 
   ingress {
@@ -1239,13 +1351,7 @@ resource "aws_security_group" "worker_sg" {
     to_port     = 31024
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow NodePort services"
   }
 
   ingress {
@@ -1261,9 +1367,11 @@ resource "aws_security_group" "worker_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
   }
 
   tags = {
+    Name = "guy-worker-sg"
     "kubernetes.io/cluster/kubernetes" = "owned"
   }
 }
@@ -1601,6 +1709,36 @@ resource "aws_iam_role_policy" "worker_elb_policy" {
           "elasticloadbalancing:DeleteLoadBalancerPolicy",
           "elasticloadbalancing:DeregisterTargets",
           "elasticloadbalancing:RegisterTargets"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "worker_debug_policy" {
+  name = "WorkerNodeDebugAccess"
+  role = aws_iam_role.worker_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams",
+          "ec2:DescribeInstances",
+          "ec2:DescribeTags",
+          "ec2:CreateTags",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeNetworkInterfaces",
+          "ssm:UpdateInstanceInformation",
+          "ssm:ListInstanceAssociations",
+          "ssm:DescribeInstanceProperties",
+          "ssm:DescribeDocumentParameters"
         ]
         Resource = "*"
       }

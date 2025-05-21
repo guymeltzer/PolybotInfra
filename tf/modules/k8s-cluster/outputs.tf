@@ -143,3 +143,31 @@ output "worker_script_hash" {
   description = "Hash of the worker user data script"
   value       = terraform_data.worker_script_hash.id
 }
+
+output "refresh_join_token" {
+  value = "If workers can't join, run this on the control plane: sudo /usr/local/bin/refresh-join-token.sh"
+}
+
+output "check_worker_ssh" {
+  value = "To check SSH configuration: ssh -i ${var.key_name != \"\" ? var.key_name : local_file.private_key[0].filename} -o StrictHostKeyChecking=no -vvv ubuntu@WORKER_PUBLIC_IP"
+}
+
+output "rebuild_worker_nodes" {
+  value = "To force rebuild of worker nodes: terraform apply -var 'rebuild_workers=true'"
+}
+
+output "debug_worker_logs" {
+  value = "Check worker logs: aws s3 ls s3://guy-polybot-logs/ | grep worker-init | sort -r | head -5"
+}
+
+output "view_latest_worker_log" {
+  value = "View latest worker log: aws s3 cp s3://guy-polybot-logs/LATEST_LOG_FILENAME -"
+}
+
+output "check_asg_status" {
+  value = "Check ASG status: aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name guy-polybot-asg --query \"AutoScalingGroups[0].Instances\""
+}
+
+output "list_all_instances" {
+  value = "List all instances: aws ec2 describe-instances --filters \"Name=tag:kubernetes.io/cluster/kubernetes,Values=owned\" --query \"Reservations[*].Instances[*].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,Name:Tags[?Key=='Name']|[0].Value}\" --output table"
+}
