@@ -628,10 +628,23 @@ resource "local_file" "kubeconfig" {
 
 # Secrets Manager for Kubernetes join command
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name        = "kubernetes-join-command-${formatdate("YYYYMMDDhhmmss", timestamp())}-${random_string.token_part1.result}"
-  description = "Kubernetes join command for worker nodes"
-  recovery_window_in_days = 0
-  force_overwrite_replica_secret = true
+  name                    = "kubernetes-join-command"
+  description             = "Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
+  name                    = "kubernetes-join-command-latest"
+  description             = "Latest Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Lambda function for node draining and token refresh
@@ -1053,42 +1066,35 @@ resource "aws_iam_instance_profile" "worker_profile" {
 
 # Also create a terraform_data resource for worker script
 resource "terraform_data" "worker_script_hash" {
-  input = filesha256("${path.module}/worker_user_data.sh")
+  input = filemd5("${path.module}/worker_user_data.sh")
 }
 
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
-  image_id      = var.worker_ami
+  image_id      = "ami-0d7a0a6a6f9a66ea2" # Ubuntu 24.04 LTS for us-east-1
   instance_type = "t3.medium"
-  key_name      = local.actual_key_name
-
-  network_interfaces {
-    subnet_id       = module.vpc.public_subnets[0]
-    security_groups = [aws_security_group.worker_sg.id]
-    associate_public_ip_address = true
-  }
-
+  
+  user_data = base64encode(file("${path.module}/worker_user_data.sh"))
+  
   iam_instance_profile {
     name = aws_iam_instance_profile.worker_profile.name
   }
-
-  # Use gzip compression to handle large user data scripts
-  user_data = base64gzip(file("${path.module}/worker_user_data.sh"))
-
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name                         = "guy-worker-node"
-      "kubernetes.io/cluster/kubernetes" = "owned"
-    }
+  
+  network_interfaces {
+    security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id]
+    associate_public_ip_address = true
   }
-
+  
   lifecycle {
     create_before_destroy = true
-    replace_triggered_by = [
-      terraform_data.worker_script_hash
-    ]
   }
+  
+  depends_on = [
+    aws_instance.control_plane,
+    aws_secretsmanager_secret.kubernetes_join_command,
+    null_resource.wait_for_control_plane,
+    terraform_data.worker_script_hash
+  ]
 }
 
 resource "aws_autoscaling_group" "worker_asg" {
@@ -1118,6 +1124,12 @@ resource "aws_autoscaling_group" "worker_asg" {
     value               = "owned"
     propagate_at_launch = true
   }
+  
+  depends_on = [
+    aws_instance.control_plane,
+    aws_secretsmanager_secret.kubernetes_join_command,
+    null_resource.wait_for_control_plane
+  ]
 }
 
 resource "aws_security_group" "worker_sg" {

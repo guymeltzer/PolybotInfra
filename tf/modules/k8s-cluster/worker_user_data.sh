@@ -171,6 +171,58 @@ sed -i '/swap/d' /etc/fstab
 systemctl daemon-reload
 systemctl restart kubelet
 
+# Function to validate and fix a join command
+validate_and_fix_join_command() {
+  local cmd="$1"
+  
+  echo "$(date) - Validating join command: $cmd"
+  
+  # Check if it starts with kubeadm join
+  if [[ ! "$cmd" =~ ^kubeadm\ join ]]; then
+    echo "$(date) - Not a valid join command, doesn't start with 'kubeadm join'"
+    return 1
+  fi
+  
+  # Extract server address
+  local server_addr=$(echo "$cmd" | grep -oP '^\s*kubeadm\s+join\s+\K[^:]+:[0-9]+')
+  if [ -z "$server_addr" ]; then
+    echo "$(date) - Cannot extract server address from join command"
+    return 1
+  fi
+  
+  # Check if it has the token parameter
+  if [[ ! "$cmd" =~ --token ]]; then
+    echo "$(date) - Join command is missing --token parameter"
+    # Find a token from the command if possible
+    local possible_token=$(echo "$cmd" | grep -oP '(?<=kubeadm join )[^:]+:[0-9]+ \K\S+' || echo "")
+    if [[ "$possible_token" =~ ^[a-z0-9]{6}\.[a-z0-9]{16}$ ]]; then
+      echo "$(date) - Found token in an unexpected position: $possible_token"
+      cmd="kubeadm join $server_addr --token $possible_token --discovery-token-unsafe-skip-ca-verification"
+      echo "$(date) - Fixed join command: $cmd"
+      echo "$cmd"
+      return 0
+    else
+      # Generate a new token
+      echo "$(date) - Generating a new token"
+      local new_token=$(kubeadm token generate)
+      cmd="kubeadm join $server_addr --token $new_token --discovery-token-unsafe-skip-ca-verification"
+      echo "$(date) - Join command with new token: $cmd"
+      echo "$cmd"
+      return 0
+    fi
+  fi
+  
+  # If it has a token but no ca-cert-hash or unsafe-skip, add unsafe-skip
+  if [[ ! "$cmd" =~ --discovery-token-ca-cert-hash ]] && [[ ! "$cmd" =~ --discovery-token-unsafe-skip-ca-verification ]]; then
+    echo "$(date) - Join command is missing certificate verification parameter"
+    cmd="$cmd --discovery-token-unsafe-skip-ca-verification"
+    echo "$(date) - Fixed join command: $cmd"
+  fi
+  
+  echo "$cmd"
+  return 0
+}
+
 # Fetch join command from Secrets Manager - using direct approach
 echo "$(date) - Fetching join command from Secrets Manager"
 MAX_ATTEMPTS=30
@@ -190,8 +242,32 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
       --output text 2>/dev/null || echo "")
     
     if [ -n "$JOIN_COMMAND" ]; then
-      echo "$(date) - Successfully retrieved join command from $SECRET_NAME"
-      break 2
+      # Check if the value is a valid join command or another secret name
+      if [[ "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
+        # Validate that it has the token parameter
+        if [[ ! "$JOIN_COMMAND" =~ --token ]]; then
+          echo "$(date) - Join command is missing the --token parameter"
+          # Extract the server address and try to fix it
+          SERVER_ADDR=$(echo "$JOIN_COMMAND" | grep -oP '^kubeadm join \K[^[:space:]]+')
+          if [ -n "$SERVER_ADDR" ]; then
+            # Generate a token locally and use it
+            LOCAL_TOKEN=$(kubeadm token generate)
+            JOIN_COMMAND="kubeadm join $SERVER_ADDR --token $LOCAL_TOKEN --discovery-token-unsafe-skip-ca-verification"
+            echo "$(date) - Fixed join command: $JOIN_COMMAND"
+            break 2
+          fi
+        else
+          echo "$(date) - Successfully retrieved valid join command from $SECRET_NAME"
+          break 2
+        fi
+      elif [[ "$JOIN_COMMAND" =~ ^kubernetes-join-command ]]; then
+        echo "$(date) - Secret value appears to be another secret name: $JOIN_COMMAND"
+        # Skip this and try another secret
+        JOIN_COMMAND=""
+      else
+        echo "$(date) - Successfully retrieved join command from $SECRET_NAME"
+        break 2
+      fi
     fi
   done
   
@@ -212,8 +288,52 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
         --output text 2>/dev/null || echo "")
       
       if [ -n "$JOIN_COMMAND" ]; then
-        echo "$(date) - Successfully retrieved join command from $LATEST_SECRET"
-        break
+        # Check if it's a valid join command
+        if [[ "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
+          # Validate that it has the token parameter
+          if [[ ! "$JOIN_COMMAND" =~ --token ]]; then
+            echo "$(date) - Join command is missing the --token parameter"
+            # Extract the server address and try to fix it
+            SERVER_ADDR=$(echo "$JOIN_COMMAND" | grep -oP '^kubeadm join \K[^[:space:]]+')
+            if [ -n "$SERVER_ADDR" ]; then
+              # Generate a token locally and use it
+              LOCAL_TOKEN=$(kubeadm token generate)
+              JOIN_COMMAND="kubeadm join $SERVER_ADDR --token $LOCAL_TOKEN --discovery-token-unsafe-skip-ca-verification"
+              echo "$(date) - Fixed join command: $JOIN_COMMAND"
+              break
+            fi
+          else
+            echo "$(date) - Successfully retrieved valid join command from $LATEST_SECRET"
+            break
+          fi
+        elif [[ "$JOIN_COMMAND" =~ ^kubernetes-join-command ]]; then
+          # Try to retrieve the nested secret
+          NESTED_SECRET=$JOIN_COMMAND
+          JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+            --region "$REGION" \
+            --secret-id "$NESTED_SECRET" \
+            --query SecretString \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$JOIN_COMMAND" ] && [[ "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
+            # Validate that it has the token parameter
+            if [[ ! "$JOIN_COMMAND" =~ --token ]]; then
+              echo "$(date) - Nested join command is missing the --token parameter"
+              # Extract the server address and try to fix it
+              SERVER_ADDR=$(echo "$JOIN_COMMAND" | grep -oP '^kubeadm join \K[^[:space:]]+')
+              if [ -n "$SERVER_ADDR" ]; then
+                # Generate a token locally and use it
+                LOCAL_TOKEN=$(kubeadm token generate)
+                JOIN_COMMAND="kubeadm join $SERVER_ADDR --token $LOCAL_TOKEN --discovery-token-unsafe-skip-ca-verification"
+                echo "$(date) - Fixed nested join command: $JOIN_COMMAND"
+                break
+              fi
+            else
+              echo "$(date) - Successfully retrieved valid join command from nested secret $NESTED_SECRET"
+              break
+            fi
+          fi
+        fi
       fi
     fi
   fi
@@ -233,6 +353,10 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
     
     if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
       echo "$(date) - Found control plane at $CONTROL_PLANE_IP"
+      # Generate a token locally and use it with unsafe skip verification
+      LOCAL_TOKEN=$(kubeadm token generate)
+      JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token ${LOCAL_TOKEN} --discovery-token-unsafe-skip-ca-verification"
+      echo "$(date) - Generated direct join command: $JOIN_COMMAND"
       break
     fi
     
@@ -240,30 +364,16 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   fi
 done
 
-# If we couldn't get a join command but found the control plane IP, construct a join command
-# This uses a simple approach with token and unsafe-skip-ca-verification
-if [ -z "$JOIN_COMMAND" ] && [ -n "$CONTROL_PLANE_IP" ]; then
-  echo "$(date) - Using direct unsafe approach with control plane IP $CONTROL_PLANE_IP"
-  
-  # Generate a token locally
-  TOKEN=$(kubeadm token generate)
-  echo "$(date) - Generated token: $TOKEN"
-  
-  # Use the direct unsafe skip approach - this will work with our relaxed authentication on control plane
-  JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token ${TOKEN} --discovery-token-unsafe-skip-ca-verification"
-  echo "$(date) - Using direct join command: $JOIN_COMMAND"
-fi
-
 if [ -z "$JOIN_COMMAND" ]; then
-  echo "$(date) - Failed to retrieve join command after $MAX_ATTEMPTS attempts"
+  echo "$(date) - Failed to retrieve a valid join command after $MAX_ATTEMPTS attempts"
   upload_logs_to_s3 "JOIN_COMMAND_FAILED"
   exit 1
 fi
 
-echo "$(date) - Join command fetched successfully"
+echo "$(date) - Join command fetched successfully: $JOIN_COMMAND"
 
 # Join cluster with retry logic
-MAX_ATTEMPTS=15
+MAX_ATTEMPTS=10
 JOIN_SUCCESS=false
 RETRY_DELAY=30
 
@@ -271,6 +381,7 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   echo "$(date) - Attempt $ATTEMPT/$MAX_ATTEMPTS to join cluster"
   
   # Execute the join command
+  echo "$(date) - Running: $JOIN_COMMAND --v=5"
   eval $JOIN_COMMAND --v=5 2>&1 | tee -a "$LOGFILE"
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     JOIN_SUCCESS=true
@@ -279,8 +390,24 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
     break
   else
     echo "$(date) - Join failed. Retrying in $RETRY_DELAY seconds..."
+    # Check kubelet logs for errors
+    echo "$(date) - Checking kubelet logs for errors:"
+    journalctl -u kubelet --no-pager -n 30 | tee -a "$LOGFILE"
+    
     sleep $RETRY_DELAY
     RETRY_DELAY=$((RETRY_DELAY * 2))
+    
+    # If we have tried several times and failed, attempt to regenerate a new token
+    if [ $ATTEMPT -eq 5 ]; then
+      echo "$(date) - Multiple failures, trying with a newly generated token"
+      NEW_TOKEN=$(kubeadm token generate)
+      # Parse existing control plane address from join command
+      CP_ADDR=$(echo "$JOIN_COMMAND" | grep -oP '^\s*kubeadm\s+join\s+\K[^:]+:[0-9]+')
+      if [ -n "$CP_ADDR" ]; then
+        JOIN_COMMAND="kubeadm join $CP_ADDR --token $NEW_TOKEN --discovery-token-unsafe-skip-ca-verification"
+        echo "$(date) - Using new join command: $JOIN_COMMAND"
+      fi
+    fi
   fi
 done
 

@@ -156,7 +156,7 @@ for i in {1..10}; do
   fi
 done
 
-# Create a service that runs every 10 minutes to ensure there's always a valid token
+# Create a service that runs every 10 minutes to ensure there's always a valid token AND updates the secret
 echo "$(date) - Setting up kubernetes token creation service"
 cat > /etc/systemd/system/k8s-token-creator.service << EOF
 [Unit]
@@ -165,7 +165,16 @@ After=network.target kubelet.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'TOKEN=\$(kubeadm token create --ttl 24h); echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; kubeadm token list >> /var/log/k8s-token-creator.log'
+ExecStart=/bin/bash -c '\\
+TOKEN=\$(kubeadm token create --ttl 24h); \\
+echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; \\
+DISCOVERY_HASH=\$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed "s/^.* //"); \\
+JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
+echo "Join command: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
+aws secretsmanager update-secret --secret-id kubernetes-join-command --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id kubernetes-join-command-latest --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+TIMESTAMP=\$(date +"%Y%m%d%H%M%S"); \\
+aws secretsmanager create-secret --name "kubernetes-join-command-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region '${REGION}' || true;'
 User=root
 Group=root
 EOF
@@ -245,19 +254,21 @@ echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND"
 
 # Store join command in AWS Secrets Manager - first create with a simple name
 echo "$(date) - Creating Secret Manager secret kubernetes-join-command"
-aws secretsmanager create-secret --name "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION" || {
-  echo "$(date) - Failed to create new secret with simple name, trying to update if it exists"
-  aws secretsmanager update-secret --secret-id "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --region "$REGION" || echo "Failed to update existing secret"
-}
+aws secretsmanager describe-secret --secret-id "kubernetes-join-command" --region "$REGION" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  # Secret exists, update it
+  aws secretsmanager update-secret --secret-id "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --region "$REGION"
+else
+  # Secret doesn't exist, create it
+  aws secretsmanager create-secret --name "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
+fi
 
 # Also create a timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
 SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
 
 echo "$(date) - Creating timestamped Secret Manager secret $SECRET_NAME"
-aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION" || {
-  echo "$(date) - Failed to create new timestamped secret"
-}
+aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
 
 # Also create a fixed-name secret that's easier to find
 FIXED_SECRET_NAME="kubernetes-join-command-latest"
@@ -277,14 +288,18 @@ sleep 5  # Give AWS some time to propagate the secrets
 
 for SECRET_NAME in "kubernetes-join-command" "kubernetes-join-command-latest" "$SECRET_NAME"; do
   echo "$(date) - Verifying secret: $SECRET_NAME"
-  if ! aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text > /dev/null; then
+  STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text)
+  if [ -z "$STORED_JOIN_COMMAND" ]; then
     echo "$(date) - WARNING: Secret $SECRET_NAME verification failed, will retry once"
     sleep 5
-    aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text > /dev/null || {
+    STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text)
+    if [ -z "$STORED_JOIN_COMMAND" ]; then
       echo "$(date) - ERROR: Secret $SECRET_NAME still not accessible after retry"
-    }
+    else
+      echo "$(date) - Secret $SECRET_NAME verified and accessible: $STORED_JOIN_COMMAND"
+    fi
   else
-    echo "$(date) - Secret $SECRET_NAME verified and accessible"
+    echo "$(date) - Secret $SECRET_NAME verified and accessible: $STORED_JOIN_COMMAND"
   fi
 done
 
@@ -325,8 +340,3 @@ echo "$(date) - You can check the cluster status using: kubectl get nodes"
 # Verify connection again
 echo "$(date) - Verifying kubectl works with updated kubeconfig"
 kubectl get nodes
-
-# Install AWS CLI for managing resources
-echo "$(date) - Installing AWS CLI"
-apt-get update
-apt-get install -y unzip
