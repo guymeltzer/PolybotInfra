@@ -547,8 +547,7 @@ resource "aws_instance" "control_plane" {
   iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
   associate_public_ip_address = true
 
-  # Compress the user data script to work around the 16KB limit
-  user_data_base64 = base64encode(templatefile("${path.module}/templates/control-plane-user-data.sh", {
+  user_data = templatefile("${path.module}/templates/control-plane-user-data.sh", {
     token_part1 = random_string.token_part1.result,
     token_part2 = random_string.token_part2.result,
     token_formatted = local.kubeadm_token,
@@ -558,7 +557,7 @@ resource "aws_instance" "control_plane" {
     region = var.region,
     worker_logs_bucket = aws_s3_bucket.worker_logs.id,
     kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name
-  }))
+  })
 
   root_block_device {
     volume_size = 20
@@ -575,7 +574,7 @@ resource "aws_instance" "control_plane" {
 
   lifecycle {
     # Prevent replacement: Ignore changes to user_data since we want to preserve the control plane
-    ignore_changes = [user_data_base64]
+    ignore_changes = [user_data]
     # Only replace when script content changes
     replace_triggered_by = [
       terraform_data.control_plane_script_hash
@@ -1072,8 +1071,8 @@ resource "aws_launch_template" "worker_lt" {
     name = aws_iam_instance_profile.worker_profile.name
   }
 
-  # Just use the file directly to avoid template expansion errors
-  user_data = base64encode(file("${path.module}/worker_user_data.sh"))
+  # Use gzip compression to handle large user data scripts
+  user_data = base64gzip(file("${path.module}/worker_user_data.sh"))
 
   tag_specifications {
     resource_type = "instance"
