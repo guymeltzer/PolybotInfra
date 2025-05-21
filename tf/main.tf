@@ -598,8 +598,7 @@ module "polybot_prod" {
 resource "null_resource" "cluster_readiness_info" {
   depends_on = [
     module.k8s-cluster,
-    terraform_data.kubectl_provider_config,
-    data.local_file.kubeconfig
+    terraform_data.kubectl_provider_config
   ]
 
   # Run on each apply
@@ -615,10 +614,10 @@ resource "null_resource" "cluster_readiness_info" {
       echo "KUBERNETES CLUSTER DEPLOYMENT INFORMATION"
       echo "---------------------------------------------------------"
       echo "Kubernetes control plane IP: ${try(module.k8s-cluster.control_plane_public_ip, "Not available yet")}"
-      echo "Kubeconfig file: ${path.module}/kubeconfig.yaml"
+      echo "Kubeconfig file: ${local.kubeconfig_path}"
       echo ""
       echo "To manually verify the cluster and create namespaces, run:"
-      echo "export KUBECONFIG=${path.module}/kubeconfig.yaml"
+      echo "export KUBECONFIG=${local.kubeconfig_path}"
       echo "kubectl get nodes"
       echo "kubectl create namespace dev --dry-run=client -o yaml | kubectl apply --validate=false -f -"
       echo "kubectl create namespace prod --dry-run=client -o yaml | kubectl apply --validate=false -f -"
