@@ -2051,20 +2051,60 @@ resource "terraform_data" "completion_progress" {
       echo -e "\\033[0;33m⏱️  This may take 5-10 minutes. Kubernetes components are being installed.\\033[0m"
       echo -e "\\033[0;33m⏱️  You can check the outputs for SSH commands to view initialization logs.\\033[0m"
       
-      # Check control plane status every minute for up to 5 minutes
-      for i in {1..5}; do
-        echo -e "\\033[0;33m⏱️  Checking control plane status (attempt $$i/5)...\\033[0m"
-        # Try to SSH to the control plane and check if nodes are ready
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-        if [ $$? -eq 0 ]; then
-          echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-          echo -e "\\033[1;34m========================================================\\033[0m"
-          echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-          echo -e "\\033[1;34m========================================================\\033[0m"
-          exit 0
-        fi
-        sleep 60
-      done
+      # Fixed implementation to avoid variable expansion issues
+      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 1/5)...\\033[0m"
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        exit 0
+      fi
+      sleep 60
+      
+      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 2/5)...\\033[0m"
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        exit 0
+      fi
+      sleep 60
+      
+      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 3/5)...\\033[0m"
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        exit 0
+      fi
+      sleep 60
+      
+      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 4/5)...\\033[0m"
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        exit 0
+      fi
+      sleep 60
+      
+      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 5/5)...\\033[0m"
+      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+        echo -e "\\033[1;34m========================================================\\033[0m"
+        exit 0
+      fi
       
       echo -e "\\033[0;33m⚠️  Control plane still initializing. Check logs for progress.\\033[0m"
       echo -e "\\033[1;34m========================================================\\033[0m"
