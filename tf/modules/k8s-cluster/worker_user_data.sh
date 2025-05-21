@@ -179,8 +179,23 @@ JOIN_COMMAND=""
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
-  # First list all available secrets for debugging
-  echo "$(date) - Available secrets:" >> "$LOGFILE"
+  # First try to get the fixed-name secret directly (faster and more reliable)
+  FIXED_SECRET_NAME="kubernetes-join-command-latest"
+  echo "$(date) - Trying to get fixed secret $FIXED_SECRET_NAME" >> "$LOGFILE"
+  JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+    --region "$REGION" \
+    --secret-id "$FIXED_SECRET_NAME" \
+    --query SecretString \
+    --output text 2>>"$LOGFILE" || echo "")
+  
+  if [ -n "$JOIN_COMMAND" ]; then
+    echo "$(date) - Successfully retrieved join command from fixed secret"
+    echo "$(date) - Join command: $JOIN_COMMAND" >> "$LOGFILE"
+    break
+  fi
+  
+  # If fixed secret not found, list all available secrets for debugging
+  echo "$(date) - Fixed secret not found, listing all secrets:" >> "$LOGFILE"
   aws secretsmanager list-secrets \
     --region "$REGION" \
     --query "SecretList[*].{Name:Name,CreatedDate:CreatedDate}" \
@@ -192,10 +207,11 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     sleep 60
   fi
   
-  # Get the newest secret by sort_by and taking the last item (newest)
+  # Get the newest secret by filtering for names containing kubernetes-join-command
+  # Without using wildcards, which causes API validation errors
   LATEST_SECRET=$(aws secretsmanager list-secrets \
     --region "$REGION" \
-    --query "sort_by(SecretList[?starts_with(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
+    --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
     --output text 2>>"$LOGFILE" || echo "")
   
   if [ -z "$LATEST_SECRET" ] || [ "$LATEST_SECRET" == "None" ]; then
@@ -219,6 +235,11 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
       echo "$(date) - Pinging control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
       ping -c 3 "$CONTROL_PLANE_IP" >> "$LOGFILE" 2>&1
+      if [ $? -eq 0 ]; then
+        echo "$(date) - Network connectivity to control plane confirmed" >> "$LOGFILE"
+      else
+        echo "$(date) - Cannot ping control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
+      fi
     else
       echo "$(date) - Could not determine control plane IP, falling back to VPC CIDR" >> "$LOGFILE"
       echo "$(date) - Pinging control plane at 10.0.0.0" >> "$LOGFILE"

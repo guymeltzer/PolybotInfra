@@ -159,22 +159,39 @@ done
 # Generate join command
 TOKEN=$(kubeadm token create)
 DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-JOIN_COMMAND="kubeadm join ${PUBLIC_IP}:6443 --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH} --token ${TOKEN}"
+JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH} --token ${TOKEN}"
 
-echo "$(date) - Generated join command with public IP: $JOIN_COMMAND"
+echo "$(date) - Generated join command with private IP: $JOIN_COMMAND"
 
 # Store join command in AWS Secrets Manager with a consistent naming pattern
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-TOKEN_PARTS=(${TOKEN//./ })
-SECRET_NAME="kubernetes-join-command-${TOKEN_PARTS[0]}.${TOKEN_PARTS[1]}"
+SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
 
-echo "$(date) - Checking if Secret Manager secret $SECRET_NAME exists"
-if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$REGION" 2>/dev/null; then
-  echo "$(date) - Updating existing Secret Manager secret"
-  aws secretsmanager update-secret --secret-id "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --region "$REGION"
+echo "$(date) - Creating Secret Manager secret $SECRET_NAME"
+aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION" || {
+  echo "$(date) - Failed to create new secret, trying to update existing one"
+  # If creation fails, try to find an existing secret to update
+  EXISTING_SECRET=$(aws secretsmanager list-secrets \
+    --region "$REGION" \
+    --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
+    --output text)
+  
+  if [ -n "$EXISTING_SECRET" ] && [ "$EXISTING_SECRET" != "None" ]; then
+    echo "$(date) - Updating existing secret $EXISTING_SECRET"
+    aws secretsmanager update-secret --secret-id "$EXISTING_SECRET" --secret-string "$JOIN_COMMAND" --region "$REGION"
+  fi
+}
+
+# Also create a fixed-name secret that's easier to find
+FIXED_SECRET_NAME="kubernetes-join-command-latest"
+echo "$(date) - Creating/updating fixed name secret $FIXED_SECRET_NAME"
+aws secretsmanager describe-secret --secret-id "$FIXED_SECRET_NAME" --region "$REGION" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+  # Secret exists, update it
+  aws secretsmanager update-secret --secret-id "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --region "$REGION"
 else
-  echo "$(date) - Creating new Secret Manager secret"
-  aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
+  # Secret doesn't exist, create it
+  aws secretsmanager create-secret --name "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Latest Kubernetes join command" --region "$REGION"
 fi
 
 # Update admin kubeconfig to use public IP
