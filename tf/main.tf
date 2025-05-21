@@ -2,6 +2,13 @@ provider "aws" {
   region = var.region
 }
 
+# Variable to indicate destroy mode - set to true when running terraform destroy
+variable "destroy_mode" {
+  description = "Set to true when destroying infrastructure to skip Kubernetes API connections"
+  type        = bool
+  default     = false
+}
+
 provider "tls" {}
 
 # Resource to clean problematic resources from Terraform state
@@ -148,6 +155,8 @@ EOF
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
+  count = local.destroy_mode ? 0 : 1
+  
   depends_on = [module.k8s-cluster]
 
   provisioner "local-exec" {
@@ -202,6 +211,8 @@ resource "null_resource" "wait_for_kubernetes" {
 
 # Configure kubectl provider with credentials after waiting for the API to be ready
 resource "terraform_data" "kubectl_provider_config" {
+  count = local.destroy_mode ? 0 : 1
+  
   depends_on = [null_resource.wait_for_kubernetes, module.k8s-cluster]
 
   triggers_replace = [
@@ -338,10 +349,16 @@ locals {
     )
   )
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
+  
+  # NEW: Special flag to disable all Kubernetes-dependent resources for destroy operations
+  # Set this to true when running terraform destroy
+  destroy_mode = tobool(try(var.destroy_mode, false))
 }
 
 # This is a workaround to ensure the local-exec commands run in the right order
 resource "null_resource" "providers_ready" {
+  count = local.destroy_mode ? 0 : 1
+  
   depends_on = [
     terraform_data.kubectl_provider_config
   ]
@@ -360,7 +377,7 @@ resource "null_resource" "providers_ready" {
 
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
-  count = local.skip_namespaces ? 0 : 1
+  count = local.destroy_mode || local.skip_namespaces ? 0 : 1
 
   depends_on = [
     terraform_data.kubectl_provider_config,
@@ -370,7 +387,7 @@ resource "null_resource" "create_namespaces" {
 
   # Only trigger after the control plane is actually ready
   triggers = {
-    kubectl_config_id = terraform_data.kubectl_provider_config.id
+    kubectl_config_id = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
     control_plane_ip  = try(module.k8s-cluster.control_plane_public_ip, "none")
     # Add a timestamp to ensure it runs when needed
     timestamp = timestamp()
@@ -492,6 +509,8 @@ module "k8s-cluster" {
 
 # Install EBS CSI Driver using local-exec only
 resource "null_resource" "install_ebs_csi_driver" {
+  count = local.destroy_mode ? 0 : 1
+  
   # Only run after we have a valid kubeconfig
   depends_on = [
     module.k8s-cluster, 
@@ -502,7 +521,7 @@ resource "null_resource" "install_ebs_csi_driver" {
   
   # Only run when needed, based on resource changes
   triggers = {
-    k8s_config_timestamp = terraform_data.kubectl_provider_config.id
+    k8s_config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
     control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
     always_run = timestamp() # Run on every apply
   }
@@ -550,7 +569,7 @@ resource "null_resource" "install_ebs_csi_driver" {
 
 # Install ArgoCD using local-exec only
 resource "null_resource" "install_argocd" {
-  count = !local.skip_argocd ? 1 : 0
+  count = local.destroy_mode || local.skip_argocd ? 0 : 1
   
   depends_on = [
     module.k8s-cluster,
@@ -563,7 +582,7 @@ resource "null_resource" "install_argocd" {
   
   # Only run when needed
   triggers = {
-    k8s_config_timestamp = terraform_data.kubectl_provider_config.id
+    k8s_config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
     control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
     always_run = timestamp() # Run on every apply
   }
@@ -642,6 +661,8 @@ module "polybot_prod" {
 
 # Output commands for manual verification and namespace creation
 resource "null_resource" "cluster_readiness_info" {
+  count = local.destroy_mode ? 0 : 1
+
   depends_on = [
     module.k8s-cluster,
     terraform_data.kubectl_provider_config
@@ -731,36 +752,55 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Add these dummy providers to prevent connection errors
+# Add these dummy providers to prevent connection errors during destroy
 provider "kubernetes" {
-  # Use conditional configuration based on kubeconfig existence
-  host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
-  client_certificate     = try(local.k8s_ready, false) ? "" : ""
-  client_key             = try(local.k8s_ready, false) ? "" : ""
-  cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
+  # Configure a deliberately invalid configuration that won't attempt connections
+  host = "https://example.invalid"
   
-  # Skip connecting during planning phase
-  ignore_annotations      = [".*"]
-  ignore_labels           = [".*"]
+  # Skip validation and prevent connection attempts
+  ignore_annotations = [".*"]
+  ignore_labels      = [".*"]
+  
+  # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
+  client_certificate     = "invalid"
+  client_key             = "invalid"
+  cluster_ca_certificate = "invalid"
+  
+  # These settings completely prevent connection attempts
+  insecure = true
+  token    = "no-connect"
 }
 
 provider "helm" {
-  # Use conditional configuration based on kubeconfig existence
+  # Configure a dummy setup that won't attempt connections
   kubernetes {
-    host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
-    client_certificate     = try(local.k8s_ready, false) ? "" : ""
-    client_key             = try(local.k8s_ready, false) ? "" : ""
-    cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
+    # Configure a deliberately invalid configuration that won't attempt connections
+    host = "https://example.invalid"
+    
+    # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
+    client_certificate     = "invalid"
+    client_key             = "invalid" 
+    cluster_ca_certificate = "invalid"
+    
+    # These settings completely prevent connection attempts
+    insecure = true
+    token    = "no-connect"
   }
 }
 
 provider "kubectl" {
-  # Use conditional configuration based on kubeconfig existence
-  host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
-  client_certificate     = try(local.k8s_ready, false) ? "" : ""
-  client_key             = try(local.k8s_ready, false) ? "" : ""
-  cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
-  load_config_file       = false
+  # Configure a deliberately invalid configuration that won't attempt connections
+  host = "https://example.invalid"
+  
+  # Configure a client cert setup that will intentionally fail validation rather than attempt to connect
+  client_certificate     = "invalid"
+  client_key             = "invalid"
+  cluster_ca_certificate = "invalid"
+  
+  # These settings completely prevent connection attempts
+  insecure          = true
+  token             = "no-connect"
+  load_config_file  = false
 }
 
 
