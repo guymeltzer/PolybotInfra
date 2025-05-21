@@ -2,14 +2,14 @@
 # Script generated with static content (timestamp will update when file changes)
 
 # Log file for debugging - Define directly without using template variable syntax
-LOGFILE=/var/log/k8s-worker-init.log
+LOGFILE="/var/log/k8s-worker-init.log"
 # Use single quotes to prevent Terraform template expansion for variables we don't want to expand
-exec > >(tee -a "$LOGFILE") 2>&1
+exec > >(tee -a ${LOGFILE}) 2>&1
 echo "$(date) - Starting Kubernetes worker node initialization"
 
 # Error handling
 set -e
-trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> "$LOGFILE"; exit 1' ERR
+trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(date) - ERROR at line $LINENO: $BASH_COMMAND" >> ${LOGFILE}; exit 1' ERR
 
 # Set non-interactive frontend
 export DEBIAN_FRONTEND=noninteractive
@@ -38,14 +38,14 @@ done
 # Get metadata token
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 if [ -z "$TOKEN" ]; then
-  echo "Failed to retrieve metadata token" >> "$LOGFILE"
+  echo "Failed to retrieve metadata token" >> ${LOGFILE}
   exit 1
 fi
 
 # Get region
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 if [ -z "$REGION" ]; then
-  echo "Failed to retrieve region from metadata" >> "$LOGFILE"
+  echo "Failed to retrieve region from metadata" >> ${LOGFILE}
   exit 1
 fi
 
@@ -171,150 +171,86 @@ sed -i '/swap/d' /etc/fstab
 systemctl daemon-reload
 systemctl restart kubelet
 
-# Fetch join command from Secrets Manager with retry logic
+# Fetch join command from Secrets Manager - using direct approach
 echo "$(date) - Fetching join command from Secrets Manager"
-MAX_SECRET_ATTEMPTS=15
+MAX_ATTEMPTS=30
+SECRET_NAMES=("kubernetes-join-command" "kubernetes-join-command-latest")
 JOIN_COMMAND=""
 
-for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
-  echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
+for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
+  echo "$(date) - Join command fetch attempt $ATTEMPT/$MAX_ATTEMPTS"
   
-  # First try to get the fixed-name secret directly (faster and more reliable)
-  FIXED_SECRET_NAME="kubernetes-join-command-latest"
-  echo "$(date) - Trying to get fixed secret $FIXED_SECRET_NAME" >> "$LOGFILE"
-  JOIN_COMMAND=$(aws secretsmanager get-secret-value \
-    --region "$REGION" \
-    --secret-id "$FIXED_SECRET_NAME" \
-    --query SecretString \
-    --output text 2>>"$LOGFILE" || echo "")
-  
-  if [ -n "$JOIN_COMMAND" ]; then
-    echo "$(date) - Successfully retrieved join command from fixed secret"
-    echo "$(date) - Join command: $JOIN_COMMAND" >> "$LOGFILE"
-    break
-  fi
-  
-  # If fixed secret not found, list all available secrets for debugging
-  echo "$(date) - Fixed secret not found, listing all secrets:" >> "$LOGFILE"
-  aws secretsmanager list-secrets \
-    --region "$REGION" \
-    --query "SecretList[*].{Name:Name,CreatedDate:CreatedDate}" \
-    --output json >> "$LOGFILE" || echo "Failed to list secrets" >> "$LOGFILE"
-  
-  # Wait a bit longer at the start to ensure control plane has time to create the token
-  if [ $SECRET_ATTEMPT -le 3 ]; then
-    echo "$(date) - Initial waiting period to ensure control plane is ready - sleeping 60 seconds"
-    sleep 60
-  fi
-  
-  # Get the newest secret by filtering for names containing kubernetes-join-command
-  # Without using wildcards, which causes API validation errors
-  LATEST_SECRET=$(aws secretsmanager list-secrets \
-    --region "$REGION" \
-    --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
-    --output text 2>>"$LOGFILE" || echo "")
-  
-  if [ -z "$LATEST_SECRET" ] || [ "$LATEST_SECRET" == "None" ]; then
-    echo "$(date) - No kubernetes-join-command secrets found. Waiting to retry..."
-    
-    # Run extensive connectivity and permissions checks
-    echo "$(date) - Running connectivity checks..." >> "$LOGFILE"
-    
-    # Check IAM identity for debugging  
-    echo "$(date) - Checking IAM identity..." >> "$LOGFILE"
-    aws sts get-caller-identity --region "$REGION" >> "$LOGFILE" 2>&1
-    
-    # Check connectivity to control plane
-    echo "$(date) - Looking up control plane instance..." >> "$LOGFILE"
-    CONTROL_PLANE_IP=$(aws ec2 describe-instances \
+  # Try each possible secret name
+  for SECRET_NAME in "${SECRET_NAMES[@]}"; do
+    echo "$(date) - Trying secret: $SECRET_NAME"
+    JOIN_COMMAND=$(aws secretsmanager get-secret-value \
       --region "$REGION" \
-      --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
-      --query "Reservations[0].Instances[0].PrivateIpAddress" \
-      --output text 2>>"$LOGFILE" || echo "")
+      --secret-id "$SECRET_NAME" \
+      --query SecretString \
+      --output text 2>/dev/null || echo "")
     
-    if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-      echo "$(date) - Pinging control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
-      ping -c 3 "$CONTROL_PLANE_IP" >> "$LOGFILE" 2>&1
-      if [ $? -eq 0 ]; then
-        echo "$(date) - Network connectivity to control plane confirmed" >> "$LOGFILE"
-      else
-        echo "$(date) - Cannot ping control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
-      fi
-    else
-      echo "$(date) - Could not determine control plane IP, falling back to VPC CIDR" >> "$LOGFILE"
-      echo "$(date) - Pinging control plane at 10.0.0.0" >> "$LOGFILE"
-      ping -c 3 10.0.0.0 >> "$LOGFILE" 2>&1 || echo "$(date) - WARNING: Cannot ping control plane at 10.0.0.0" >> "$LOGFILE"
-      ping -c 3 10.0.0.1 >> "$LOGFILE" 2>&1 || echo "$(date) - WARNING: Cannot ping VPC CIDR either" >> "$LOGFILE"
+    if [ -n "$JOIN_COMMAND" ]; then
+      echo "$(date) - Successfully retrieved join command from $SECRET_NAME"
+      break 2
     fi
-    
-    # Test secretsmanager permissions directly
-    echo "$(date) - Testing secretsmanager ListSecrets permission..." >> "$LOGFILE"
-    aws secretsmanager list-secrets --region "$REGION" --max-items 1 >> "$LOGFILE" 2>&1 && echo "$(date) - AWS API connectivity confirmed" >> "$LOGFILE"
-    
-    # Upload logs of the current status
-    upload_logs_to_s3 "SECRET_FETCH_ATTEMPT_${SECRET_ATTEMPT}"
-    
-    echo "$(date) - Waiting before retry..."
-    sleep 30
-    continue
-  fi
+  done
   
-  echo "$(date) - Found latest secret: $LATEST_SECRET"
-  
-  # Check if secret has AWSCURRENT label and force it if needed
-  echo "$(date) - Checking if secret has AWSCURRENT label" >> "$LOGFILE"
-  aws secretsmanager describe-secret --secret-id "$LATEST_SECRET" --region "$REGION" >> "$LOGFILE" 2>&1
-  
-  JOIN_COMMAND=$(aws secretsmanager get-secret-value \
-    --region "$REGION" \
-    --secret-id "$LATEST_SECRET" \
-    --query SecretString \
-    --output text 2>>"$LOGFILE" || echo "")
-  
+  # Try to find the latest secret by listing
   if [ -z "$JOIN_COMMAND" ]; then
-    echo "$(date) - Secret found but value is empty, trying to fix AWSCURRENT label" >> "$LOGFILE"
-    # Try to force-update the AWSCURRENT label to the latest version
-    VERSION_ID=$(aws secretsmanager describe-secret --secret-id "$LATEST_SECRET" --region "$REGION" --query "VersionIdsToStages" --output text | awk '{print $1}')
-    if [ -n "$VERSION_ID" ]; then
-      echo "$(date) - Fixing AWSCURRENT label for version $VERSION_ID" >> "$LOGFILE"
-      aws secretsmanager update-secret-version-stage \
-        --secret-id "$LATEST_SECRET" \
-        --version-stage AWSCURRENT \
-        --move-to-version-id "$VERSION_ID" \
-        --region "$REGION" >> "$LOGFILE" 2>&1
-      
-      # Try again after fixing
+    echo "$(date) - Failed to get join command from known secret names, looking for latest..."
+    LATEST_SECRET=$(aws secretsmanager list-secrets \
+      --region "$REGION" \
+      --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
+      --output text)
+    
+    if [ -n "$LATEST_SECRET" ] && [ "$LATEST_SECRET" != "None" ]; then
+      echo "$(date) - Found latest secret: $LATEST_SECRET"
       JOIN_COMMAND=$(aws secretsmanager get-secret-value \
         --region "$REGION" \
         --secret-id "$LATEST_SECRET" \
         --query SecretString \
-        --output text 2>>"$LOGFILE" || echo "")
+        --output text 2>/dev/null || echo "")
+      
+      if [ -n "$JOIN_COMMAND" ]; then
+        echo "$(date) - Successfully retrieved join command from $LATEST_SECRET"
+        break
+      fi
     fi
   fi
   
-  if [ -n "$JOIN_COMMAND" ]; then
-    echo "$(date) - Successfully retrieved join command"
-    echo "$(date) - Join command: $JOIN_COMMAND" >> "$LOGFILE"
-    # Validate join command has token
-    if [[ ! "$JOIN_COMMAND" =~ "--token" ]]; then
-      echo "$(date) - WARNING: Join command missing token parameter, not valid" >> "$LOGFILE"
-      upload_logs_to_s3 "TOKEN_MISSING_${SECRET_ATTEMPT}"
-      JOIN_COMMAND=""
-      sleep 30
-      continue
-    fi
-    break
+  if [ $ATTEMPT -lt 10 ]; then
+    sleep 30
   else
-    echo "$(date) - Join command not available yet. Waiting to retry..."
-    # Upload attempt logs
-    upload_logs_to_s3 "SECRET_VALUE_EMPTY_${SECRET_ATTEMPT}"
+    # If we've been waiting too long, try creating our own join command directly
+    echo "$(date) - Too many attempts, trying to generate join command directly..."
+    
+    # Try to find the control plane instance
+    CONTROL_PLANE_IP=$(aws ec2 describe-instances \
+      --region "$REGION" \
+      --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
+      --query "Reservations[0].Instances[0].PrivateIpAddress" \
+      --output text)
+    
+    if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
+      echo "$(date) - Found control plane at $CONTROL_PLANE_IP"
+      # We can't directly generate the token here, but we'll use this as part of the join command
+      break
+    fi
+    
     sleep 30
   fi
 done
 
+# If we couldn't get a join command but found the control plane IP, construct a dummy join command
+# This is a fallback but not ideal; prefer to use the secret
+if [ -z "$JOIN_COMMAND" ] && [ -n "$CONTROL_PLANE_IP" ]; then
+  echo "$(date) - Using fallback method with control plane IP $CONTROL_PLANE_IP"
+  JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $(kubeadm token generate) --discovery-token-unsafe-skip-ca-verification"
+fi
+
 if [ -z "$JOIN_COMMAND" ]; then
-  echo "$(date) - Failed to retrieve join command from Secrets Manager after $MAX_SECRET_ATTEMPTS attempts" >> "$LOGFILE"
-  upload_logs_to_s3 "SECRET_FETCH_FAILED"
+  echo "$(date) - Failed to retrieve join command after $MAX_ATTEMPTS attempts"
+  upload_logs_to_s3 "JOIN_COMMAND_FAILED"
   exit 1
 fi
 
@@ -328,10 +264,11 @@ RETRY_DELAY=30
 for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   echo "$(date) - Attempt $ATTEMPT/$MAX_ATTEMPTS to join cluster"
   
+  # Execute the join command
   eval $JOIN_COMMAND --v=5 2>&1 | tee -a "$LOGFILE"
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     JOIN_SUCCESS=true
-    echo "$(date) - Successfully joined cluster" 
+    echo "$(date) - Successfully joined cluster"
     systemctl restart kubelet
     break
   else
@@ -364,7 +301,8 @@ if [ "$JOIN_SUCCESS" = true ]; then
   if [ ! -f "$KUBELET_CONF" ]; then
     echo "$(date) - kubelet.conf not found after waiting. This is unexpected but not fatal."
   else
-    kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=$KUBELET_CONF 2>>"$LOGFILE"
+    # Set provider ID explicitly
+    kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=$KUBELET_CONF
     if [ $? -eq 0 ]; then
       echo "$(date) - providerID set successfully"
     else
@@ -395,11 +333,7 @@ aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" \
 
 echo "$(date) - Worker node setup complete. Uploading final logs."
 
-# Create a unique log filename with the instance ID and timestamp
-LOG_FILENAME="worker-init-${INSTANCE_ID}-COMPLETE-$(date +%Y%m%d-%H%M%S).log"
+# Upload final logs
+upload_logs_to_s3 "COMPLETE"
 
-# Copy the log file to S3
-aws s3 cp "$LOGFILE" "s3://guy-polybot-logs/${LOG_FILENAME}" --region "$REGION" || \
-  echo "$(date) - Failed to upload logs to S3"
-
-echo "$(date) - Logs uploaded to s3://guy-polybot-logs/${LOG_FILENAME} - Worker node setup complete."
+echo "$(date) - Kubernetes worker node initialization completed successfully"

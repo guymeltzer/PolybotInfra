@@ -163,23 +163,20 @@ JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${TOKEN} --discovery-token
 
 echo "$(date) - Generated join command with private IP: $JOIN_COMMAND"
 
-# Store join command in AWS Secrets Manager with a consistent naming pattern
+# Store join command in AWS Secrets Manager - first create with a simple name
+echo "$(date) - Creating Secret Manager secret kubernetes-join-command"
+aws secretsmanager create-secret --name "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION" || {
+  echo "$(date) - Failed to create new secret with simple name, trying to update if it exists"
+  aws secretsmanager update-secret --secret-id "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --region "$REGION" || echo "Failed to update existing secret"
+}
+
+# Also create a timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
 SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
 
-echo "$(date) - Creating Secret Manager secret $SECRET_NAME"
+echo "$(date) - Creating timestamped Secret Manager secret $SECRET_NAME"
 aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION" || {
-  echo "$(date) - Failed to create new secret, trying to update existing one"
-  # If creation fails, try to find an existing secret to update
-  EXISTING_SECRET=$(aws secretsmanager list-secrets \
-    --region "$REGION" \
-    --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
-    --output text)
-  
-  if [ -n "$EXISTING_SECRET" ] && [ "$EXISTING_SECRET" != "None" ]; then
-    echo "$(date) - Updating existing secret $EXISTING_SECRET"
-    aws secretsmanager update-secret --secret-id "$EXISTING_SECRET" --secret-string "$JOIN_COMMAND" --region "$REGION"
-  fi
+  echo "$(date) - Failed to create new timestamped secret"
 }
 
 # Also create a fixed-name secret that's easier to find
@@ -194,17 +191,22 @@ else
   aws secretsmanager create-secret --name "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Latest Kubernetes join command" --region "$REGION"
 fi
 
-# Verify the secret was created correctly and is accessible
-echo "$(date) - Verifying secret is accessible"
-sleep 5  # Give AWS some time to propagate the secret
-aws secretsmanager get-secret-value --secret-id "$FIXED_SECRET_NAME" --region "$REGION" || {
-  echo "$(date) - WARNING: Secret verification failed, attempting to fix permissions"
-  aws secretsmanager update-secret-version-stage \
-    --secret-id "$FIXED_SECRET_NAME" \
-    --version-stage AWSCURRENT \
-    --move-to-version-id $(aws secretsmanager describe-secret --secret-id "$FIXED_SECRET_NAME" --query "VersionIdsToStages" --output text | awk '{print $1}') \
-    --region "$REGION"
-}
+# Verify the secrets are accessible
+echo "$(date) - Verifying secrets are accessible"
+sleep 5  # Give AWS some time to propagate the secrets
+
+for SECRET_NAME in "kubernetes-join-command" "kubernetes-join-command-latest" "$SECRET_NAME"; do
+  echo "$(date) - Verifying secret: $SECRET_NAME"
+  if ! aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text > /dev/null; then
+    echo "$(date) - WARNING: Secret $SECRET_NAME verification failed, will retry once"
+    sleep 5
+    aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text > /dev/null || {
+      echo "$(date) - ERROR: Secret $SECRET_NAME still not accessible after retry"
+    }
+  else
+    echo "$(date) - Secret $SECRET_NAME verified and accessible"
+  fi
+done
 
 # Update admin kubeconfig to use public IP
 echo "$(date) - Configuring kubeconfig with public IP"
