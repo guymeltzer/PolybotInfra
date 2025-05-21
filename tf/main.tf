@@ -586,3 +586,13 @@ resource "null_resource" "cluster_readiness_info" {
     EOT
   }
 }
+
+terraform {
+  # Speed up parallel operations
+  experiments = [dependency]
+}
+
+# Set Terraform parallelism in a supported location
+provider "terraform" {
+  parallelism = 10
+}
