@@ -285,12 +285,12 @@ resource "terraform_data" "kubectl_provider_config" {
       # Check if we got a valid kubeconfig from the server
       if [ ! -s /tmp/admin_conf.txt ] || ! grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
         echo "WARNING: Failed to retrieve a valid kubeconfig. Creating placeholder instead."
-        cat > /tmp/admin_conf.txt << EOF
+                 cat > /tmp/admin_conf.txt << EOF
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://${PUBLIC_IP}:6443
+    server: https://\$PUBLIC_IP:6443
     insecure-skip-tls-verify: true
   name: kubernetes
 contexts:
