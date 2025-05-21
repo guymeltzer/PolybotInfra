@@ -1195,6 +1195,7 @@ resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
+  key_name      = local.actual_key_name
 
   user_data = base64encode(
     replace(
@@ -1244,7 +1245,8 @@ resource "terraform_data" "force_asg_update" {
   input = terraform_data.worker_script_hash.id
   
   triggers_replace = [
-    aws_launch_template.worker_lt.latest_version
+    aws_launch_template.worker_lt.latest_version,
+    var.rebuild_workers
   ]
 }
 
@@ -1415,8 +1417,8 @@ resource "aws_iam_role_policy_attachment" "worker_policies" {
 }
 
 # Worker node inline policies
-resource "aws_iam_role_policy" "worker_secrets_ec2_policy" {
-  name = "SecretsManagerAndEC2TagsAccess"
+resource "aws_iam_role_policy" "worker_secrets_access_policy" {
+  name = "SecretsManagerEnhancedAccess"
   role = aws_iam_role.worker_role.id
 
   policy = jsonencode({
@@ -1426,12 +1428,18 @@ resource "aws_iam_role_policy" "worker_secrets_ec2_policy" {
         Effect = "Allow"
         Action = [
           "secretsmanager:GetSecretValue",
-          "ec2:CreateTags"
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:ListSecrets",
+          "secretsmanager:ListSecretVersionIds"
         ]
-        Resource = [
-          "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command-*",
-          "arn:aws:ec2:${var.region}:*:instance/*"
+        Resource = "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:ListSecrets"
         ]
+        Resource = "*"
       }
     ]
   })
@@ -1449,7 +1457,8 @@ resource "aws_iam_role_policy" "worker_ec2_tags_policy" {
         Action = [
           "ec2:CreateTags",
           "ec2:DeleteTags",
-          "ec2:DescribeTags"
+          "ec2:DescribeTags",
+          "ec2:DescribeInstances"
         ]
         Resource = "*"
       }

@@ -65,3 +65,9 @@ variable "addons" {
   type        = list(string)
   default     = []
 }
+
+variable "rebuild_workers" {
+  description = "Set to true to force rebuilding worker nodes"
+  type        = bool
+  default     = false
+}

@@ -164,65 +164,96 @@ join_cluster() {
   
   echo "Attempting to join Kubernetes cluster..."
   
-  # Try to get join command from secrets manager
-  for ((ATTEMPT=1; ATTEMPT<=20; ATTEMPT++)); do
-    echo "Join attempt $ATTEMPT/20"
+  # Try to get join command from secrets manager with enhanced retry
+  MAX_RETRIES=20
+  for ((ATTEMPT=1; ATTEMPT<=MAX_RETRIES; ATTEMPT++)); do
+    echo "Join attempt $ATTEMPT/$MAX_RETRIES"
     JOIN_COMMAND=""
     
     # Try known secrets
     for SECRET_NAME in "${SECRET_NAMES[@]}"; do
       echo "Checking secret: $SECRET_NAME"
-      JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_NAME" --query SecretString --output text 2>/dev/null || echo "")
-      if [[ -n "$JOIN_COMMAND" && "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
-        echo "Found join command in $SECRET_NAME: $JOIN_COMMAND"
-        break
+      SECRET_VALUE=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_NAME" 2>/dev/null || echo "")
+      if [ -n "$SECRET_VALUE" ]; then
+        JOIN_COMMAND=$(echo "$SECRET_VALUE" | jq -r '.SecretString' 2>/dev/null || echo "$SECRET_VALUE" | grep -o 'SecretString.*' | cut -d '"' -f 3)
+        if [[ -n "$JOIN_COMMAND" && "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
+          echo "Found join command in $SECRET_NAME: $JOIN_COMMAND"
+          break
+        else
+          echo "Invalid join command format in $SECRET_NAME: $JOIN_COMMAND"
+        fi
+      else
+        echo "Failed to retrieve $SECRET_NAME or secret is empty"
       fi
     done
     
     # If no command found or command contains old IP, try to get current control plane IP
     if [[ -z "$JOIN_COMMAND" || ! "$JOIN_COMMAND" =~ --token ]]; then
       echo "No valid join command found in secrets, querying for control plane IP..."
-      CONTROL_PLANE_IP=$(aws ec2 describe-instances --region "$REGION" \
-                          --filters "Name=tag:Name,Values=k8s-control-plane" \
-                                    "Name=instance-state-name,Values=running" \
-                          --query "Reservations[0].Instances[0].PrivateIpAddress" \
-                          --output text)
       
-      if [[ -n "$CONTROL_PLANE_IP" && "$CONTROL_PLANE_IP" != "None" ]]; then
-        echo "Found control plane IP: $CONTROL_PLANE_IP"
-        
-        # Try to get token from existing join command or generate new one
-        TOKEN=""
-        DISCOVERY_HASH=""
-        
-        if [[ -n "$JOIN_COMMAND" ]]; then
-          # Extract token and hash from existing command
-          TOKEN=$(echo "$JOIN_COMMAND" | grep -oP -- '--token \K[^ ]+' || echo "")
-          DISCOVERY_HASH=$(echo "$JOIN_COMMAND" | grep -oP -- '--discovery-token-ca-cert-hash \K[^ ]+' || echo "")
-        fi
-        
-        # Generate token if we couldn't extract it
-        if [ -z "$TOKEN" ]; then
-          TOKEN=$(kubeadm token generate)
-        fi
-        
-        # Create new join command with current control plane IP
-        if [ -n "$DISCOVERY_HASH" ]; then
-          JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
-        else
-          JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
-        fi
-        
-        echo "Created new join command: $JOIN_COMMAND"
+      # Try listing all secrets with kubernetes-join-command prefix
+      echo "Listing all kubernetes-join-command secrets..."
+      ALL_SECRETS=$(aws secretsmanager list-secrets --region "$REGION" --filters Key=name,Values=kubernetes-join-command --query "SecretList[*].Name" --output text 2>/dev/null || echo "")
+      if [ -n "$ALL_SECRETS" ]; then
+        echo "Found these secrets: $ALL_SECRETS"
+        # Try each secret to find a valid join command
+        for SECRET in $ALL_SECRETS; do
+          echo "Trying secret: $SECRET"
+          SECRET_VALUE=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET" --query SecretString --output text 2>/dev/null || echo "")
+          if [[ -n "$SECRET_VALUE" && "$SECRET_VALUE" =~ ^kubeadm\ join ]]; then
+            JOIN_COMMAND="$SECRET_VALUE"
+            echo "Found valid join command in $SECRET: $JOIN_COMMAND"
+            break
+          fi
+        done
       else
-        echo "Failed to find control plane IP"
+        echo "No kubernetes-join-command secrets found"
+      fi
+      
+      # If still no valid join command, query EC2 for control plane IP
+      if [[ -z "$JOIN_COMMAND" || ! "$JOIN_COMMAND" =~ --token ]]; then
+        CONTROL_PLANE_IP=$(aws ec2 describe-instances --region "$REGION" \
+                            --filters "Name=tag:Name,Values=k8s-control-plane" \
+                                      "Name=instance-state-name,Values=running" \
+                            --query "Reservations[0].Instances[0].PrivateIpAddress" \
+                            --output text)
+        
+        if [[ -n "$CONTROL_PLANE_IP" && "$CONTROL_PLANE_IP" != "None" ]]; then
+          echo "Found control plane IP: $CONTROL_PLANE_IP"
+          
+          # Try to get token from existing join command or generate new one
+          TOKEN=""
+          DISCOVERY_HASH=""
+          
+          if [[ -n "$JOIN_COMMAND" ]]; then
+            # Extract token and hash from existing command
+            TOKEN=$(echo "$JOIN_COMMAND" | grep -oP -- '--token \K[^ ]+' || echo "")
+            DISCOVERY_HASH=$(echo "$JOIN_COMMAND" | grep -oP -- '--discovery-token-ca-cert-hash \K[^ ]+' || echo "")
+          fi
+          
+          # Generate token if we couldn't extract it
+          if [ -z "$TOKEN" ]; then
+            TOKEN=$(kubeadm token generate)
+          fi
+          
+          # Create new join command with current control plane IP
+          if [ -n "$DISCOVERY_HASH" ]; then
+            JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
+          else
+            JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
+          fi
+          
+          echo "Created new join command: $JOIN_COMMAND"
+        else
+          echo "Failed to find control plane IP"
+        fi
       fi
     fi
     
     # Exit if we can't get a join command
     if [ -z "$JOIN_COMMAND" ]; then
-      echo "Failed to retrieve join command, will retry in 15 seconds..."
-      sleep 15
+      echo "Failed to retrieve join command, will retry in $((ATTEMPT * 5)) seconds..."
+      sleep $((ATTEMPT * 5))
       continue
     fi
     
@@ -269,7 +300,7 @@ join_cluster() {
     fi
   done
   
-  echo "All join attempts failed."
+  echo "All join attempts failed after $MAX_RETRIES tries."
   upload_logs_to_s3 "JOIN_FAILED"
   exit 1
 }
