@@ -90,7 +90,7 @@ sed -i '/swap/d' /etc/fstab
 REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
 
 echo "$(date) - Retrieving instance metadata"
 echo "Instance ID: $INSTANCE_ID"
@@ -104,7 +104,33 @@ echo "127.0.0.1 $(hostname -f)" >> /etc/hosts
 
 # Initialize Kubernetes cluster
 echo "$(date) - Initializing Kubernetes control plane with kubeadm"
-cat > /tmp/kubeadm-config.yaml << EOF
+
+# Ensure PUBLIC_IP is either a valid IP or remove it
+if [ -z "$PUBLIC_IP" ]; then
+  # Create config without PUBLIC_IP
+  cat > /tmp/kubeadm-config.yaml << EOF
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  kubeletExtraArgs:
+    cloud-provider: "external"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+networking:
+  podSubnet: "192.168.0.0/16"
+apiServer:
+  certSANs:
+  - "${PRIVATE_IP}"
+  - "127.0.0.1"
+  - "localhost"
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+EOF
+else
+  # Create config with PUBLIC_IP
+  cat > /tmp/kubeadm-config.yaml << EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
@@ -125,6 +151,11 @@ controllerManager:
   extraArgs:
     cloud-provider: "external"
 EOF
+fi
+
+# Print the kubeadm config for debugging
+echo "$(date) - Kubeadm config contents:"
+cat /tmp/kubeadm-config.yaml
 
 kubeadm init --config=/tmp/kubeadm-config.yaml --v=5
 
