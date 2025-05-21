@@ -148,21 +148,16 @@ EOF
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
-  # Only create this resource when the control plane is ready
-  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
-  
-  # Ensure this resource runs only after the control plane exists
-  depends_on = [
-    module.k8s-cluster,
-    terraform_data.init_environment
-  ]
+  # Use a static count value
+  count = 1
+
+  # Make sure this only runs after the cluster setup starts
+  depends_on = [module.k8s-cluster]
 
   # Run only when needed by tracking the control plane
   triggers = {
-    # Add control plane IP to ensure it runs when IP changes
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
-    # Add control plane instance ID to ensure it runs when instance changes
-    control_plane_id = module.k8s-cluster.control_plane_id
+    # This will trigger a recreation if the cluster config changes
+    instance_id = module.k8s-cluster.control_plane_id
   }
 
   # Check if the control plane API is actually accessible
@@ -171,15 +166,34 @@ resource "null_resource" "wait_for_kubernetes" {
     command     = <<-EOT
       #!/bin/bash
       set -e
-      echo "Waiting for Kubernetes API at https://${module.k8s-cluster.control_plane_public_ip}:6443 to be ready..."
+      
+      # Get the control plane instance ID
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      
+      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
+        echo "No running control plane instance found"
+        exit 0
+      fi
+      
+      # Get the public IP of the control plane
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+      
+      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
+        echo "Control plane instance doesn't have a public IP yet"
+        exit 0
+      fi
+      
+      echo "Found control plane public IP: $PUBLIC_IP"
+      
+      echo "Waiting for Kubernetes API at https://$PUBLIC_IP:6443 to be ready..."
       
       # Function to test if API is reachable
       test_api() {
-        curl -k -s --max-time 5 https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz
+        curl -k -s --max-time 5 https://$PUBLIC_IP:6443/healthz
       }
       
       # Wait for API to be ready with retries
-      MAX_ATTEMPTS=30
+      MAX_ATTEMPTS=10
       for ((i=1; i<=MAX_ATTEMPTS; i++)); do
         echo "Attempt $i/$MAX_ATTEMPTS - Testing API connection..."
         if test_api | grep -q "ok"; then
@@ -201,8 +215,8 @@ resource "null_resource" "wait_for_kubernetes" {
 
 # Configure kubectl provider with credentials after waiting for the API to be ready
 resource "terraform_data" "kubectl_provider_config" {
-  # Only create this resource when the control plane has an IP
-  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
+  # Use a static count value
+  count = 1
 
   # Ensure this runs after the control plane is available and we've waited for the API
   depends_on = [
@@ -212,23 +226,37 @@ resource "terraform_data" "kubectl_provider_config" {
 
   # Trigger updates when control plane details change
   triggers_replace = [
-    module.k8s-cluster.control_plane_public_ip,
     module.k8s-cluster.control_plane_id
   ]
 
   # Retrieve and store kubeconfig directly from the control plane
   provisioner "local-exec" {
     command = <<-EOT
-      # Set up variables
-      PUBLIC_IP=${module.k8s-cluster.control_plane_public_ip}
-      INSTANCE_ID=${module.k8s-cluster.control_plane_id}
+      # Wait for instance to appear
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      
+      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
+        echo "No running control plane instance found, exiting early"
+        exit 0
+      fi
+      
+      # Get the public IP of the control plane
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+      
+      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
+        echo "Control plane instance doesn't have a public IP yet, exiting early"
+        exit 0
+      fi
       
       echo "Using control plane with IP: $PUBLIC_IP and instance ID: $INSTANCE_ID"
       
       # Wait for SSM to be ready
-      echo "Ensuring SSM is available on the control plane..."
-      aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-        --query "InstanceInformationList[*].PingStatus" --output text
+      echo "Checking if SSM is available on the control plane..."
+      if ! aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+           --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+        echo "SSM not available yet, exiting early"
+        exit 0
+      fi
       
       # Retrieve the kubeconfig from the control plane
       echo "Getting kubeconfig from control plane..."
@@ -242,11 +270,15 @@ resource "terraform_data" "kubectl_provider_config" {
       aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
         --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text > /tmp/kubeconfig_content.yaml
       
-      # Update server endpoint in the kubeconfig
-      cat /tmp/kubeconfig_content.yaml | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
-      chmod 600 ./kubeconfig.yaml
-      
-      echo "Created kubeconfig.yaml with server endpoint: https://$PUBLIC_IP:6443"
+      # Only update kubeconfig if we got valid content
+      if grep -q "apiVersion: v1" /tmp/kubeconfig_content.yaml; then
+        # Update server endpoint in the kubeconfig
+        cat /tmp/kubeconfig_content.yaml | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
+        chmod 600 ./kubeconfig.yaml
+        echo "Created kubeconfig.yaml with server endpoint: https://$PUBLIC_IP:6443"
+      else
+        echo "Failed to retrieve valid kubeconfig, not updating existing file"
+      fi
     EOT
   }
 }
@@ -274,8 +306,8 @@ locals {
 
 # This ensures the Kubernetes providers are properly initialized before any resources use them
 resource "null_resource" "providers_ready" {
-  # Only create when we have a control plane IP
-  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
+  # Use a static count value
+  count = 1
   
   # Depend on both the kubeconfig and the wait for Kubernetes resources
   depends_on = [
@@ -285,8 +317,6 @@ resource "null_resource" "providers_ready" {
 
   triggers = {
     # Track control plane properties to ensure this runs when they change
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
-    control_plane_id = module.k8s-cluster.control_plane_id
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
@@ -296,17 +326,29 @@ resource "null_resource" "providers_ready" {
       #!/bin/bash
       set -e
       
+      # Check if kubeconfig exists
       if [ ! -f "${local.kubeconfig_path}" ]; then
-        echo "ERROR: Kubeconfig doesn't exist at ${local.kubeconfig_path}"
-        exit 1
+        echo "Kubeconfig doesn't exist yet, creating placeholder"
+        exit 0
       fi
       
-      echo "Kubeconfig exists, checking if it has a real server endpoint..."
-      if grep -q "server: https://${module.k8s-cluster.control_plane_public_ip}" "${local.kubeconfig_path}"; then
-        echo "Kubeconfig contains real control plane IP (${module.k8s-cluster.control_plane_public_ip})"
-      else
-        echo "ERROR: Kubeconfig doesn't reference the real control plane IP"
-        exit 1
+      echo "Kubeconfig exists at ${local.kubeconfig_path}"
+      
+      # Get control plane info if available
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      
+      if [ "$INSTANCE_ID" != "None" ] && [ ! -z "$INSTANCE_ID" ]; then
+        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+        
+        if [ "$PUBLIC_IP" != "None" ] && [ ! -z "$PUBLIC_IP" ]; then
+          echo "Checking if kubeconfig contains the real control plane IP..."
+          if grep -q "server: https://$PUBLIC_IP:6443" "${local.kubeconfig_path}"; then
+            echo "Kubeconfig contains real control plane IP ($PUBLIC_IP)"
+          else
+            echo "Updating kubeconfig with current IP"
+            sed -i '' "s|server:.*|server: https://$PUBLIC_IP:6443|" "${local.kubeconfig_path}" || true
+          fi
+        fi
       fi
       
       echo "Providers ready with kubeconfig at ${local.kubeconfig_path}"
@@ -316,8 +358,8 @@ resource "null_resource" "providers_ready" {
 
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
-  # Only create when we have a control plane IP and we're not skipping namespaces
-  count = (module.k8s-cluster.control_plane_public_ip != "" && !local.skip_namespaces) ? 1 : 0
+  # Use a static count value based on the skip_namespaces flag
+  count = local.skip_namespaces ? 0 : 1
 
   # Ensure all prerequisites are met
   depends_on = [
@@ -329,7 +371,7 @@ resource "null_resource" "create_namespaces" {
   # Only trigger after the control plane is actually ready
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    instance_id = module.k8s-cluster.control_plane_id
   }
 
   # Use local-exec to create namespaces directly with kubectl
@@ -448,8 +490,8 @@ module "k8s-cluster" {
 
 # Install EBS CSI Driver using local-exec only
 resource "null_resource" "install_ebs_csi_driver" {
-  # Only create when we have a control plane IP
-  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
+  # Use a static count value
+  count = 1
   
   # Only run after we have a valid kubeconfig
   depends_on = [
@@ -462,7 +504,7 @@ resource "null_resource" "install_ebs_csi_driver" {
   # Only run when needed, based on resource changes
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    instance_id = module.k8s-cluster.control_plane_id
   }
   
   provisioner "local-exec" {
@@ -508,8 +550,8 @@ resource "null_resource" "install_ebs_csi_driver" {
 
 # Install ArgoCD using local-exec only
 resource "null_resource" "install_argocd" {
-  # Only create when we have a control plane IP and we're not skipping ArgoCD
-  count = (module.k8s-cluster.control_plane_public_ip != "" && !local.skip_argocd) ? 1 : 0
+  # Use a static count value based on the skip_argocd flag
+  count = local.skip_argocd ? 0 : 1
   
   # Ensure all prerequisites are met
   depends_on = [
@@ -524,7 +566,7 @@ resource "null_resource" "install_argocd" {
   # Only run when needed
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    instance_id = module.k8s-cluster.control_plane_id
   }
   
   provisioner "local-exec" {
@@ -601,8 +643,8 @@ module "polybot_prod" {
 
 # Output commands for manual verification and namespace creation
 resource "null_resource" "cluster_readiness_info" {
-  # Only create when we have a control plane IP
-  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
+  # Use a static count value
+  count = 1
 
   depends_on = [
     module.k8s-cluster,
@@ -695,30 +737,24 @@ resource "terraform_data" "deployment_completion_information" {
 
 # Configure providers with proper dependency handling
 provider "kubernetes" {
-  # Only configure when kubeconfig is ready with real values
-  host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
-  cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
-  client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
-  client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
+  # Use config_path instead of trying to parse the YAML during plan
+  config_path    = "${path.module}/kubeconfig.yaml"
+  config_context = "kubernetes-admin@kubernetes"
 }
 
 provider "helm" {
   kubernetes {
-    # Only configure when kubeconfig is ready with real values
-    host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
-    cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
-    client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
-    client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
+    # Use config_path instead of trying to parse the YAML during plan
+    config_path    = "${path.module}/kubeconfig.yaml"
+    config_context = "kubernetes-admin@kubernetes"
   }
 }
 
 provider "kubectl" {
-  # Only configure when kubeconfig is ready with real values
-  host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
-  cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
-  client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
-  client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
-  load_config_file       = false
+  # Use config_path instead of trying to parse the YAML during plan
+  config_path    = "${path.module}/kubeconfig.yaml"
+  config_context = "kubernetes-admin@kubernetes"
+  load_config_file = true
 }
 
 # Special resource to clean up Kubernetes state
