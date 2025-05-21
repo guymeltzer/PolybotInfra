@@ -83,13 +83,13 @@ output "subnet_ids" {
 # Conditional outputs for ArgoCD, using try() to handle potential errors
 output "argocd_url" {
   description = "URL of the ArgoCD server"
-  value       = try(module.argocd.argocd_server_service_url, "argocd-not-available")
+  value       = "https://${module.k8s-cluster.control_plane_public_ip}:30080 (Once ArgoCD is deployed)"
 }
 
 output "argocd_applications" {
   description = "ArgoCD applications deployed"
-  value       = try(module.argocd.argocd_applications, null)
-  sensitive   = true
+  value       = "Deploy applications manually through ArgoCD UI"
+  sensitive   = false
 }
 
 output "ssh_key_name" {
