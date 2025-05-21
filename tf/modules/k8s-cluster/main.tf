@@ -9,8 +9,8 @@ module "vpc" {
   public_subnets  = ["10.0.0.0/24", "10.0.2.0/24"]
   private_subnets = ["10.0.1.0/24"]
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
+  enable_nat_gateway = true
+  single_nat_gateway = true
   enable_dns_hostnames = true
   enable_dns_support   = true
 
@@ -78,7 +78,7 @@ resource "aws_security_group" "k8s_sg" {
   }
 
   tags = {
-    Name                               = "guy-k8s-sg"
+    Name = "guy-k8s-sg"
     "kubernetes.io/cluster/kubernetes" = "owned"
   }
 }
@@ -183,8 +183,8 @@ resource "aws_iam_role_policy" "control_plane_asg_refresh_policy" {
         }
       },
       {
-        Effect   = "Allow"
-        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Effect = "Allow"
+        Action = "autoscaling:DescribeAutoScalingGroups"
         Resource = "*"
       }
     ]
@@ -199,9 +199,9 @@ resource "aws_iam_role_policy" "control_plane_pass_role_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "Statement1"
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
+        Sid = "Statement1"
+        Effect = "Allow"
+        Action = "iam:PassRole"
         Resource = "arn:aws:iam::*:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
       }
     ]
@@ -216,7 +216,7 @@ resource "aws_iam_role_policy" "control_plane_ssm_secrets_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Statement1"
+        Sid = "Statement1"
         Effect = "Allow"
         Action = [
           "ssm:SendCommand",
@@ -247,8 +247,8 @@ resource "aws_iam_role_policy" "control_plane_autoscaling_policy" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
+        Effect = "Allow"
+        Action = "iam:PassRole"
         Resource = "arn:aws:iam::*:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
       }
     ]
@@ -263,8 +263,8 @@ resource "aws_iam_role_policy" "control_plane_lambda_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = "lambda:InvokeFunction"
+        Effect = "Allow"
+        Action = "lambda:InvokeFunction"
         Resource = "arn:aws:lambda:${var.region}:*:function:generate-join-command"
       }
     ]
@@ -279,7 +279,7 @@ resource "aws_iam_role_policy" "control_plane_instance_management_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Statement1"
+        Sid = "Statement1"
         Effect = "Allow"
         Action = [
           "autoscaling:UpdateAutoScalingGroup",
@@ -318,8 +318,8 @@ resource "aws_iam_role_policy" "control_plane_run_instances_policy" {
         ]
       },
       {
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
+        Effect = "Allow"
+        Action = "iam:PassRole"
         Resource = "arn:aws:iam::*:instance-profile/Guy-K8S-Control_Plane-IAM-Role"
         Condition = {
           StringEquals = {
@@ -464,13 +464,13 @@ resource "aws_iam_role_policy" "control_plane_launch_template_policy" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = "ec2:RunInstances"
+        Effect = "Allow"
+        Action = "ec2:RunInstances"
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
+        Effect = "Allow"
+        Action = "iam:PassRole"
         Resource = "arn:aws:iam::*:role/Guy-K8S-Control_Plane-IAM-Role"
         Condition = {
           StringEquals = {
@@ -539,12 +539,12 @@ resource "terraform_data" "control_plane_script_hash" {
 }
 
 resource "aws_instance" "control_plane" {
-  ami                         = var.control_plane_ami
-  instance_type               = var.control_plane_instance_type
-  key_name                    = local.actual_key_name
-  subnet_id                   = module.vpc.public_subnets[0]
-  vpc_security_group_ids      = [aws_security_group.control_plane_sg.id]
-  iam_instance_profile        = aws_iam_instance_profile.control_plane_profile.name
+  ami                    = var.control_plane_ami
+  instance_type          = var.control_plane_instance_type
+  key_name               = local.actual_key_name
+  subnet_id              = module.vpc.public_subnets[0]
+  vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
+  iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
   associate_public_ip_address = true
 
   # Compress the user data with gzip to stay under the 16KB limit
@@ -555,7 +555,7 @@ resource "aws_instance" "control_plane" {
           replace(
             replace(
               file("${path.module}/control_plane_user_data.sh"),
-              "##KUBERNETES_JOIN_COMMAND_SECRET##",
+              "##KUBERNETES_JOIN_COMMAND_SECRET##", 
               aws_secretsmanager_secret.kubernetes_join_command.name
             ),
             "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
@@ -625,13 +625,13 @@ resource "null_resource" "wait_for_control_plane" {
 
 resource "local_file" "kubeconfig" {
   content = templatefile("${path.module}/templates/kubeconfig.tpl", {
-    endpoint     = aws_lb.polybot_alb.dns_name
-    token        = local.kubeadm_token
-    cluster_ca   = base64encode(file("${path.module}/certs/ca.crt"))
-    client_cert  = base64encode(file("${path.module}/certs/client.crt"))
-    client_key   = base64encode(file("${path.module}/certs/client.key"))
-    aws_region   = var.region
-    cluster_name = "k8s-cluster"
+    endpoint       = aws_lb.polybot_alb.dns_name
+    token          = local.kubeadm_token
+    cluster_ca     = base64encode(file("${path.module}/certs/ca.crt"))
+    client_cert    = base64encode(file("${path.module}/certs/client.crt"))
+    client_key     = base64encode(file("${path.module}/certs/client.key"))
+    aws_region     = var.region
+    cluster_name   = "k8s-cluster"
   })
   filename = "${path.module}/kubeconfig"
 
@@ -646,9 +646,9 @@ resource "random_id" "suffix" {
 }
 
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name                           = "kubernetes-join-command-${random_id.suffix.hex}"
-  description                    = "Kubernetes join command for worker nodes"
-  recovery_window_in_days        = 0 # No recovery window for easy replacement
+  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
+  description             = "Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
   force_overwrite_replica_secret = true
 
   lifecycle {
@@ -657,9 +657,9 @@ resource "aws_secretsmanager_secret" "kubernetes_join_command" {
 }
 
 resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
-  name                           = "kubernetes-join-command-latest-${random_id.suffix.hex}"
-  description                    = "Latest Kubernetes join command for worker nodes"
-  recovery_window_in_days        = 0 # No recovery window for easy replacement
+  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
+  description             = "Latest Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
   force_overwrite_replica_secret = true
 
   lifecycle {
@@ -681,7 +681,7 @@ resource "aws_lambda_function" "node_management_lambda" {
   environment {
     variables = {
       CONTROL_PLANE_INSTANCE_ID = aws_instance.control_plane.id
-      REGION                    = var.region
+      REGION                   = var.region
     }
   }
 
@@ -694,7 +694,7 @@ resource "aws_lambda_function" "node_management_lambda" {
 # Create the Lambda package with the node draining/token refresh code
 resource "local_file" "lambda_function_code" {
   filename = "${path.module}/lambda_code.py"
-  content  = <<EOF
+  content = <<EOF
 import boto3
 import json
 import time
@@ -889,7 +889,7 @@ EOF
 
 resource "null_resource" "create_lambda_zip" {
   depends_on = [local_file.lambda_function_code]
-
+  
   provisioner "local-exec" {
     command = "cd ${path.module} && zip lambda_package.zip lambda_code.py"
   }
@@ -1136,13 +1136,13 @@ resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
-
+  
   user_data = base64encode(
     gzip(
       replace(
         replace(
           file("${path.module}/worker_user_data.sh"),
-          "##KUBERNETES_JOIN_COMMAND_SECRET##",
+          "##KUBERNETES_JOIN_COMMAND_SECRET##", 
           aws_secretsmanager_secret.kubernetes_join_command.name
         ),
         "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
@@ -1150,20 +1150,20 @@ resource "aws_launch_template" "worker_lt" {
       )
     )
   )
-
+  
   iam_instance_profile {
     name = aws_iam_instance_profile.worker_profile.name
   }
-
+  
   network_interfaces {
     security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id]
     associate_public_ip_address = true
   }
-
+  
   lifecycle {
     create_before_destroy = true
   }
-
+  
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
@@ -1173,16 +1173,16 @@ resource "aws_launch_template" "worker_lt" {
 }
 
 resource "aws_autoscaling_group" "worker_asg" {
-  name                      = "guy-polybot-asg"
-  max_size                  = 3
-  min_size                  = 1
-  desired_capacity          = 2
-  vpc_zone_identifier       = module.vpc.public_subnets
-  target_group_arns         = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
-  health_check_type         = "EC2"
+  name                = "guy-polybot-asg"
+  max_size            = 3
+  min_size            = 1
+  desired_capacity    = 2
+  vpc_zone_identifier = module.vpc.public_subnets
+  target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
+  health_check_type   = "EC2"
   health_check_grace_period = 300
-  default_cooldown          = 300
-
+  default_cooldown    = 300
+  
   launch_template {
     id      = aws_launch_template.worker_lt.id
     version = "$Latest"
@@ -1199,7 +1199,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     value               = "owned"
     propagate_at_launch = true
   }
-
+  
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
@@ -1268,7 +1268,7 @@ resource "aws_iam_role" "worker_role" {
       }
     ]
   })
-
+  
   lifecycle {
     create_before_destroy = true
   }
@@ -1342,8 +1342,8 @@ resource "aws_iam_role_policy" "worker_autoscaling_lifecycle_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = "autoscaling:CompleteLifecycleAction"
+        Effect = "Allow"
+        Action = "autoscaling:CompleteLifecycleAction"
         Resource = "arn:aws:autoscaling:${var.region}:*:autoScalingGroup:*:autoScalingGroupName/guy-polybot-asg"
       }
     ]
@@ -1418,7 +1418,7 @@ resource "aws_iam_role_policy" "worker_ssm_parameters_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Statement1"
+        Sid = "Statement1"
         Effect = "Allow"
         Action = [
           "ssm:GetParameter",
@@ -1523,8 +1523,8 @@ resource "aws_iam_role_policy" "worker_sns_publish_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = "sns:Publish"
+        Effect = "Allow"
+        Action = "sns:Publish"
         Resource = "arn:aws:sns:${var.region}:*:Guy-netflix-event-topic"
       }
     ]
@@ -1539,8 +1539,8 @@ resource "aws_iam_role_policy" "worker_lambda_invoke_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = "lambda:InvokeFunction"
+        Effect = "Allow"
+        Action = "lambda:InvokeFunction"
         Resource = "arn:aws:lambda:${var.region}:*:function:*"
       }
     ]
@@ -1555,7 +1555,7 @@ resource "aws_iam_role_policy" "worker_elb_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AllowEC2Tagging"
+        Sid = "AllowEC2Tagging"
         Effect = "Allow"
         Action = [
           "ec2:CreateTags",
@@ -1569,7 +1569,7 @@ resource "aws_iam_role_policy" "worker_elb_policy" {
         Resource = "*"
       },
       {
-        Sid    = "AllowELBPermissions"
+        Sid = "AllowELBPermissions"
         Effect = "Allow"
         Action = [
           "elasticloadbalancing:CreateLoadBalancer",
@@ -1700,8 +1700,8 @@ resource "aws_route53_record" "cert_validation" {
 */
 
 resource "aws_iam_role_policy" "control_plane_inline_policy" {
-  name = "control-plane-inline-policy"
-  role = aws_iam_role.control_plane_role.id
+  name   = "control-plane-inline-policy"
+  role   = aws_iam_role.control_plane_role.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -1795,7 +1795,7 @@ locals {
 
 # S3 bucket for worker node logs
 resource "aws_s3_bucket" "worker_logs" {
-  bucket        = "guy-polybot-logs"
+  bucket = "guy-polybot-logs"
   force_destroy = true
 }
 
@@ -1808,7 +1808,7 @@ resource "aws_s3_bucket_ownership_controls" "worker_logs" {
 
 resource "aws_s3_bucket_acl" "worker_logs" {
   depends_on = [aws_s3_bucket_ownership_controls.worker_logs]
-  bucket     = aws_s3_bucket.worker_logs.id
-  acl        = "private"
+  bucket = aws_s3_bucket.worker_logs.id
+  acl    = "private"
 }
 
