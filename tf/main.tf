@@ -2,13 +2,6 @@ provider "aws" {
   region = var.region
 }
 
-# Variable to indicate destroy mode - set to true when running terraform destroy
-variable "destroy_mode" {
-  description = "Set to true when destroying infrastructure to skip Kubernetes API connections"
-  type        = bool
-  default     = false
-}
-
 provider "tls" {}
 
 # Resource to clean problematic resources from Terraform state
@@ -155,196 +148,105 @@ EOF
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
-  # Use count to conditionally create this resource - skip if placeholder kubeconfig
-  count = var.destroy_mode ? 0 : (
-    fileexists("${path.module}/kubeconfig.yaml") && 
-    contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
-    ) ? 0 : 1
-  )
+  # Only create this resource when the control plane is ready
+  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
   
-  # Make sure this only runs after the cluster setup starts
-  depends_on = [module.k8s-cluster]
+  # Ensure this resource runs only after the control plane exists
+  depends_on = [
+    module.k8s-cluster,
+    terraform_data.init_environment
+  ]
 
-  # Run only when needed by adding a dynamic trigger
+  # Run only when needed by tracking the control plane
   triggers = {
-    # This will ensure it runs only when needed
-    cluster_id = try(module.k8s-cluster.control_plane_id, "no-id-yet")
-    # Always run if the hash of the scripts changes
-    script_hash = join("", [
-      try(module.k8s-cluster.control_plane_script_hash, ""),
-      try(module.k8s-cluster.worker_script_hash, "")
-    ])
+    # Add control plane IP to ensure it runs when IP changes
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    # Add control plane instance ID to ensure it runs when instance changes
+    control_plane_id = module.k8s-cluster.control_plane_id
   }
 
+  # Check if the control plane API is actually accessible
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      echo "Waiting for Kubernetes cluster to be ready..."
+      #!/bin/bash
+      set -e
+      echo "Waiting for Kubernetes API at https://${module.k8s-cluster.control_plane_public_ip}:6443 to be ready..."
       
-      # Wait for control plane to be available
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
-      if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
-        echo "Control plane instance not found yet, waiting..."
-        sleep 60
-      else
-        echo "Control plane instance found: $INSTANCE_ID"
-      fi
+      # Function to test if API is reachable
+      test_api() {
+        curl -k -s --max-time 5 https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz
+      }
       
-      # Wait for SSM to be available
+      # Wait for API to be ready with retries
       MAX_ATTEMPTS=30
       for ((i=1; i<=MAX_ATTEMPTS; i++)); do
-        echo "Checking if control plane is ready (attempt $i/$MAX_ATTEMPTS)..."
-        
-        # Check if SSM is available
-        if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-          echo "Control plane SSM is online"
-          
-          # Check if kubeadm has initialized
-          if aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" --instance-ids "$INSTANCE_ID" \
-              --parameters '{"commands":["test -f /etc/kubernetes/admin.conf && echo \"Found\""], "executionTimeout":["30"]}' \
-              --output text --query "Command.CommandId" > /tmp/cmd_id.txt; then
-              
-            sleep 10
-            OUTPUT=$(aws ssm get-command-invocation --region ${var.region} --command-id "$(cat /tmp/cmd_id.txt)" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text)
-            if [[ "$OUTPUT" == *"Found"* ]]; then
-              echo "Control plane is initialized successfully"
-              break
-            fi
-          fi
+        echo "Attempt $i/$MAX_ATTEMPTS - Testing API connection..."
+        if test_api | grep -q "ok"; then
+          echo "API server is ready!"
+          exit 0
         fi
         
         if [ $i -eq $MAX_ATTEMPTS ]; then
-          echo "WARNING: Control plane initialization timeout, but continuing..."
+          echo "WARNING: API server not responding after $MAX_ATTEMPTS attempts, but continuing..."
+          exit 0
         else
-          echo "Control plane not ready yet, waiting 30 seconds..."
-          sleep 30
+          echo "API not ready yet, waiting 10 seconds..."
+          sleep 10
         fi
       done
-      
-      echo "Wait for Kubernetes cluster complete"
     EOT
   }
 }
 
 # Configure kubectl provider with credentials after waiting for the API to be ready
 resource "terraform_data" "kubectl_provider_config" {
-  count = local.destroy_mode ? 0 : 1
-  
-  depends_on = [null_resource.wait_for_kubernetes, module.k8s-cluster]
+  # Only create this resource when the control plane has an IP
+  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
 
-  triggers_replace = [
-    try(module.k8s-cluster.control_plane_public_ip, "no-ip-yet"),
-    try(module.k8s-cluster.control_plane_id, "no-id-yet"),
-    # Add a hash of the scripts to ensure we redeploy if scripts change
-    try(module.k8s-cluster.control_plane_script_hash, "no-hash-yet"),
-    try(module.k8s-cluster.worker_script_hash, "no-hash-yet")
+  # Ensure this runs after the control plane is available and we've waited for the API
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    module.k8s-cluster
   ]
 
+  # Trigger updates when control plane details change
+  triggers_replace = [
+    module.k8s-cluster.control_plane_public_ip,
+    module.k8s-cluster.control_plane_id
+  ]
+
+  # Retrieve and store kubeconfig directly from the control plane
   provisioner "local-exec" {
     command = <<-EOT
-      # Make sure we have the AWS CLI available
-      which aws || { echo "AWS CLI not installed"; exit 1; }
+      # Set up variables
+      PUBLIC_IP=${module.k8s-cluster.control_plane_public_ip}
+      INSTANCE_ID=${module.k8s-cluster.control_plane_id}
       
-      # Get the control plane instance ID
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      echo "Using control plane with IP: $PUBLIC_IP and instance ID: $INSTANCE_ID"
       
-      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
-        echo "No running control plane instance found, will wait for it to be created"
-        sleep 30
-        exit 0
-      fi
+      # Wait for SSM to be ready
+      echo "Ensuring SSM is available on the control plane..."
+      aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+        --query "InstanceInformationList[*].PingStatus" --output text
       
-      echo "Found control plane instance ID: $INSTANCE_ID"
-      echo $INSTANCE_ID > /tmp/instance_id.txt
+      # Retrieve the kubeconfig from the control plane
+      echo "Getting kubeconfig from control plane..."
+      aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" \
+        --instance-ids "$INSTANCE_ID" --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
+        --output text --query "Command.CommandId" > /tmp/command_id.txt
       
-      # Get the public IP of the control plane
-      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-      
-      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
-        echo "Control plane instance doesn't have a public IP yet, will wait"
-        sleep 30
-        exit 0
-      fi
-      
-      echo "Found control plane public IP: $PUBLIC_IP"
-      echo $PUBLIC_IP > /tmp/public_ip.txt
-    EOT
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Waiting for SSM to be ready on the instance..."
-      MAX_ATTEMPTS=30
-      WAIT_SECONDS=30
-      
-      PUBLIC_IP=$(cat /tmp/public_ip.txt)
-      INSTANCE_ID=$(cat /tmp/instance_id.txt)
-      
-      for ((i=1; i<=MAX_ATTEMPTS; i++)); do
-        echo "Attempt $i of $MAX_ATTEMPTS - Checking if SSM is ready..."
-        
-        if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-          echo "SSM is ready!"
-          break
-        else
-          echo "SSM not ready yet, waiting $WAIT_SECONDS seconds..."
-          sleep $WAIT_SECONDS
-        fi
-        
-        if [ $i -eq $MAX_ATTEMPTS ]; then
-          echo "WARNING: Reached maximum attempts. Will try to continue but may encounter errors."
-        fi
-      done
-      
-      # Try to get the kubeconfig from the control plane
-      echo "Retrieving kubeconfig from control plane..."
-      aws ssm send-command --region ${var.region} --document-name AWS-RunShellScript --instance-ids $INSTANCE_ID \
-        --parameters 'commands=["sudo cat /etc/kubernetes/admin.conf"]' \
-        --output text --query Command.CommandId > /tmp/command_id.txt
-      
-      sleep 10
+      sleep 5
       
       # Get the kubeconfig content
       aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
-        --instance-id $INSTANCE_ID --query StandardOutputContent --output text > /tmp/admin_conf.txt
+        --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text > /tmp/kubeconfig_content.yaml
       
-      # Check if we got a valid kubeconfig from the server
-      if [ ! -s /tmp/admin_conf.txt ] || ! grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
-        echo "WARNING: Failed to retrieve a valid kubeconfig. Creating placeholder instead."
-                 cat > /tmp/admin_conf.txt << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://\$PUBLIC_IP:6443
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    token: placeholder
-EOF
-      else
-        echo "Successfully retrieved kubeconfig from control plane"
-      fi
+      # Update server endpoint in the kubeconfig
+      cat /tmp/kubeconfig_content.yaml | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
+      chmod 600 ./kubeconfig.yaml
       
-      # Update the server endpoint in the kubeconfig
-      cat /tmp/admin_conf.txt | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > /tmp/modified_admin.conf
-      
-      # Create kubeconfig.yaml in the current directory
-      cp /tmp/modified_admin.conf ./kubeconfig.yaml && chmod 600 ./kubeconfig.yaml
-      
-      echo "Created usable kubeconfig.yaml file in current directory with server endpoint: https://$PUBLIC_IP:6443"
+      echo "Created kubeconfig.yaml with server endpoint: https://$PUBLIC_IP:6443"
     EOT
   }
 }
@@ -368,36 +270,56 @@ locals {
     )
   )
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
-  
-  # NEW: Special flag to disable all Kubernetes-dependent resources for destroy operations
-  # Set this to true when running terraform destroy
-  destroy_mode = tobool(try(var.destroy_mode, false))
 }
 
-# This is a workaround to ensure the local-exec commands run in the right order
+# This ensures the Kubernetes providers are properly initialized before any resources use them
 resource "null_resource" "providers_ready" {
-  count = local.destroy_mode ? 0 : 1
+  # Only create when we have a control plane IP
+  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
   
+  # Depend on both the kubeconfig and the wait for Kubernetes resources
   depends_on = [
-    terraform_data.kubectl_provider_config
+    terraform_data.kubectl_provider_config,
+    null_resource.wait_for_kubernetes
   ]
 
   triggers = {
-    # Use the instance_id instead of file hash to avoid inconsistency during apply
-    instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
-    # Add a timestamp component to ensure this runs when needed
-    config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
+    # Track control plane properties to ensure this runs when they change
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    control_plane_id = module.k8s-cluster.control_plane_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
+  # Verify the kubeconfig is accessible
   provisioner "local-exec" {
-    command = "echo 'Kubeconfig generated at ${local.kubeconfig_path}'"
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      if [ ! -f "${local.kubeconfig_path}" ]; then
+        echo "ERROR: Kubeconfig doesn't exist at ${local.kubeconfig_path}"
+        exit 1
+      fi
+      
+      echo "Kubeconfig exists, checking if it has a real server endpoint..."
+      if grep -q "server: https://${module.k8s-cluster.control_plane_public_ip}" "${local.kubeconfig_path}"; then
+        echo "Kubeconfig contains real control plane IP (${module.k8s-cluster.control_plane_public_ip})"
+      else
+        echo "ERROR: Kubeconfig doesn't reference the real control plane IP"
+        exit 1
+      fi
+      
+      echo "Providers ready with kubeconfig at ${local.kubeconfig_path}"
+    EOT
   }
 }
 
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
-  count = local.destroy_mode || local.skip_namespaces ? 0 : 1
+  # Only create when we have a control plane IP and we're not skipping namespaces
+  count = (module.k8s-cluster.control_plane_public_ip != "" && !local.skip_namespaces) ? 1 : 0
 
+  # Ensure all prerequisites are met
   depends_on = [
     terraform_data.kubectl_provider_config,
     null_resource.providers_ready,
@@ -406,10 +328,8 @@ resource "null_resource" "create_namespaces" {
 
   # Only trigger after the control plane is actually ready
   triggers = {
-    kubectl_config_id = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
-    control_plane_ip  = try(module.k8s-cluster.control_plane_public_ip, "none")
-    # Add a timestamp to ensure it runs when needed
-    timestamp = timestamp()
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
   }
 
   # Use local-exec to create namespaces directly with kubectl
@@ -528,7 +448,8 @@ module "k8s-cluster" {
 
 # Install EBS CSI Driver using local-exec only
 resource "null_resource" "install_ebs_csi_driver" {
-  count = local.destroy_mode ? 0 : 1
+  # Only create when we have a control plane IP
+  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
   
   # Only run after we have a valid kubeconfig
   depends_on = [
@@ -540,9 +461,8 @@ resource "null_resource" "install_ebs_csi_driver" {
   
   # Only run when needed, based on resource changes
   triggers = {
-    k8s_config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
-    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
-    always_run = timestamp() # Run on every apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
   }
   
   provisioner "local-exec" {
@@ -588,8 +508,10 @@ resource "null_resource" "install_ebs_csi_driver" {
 
 # Install ArgoCD using local-exec only
 resource "null_resource" "install_argocd" {
-  count = local.destroy_mode || local.skip_argocd ? 0 : 1
+  # Only create when we have a control plane IP and we're not skipping ArgoCD
+  count = (module.k8s-cluster.control_plane_public_ip != "" && !local.skip_argocd) ? 1 : 0
   
+  # Ensure all prerequisites are met
   depends_on = [
     module.k8s-cluster,
     null_resource.wait_for_kubernetes,
@@ -601,9 +523,8 @@ resource "null_resource" "install_argocd" {
   
   # Only run when needed
   triggers = {
-    k8s_config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
-    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
-    always_run = timestamp() # Run on every apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
   }
   
   provisioner "local-exec" {
@@ -680,7 +601,8 @@ module "polybot_prod" {
 
 # Output commands for manual verification and namespace creation
 resource "null_resource" "cluster_readiness_info" {
-  count = local.destroy_mode ? 0 : 1
+  # Only create when we have a control plane IP
+  count = module.k8s-cluster.control_plane_public_ip != "" ? 1 : 0
 
   depends_on = [
     module.k8s-cluster,
@@ -771,92 +693,53 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Configure providers to use the generated kubeconfig only if it's valid
+# Configure providers with proper dependency handling
 provider "kubernetes" {
-  # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
-  host = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
-    ) ? "https://do-not-connect:6443" : null
-  ) : "https://do-not-connect:6443"
-  
-  # Use config_path only when a valid kubeconfig exists
-  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
-    ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
-  ) : "/dev/null"
-  
-  # Skip validation when we're not connecting
-  insecure = true
+  # Only configure when kubeconfig is ready with real values
+  host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
+  cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
+  client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
+  client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
 }
 
 provider "helm" {
   kubernetes {
-    # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
-    host = fileexists("${path.module}/kubeconfig.yaml") ? (
-      contains(
-        try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-        "    server: https://placeholder:6443"
-      ) ? "https://do-not-connect:6443" : null
-    ) : "https://do-not-connect:6443"
-    
-    # Use config_path only when a valid kubeconfig exists
-    config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-      contains(
-        try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-        "    server: https://placeholder:6443"
-      ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
-    ) : "/dev/null"
-    
-    # Skip validation when we're not connecting
-    insecure = true
+    # Only configure when kubeconfig is ready with real values
+    host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
+    cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
+    client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
+    client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
   }
 }
 
 provider "kubectl" {
-  # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
-  host = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
-    ) ? "https://do-not-connect:6443" : null
-  ) : "https://do-not-connect:6443"
-  
-  # Use config_path only when a valid kubeconfig exists
-  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
-    ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
-  ) : "/dev/null"
-  
-  # Skip validation when we're not connecting
-  insecure = true
-  load_config_file = true
+  # Only configure when kubeconfig is ready with real values
+  host                   = module.k8s-cluster.control_plane_public_ip != "" ? "https://${module.k8s-cluster.control_plane_public_ip}:6443" : ""
+  cluster_ca_certificate = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).clusters[0].cluster["certificate-authority-data"]) : ""
+  client_certificate     = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-certificate-data"]) : ""
+  client_key             = fileexists("${path.module}/kubeconfig.yaml") ? base64decode(yamldecode(file("${path.module}/kubeconfig.yaml")).users[0].user["client-key-data"]) : ""
+  load_config_file       = false
 }
 
-# Special resource to remove Kubernetes objects from state
+# Special resource to clean up Kubernetes state
 resource "terraform_data" "kubernetes_state_clean" {
-  count = var.destroy_mode ? 1 : 0
-  
-  # Always run during destroy operations
+  # Only run during destroy operations
   triggers_replace = {
     timestamp = timestamp()
   }
 
+  # This will only be executed during destroy operations
   provisioner "local-exec" {
+    when = destroy
     command = <<-EOT
-      echo "Removing Kubernetes-dependent resources from state..."
+      echo "Removing Kubernetes-dependent resources from state if needed..."
       terraform state rm null_resource.wait_for_kubernetes[0] || true
       terraform state rm null_resource.install_ebs_csi_driver[0] || true
       terraform state rm null_resource.install_argocd[0] || true
       terraform state rm null_resource.create_namespaces[0] || true
       terraform state rm null_resource.providers_ready[0] || true
       terraform state rm terraform_data.kubectl_provider_config[0] || true
-      echo "Kubernetes resources removed from state."
+      echo "Kubernetes resources cleaned up from state."
     EOT
   }
 }
