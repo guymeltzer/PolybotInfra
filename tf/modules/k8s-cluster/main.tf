@@ -602,7 +602,8 @@ resource "aws_instance" "control_plane" {
   }
 
   tags = {
-    Name = "k8s-control-plane"
+    Name = "guy-control-plane"
+    Role = "control-plane"
   }
 
   depends_on = [
@@ -2047,67 +2048,106 @@ resource "terraform_data" "completion_progress" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      echo -e "\\033[0;32m➡️  Step 3/4: All infrastructure created, waiting for cluster initialization...\\033[0m"
-      echo -e "\\033[0;33m⏱️  This may take 5-10 minutes. Kubernetes components are being installed.\\033[0m"
-      echo -e "\\033[0;33m⏱️  You can check the outputs for SSH commands to view initialization logs.\\033[0m"
+      echo -e "\\033[1;34m================================================================\\033[0m"
+      echo -e "\\033[1;34m 🚀 Step 3/4: Kubernetes Cluster Initialization in Progress 🚀 \\033[0m"
+      echo -e "\\033[1;34m================================================================\\033[0m"
+      echo -e "\\033[0;33m⏱️  Initializing control plane and worker nodes...\\033[0m"
       
-      # Fixed implementation to avoid variable expansion issues
-      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 1/5)...\\033[0m"
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-      if [ "$?" -eq 0 ]; then
-        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        exit 0
-      fi
-      sleep 60
+      CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
+      TIMEOUT_MINUTES=15
       
-      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 2/5)...\\033[0m"
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-      if [ "$?" -eq 0 ]; then
-        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        exit 0
-      fi
-      sleep 60
+      # Progress display spinner function
+      display_spinner() {
+        local pid=$1
+        local message="$2"
+        local delay=0.75
+        local spinstr='⣾⣽⣻⢿⡿⣟⣯⣷'
+        local start_time=$(date +%s)
+        local elapsed=0
+        
+        while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+          local temp=${spinstr#?}
+          printf "\\r\\033[0;33m %-60s %s\\033[0m %02d:%02d " "$message" "${spinstr}" $((elapsed/60)) $((elapsed%60))
+          local spinstr=$temp${spinstr%"$temp"}
+          sleep $delay
+          elapsed=$(( $(date +%s) - start_time ))
+          
+          # Send a status update every 15 seconds
+          if [ $((elapsed % 15)) -eq 0 ]; then
+            echo -e ""
+            echo -e "\\033[0;36m    ℹ️  Still working... ($((elapsed/60)) min $((elapsed%60)) sec elapsed)\\033[0m"
+            # Show different messages during the wait to keep the user informed
+            if [ $((elapsed % 60)) -eq 0 ] && [ $elapsed -gt 0 ]; then
+              case $((elapsed / 60 % 4)) in
+                0) echo -e "\\033[0;36m    ℹ️  Control plane initializing Kubernetes components...\\033[0m" ;;
+                1) echo -e "\\033[0;36m    ℹ️  Setting up container networking and security...\\033[0m" ;;
+                2) echo -e "\\033[0;36m    ℹ️  Configuring cluster credentials and certificates...\\033[0m" ;;
+                3) echo -e "\\033[0;36m    ℹ️  Waiting for worker nodes to register with the cluster...\\033[0m" ;;
+              esac
+            fi
+          fi
+        done
+        printf "\\r\\033[K"
+      }
       
-      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 3/5)...\\033[0m"
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-      if [ "$?" -eq 0 ]; then
-        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        exit 0
-      fi
-      sleep 60
+      # Function to check the cluster status
+      check_cluster_status() {
+        local attempt=$1
+        echo -e "\\033[0;33m🔍 Checking Kubernetes cluster status (Attempt $attempt/5)...\\033[0m"
+        
+        # Run the SSH command in the background
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$CONTROL_PLANE_IP "kubectl get nodes" > /tmp/nodes_output 2>&1 &
+        local ssh_pid=$!
+        
+        # Display a spinner while waiting
+        display_spinner $ssh_pid "Connecting to control plane and retrieving node status..."
+        
+        # Check the result
+        if grep -q "Ready" /tmp/nodes_output; then
+          echo -e "\\033[0;32m✅ Kubernetes nodes found and ready!\\033[0m"
+          cat /tmp/nodes_output
+          return 0
+        else
+          echo -e "\\033[0;33m⏱️  Cluster not ready yet. Output from control plane:\\033[0m"
+          cat /tmp/nodes_output
+          echo ""
+          return 1
+        fi
+      }
       
-      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 4/5)...\\033[0m"
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-      if [ "$?" -eq 0 ]; then
-        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        exit 0
-      fi
-      sleep 60
+      # Main check loop
+      for attempt in {1..5}; do
+        if check_cluster_status $attempt; then
+          echo -e "\\033[1;34m================================================================\\033[0m"
+          echo -e "\\033[1;32m ✅ Step 4/4: Kubernetes Cluster is Ready!\\033[0m"
+          echo -e "\\033[1;34m================================================================\\033[0m"
+          echo -e "\\033[1;32m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+          echo -e "\\033[1;34m================================================================\\033[0m"
+          echo -e "\\033[0;32m📋 Cluster Information:\\033[0m"
+          echo -e "\\033[0;32m   🖥️  Control Plane: ssh ubuntu@$CONTROL_PLANE_IP\\033[0m"
+          echo -e "\\033[0;32m   🔍 Check Status: kubectl --kubeconfig=./kubeconfig.yaml get nodes\\033[0m"
+          echo -e "\\033[0;32m   📜 View Logs: ssh ubuntu@$CONTROL_PLANE_IP \"cat /var/log/k8s-control-plane-init.log\"\\033[0m"
+          echo -e "\\033[1;34m================================================================\\033[0m"
+          exit 0
+        fi
+        
+        if [ $attempt -lt 5 ]; then
+          local wait_time=60
+          echo -e "\\033[0;33m⏱️  Waiting $wait_time seconds before next check...\\033[0m"
+          sleep $wait_time &
+          display_spinner $! "Waiting for Kubernetes components to initialize..."
+        fi
+      done
       
-      echo -e "\\033[0;33m⏱️  Checking control plane status (attempt 5/5)...\\033[0m"
-      ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-      if [ "$?" -eq 0 ]; then
-        echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
-        echo -e "\\033[1;34m========================================================\\033[0m"
-        exit 0
-      fi
-      
-      echo -e "\\033[0;33m⚠️  Control plane still initializing. Check logs for progress.\\033[0m"
-      echo -e "\\033[1;34m========================================================\\033[0m"
+      # Final status when all checks fail
+      echo -e "\\033[1;34m================================================================\\033[0m"
+      echo -e "\\033[0;33m⚠️  Control plane initialization in progress.\\033[0m"
+      echo -e "\\033[0;33m⚠️  Deployment continuing, but manual verification recommended.\\033[0m"
+      echo -e "\\033[0;33m⚠️  Try these commands to check the cluster status:\\033[0m"
+      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"sudo systemctl status kubelet\"\\033[0m"
+      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"sudo journalctl -u kubelet\"\\033[0m"
+      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"kubectl get nodes\"\\033[0m"
+      echo -e "\\033[1;34m================================================================\\033[0m"
     EOT
   }
 }

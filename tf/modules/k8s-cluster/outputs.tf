@@ -195,7 +195,48 @@ output "network_resources" {
 
 output "deployment_summary" {
   description = "Summary of the deployed infrastructure"
-  value = "✅ Deployment Summary\n==============================\n🚀 Access your Kubernetes cluster by SSH'ing to the control plane\n🔑 Kubeconfig available at: ${local_file.kubeconfig.filename}\n🌍 Application available at: http://${aws_lb.polybot_alb.dns_name}\n\nHappy shipping! 🎉"
+  value = <<-EOT
+    
+    ========================================================
+    🎉 KUBERNETES CLUSTER DEPLOYMENT COMPLETE! 🎉
+    ========================================================
+    
+    🧠 DEPLOYMENT SUMMARY:
+    
+    🟢 Control Plane:
+       • Public IP: ${aws_instance.control_plane.public_ip}
+       • Instance ID: ${aws_instance.control_plane.id}
+       • SSH Command: ssh -i <your-key.pem> ubuntu@${aws_instance.control_plane.public_ip}
+    
+    📦 Worker Node(s):
+       • Count: ${var.worker_count}
+       • Auto Scaling Group: ${aws_autoscaling_group.worker_asg.name}
+       • Instance Type: ${var.worker_instance_type}
+    
+    🔐 Kubeconfig:
+       • Path: ${local_file.kubeconfig.filename}
+       • Usage: export KUBECONFIG=${local_file.kubeconfig.filename}
+    
+    🌐 Load Balancer:
+       • DNS Name: ${aws_lb.polybot_alb.dns_name}
+       • ARN: ${aws_lb.polybot_alb.arn}
+    
+    📚 USEFUL COMMANDS:
+    
+    • Check cluster status:
+      kubectl --kubeconfig=${local_file.kubeconfig.filename} get nodes
+    
+    • View all pods:
+      kubectl --kubeconfig=${local_file.kubeconfig.filename} get pods -A
+    
+    • View control plane logs:
+      ssh -i <your-key.pem> ubuntu@${aws_instance.control_plane.public_ip} "cat /var/log/k8s-control-plane-init.log"
+    
+    • View worker logs in S3:
+      aws s3 ls s3://${aws_s3_bucket.worker_logs.id}/ | grep worker-init
+    
+    ========================================================
+  EOT
 }
 
 output "init_logs_commands" {
