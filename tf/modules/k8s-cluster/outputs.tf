@@ -120,3 +120,18 @@ output "worker_logs_command" {
 output "ssh_command_worker_nodes" {
   value = "SSH to worker nodes using: ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@WORKER_PUBLIC_IP (replace WORKER_PUBLIC_IP with values from the worker_node_info command)"
 }
+
+output "control_plane_id" {
+  description = "The ID of the control plane instance"
+  value       = aws_instance.control_plane.id
+}
+
+output "control_plane_script_hash" {
+  description = "Hash of the control plane user data script"
+  value       = terraform_data.control_plane_script_hash.id
+}
+
+output "worker_script_hash" {
+  description = "Hash of the worker user data script"
+  value       = terraform_data.worker_script_hash.id
+}
