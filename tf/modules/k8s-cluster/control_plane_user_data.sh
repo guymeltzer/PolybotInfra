@@ -171,8 +171,8 @@ echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; \\
 DISCOVERY_HASH=\$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed "s/^.* //"); \\
 JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
 echo "Join command: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
-aws secretsmanager update-secret --secret-id ${kubernetes_join_command_secret} --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
-aws secretsmanager update-secret --secret-id ${kubernetes_join_command_latest_secret} --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id "${kubernetes_join_command_secret}" --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id "${kubernetes_join_command_latest_secret}" --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
 TIMESTAMP=\$(date +"%Y%m%d%H%M%S"); \\
 aws secretsmanager create-secret --name "${kubernetes_join_command_secret}-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region '${REGION}' || true;'
 User=root
@@ -253,53 +253,55 @@ ALT_JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --disc
 echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name
-echo "$(date) - Creating Secret Manager secret ${kubernetes_join_command_secret}"
-aws secretsmanager describe-secret --secret-id "${kubernetes_join_command_secret}" --region "$REGION" > /dev/null 2>&1
+MAIN_SECRET="${kubernetes_join_command_secret}"
+LATEST_SECRET="${kubernetes_join_command_latest_secret}"
+
+echo "$(date) - Creating Secret Manager secret $MAIN_SECRET"
+aws secretsmanager describe-secret --secret-id "$MAIN_SECRET" --region "$REGION" > /dev/null 2>&1
 if [ $? -eq 0 ]; then
   # Secret exists, update it
-  aws secretsmanager update-secret --secret-id "${kubernetes_join_command_secret}" --secret-string "$JOIN_COMMAND" --region "$REGION"
+  aws secretsmanager update-secret --secret-id "$MAIN_SECRET" --secret-string "$JOIN_COMMAND" --region "$REGION"
 else
   # Secret doesn't exist, create it
-  aws secretsmanager create-secret --name "${kubernetes_join_command_secret}" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
+  aws secretsmanager create-secret --name "$MAIN_SECRET" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
 fi
 
 # Also create a timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-SECRET_NAME="${kubernetes_join_command_secret}-${TIMESTAMP}"
+SECRET_NAME="$MAIN_SECRET-${TIMESTAMP}"
 
 echo "$(date) - Creating timestamped Secret Manager secret $SECRET_NAME"
 aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
 
 # Also create a fixed-name secret that's easier to find
-FIXED_SECRET_NAME="${kubernetes_join_command_latest_secret}"
-echo "$(date) - Creating/updating fixed name secret $FIXED_SECRET_NAME"
-aws secretsmanager describe-secret --secret-id "$FIXED_SECRET_NAME" --region "$REGION" > /dev/null 2>&1
+echo "$(date) - Creating/updating fixed name secret $LATEST_SECRET"
+aws secretsmanager describe-secret --secret-id "$LATEST_SECRET" --region "$REGION" > /dev/null 2>&1
 if [ $? -eq 0 ]; then
   # Secret exists, update it
-  aws secretsmanager update-secret --secret-id "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --region "$REGION"
+  aws secretsmanager update-secret --secret-id "$LATEST_SECRET" --secret-string "$JOIN_COMMAND" --region "$REGION"
 else
   # Secret doesn't exist, create it
-  aws secretsmanager create-secret --name "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Latest Kubernetes join command" --region "$REGION"
+  aws secretsmanager create-secret --name "$LATEST_SECRET" --secret-string "$JOIN_COMMAND" --description "Latest Kubernetes join command" --region "$REGION"
 fi
 
 # Verify the secrets are accessible
 echo "$(date) - Verifying secrets are accessible"
 sleep 5  # Give AWS some time to propagate the secrets
 
-for SECRET_NAME in "${kubernetes_join_command_secret}" "${kubernetes_join_command_latest_secret}" "$SECRET_NAME"; do
-  echo "$(date) - Verifying secret: $SECRET_NAME"
-  STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text)
+for CHECK_SECRET in "$MAIN_SECRET" "$LATEST_SECRET" "$SECRET_NAME"; do
+  echo "$(date) - Verifying secret: $CHECK_SECRET"
+  STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$CHECK_SECRET" --region "$REGION" --query SecretString --output text)
   if [ -z "$STORED_JOIN_COMMAND" ]; then
-    echo "$(date) - WARNING: Secret $SECRET_NAME verification failed, will retry once"
+    echo "$(date) - WARNING: Secret $CHECK_SECRET verification failed, will retry once"
     sleep 5
-    STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text)
+    STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$CHECK_SECRET" --region "$REGION" --query SecretString --output text)
     if [ -z "$STORED_JOIN_COMMAND" ]; then
-      echo "$(date) - ERROR: Secret $SECRET_NAME still not accessible after retry"
+      echo "$(date) - ERROR: Secret $CHECK_SECRET still not accessible after retry"
     else
-      echo "$(date) - Secret $SECRET_NAME verified and accessible: $STORED_JOIN_COMMAND"
+      echo "$(date) - Secret $CHECK_SECRET verified and accessible: $STORED_JOIN_COMMAND"
     fi
   else
-    echo "$(date) - Secret $SECRET_NAME verified and accessible: $STORED_JOIN_COMMAND"
+    echo "$(date) - Secret $CHECK_SECRET verified and accessible: $STORED_JOIN_COMMAND"
   fi
 done
 

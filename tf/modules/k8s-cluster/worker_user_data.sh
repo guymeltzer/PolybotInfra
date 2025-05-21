@@ -226,7 +226,10 @@ validate_and_fix_join_command() {
 # Fetch join command from Secrets Manager - using direct approach
 echo "$(date) - Fetching join command from Secrets Manager"
 MAX_ATTEMPTS=30
-SECRET_NAMES=("${kubernetes_join_command_secret}" "${kubernetes_join_command_latest_secret}")
+# Define the secret names to try - templated from Terraform
+MAIN_SECRET="${kubernetes_join_command_secret}"
+LATEST_SECRET="${kubernetes_join_command_latest_secret}"
+SECRET_NAMES=("$MAIN_SECRET" "$LATEST_SECRET")
 JOIN_COMMAND=""
 
 for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
@@ -274,9 +277,10 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   # Try to find the latest secret by listing
   if [ -z "$JOIN_COMMAND" ]; then
     echo "$(date) - Failed to get join command from known secret names, looking for latest..."
+    QUERY_PREFIX=$(echo "$MAIN_SECRET" | cut -d'-' -f1-3) # Get the prefix part of the secret name
     LATEST_SECRET=$(aws secretsmanager list-secrets \
       --region "$REGION" \
-      --query "sort_by(SecretList[?contains(Name, '${kubernetes_join_command_secret}')], &CreatedDate)[-1].Name" \
+      --query "sort_by(SecretList[?contains(Name, '$QUERY_PREFIX')], &CreatedDate)[-1].Name" \
       --output text)
     
     if [ -n "$LATEST_SECRET" ] && [ "$LATEST_SECRET" != "None" ]; then
