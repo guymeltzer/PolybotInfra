@@ -12,14 +12,38 @@ setup_core() {
   curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
   unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
   
-  # Get AWS metadata
+  # Get AWS metadata - using IMDSv2 with fallbacks
+  echo "Fetching EC2 instance metadata..."
+  
+  # Try IMDSv2 first
   TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
   REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
   PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
   INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
   AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+  
+  # Fallback to IMDSv1 if needed
+  if [ -z "$REGION" ]; then
+    echo "IMDSv2 failed, falling back to IMDSv1"
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+  fi
+  
+  # Last resort fallback
+  if [ -z "$REGION" ]; then
+    echo "Metadata service unavailable, using defaults"
+    REGION="us-east-1"
+    PRIVATE_IP=$(hostname -I | awk '{print $1}')
+    INSTANCE_ID=$(hostname)
+    AZ="${REGION}a"
+  fi
+  
   PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
   export AWS_DEFAULT_REGION="$REGION"
+  
+  echo "Instance metadata: Region=$REGION, IP=$PRIVATE_IP, ID=$INSTANCE_ID, AZ=$AZ"
   
   # Setup SSH access
   mkdir -p /home/ubuntu/.ssh
@@ -96,57 +120,110 @@ join_cluster() {
   LATEST_SECRET="##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##"
   SECRET_NAMES=("$MAIN_SECRET" "$LATEST_SECRET")
   
+  echo "Attempting to join Kubernetes cluster..."
+  
   # Try to get join command from secrets manager
-  for ((ATTEMPT=1; ATTEMPT<=15; ATTEMPT++)); do
+  for ((ATTEMPT=1; ATTEMPT<=20; ATTEMPT++)); do
+    echo "Join attempt $ATTEMPT/20"
+    JOIN_COMMAND=""
+    
     # Try known secrets
     for SECRET_NAME in "${SECRET_NAMES[@]}"; do
+      echo "Checking secret: $SECRET_NAME"
       JOIN_COMMAND=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_NAME" --query SecretString --output text 2>/dev/null || echo "")
       if [[ -n "$JOIN_COMMAND" && "$JOIN_COMMAND" =~ ^kubeadm\ join ]]; then
-        if [[ ! "$JOIN_COMMAND" =~ --token ]]; then
-          SERVER_ADDR=$(echo "$JOIN_COMMAND" | grep -oP '^kubeadm join \K[^[:space:]]+')
-          if [ -n "$SERVER_ADDR" ]; then
-            JOIN_COMMAND="kubeadm join $SERVER_ADDR --token $(kubeadm token generate) --discovery-token-unsafe-skip-ca-verification"
-          fi
-        fi
-        break 2
+        echo "Found join command in $SECRET_NAME: $JOIN_COMMAND"
+        break
       fi
     done
     
-    # Try to find through listing
-    if [ $ATTEMPT -gt 10 ]; then
-      CONTROL_PLANE_IP=$(aws ec2 describe-instances --region "$REGION" --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
-      if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-        JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $(kubeadm token generate) --discovery-token-unsafe-skip-ca-verification"
-        break
+    # If no command found or command contains old IP, try to get current control plane IP
+    if [[ -z "$JOIN_COMMAND" || ! "$JOIN_COMMAND" =~ --token ]]; then
+      echo "No valid join command found in secrets, querying for control plane IP..."
+      CONTROL_PLANE_IP=$(aws ec2 describe-instances --region "$REGION" \
+                          --filters "Name=tag:Name,Values=k8s-control-plane" \
+                                    "Name=instance-state-name,Values=running" \
+                          --query "Reservations[0].Instances[0].PrivateIpAddress" \
+                          --output text)
+      
+      if [[ -n "$CONTROL_PLANE_IP" && "$CONTROL_PLANE_IP" != "None" ]]; then
+        echo "Found control plane IP: $CONTROL_PLANE_IP"
+        
+        # Try to get token from existing join command or generate new one
+        TOKEN=""
+        DISCOVERY_HASH=""
+        
+        if [[ -n "$JOIN_COMMAND" ]]; then
+          # Extract token and hash from existing command
+          TOKEN=$(echo "$JOIN_COMMAND" | grep -oP -- '--token \K[^ ]+' || echo "")
+          DISCOVERY_HASH=$(echo "$JOIN_COMMAND" | grep -oP -- '--discovery-token-ca-cert-hash \K[^ ]+' || echo "")
+        fi
+        
+        # Generate token if we couldn't extract it
+        if [ -z "$TOKEN" ]; then
+          TOKEN=$(kubeadm token generate)
+        fi
+        
+        # Create new join command with current control plane IP
+        if [ -n "$DISCOVERY_HASH" ]; then
+          JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
+        else
+          JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
+        fi
+        
+        echo "Created new join command: $JOIN_COMMAND"
+      else
+        echo "Failed to find control plane IP"
       fi
     fi
     
-    sleep 15
-  done
-  
-  # Exit if we can't get a join command
-  if [ -z "$JOIN_COMMAND" ]; then
-    echo "Failed to retrieve join command" >> "$LOGFILE"
-    upload_logs_to_s3 "JOIN_COMMAND_FAILED"
-    exit 1
-  fi
-  
-  # Join with retries
-  for ((ATTEMPT=1; ATTEMPT<=5; ATTEMPT++)); do
+    # Exit if we can't get a join command
+    if [ -z "$JOIN_COMMAND" ]; then
+      echo "Failed to retrieve join command, will retry in 15 seconds..."
+      sleep 15
+      continue
+    fi
+    
+    # Try executing the join command
+    echo "Executing join command: $JOIN_COMMAND"
     if eval $JOIN_COMMAND --v=5; then
+      echo "Successfully joined the cluster!"
       systemctl restart kubelet
+      
       # Signal success after joining
-      [ -f "/etc/kubernetes/kubelet.conf" ] && kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=/etc/kubernetes/kubelet.conf || true
-      aws autoscaling complete-lifecycle-action --lifecycle-hook-name "guy-scale-up-hook" --auto-scaling-group-name "guy-polybot-asg" --lifecycle-action-result "CONTINUE" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true
-      aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" --tags Key=node-role.kubernetes.io/worker,Value=true Key=k8s.io/autoscaled-node,Value=true Key=Name,Value="$NODE_NAME" 2>/dev/null || true
+      if [ -f "/etc/kubernetes/kubelet.conf" ]; then
+        echo "Setting provider ID for the node..."
+        kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=/etc/kubernetes/kubelet.conf || true
+      fi
+      
+      # Complete lifecycle action
+      echo "Completing lifecycle action..."
+      aws autoscaling complete-lifecycle-action \
+        --lifecycle-hook-name "guy-scale-up-hook" \
+        --auto-scaling-group-name "guy-polybot-asg" \
+        --lifecycle-action-result "CONTINUE" \
+        --instance-id "$INSTANCE_ID" \
+        --region "$REGION" 2>/dev/null || true
+      
+      # Tag the instance
+      echo "Tagging instance..."
+      aws ec2 create-tags \
+        --region "$REGION" \
+        --resources "$INSTANCE_ID" \
+        --tags Key=node-role.kubernetes.io/worker,Value=true \
+               Key=k8s.io/autoscaled-node,Value=true \
+               Key=Name,Value="$NODE_NAME" 2>/dev/null || true
+      
       upload_logs_to_s3 "COMPLETE"
       echo "Kubernetes worker node initialization completed successfully"
       return 0
     else
-      sleep $((ATTEMPT * 30))
+      echo "Join command failed, will retry in $((ATTEMPT * 5)) seconds..."
+      sleep $((ATTEMPT * 5))
     fi
   done
   
+  echo "All join attempts failed."
   upload_logs_to_s3 "JOIN_FAILED"
   exit 1
 }

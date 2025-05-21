@@ -121,6 +121,14 @@ output "ssh_command_worker_nodes" {
   value = "SSH to worker nodes using: ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@WORKER_PUBLIC_IP (replace WORKER_PUBLIC_IP with values from the worker_node_info command)"
 }
 
+output "troubleshoot_worker_init" {
+  value = "To check worker initialization logs: aws s3 ls s3://guy-polybot-logs/ --region ${var.region} | grep worker-init | sort -r | head -5"
+}
+
+output "rotate_join_token" {
+  value = "If workers can't join, try: ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip} 'sudo systemctl start k8s-token-creator.service && sudo systemctl status k8s-token-creator.service'"
+}
+
 output "control_plane_id" {
   description = "The ID of the control plane instance"
   value       = aws_instance.control_plane.id

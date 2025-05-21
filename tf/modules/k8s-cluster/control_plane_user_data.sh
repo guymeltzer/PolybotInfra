@@ -201,11 +201,31 @@ After=network.target kubelet.service
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c '\\
+# Get latest instance metadata\\
+get_meta() {\\
+  TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || echo "")\\
+  if [ -n "\$TOKEN" ]; then\\
+    curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" "http://169.254.169.254/latest/meta-data/\$1" || echo ""\\
+  else\\
+    curl -s "http://169.254.169.254/latest/meta-data/\$1" || echo ""\\
+  fi\\
+}\\
+\\
+PRIVATE_IP=\$(get_meta "local-ipv4")\\
+PUBLIC_IP=\$(get_meta "public-ipv4")\\
+\\
+# Determine which IP to use (prefer public if available)\\
+API_SERVER_IP="\${PRIVATE_IP}"\\
+if [ -n "\${PUBLIC_IP}" ]; then\\
+  API_SERVER_IP="\${PUBLIC_IP}"\\
+fi\\
+\\
+# Create new token and generate join command\\
 TOKEN=\$(kubeadm token create --ttl 24h); \\
 echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; \\
 DISCOVERY_HASH=\$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed "s/^.* //"); \\
-JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
-echo "Join command: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
+JOIN_COMMAND="kubeadm join \${API_SERVER_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
+echo "Join command with IP \${API_SERVER_IP}: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
 aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_SECRET## --secret-string "\$JOIN_COMMAND" --region ##REGION## || true; \\
 aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_LATEST_SECRET## --secret-string "\$JOIN_COMMAND" --region ##REGION## || true; \\
 TIMESTAMP=\$(date +"%Y%m%d%H%M%S"); \\
@@ -272,9 +292,19 @@ echo "$(date) - Security restoration timer started"
 # Generate join command with a long TTL token for reliability (7 days)
 STABLE_TOKEN=$(kubeadm token create --ttl 168h)
 DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
 
-echo "$(date) - Generated join command with private IP: $JOIN_COMMAND"
+# Determine which IP to use for the join command (prefer public IP if available)
+API_SERVER_IP="${PRIVATE_IP}"
+if [ -n "${PUBLIC_IP}" ]; then
+  API_SERVER_IP="${PUBLIC_IP}"
+  echo "$(date) - Using public IP for join command: ${PUBLIC_IP}"
+else
+  echo "$(date) - Using private IP for join command: ${PRIVATE_IP}"
+fi
+
+JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
+
+echo "$(date) - Generated join command: $JOIN_COMMAND"
 
 # Print token info for debugging
 echo "$(date) - Token information:"
@@ -284,7 +314,7 @@ kubeadm token list
 echo "$(date) - CA cert hash: sha256:${DISCOVERY_HASH}"
 
 # For workers using the unsafe-skip-ca-verification option
-ALT_JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-unsafe-skip-ca-verification"
+ALT_JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-unsafe-skip-ca-verification"
 echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name

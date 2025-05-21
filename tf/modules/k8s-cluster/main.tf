@@ -1170,6 +1170,15 @@ resource "aws_launch_template" "worker_lt" {
   ]
 }
 
+# Force update ASG when worker script changes
+resource "terraform_data" "force_asg_update" {
+  input = terraform_data.worker_script_hash.id
+  
+  triggers_replace = [
+    aws_launch_template.worker_lt.latest_version
+  ]
+}
+
 resource "aws_autoscaling_group" "worker_asg" {
   name                = "guy-polybot-asg"
   max_size            = 3
@@ -1201,8 +1210,16 @@ resource "aws_autoscaling_group" "worker_asg" {
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
-    null_resource.wait_for_control_plane
+    null_resource.wait_for_control_plane,
+    terraform_data.force_asg_update
   ]
+  
+  lifecycle {
+    # Force replacement when worker script hash changes
+    replace_triggered_by = [
+      terraform_data.worker_script_hash
+    ]
+  }
 }
 
 resource "aws_security_group" "worker_sg" {
