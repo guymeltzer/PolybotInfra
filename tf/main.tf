@@ -328,8 +328,8 @@ locals {
     module.k8s-cluster.control_plane_public_ip,
     "kubernetes.default.svc"
   )
-  skip_argocd     = true # Set to true to skip ArgoCD deployment temporarily
-  skip_namespaces = true # Skip namespace creation until the cluster is fully ready
+  skip_argocd     = false # Enable ArgoCD deployment
+  skip_namespaces = false # Enable namespace creation
 }
 
 # Add a data source to ensure kubeconfig is ready
@@ -466,39 +466,38 @@ module "k8s-cluster" {
 }
 
 # Install EBS CSI Driver for persistent storage
-# Commented out temporarily to avoid hanging issues
-# resource "helm_release" "aws_ebs_csi_driver" {
-#   count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
-#   name       = "aws-ebs-csi-driver"
-#   repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
-#   chart      = "aws-ebs-csi-driver"
-#   namespace  = "kube-system"
-#   version    = "2.23.0"  # Use a specific stable version
-#   
-#   # Set shorter timeout to avoid long waits
-#   timeout    = 300
-#   wait       = false  # Don't wait for resources to be ready
-#   
-#   # Simplified values
-#   values = [<<EOF
-# controller:
-#   serviceAccount:
-#     annotations:
-#       eks.amazonaws.com/role-arn: ${module.k8s-cluster.control_plane_iam_role_arn}
-# storageClasses:
-#   - name: ebs-sc
-#     annotations:
-#       storageclass.kubernetes.io/is-default-class: "true"
-#     volumeBindingMode: WaitForFirstConsumer
-#     parameters:
-#       csi.storage.k8s.io/fstype: ext4
-#       type: gp2
-#       encrypted: "true"
-# EOF
-#   ]
-# 
-#   depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
-# }
+resource "helm_release" "aws_ebs_csi_driver" {
+  count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
+  name       = "aws-ebs-csi-driver"
+  repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
+  chart      = "aws-ebs-csi-driver"
+  namespace  = "kube-system"
+  version    = "2.23.0"  # Use a specific stable version
+  
+  # Set shorter timeout to avoid long waits
+  timeout    = 300
+  wait       = false  # Don't wait for resources to be ready
+  
+  # Simplified values
+  values = [<<EOF
+controller:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: ${module.k8s-cluster.control_plane_iam_role_arn}
+storageClasses:
+  - name: ebs-sc
+    annotations:
+      storageclass.kubernetes.io/is-default-class: "true"
+    volumeBindingMode: WaitForFirstConsumer
+    parameters:
+      csi.storage.k8s.io/fstype: ext4
+      type: gp2
+      encrypted: "true"
+EOF
+  ]
+
+  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+}
 
 # ArgoCD deployment - only create after namespaces are ready
 module "argocd" {
