@@ -303,6 +303,14 @@ aws sns list-topics --max-items 1
 # Notify completion via SNS (if available)
 SNS_TOPIC_ARN=$(aws sns list-topics --query 'Topics[0].TopicArn' --output text 2>/dev/null || echo "")
 if [ -n "$${SNS_TOPIC_ARN}" ] && [[ "$${SNS_TOPIC_ARN}" == arn:aws:sns:* ]]; then
+  # Ensure we have the instance ID
+  if [ -z "$${INSTANCE_ID}" ]; then
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || 
+                  curl -s http://169.254.169.254/latest/meta-data/instance-id || 
+                  hostname || 
+                  echo "unknown-instance")
+  fi
+
   echo "$(date) - Sending notification to SNS topic: $${SNS_TOPIC_ARN}"
   aws sns publish \
     --topic-arn "$${SNS_TOPIC_ARN}" \
@@ -311,10 +319,22 @@ if [ -n "$${SNS_TOPIC_ARN}" ] && [[ "$${SNS_TOPIC_ARN}" == arn:aws:sns:* ]]; the
 fi
 
 # Tag instance with completion status for external monitoring
-aws ec2 create-tags \
-  --resources "$${INSTANCE_ID}" \
-  --tags "Key=KubernetesInitStatus,Value=Complete" \
-  --region $${AWS_REGION}
+# Ensure we have the instance ID
+if [ -z "$${INSTANCE_ID}" ]; then
+  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || 
+                curl -s http://169.254.169.254/latest/meta-data/instance-id || 
+                hostname || 
+                echo "unknown-instance")
+fi
+
+if [ "$${INSTANCE_ID}" != "unknown-instance" ]; then
+  aws ec2 create-tags \
+    --resources "$${INSTANCE_ID}" \
+    --tags "Key=KubernetesInitStatus,Value=Complete" \
+    --region $${AWS_REGION}
+else
+  echo "$(date) - WARNING: Could not determine instance ID for tagging"
+fi
 
 echo "$(date) - Kubernetes control plane initialization completed successfully"
 echo "$(date) - You can check the cluster status using: kubectl get nodes"
@@ -354,7 +374,18 @@ aws --version
 upload_logs_to_s3() {
   LOG_STATUS=$1
   echo "$(date) - $LOG_STATUS - Uploading logs to S3"
-  LOG_FILENAME="control-plane-init-${INSTANCE_ID}-${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
+  
+  # Get instance ID if not already set
+  if [ -z "$${INSTANCE_ID}" ]; then
+    # Try to get instance ID from metadata
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown-instance")
+    # Add fallback for older IMDSv1
+    if [ -z "$${INSTANCE_ID}" ] || [ "$${INSTANCE_ID}" == "unknown-instance" ]; then
+      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || hostname || echo "unknown-instance")
+    fi
+  fi
+  
+  LOG_FILENAME="control-plane-init-$${INSTANCE_ID}-${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
   aws s3 cp "$LOGFILE" "s3://${worker_logs_bucket}/${LOG_FILENAME}" --region "${region}" || echo "Failed to upload logs to S3"
 }
 
