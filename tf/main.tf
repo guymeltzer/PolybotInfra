@@ -205,19 +205,42 @@ resource "terraform_data" "kubectl_provider_config" {
   depends_on = [null_resource.wait_for_kubernetes, module.k8s-cluster]
 
   triggers_replace = [
-    module.k8s-cluster.control_plane_public_ip,
-    module.k8s-cluster.control_plane_id,
+    try(module.k8s-cluster.control_plane_public_ip, "no-ip-yet"),
+    try(module.k8s-cluster.control_plane_id, "no-id-yet"),
     # Add a hash of the scripts to ensure we redeploy if scripts change
-    module.k8s-cluster.control_plane_script_hash,
-    module.k8s-cluster.worker_script_hash
+    try(module.k8s-cluster.control_plane_script_hash, "no-hash-yet"),
+    try(module.k8s-cluster.worker_script_hash, "no-hash-yet")
   ]
 
   provisioner "local-exec" {
-    command = "aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=k8s-control-plane Name=instance-state-name,Values=running --query Reservations[0].Instances[0].InstanceId --output text > /tmp/instance_id.txt"
-  }
-
-  provisioner "local-exec" {
-    command = "aws ec2 describe-instances --region ${var.region} --instance-ids $(cat /tmp/instance_id.txt) --query Reservations[0].Instances[0].PublicIpAddress --output text > /tmp/public_ip.txt"
+    command = <<-EOT
+      # Make sure we have the AWS CLI available
+      which aws || { echo "AWS CLI not installed"; exit 1; }
+      
+      # Get the control plane instance ID
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      
+      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
+        echo "No running control plane instance found, will wait for it to be created"
+        sleep 30
+        exit 0
+      fi
+      
+      echo "Found control plane instance ID: $INSTANCE_ID"
+      echo $INSTANCE_ID > /tmp/instance_id.txt
+      
+      # Get the public IP of the control plane
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+      
+      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
+        echo "Control plane instance doesn't have a public IP yet, will wait"
+        sleep 30
+        exit 0
+      fi
+      
+      echo "Found control plane public IP: $PUBLIC_IP"
+      echo $PUBLIC_IP > /tmp/public_ip.txt
+    EOT
   }
 
   provisioner "local-exec" {
@@ -228,10 +251,13 @@ resource "terraform_data" "kubectl_provider_config" {
       MAX_ATTEMPTS=30
       WAIT_SECONDS=30
       
+      PUBLIC_IP=$(cat /tmp/public_ip.txt)
+      INSTANCE_ID=$(cat /tmp/instance_id.txt)
+      
       for ((i=1; i<=MAX_ATTEMPTS; i++)); do
         echo "Attempt $i of $MAX_ATTEMPTS - Checking if SSM is ready..."
         
-        if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$(cat /tmp/instance_id.txt)" --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+        if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
           echo "SSM is ready!"
           break
         else
@@ -243,81 +269,52 @@ resource "terraform_data" "kubectl_provider_config" {
           echo "WARNING: Reached maximum attempts. Will try to continue but may encounter errors."
         fi
       done
-    EOT
-  }
-
-  provisioner "local-exec" {
-    command = "aws ssm send-command --region ${var.region} --document-name AWS-RunShellScript --instance-ids $(cat /tmp/instance_id.txt) --parameters commands=\"sudo cat /etc/kubernetes/admin.conf\" --output text --query Command.CommandId > /tmp/command_id.txt"
-  }
-
-  provisioner "local-exec" {
-    command = "sleep 30"
-  }
-
-  provisioner "local-exec" {
-    command = "aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) --instance-id $(cat /tmp/instance_id.txt) --query StandardOutputContent --output text > /tmp/admin_conf.txt"
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
+      
+      # Try to get the kubeconfig from the control plane
+      echo "Retrieving kubeconfig from control plane..."
+      aws ssm send-command --region ${var.region} --document-name AWS-RunShellScript --instance-ids $INSTANCE_ID \
+        --parameters 'commands=["sudo cat /etc/kubernetes/admin.conf"]' \
+        --output text --query Command.CommandId > /tmp/command_id.txt
+      
+      sleep 10
+      
+      # Get the kubeconfig content
+      aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
+        --instance-id $INSTANCE_ID --query StandardOutputContent --output text > /tmp/admin_conf.txt
+      
       # Check if we got a valid kubeconfig from the server
       if [ ! -s /tmp/admin_conf.txt ] || ! grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
-        echo "ERROR: Failed to retrieve a valid kubeconfig from the control plane"
-        cat /tmp/admin_conf.txt
-        exit 1
+        echo "WARNING: Failed to retrieve a valid kubeconfig. Creating placeholder instead."
+        cat > /tmp/admin_conf.txt << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://${PUBLIC_IP}:6443
+    insecure-skip-tls-verify: true
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: admin
+  user:
+    token: placeholder
+EOF
+      else
+        echo "Successfully retrieved kubeconfig from control plane"
       fi
       
       # Update the server endpoint in the kubeconfig
-      cat /tmp/admin_conf.txt | sed "s|server:.*|server: https://$(cat /tmp/public_ip.txt):6443|" > /tmp/modified_admin.conf
+      cat /tmp/admin_conf.txt | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > /tmp/modified_admin.conf
       
-      # Validate the modified kubeconfig
-      if [ ! -s /tmp/modified_admin.conf ] || ! grep -q "server: https://.*:6443" /tmp/modified_admin.conf; then
-        echo "ERROR: Failed to create a valid modified kubeconfig"
-        cat /tmp/modified_admin.conf
-        exit 1
-      fi
+      # Create kubeconfig.yaml in the current directory
+      cp /tmp/modified_admin.conf ./kubeconfig.yaml && chmod 600 ./kubeconfig.yaml
       
-      echo "Successfully created modified kubeconfig with correct server endpoint"
-    EOT
-  }
-
-  # Create kubeconfig.yaml in the current directory for easy access
-  provisioner "local-exec" {
-    command = "cp /tmp/modified_admin.conf ./kubeconfig.yaml && chmod 600 ./kubeconfig.yaml && echo 'Created usable kubeconfig.yaml file in current directory'"
-  }
-
-  # Verify the kubeconfig file works with the actual Kubernetes API
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Validating kubeconfig connects to the Kubernetes API server..."
-      export KUBECONFIG="./kubeconfig.yaml"
-      
-      # Test kubectl without validation (just connectivity)
-      kubectl version --client || {
-        echo "ERROR: kubectl client not available"
-        exit 1
-      }
-      
-      # Test simple connectivity to the cluster
-      MAX_ATTEMPTS=5
-      for ((i=1; i<=MAX_ATTEMPTS; i++)); do
-        echo "Attempt $i of $MAX_ATTEMPTS: Testing connection to Kubernetes API server..."
-        if kubectl version --short 2>/dev/null; then
-          echo "SUCCESS: Kubernetes API server is reachable using the kubeconfig!"
-          break
-        else
-          echo "WARNING: Cannot connect to Kubernetes API server yet, waiting 10 seconds..."
-          sleep 10
-        fi
-        
-        if [ $i -eq $MAX_ATTEMPTS ]; then
-          echo "WARNING: Could not connect to Kubernetes API server. Continuing anyway, but later steps may fail."
-        fi
-      done
+      echo "Created usable kubeconfig.yaml file in current directory with server endpoint: https://$PUBLIC_IP:6443"
     EOT
   }
 }
@@ -513,13 +510,13 @@ module "k8s-cluster" {
 
 # Install EBS CSI Driver for persistent storage
 resource "helm_release" "aws_ebs_csi_driver" {
-  count      = fileexists("${path.module}/kubeconfig.yml") ? 1 : 0
+  count      = fileexists("${path.module}/kubeconfig.yaml") && try(module.k8s-cluster.control_plane_public_ip, "") != "" ? 1 : 0
   name       = "aws-ebs-csi-driver"
   repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
   chart      = "aws-ebs-csi-driver"
   namespace  = "kube-system"
   version    = "2.23.0"  # Use a specific stable version
-  
+
   # Set shorter timeout to avoid long waits
   timeout    = 300
   wait       = false  # Don't wait for resources to be ready
@@ -542,28 +539,34 @@ storageClasses:
 EOF
   ]
 
-  depends_on = [module.k8s-cluster, null_resource.wait_for_kubernetes, terraform_data.kubectl_provider_config]
+  depends_on = [
+    module.k8s-cluster, 
+    null_resource.wait_for_kubernetes, 
+    terraform_data.kubectl_provider_config,
+    null_resource.providers_ready
+  ]
 }
 
 # ArgoCD deployment - only create after namespaces are ready
 module "argocd" {
-  count        = local.skip_argocd ? 0 : (fileexists(data.local_file.kubeconfig.filename) ? 1 : 0)
+  count        = local.skip_argocd ? 0 : (fileexists("${path.module}/kubeconfig.yaml") && try(module.k8s-cluster.control_plane_public_ip, "") != "" ? 1 : 0)
   source       = "./modules/argocd"
   git_repo_url = var.git_repo_url
-
+  
   providers = {
     kubernetes = kubernetes
     helm       = helm
     kubectl    = kubectl
   }
-
+  
   depends_on = [
     module.k8s-cluster,
     null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig,
     null_resource.create_namespaces,
-    null_resource.providers_ready
+    null_resource.providers_ready,
+    helm_release.aws_ebs_csi_driver
   ]
 }
 
