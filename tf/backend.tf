@@ -30,9 +30,9 @@ terraform {
     }
   }
   backend "s3" {
-    bucket         = "polybot-tfstate-bucket"
-    key            = "polybot/terraform.tfstate"
-    region         = "us-east-1"
+    bucket = "polybot-tfstate-bucket"
+    key    = "polybot/terraform.tfstate"
+    region = "us-east-1"
   }
   required_version = ">= 1.7.0"
 }

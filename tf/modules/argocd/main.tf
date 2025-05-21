@@ -1,15 +1,15 @@
 terraform {
   required_providers {
     kubernetes = {
-      source = "hashicorp/kubernetes"
+      source                = "hashicorp/kubernetes"
       configuration_aliases = [kubernetes]
     }
     helm = {
-      source = "hashicorp/helm"
+      source                = "hashicorp/helm"
       configuration_aliases = [helm]
     }
     kubectl = {
-      source = "gavinbunney/kubectl"
+      source                = "gavinbunney/kubectl"
       configuration_aliases = [kubectl]
     }
   }
@@ -26,8 +26,8 @@ resource "helm_release" "argocd" {
   name       = "argocd"
   repository = "https://argoproj.github.io/argo-helm"
   chart      = "argo-cd"
-  namespace  = "argocd"  # Use string directly instead of referencing the removed resource
-  version    = "5.51.4"  # Specify a stable version
+  namespace  = "argocd" # Use string directly instead of referencing the removed resource
+  version    = "5.51.4" # Specify a stable version
 
   values = [
     <<-EOT
@@ -42,15 +42,15 @@ resource "helm_release" "argocd" {
     EOT
   ]
 
-  wait             = false  # Don't wait for all resources to be ready
-  timeout          = 300    # 5 minutes timeout
-  atomic           = false  # Don't use atomic deployment to avoid failures
-  cleanup_on_fail  = true
+  wait            = false # Don't wait for all resources to be ready
+  timeout         = 300   # 5 minutes timeout
+  atomic          = false # Don't use atomic deployment to avoid failures
+  cleanup_on_fail = true
 }
 
 # Wait for ArgoCD to be ready before creating applications
 resource "time_sleep" "wait_for_argocd" {
-  depends_on = [helm_release.argocd]
+  depends_on      = [helm_release.argocd]
   create_duration = "60s"
 }
 

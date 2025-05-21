@@ -22,7 +22,7 @@ provider "local" {}
 # Resource to automate secrets management and cleanup
 resource "terraform_data" "manage_secrets" {
   depends_on = [terraform_data.clean_kubernetes_state]
-  
+
   # Always run on every apply
   triggers_replace = {
     timestamp = timestamp()
@@ -31,7 +31,7 @@ resource "terraform_data" "manage_secrets" {
   # Run script to check and clean up secrets
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       
       echo "Checking for stale AWS secrets..."
@@ -104,7 +104,7 @@ resource "terraform_data" "manage_secrets" {
 # Resource to ensure proper initialization before anything else runs
 resource "terraform_data" "init_environment" {
   depends_on = [terraform_data.manage_secrets]
-  
+
   # This will run on every apply
   triggers_replace = {
     # Always run at the beginning of every terraform apply
@@ -114,7 +114,7 @@ resource "terraform_data" "init_environment" {
   # Create a valid kubeconfig before any resources are created
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       echo "Initializing environment with placeholder kubeconfig..."
       
@@ -259,7 +259,7 @@ resource "terraform_data" "kubectl_provider_config" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       # Check if we got a valid kubeconfig from the server
       if [ ! -s /tmp/admin_conf.txt ] || ! grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
@@ -286,11 +286,11 @@ resource "terraform_data" "kubectl_provider_config" {
   provisioner "local-exec" {
     command = "cp /tmp/modified_admin.conf ./kubeconfig.yaml && chmod 600 ./kubeconfig.yaml && echo 'Created usable kubeconfig.yaml file in current directory'"
   }
-  
+
   # Verify the kubeconfig file works with the actual Kubernetes API
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       echo "Validating kubeconfig connects to the Kubernetes API server..."
       export KUBECONFIG="./kubeconfig.yaml"
@@ -327,7 +327,7 @@ locals {
     module.k8s-cluster.control_plane_public_ip,
     "kubernetes.default.svc"
   )
-  skip_argocd = true # Set to true to skip ArgoCD deployment temporarily
+  skip_argocd     = true # Set to true to skip ArgoCD deployment temporarily
   skip_namespaces = true # Skip namespace creation until the cluster is fully ready
 }
 
@@ -353,7 +353,7 @@ provider "helm" {
 
 # Configure the kubectl provider with proper authentication
 provider "kubectl" {
-  config_path     = data.local_file.kubeconfig.filename
+  config_path      = data.local_file.kubeconfig.filename
   load_config_file = true
 }
 
@@ -364,14 +364,14 @@ resource "null_resource" "providers_ready" {
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig
   ]
-  
+
   triggers = {
     # Use the instance_id instead of file hash to avoid inconsistency during apply
     instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
     # Add a timestamp component to ensure this runs when needed
     config_timestamp = terraform_data.kubectl_provider_config.id
   }
-  
+
   provisioner "local-exec" {
     command = "echo 'Kubernetes providers ready with kubeconfig ${data.local_file.kubeconfig.filename}'"
   }
@@ -380,23 +380,23 @@ resource "null_resource" "providers_ready" {
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
   count = local.skip_namespaces ? 0 : 1
-  
+
   depends_on = [
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig,
     null_resource.providers_ready
   ]
-  
+
   # Only trigger after the control plane is actually ready
   triggers = {
     kubectl_config_id = terraform_data.kubectl_provider_config.id
-    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "none")
+    control_plane_ip  = try(module.k8s-cluster.control_plane_public_ip, "none")
   }
 
   # Use local-exec to create namespaces directly with kubectl
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       set -e
       
@@ -501,19 +501,19 @@ module "k8s-cluster" {
 
 # ArgoCD deployment - only create after namespaces are ready
 module "argocd" {
-  count          = local.skip_argocd ? 0 : (fileexists(data.local_file.kubeconfig.filename) ? 1 : 0)
-  source         = "./modules/argocd"
-  git_repo_url   = var.git_repo_url
-  
+  count        = local.skip_argocd ? 0 : (fileexists(data.local_file.kubeconfig.filename) ? 1 : 0)
+  source       = "./modules/argocd"
+  git_repo_url = var.git_repo_url
+
   providers = {
     kubernetes = kubernetes
     helm       = helm
     kubectl    = kubectl
   }
-  
-  depends_on     = [
-    module.k8s-cluster, 
-    null_resource.wait_for_kubernetes, 
+
+  depends_on = [
+    module.k8s-cluster,
+    null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig,
     null_resource.create_namespaces,
@@ -523,32 +523,32 @@ module "argocd" {
 
 # Development environment resources
 module "polybot_dev" {
-  source          = "./modules/polybot"
-  region          = var.region
-  route53_zone_id = var.route53_zone_id
-  alb_dns_name    = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id     = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment     = "dev"
-  telegram_token  = var.telegram_token_dev
-  aws_access_key_id = var.aws_access_key_id
+  source                = "./modules/polybot"
+  region                = var.region
+  route53_zone_id       = var.route53_zone_id
+  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
+  environment           = "dev"
+  telegram_token        = var.telegram_token_dev
+  aws_access_key_id     = var.aws_access_key_id
   aws_secret_access_key = var.aws_secret_access_key
-  docker_username = var.docker_username
-  docker_password = var.docker_password
+  docker_username       = var.docker_username
+  docker_password       = var.docker_password
 }
 
 # Production environment resources
 module "polybot_prod" {
-  source          = "./modules/polybot"
-  region          = var.region
-  route53_zone_id = var.route53_zone_id
-  alb_dns_name    = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id     = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment     = "prod"
-  telegram_token  = var.telegram_token_prod
-  aws_access_key_id = var.aws_access_key_id
+  source                = "./modules/polybot"
+  region                = var.region
+  route53_zone_id       = var.route53_zone_id
+  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
+  environment           = "prod"
+  telegram_token        = var.telegram_token_prod
+  aws_access_key_id     = var.aws_access_key_id
   aws_secret_access_key = var.aws_secret_access_key
-  docker_username = var.docker_username
-  docker_password = var.docker_password
+  docker_username       = var.docker_username
+  docker_password       = var.docker_password
 }
 
 # Output commands for manual verification and namespace creation
@@ -558,15 +558,15 @@ resource "null_resource" "cluster_readiness_info" {
     terraform_data.kubectl_provider_config,
     data.local_file.kubeconfig
   ]
-  
+
   # Run on each apply
   triggers = {
     always_run = timestamp()
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       echo "---------------------------------------------------------"
       echo "KUBERNETES CLUSTER DEPLOYMENT INFORMATION"

@@ -6,7 +6,7 @@ locals {
 # S3 bucket for storing polybot data
 resource "aws_s3_bucket" "polybot_bucket" {
   bucket = "${local.name_prefix}-bucket-${var.region}"
-  
+
   tags = {
     Name        = "${local.name_prefix}-bucket"
     Environment = var.environment
@@ -30,12 +30,12 @@ resource "aws_s3_bucket_acl" "polybot_bucket_acl" {
 
 # SQS queue for polybot messages
 resource "aws_sqs_queue" "polybot_queue" {
-  name                      = "${local.name_prefix}-queue"
-  delay_seconds             = 0
-  max_message_size          = 262144
-  message_retention_seconds = 86400
+  name                       = "${local.name_prefix}-queue"
+  delay_seconds              = 0
+  max_message_size           = 262144
+  message_retention_seconds  = 86400
   visibility_timeout_seconds = 30
-  
+
   tags = {
     Name        = "${local.name_prefix}-queue"
     Environment = var.environment
@@ -44,10 +44,10 @@ resource "aws_sqs_queue" "polybot_queue" {
 
 # Store Telegram token in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "telegram_token" {
-  name_prefix = "guy-polybot-${var.environment}-telegram-token-"
-  description = "Telegram Bot Token for Polybot ${var.environment} environment"
-  recovery_window_in_days = 0  # Allow immediate reuse
-  
+  name_prefix             = "guy-polybot-${var.environment}-telegram-token-"
+  description             = "Telegram Bot Token for Polybot ${var.environment} environment"
+  recovery_window_in_days = 0 # Allow immediate reuse
+
   tags = {
     Environment = var.environment
   }
@@ -60,10 +60,10 @@ resource "aws_secretsmanager_secret_version" "telegram_token_value" {
 
 # Store Docker Hub credentials in AWS Secrets Manager
 resource "aws_secretsmanager_secret" "docker_credentials" {
-  name_prefix = "guy-polybot-${var.environment}-docker-credentials-"
-  description = "Docker Hub credentials for Polybot ${var.environment} environment"
-  recovery_window_in_days = 0  # Allow immediate reuse
-  
+  name_prefix             = "guy-polybot-${var.environment}-docker-credentials-"
+  description             = "Docker Hub credentials for Polybot ${var.environment} environment"
+  recovery_window_in_days = 0 # Allow immediate reuse
+
   tags = {
     Environment = var.environment
   }
@@ -80,7 +80,7 @@ resource "aws_secretsmanager_secret_version" "docker_credentials_value" {
 # SNS topic for lifecycle events
 resource "aws_sns_topic" "lifecycle_topic" {
   name = "${local.name_prefix}-lifecycle-topic"
-  
+
   tags = {
     Name        = "${local.name_prefix}-lifecycle-topic"
     Environment = var.environment
@@ -104,11 +104,11 @@ resource "aws_route53_record" "polybot_record" {
 */
 
 resource "aws_secretsmanager_secret" "polybot_secrets" {
-  name_prefix = "${local.name_prefix}-secrets-"
-  description = "Various Polybot configuration secrets for ${var.environment} environment"
-  recovery_window_in_days = 0  # Allow immediate reuse
+  name_prefix                    = "${local.name_prefix}-secrets-"
+  description                    = "Various Polybot configuration secrets for ${var.environment} environment"
+  recovery_window_in_days        = 0 # Allow immediate reuse
   force_overwrite_replica_secret = true
-  
+
   tags = {
     Name        = "${local.name_prefix}-secrets"
     Environment = var.environment
@@ -116,7 +116,7 @@ resource "aws_secretsmanager_secret" "polybot_secrets" {
 }
 
 resource "aws_secretsmanager_secret_version" "polybot_secrets_version" {
-  secret_id     = aws_secretsmanager_secret.polybot_secrets.id
+  secret_id = aws_secretsmanager_secret.polybot_secrets.id
   secret_string = jsonencode({
     telegram_token  = var.telegram_token
     aws_access_key  = var.aws_access_key_id
