@@ -4,22 +4,19 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    # Only include Kubernetes providers when NOT in destroy mode
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.23"
-      configuration_aliases = []
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.11"
-      configuration_aliases = []
-    }
-    kubectl = {
-      source  = "gavinbunney/kubectl"
-      version = "~> 1.14"
-      configuration_aliases = []
-    }
+    # Comment out Kubernetes providers to prevent connection attempts
+    # kubernetes = {
+    #   source  = "hashicorp/kubernetes"
+    #   version = "~> 2.23"
+    # }
+    # helm = {
+    #   source  = "hashicorp/helm"
+    #   version = "~> 2.11"
+    # }
+    # kubectl = {
+    #   source  = "gavinbunney/kubectl"
+    #   version = "~> 1.14"
+    # }
     time = {
       source  = "hashicorp/time"
       version = "~> 0.9"

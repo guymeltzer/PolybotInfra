@@ -781,28 +781,6 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Configure providers with proper dependency handling
-provider "kubernetes" {
-  # Simple configuration that works in both cases
-  host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
-  insecure = true  
-}
-
-provider "helm" {
-  kubernetes {
-    # Simple configuration that works in both cases
-    host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
-    insecure = true
-  }
-}
-
-provider "kubectl" {
-  # Simple configuration that works in both cases
-  host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
-  insecure = true
-  load_config_file = true
-}
-
 # Special resource to clean up Kubernetes state
 resource "terraform_data" "kubernetes_state_clean" {
   # Only run during destroy operations
