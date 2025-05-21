@@ -733,24 +733,34 @@ resource "terraform_data" "deployment_completion_information" {
 
 # Add these dummy providers to prevent connection errors
 provider "kubernetes" {
-  # Empty configuration prevents connection attempts
-  host = ""
-  config_path = ""
+  # Use conditional configuration based on kubeconfig existence
+  host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
+  client_certificate     = try(local.k8s_ready, false) ? "" : ""
+  client_key             = try(local.k8s_ready, false) ? "" : ""
+  cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
+  
+  # Skip connecting during planning phase
+  ignore_annotations      = [".*"]
+  ignore_labels           = [".*"]
 }
 
 provider "helm" {
-  # Empty configuration prevents connection attempts
+  # Use conditional configuration based on kubeconfig existence
   kubernetes {
-    host = ""
-    config_path = ""
+    host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
+    client_certificate     = try(local.k8s_ready, false) ? "" : ""
+    client_key             = try(local.k8s_ready, false) ? "" : ""
+    cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
   }
 }
 
 provider "kubectl" {
-  # Empty configuration prevents connection attempts
-  host = ""
-  config_path = ""
-  load_config_file = false
+  # Use conditional configuration based on kubeconfig existence
+  host                   = try(local.k8s_ready, false) ? "https://${local.control_plane_ip}:6443" : ""
+  client_certificate     = try(local.k8s_ready, false) ? "" : ""
+  client_key             = try(local.k8s_ready, false) ? "" : ""
+  cluster_ca_certificate = try(local.k8s_ready, false) ? "" : ""
+  load_config_file       = false
 }
 
 
