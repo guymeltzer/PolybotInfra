@@ -86,72 +86,76 @@ echo "$(date) - Disabling swap"
 swapoff -a
 sed -i '/swap/d' /etc/fstab
 
-# Retrieve instance metadata
-REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
-
+# Retrieve instance metadata with IMDSv2 token method with fallback
 echo "$(date) - Retrieving instance metadata"
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || echo "")
+if [ -n "$TOKEN" ]; then
+  # Use token for metadata retrieval
+  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "")
+  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "")
+  PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
+  PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+else
+  # Fallback to direct metadata access
+  REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region || echo "")
+  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || echo "")
+  PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
+  PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+fi
+
+# Fallback to extracting IP from hostname if metadata service failed
+if [ -z "$PRIVATE_IP" ]; then
+  # Extract from hostname (hostname format is typically ip-10-0-0-99.ec2.internal)
+  HOSTNAME=$(hostname -f)
+  if [[ $HOSTNAME =~ ip-([0-9]+-[0-9]+-[0-9]+-[0-9]+) ]]; then
+    # Convert from ip-10-0-0-99 format to 10.0.0.99
+    PRIVATE_IP=$(echo ${BASH_REMATCH[1]} | tr '-' '.')
+    echo "$(date) - Extracted private IP $PRIVATE_IP from hostname"
+  fi
+fi
+
 echo "Instance ID: $INSTANCE_ID"
 echo "Private IP: $PRIVATE_IP"
 echo "Public IP: $PUBLIC_IP"
 echo "Hostname: $(hostname -f)"
 
-# Set up hostname
-hostnamectl set-hostname "ip-${PRIVATE_IP//./-}.ec2.internal"
-echo "127.0.0.1 $(hostname -f)" >> /etc/hosts
+# Set up hostname if not already done
+if [ -n "$PRIVATE_IP" ]; then
+  hostnamectl set-hostname "ip-${PRIVATE_IP//./-}.ec2.internal"
+  echo "127.0.0.1 $(hostname -f)" >> /etc/hosts
+fi
 
 # Initialize Kubernetes cluster
 echo "$(date) - Initializing Kubernetes control plane with kubeadm"
 
-# Ensure PUBLIC_IP is either a valid IP or remove it
-if [ -z "$PUBLIC_IP" ]; then
-  # Create config without PUBLIC_IP
-  cat > /tmp/kubeadm-config.yaml << EOF
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
-nodeRegistration:
-  kubeletExtraArgs:
-    cloud-provider: "external"
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-networking:
-  podSubnet: "192.168.0.0/16"
-apiServer:
-  certSANs:
-  - "${PRIVATE_IP}"
-  - "127.0.0.1"
-  - "localhost"
-controllerManager:
-  extraArgs:
-    cloud-provider: "external"
-EOF
-else
-  # Create config with PUBLIC_IP
-  cat > /tmp/kubeadm-config.yaml << EOF
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
-nodeRegistration:
-  kubeletExtraArgs:
-    cloud-provider: "external"
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-networking:
-  podSubnet: "192.168.0.0/16"
-apiServer:
-  certSANs:
-  - "${PRIVATE_IP}"
-  - "${PUBLIC_IP}"
-  - "127.0.0.1"
-  - "localhost"
-controllerManager:
-  extraArgs:
-    cloud-provider: "external"
-EOF
+# Build certSANs array dynamically with only non-empty values
+CERT_SANS=""
+if [ -n "$PRIVATE_IP" ]; then
+  CERT_SANS="  - \"${PRIVATE_IP}\""
 fi
+CERT_SANS="${CERT_SANS}\n  - \"127.0.0.1\"\n  - \"localhost\""
+if [ -n "$PUBLIC_IP" ]; then
+  CERT_SANS="${CERT_SANS}\n  - \"${PUBLIC_IP}\""
+fi
+
+cat > /tmp/kubeadm-config.yaml << EOF
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  kubeletExtraArgs:
+    cloud-provider: "external"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+networking:
+  podSubnet: "192.168.0.0/16"
+apiServer:
+  certSANs:
+$(echo -e "$CERT_SANS")
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+EOF
 
 # Print the kubeadm config for debugging
 echo "$(date) - Kubeadm config contents:"
