@@ -455,7 +455,7 @@ resource "null_resource" "create_namespaces" {
         if [ $i -eq $MAX_RETRIES ]; then
           echo -e "\033[0;31m❌ ERROR: Could not connect to API server after 30 attempts. Manual intervention required.\033[0m"
           echo -e "\033[0;33m📋 Troubleshooting tips:\033[0m"
-          echo -e "   1. SSH to control plane: ssh ubuntu@\${control_plane_ip}"
+          echo -e "   1. SSH to control plane: ssh ubuntu@${module.k8s-cluster.control_plane_public_ip}"
           echo -e "   2. Check logs: sudo journalctl -u kubelet"
           echo -e "   3. Check status: sudo systemctl status kubelet"
           echo -e "   4. Check pods: sudo kubectl get pods -A"
