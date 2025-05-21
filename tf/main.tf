@@ -155,8 +155,15 @@ EOF
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
-  # Completely disable this resource during destroy
-  count = local.destroy_mode ? 0 : 1
+  # Use count to conditionally create this resource - skip if placeholder kubeconfig
+  count = var.destroy_mode ? 0 : (
+    fileexists("${path.module}/kubeconfig.yaml") && 
+    contains(
+      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+      "    server: https://placeholder:6443"
+    ) ? 0 : 1
+  )
+  
   # Make sure this only runs after the cluster setup starts
   depends_on = [module.k8s-cluster]
 
@@ -764,19 +771,71 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Configure providers to use the generated kubeconfig
+# Configure providers to use the generated kubeconfig only if it's valid
 provider "kubernetes" {
-  config_path = "${path.module}/kubeconfig.yaml"
+  # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
+  host = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(
+      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+      "    server: https://placeholder:6443"
+    ) ? "https://do-not-connect:6443" : null
+  ) : "https://do-not-connect:6443"
+  
+  # Use config_path only when a valid kubeconfig exists
+  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(
+      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+      "    server: https://placeholder:6443"
+    ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
+  ) : "/dev/null"
+  
+  # Skip validation when we're not connecting
+  insecure = true
 }
 
 provider "helm" {
   kubernetes {
-    config_path = "${path.module}/kubeconfig.yaml"
+    # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
+    host = fileexists("${path.module}/kubeconfig.yaml") ? (
+      contains(
+        try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+        "    server: https://placeholder:6443"
+      ) ? "https://do-not-connect:6443" : null
+    ) : "https://do-not-connect:6443"
+    
+    # Use config_path only when a valid kubeconfig exists
+    config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+      contains(
+        try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+        "    server: https://placeholder:6443"
+      ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
+    ) : "/dev/null"
+    
+    # Skip validation when we're not connecting
+    insecure = true
   }
 }
 
 provider "kubectl" {
-  config_path = "${path.module}/kubeconfig.yaml"
+  # Skip initialization if destroy_mode is set or if kubeconfig doesn't exist properly
+  host = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(
+      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+      "    server: https://placeholder:6443"
+    ) ? "https://do-not-connect:6443" : null
+  ) : "https://do-not-connect:6443"
+  
+  # Use config_path only when a valid kubeconfig exists
+  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(
+      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
+      "    server: https://placeholder:6443"
+    ) ? "/dev/null" : "${path.module}/kubeconfig.yaml"
+  ) : "/dev/null"
+  
+  # Skip validation when we're not connecting
+  insecure = true
+  load_config_file = true
 }
 
 # Special resource to remove Kubernetes objects from state
