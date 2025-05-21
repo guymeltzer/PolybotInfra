@@ -67,7 +67,13 @@ variable "addons" {
 }
 
 variable "rebuild_workers" {
-  description = "Set to true to force rebuilding worker nodes"
+  description = "Flag to trigger rebuild of worker nodes"
+  type        = bool
+  default     = false
+}
+
+variable "rebuild_control_plane" {
+  description = "Flag to trigger rebuild of the control plane instance"
   type        = bool
   default     = false
 }

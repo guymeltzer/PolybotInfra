@@ -500,6 +500,7 @@ module "k8s-cluster" {
   key_name                    = var.key_name
   control_plane_ami           = var.control_plane_ami
   worker_ami                  = var.worker_ami
+  rebuild_control_plane       = false # Set to true only when you need to force a rebuild
 
   addons = [
     "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/storage-class.yaml",
