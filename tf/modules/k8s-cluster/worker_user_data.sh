@@ -14,6 +14,20 @@ trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"; echo "$(dat
 # Set non-interactive frontend
 export DEBIAN_FRONTEND=noninteractive
 
+# Install AWS CLI early before doing anything else
+echo "$(date) - Installing AWS CLI"
+apt-get update
+apt-get install -y curl unzip
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+export PATH=$PATH:/usr/local/bin
+rm -rf awscliv2.zip aws/
+
+# Verify AWS CLI installation
+echo "$(date) - Verifying AWS CLI installation"
+aws --version
+
 # Wait for metadata and network
 echo "$(date) - Waiting for metadata service"
 until curl -s -m 5 http://169.254.169.254/latest/meta-data/ > /dev/null; do
@@ -35,37 +49,14 @@ if [ -z "$REGION" ]; then
   exit 1
 fi
 
+# Configure AWS CLI with region
+export AWS_DEFAULT_REGION="$REGION"
+
 # After getting instance metadata
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
-
-# Update package lists
-echo "$(date) - Updating package lists"
-apt-get update
-echo "$(date) - Fixing package manager state"
-apt-get install -f -y
-dpkg --configure -a
-
-# Install base packages first
-echo "$(date) - Installing base packages"
-apt-get install -y apt-transport-https ca-certificates curl gnupg software-properties-common jq unzip
-
-# Install AWS CLI early before using any AWS commands
-echo "$(date) - Installing AWS CLI"
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip -q awscliv2.zip
-./aws/install
-export PATH=$PATH:/usr/local/bin
-rm -rf awscliv2.zip aws/
-
-# Configure AWS CLI with region
-export AWS_DEFAULT_REGION="$REGION"
-
-# Verify AWS CLI installation
-echo "$(date) - Verifying AWS CLI installation"
-aws --version
 
 # Add logging with S3 upload function at the top of the script, after the LOGFILE and error handling setup
 # Function to upload logs to S3 even if script fails
@@ -103,6 +94,17 @@ chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 # Upload initialization logs
 upload_logs_to_s3 "INIT"
+
+# Update package lists
+echo "$(date) - Updating package lists"
+apt-get update
+echo "$(date) - Fixing package manager state"
+apt-get install -f -y
+dpkg --configure -a
+
+# Install base packages first
+echo "$(date) - Installing base packages"
+apt-get install -y apt-transport-https ca-certificates curl gnupg software-properties-common jq
 
 # Configure kernel modules for Kubernetes
 echo "$(date) - Configuring kernel modules"
@@ -178,10 +180,9 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   echo "$(date) - Secret fetch attempt $SECRET_ATTEMPT/$MAX_SECRET_ATTEMPTS"
   
   # First list all available secrets for debugging
-  echo "$(date) - Available kubernetes-join-command secrets:" >> "$LOGFILE"
+  echo "$(date) - Available secrets:" >> "$LOGFILE"
   aws secretsmanager list-secrets \
     --region "$REGION" \
-    --filters Key=name,Values="kubernetes-join-command*" \
     --query "SecretList[*].{Name:Name,CreatedDate:CreatedDate}" \
     --output json >> "$LOGFILE" || echo "Failed to list secrets" >> "$LOGFILE"
   
@@ -194,8 +195,7 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   # Get the newest secret by sort_by and taking the last item (newest)
   LATEST_SECRET=$(aws secretsmanager list-secrets \
     --region "$REGION" \
-    --filters Key=name,Values="kubernetes-join-command*" \
-    --query "sort_by(SecretList, &CreatedDate)[-1].Name" \
+    --query "sort_by(SecretList[?starts_with(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
     --output text 2>>"$LOGFILE" || echo "")
   
   if [ -z "$LATEST_SECRET" ] || [ "$LATEST_SECRET" == "None" ]; then
@@ -204,15 +204,12 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     # Run extensive connectivity and permissions checks
     echo "$(date) - Running connectivity checks..." >> "$LOGFILE"
     
-    # Direct API connectivity test  
-    aws secretsmanager get-random-password --region "$REGION" --password-length 8 >> "$LOGFILE" 2>&1 || echo "Failed API test" >> "$LOGFILE"
-    
-    # Echo the AWS identity
-    echo "$(date) - Current AWS identity:" >> "$LOGFILE"
+    # Check IAM identity for debugging  
+    echo "$(date) - Checking IAM identity..." >> "$LOGFILE"
     aws sts get-caller-identity --region "$REGION" >> "$LOGFILE" 2>&1
     
     # Check connectivity to control plane
-    echo "$(date) - Checking connectivity to control plane:" >> "$LOGFILE"
+    echo "$(date) - Looking up control plane instance..." >> "$LOGFILE"
     CONTROL_PLANE_IP=$(aws ec2 describe-instances \
       --region "$REGION" \
       --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
@@ -220,11 +217,18 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
       --output text 2>>"$LOGFILE" || echo "")
     
     if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-      echo "$(date) - Found control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
+      echo "$(date) - Pinging control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
       ping -c 3 "$CONTROL_PLANE_IP" >> "$LOGFILE" 2>&1
     else
-      echo "$(date) - Control plane not found" >> "$LOGFILE"
+      echo "$(date) - Could not determine control plane IP, falling back to VPC CIDR" >> "$LOGFILE"
+      echo "$(date) - Pinging control plane at 10.0.0.0" >> "$LOGFILE"
+      ping -c 3 10.0.0.0 >> "$LOGFILE" 2>&1 || echo "$(date) - WARNING: Cannot ping control plane at 10.0.0.0" >> "$LOGFILE"
+      ping -c 3 10.0.0.1 >> "$LOGFILE" 2>&1 || echo "$(date) - WARNING: Cannot ping VPC CIDR either" >> "$LOGFILE"
     fi
+    
+    # Test secretsmanager permissions directly
+    echo "$(date) - Testing secretsmanager ListSecrets permission..." >> "$LOGFILE"
+    aws secretsmanager list-secrets --region "$REGION" --max-items 1 >> "$LOGFILE" 2>&1 && echo "$(date) - AWS API connectivity confirmed" >> "$LOGFILE"
     
     # Upload logs of the current status
     upload_logs_to_s3 "SECRET_FETCH_ATTEMPT_${SECRET_ATTEMPT}"
