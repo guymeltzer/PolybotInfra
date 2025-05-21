@@ -159,7 +159,7 @@ done
 # Generate join command
 TOKEN=$(kubeadm token create)
 DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH} --token ${TOKEN}"
+JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
 
 echo "$(date) - Generated join command with private IP: $JOIN_COMMAND"
 
@@ -193,6 +193,18 @@ else
   # Secret doesn't exist, create it
   aws secretsmanager create-secret --name "$FIXED_SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Latest Kubernetes join command" --region "$REGION"
 fi
+
+# Verify the secret was created correctly and is accessible
+echo "$(date) - Verifying secret is accessible"
+sleep 5  # Give AWS some time to propagate the secret
+aws secretsmanager get-secret-value --secret-id "$FIXED_SECRET_NAME" --region "$REGION" || {
+  echo "$(date) - WARNING: Secret verification failed, attempting to fix permissions"
+  aws secretsmanager update-secret-version-stage \
+    --secret-id "$FIXED_SECRET_NAME" \
+    --version-stage AWSCURRENT \
+    --move-to-version-id $(aws secretsmanager describe-secret --secret-id "$FIXED_SECRET_NAME" --query "VersionIdsToStages" --output text | awk '{print $1}') \
+    --region "$REGION"
+}
 
 # Update admin kubeconfig to use public IP
 echo "$(date) - Configuring kubeconfig with public IP"

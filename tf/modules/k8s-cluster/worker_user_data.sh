@@ -261,15 +261,48 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   
   echo "$(date) - Found latest secret: $LATEST_SECRET"
   
+  # Check if secret has AWSCURRENT label and force it if needed
+  echo "$(date) - Checking if secret has AWSCURRENT label" >> "$LOGFILE"
+  aws secretsmanager describe-secret --secret-id "$LATEST_SECRET" --region "$REGION" >> "$LOGFILE" 2>&1
+  
   JOIN_COMMAND=$(aws secretsmanager get-secret-value \
     --region "$REGION" \
     --secret-id "$LATEST_SECRET" \
     --query SecretString \
     --output text 2>>"$LOGFILE" || echo "")
   
+  if [ -z "$JOIN_COMMAND" ]; then
+    echo "$(date) - Secret found but value is empty, trying to fix AWSCURRENT label" >> "$LOGFILE"
+    # Try to force-update the AWSCURRENT label to the latest version
+    VERSION_ID=$(aws secretsmanager describe-secret --secret-id "$LATEST_SECRET" --region "$REGION" --query "VersionIdsToStages" --output text | awk '{print $1}')
+    if [ -n "$VERSION_ID" ]; then
+      echo "$(date) - Fixing AWSCURRENT label for version $VERSION_ID" >> "$LOGFILE"
+      aws secretsmanager update-secret-version-stage \
+        --secret-id "$LATEST_SECRET" \
+        --version-stage AWSCURRENT \
+        --move-to-version-id "$VERSION_ID" \
+        --region "$REGION" >> "$LOGFILE" 2>&1
+      
+      # Try again after fixing
+      JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+        --region "$REGION" \
+        --secret-id "$LATEST_SECRET" \
+        --query SecretString \
+        --output text 2>>"$LOGFILE" || echo "")
+    fi
+  fi
+  
   if [ -n "$JOIN_COMMAND" ]; then
     echo "$(date) - Successfully retrieved join command"
     echo "$(date) - Join command: $JOIN_COMMAND" >> "$LOGFILE"
+    # Validate join command has token
+    if [[ ! "$JOIN_COMMAND" =~ "--token" ]]; then
+      echo "$(date) - WARNING: Join command missing token parameter, not valid" >> "$LOGFILE"
+      upload_logs_to_s3 "TOKEN_MISSING_${SECRET_ATTEMPT}"
+      JOIN_COMMAND=""
+      sleep 30
+      continue
+    fi
     break
   else
     echo "$(date) - Join command not available yet. Waiting to retry..."
