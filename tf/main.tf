@@ -367,7 +367,7 @@ resource "null_resource" "providers_ready" {
     # Use the instance_id instead of file hash to avoid inconsistency during apply
     instance_id = try(module.k8s-cluster.control_plane_instance_id, "placeholder-instance-id")
     # Add a timestamp component to ensure this runs when needed
-    config_timestamp = terraform_data.kubectl_provider_config.id
+    config_timestamp = local.destroy_mode ? "dummy-id" : try(terraform_data.kubectl_provider_config[0].id, "dummy-id")
   }
 
   provisioner "local-exec" {
