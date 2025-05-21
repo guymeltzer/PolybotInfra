@@ -1136,18 +1136,16 @@ resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
-  
+
   user_data = base64encode(
-    gzip(
+    replace(
       replace(
-        replace(
-          file("${path.module}/worker_user_data.sh"),
-          "##KUBERNETES_JOIN_COMMAND_SECRET##", 
-          aws_secretsmanager_secret.kubernetes_join_command.name
-        ),
-        "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
-        aws_secretsmanager_secret.kubernetes_join_command_latest.name
-      )
+        file("${path.module}/worker_user_data.sh"),
+        "##KUBERNETES_JOIN_COMMAND_SECRET##",
+        aws_secretsmanager_secret.kubernetes_join_command.name
+      ),
+      "##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##",
+      aws_secretsmanager_secret.kubernetes_join_command_latest.name
     )
   )
   
