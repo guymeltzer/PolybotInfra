@@ -167,3 +167,38 @@ output "check_asg" {
 output "list_instances" {
   value = "aws ec2 describe-instances --filters Name=tag:kubernetes.io/cluster/kubernetes,Values=owned"
 }
+
+output "control_plane_info" {
+  description = "Control plane information including SSH access"
+  value = "📡 Control Plane\n------------------------------\nInstance ID:   ${aws_instance.control_plane.id}\nPublic IP:     ${aws_instance.control_plane.public_ip}\nPrivate IP:    ${aws_instance.control_plane.private_ip}\nSSH Command:   ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip}"
+}
+
+output "kubernetes_access" {
+  description = "Kubernetes API access details"
+  value = "🛡️ Kubernetes Access\n------------------------------\nAPI Endpoint: https://${aws_instance.control_plane.public_ip}:6443\nKubeconfig:   ${local_file.kubeconfig.filename}"
+}
+
+output "worker_nodes_info" {
+  description = "Worker node management commands"
+  value = "🔧 Worker Nodes\n------------------------------\nASG name:      ${aws_autoscaling_group.worker_asg.name}\nSSH access:    ssh -i ${local.actual_key_name}.pem ubuntu@WORKER_PUBLIC_IP\nFind workers:  aws ec2 describe-instances --region ${var.region} --filters \"Name=tag:Name,Values=guy-worker-node*\" --output table"
+}
+
+output "debugging_commands" {
+  description = "Useful debugging commands"
+  value = "🔍 Debugging Tools\n------------------------------\nCheck logs:      aws s3 ls s3://guy-polybot-logs/ | grep worker-init | sort -r | head -5\nView log file:   aws s3 cp s3://guy-polybot-logs/LOGFILENAME -\nCheck ASG:       aws autoscaling describe-auto-scaling-groups --name guy-polybot-asg\nRefresh tokens:  ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip} \"sudo /usr/local/bin/refresh-join-token.sh\""
+}
+
+output "network_resources" {
+  description = "Network resources information"
+  value = "🌐 Network Resources\n------------------------------\nVPC ID:        ${module.vpc.vpc_id}\nALB DNS name:  ${aws_lb.polybot_alb.dns_name}\nALB Zone ID:   ${aws_lb.polybot_alb.zone_id}"
+}
+
+output "deployment_summary" {
+  description = "Summary of the deployed infrastructure"
+  value = "✅ Deployment Summary\n==============================\n🚀 Access your Kubernetes cluster by SSH'ing to the control plane\n🔑 Kubeconfig available at: ${local_file.kubeconfig.filename}\n🌍 Application available at: http://${aws_lb.polybot_alb.dns_name}\n\nHappy shipping! 🎉"
+}
+
+output "init_logs_commands" {
+  description = "Commands to view initialization logs on control plane and worker nodes"
+  value = "🧪 Init Logs\n------------------------------\n📄 Control Plane Init Log:\nView with: ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip} 'cat /home/ubuntu/init_summary.log'\n\n📄 Worker Node Init Logs:\nView with: ssh -i ${local.actual_key_name}.pem ubuntu@WORKER_PUBLIC_IP 'cat /home/ubuntu/init_summary.log'\n(Replace WORKER_PUBLIC_IP with the IP from worker_node_info command)\n\nNote: These logs contain full initialization process details for troubleshooting."
+}

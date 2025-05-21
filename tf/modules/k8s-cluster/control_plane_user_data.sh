@@ -180,14 +180,14 @@ kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/
 
 # Wait for calico pods to be ready
 echo "$(date) - Waiting for Calico pods to become ready"
-kubectl get pods -n kube-system | grep calico
+kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers || true
 for i in {1..10}; do
   echo "$(date) - Waiting for Calico to be ready (attempt $i/10)"
-  if kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers | grep -v 'Running'; then
-    sleep 15
-  else
+  if kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | grep -q "Running"; then
     echo "$(date) - Calico is ready"
     break
+  else
+    sleep 15
   fi
 done
 
@@ -486,3 +486,10 @@ echo "$(date) - You can check the cluster status using: kubectl get nodes"
 # Verify connection again
 echo "$(date) - Verifying kubectl works with updated kubeconfig"
 kubectl get nodes
+
+# Create a summary log file in ubuntu's home directory for easy access
+echo "$(date) - Creating log summary file"
+cat ${LOGFILE} > /home/ubuntu/init_summary.log
+chown ubuntu:ubuntu /home/ubuntu/init_summary.log
+chmod 644 /home/ubuntu/init_summary.log
+echo "$(date) - Log summary created at /home/ubuntu/init_summary.log"

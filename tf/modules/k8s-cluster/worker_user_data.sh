@@ -14,40 +14,42 @@ setup_ssh() {
   mkdir -p /home/ubuntu/.ssh
   chmod 700 /home/ubuntu/.ssh
   
-  # Add authorized key with explicit newline
-  echo -e "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P/SVdCGlnxLkYJwYhAoI58xI7V5rpnbO3bDvXzKt/59B0ZVKu1xvvXVUBXGIcHHaWYi/IKO8G+vWgHDXVCGCq4HFG2fJPHwkRNDc5kkOEjthn4s+TlRIJZpvbXRXwHFDJbA/4zE5XuThUwpZROM/MwGEYUjWCnRwYS5bGAglHGnEEA8YGbnCRc9aAeRk8OFEEmSQGp9SSvOEKUiQ3lqMQZP1Qh3WI+GH8D+pHnRDLvQeYxBMwSgFwlILTvp0LMUx9N7hugtFg2FAHnKsD6fRTKwJfTgNLLMYlXqCWVUoJtY+M18YRrZ7niLMZFSSVVWbcJbHXPJ+g3I+n/4nkdxiXQOMYkYcPWCFrzYoZA8/FfHgODZ2Mxx48PR0LXIcj0nYnNY0bJ8+pU9ZPZUilfTQc5Mu5GXXCXe8KwKUxDjcS1JNUXyxTvn+mvMESR/AUFKQNzgXz15J6N0jNfRs5fLeZMNa/YJdkk= gmeltzer@gmeltzer-mbp" > /home/ubuntu/.ssh/authorized_keys
+  # Add authorized key with explicit newline and hash
+  cat > /home/ubuntu/.ssh/authorized_keys << 'EOF'
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDArp5UgxdxwpyDGbsLpvbgXQev0fG6DQj15P/SVdCGlnxLkYJwYhAoI58xI7V5rpnbO3bDvXzKt/59B0ZVKu1xvvXVUBXGIcHHaWYi/IKO8G+vWgHDXVCGCq4HFG2fJPHwkRNDc5kkOEjthn4s+TlRIJZpvbXRXwHFDJbA/4zE5XuThUwpZROM/MwGEYUjWCnRwYS5bGAglHGnEEA8YGbnCRc9aAeRk8OFEEmSQGp9SSvOEKUiQ3lqMQZP1Qh3WI+GH8D+pHnRDLvQeYxBMwSgFwlILTvp0LMUx9N7hugtFg2FAHnKsD6fRTKwJfTgNLLMYlXqCWVUoJtY+M18YRrZ7niLMZFSSVVWbcJbHXPJ+g3I+n/4nkdxiXQOMYkYcPWCFrzYoZA8/FfHgODZ2Mxx48PR0LXIcj0nYnNY0bJ8+pU9ZPZUilfTQc5Mu5GXXCXe8KwKUxDjcS1JNUXyxTvn+mvMESR/AUFKQNzgXz15J6N0jNfRs5fLeZMNa/YJdkk= gmeltzer@gmeltzer-mbp
+EOF
   
   # Set correct ownership and permissions
   chmod 600 /home/ubuntu/.ssh/authorized_keys
   chown -R ubuntu:ubuntu /home/ubuntu/.ssh
   
-  # Verify SSH setup
-  if [ ! -f /home/ubuntu/.ssh/authorized_keys ]; then
-    echo "ERROR: SSH authorized_keys file was not created!"
-    return 1
-  fi
+  # Debug
+  echo "============= SSH DEBUG INFO ==============="
+  ls -la /home/ubuntu/.ssh/
+  echo "authorized_keys content:"
+  cat /home/ubuntu/.ssh/authorized_keys
+  echo "authorized_keys permissions: $(stat -c "%a" /home/ubuntu/.ssh/authorized_keys)"
+  echo "SSH directory permissions: $(stat -c "%a" /home/ubuntu/.ssh)"
+  echo "============= END SSH DEBUG ==============="
   
-  # Verify file permissions
-  AUTH_KEYS_PERMS=$(stat -c "%a" /home/ubuntu/.ssh/authorized_keys)
-  SSH_DIR_PERMS=$(stat -c "%a" /home/ubuntu/.ssh)
-  echo "SSH directory permissions: ${SSH_DIR_PERMS}"
-  echo "authorized_keys permissions: ${AUTH_KEYS_PERMS}"
-  
-  # Verify file contents
-  AUTH_KEYS_COUNT=$(grep -c "ssh-rsa" /home/ubuntu/.ssh/authorized_keys || true)
-  echo "Found ${AUTH_KEYS_COUNT} SSH keys in authorized_keys file"
-  
-  # Configure SSHd if needed
+  # Ensure sshd is configured properly
   if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then
     echo "Configuring sshd to disallow password authentication"
     sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
     systemctl restart ssh
   fi
   
+  # Verify PubkeyAuthentication is enabled
+  if ! grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config; then
+    echo "Ensuring PubkeyAuthentication is enabled"
+    echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
+    systemctl restart sshd
+  fi
+  
   # Ensure sshd is running
   systemctl status ssh
   
-  echo "SSH setup completed"
+  echo "SSH setup completed successfully"
 }
 
 # Setup core services
@@ -308,4 +310,14 @@ join_cluster() {
 # Main execution
 setup_core
 setup_kube
-join_cluster 
+join_cluster
+
+# Create a summary log file in ubuntu's home directory for easy access
+echo "Creating log summary file for easy access"
+cat ${LOGFILE} > /home/ubuntu/init_summary.log
+chown ubuntu:ubuntu /home/ubuntu/init_summary.log
+chmod 644 /home/ubuntu/init_summary.log
+echo "Log summary created at /home/ubuntu/init_summary.log"
+
+# Final log upload with summary status
+upload_logs_to_s3 "FINAL" 

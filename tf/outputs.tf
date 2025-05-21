@@ -116,3 +116,8 @@ output "worker_logs_command" {
 output "worker_node_info" {
   value = module.k8s-cluster.worker_node_info
 }
+
+output "init_logs_commands" {
+  description = "Commands to view initialization logs on control plane and worker nodes"
+  value       = module.k8s-cluster.init_logs_commands
+}
