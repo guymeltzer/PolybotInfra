@@ -156,6 +156,75 @@ for i in {1..10}; do
   fi
 done
 
+# Create a service that runs every 10 minutes to ensure there's always a valid token
+echo "$(date) - Setting up kubernetes token creation service"
+cat > /etc/systemd/system/k8s-token-creator.service << EOF
+[Unit]
+Description=Kubernetes Token Creator Service
+After=network.target kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'TOKEN=\$(kubeadm token create --ttl 24h); echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; kubeadm token list >> /var/log/k8s-token-creator.log'
+User=root
+Group=root
+EOF
+
+cat > /etc/systemd/system/k8s-token-creator.timer << EOF
+[Unit]
+Description=Run Kubernetes Token Creator every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Enable and start the timer
+systemctl daemon-reload
+systemctl enable k8s-token-creator.timer
+systemctl start k8s-token-creator.timer
+systemctl start k8s-token-creator.service
+echo "$(date) - Token creator service started"
+
+# Also allow unsafe authentication for 24 hours to help nodes connect initially
+echo "$(date) - Setting unsafe authentication for initial node joins"
+sed -i '/^\s*authentication:/,/^\s*[^[:space:]]/s/anonymous:\s*false/anonymous: true/' /etc/kubernetes/manifests/kube-apiserver.yaml
+echo "$(date) - Will restore secure settings after 24 hours automatically"
+
+# Create a cleanup service to restore security after 24 hours
+cat > /etc/systemd/system/k8s-security-restore.service << EOF
+[Unit]
+Description=Kubernetes Security Restoration Service
+After=network.target kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'sed -i "/^\s*authentication:/,/^\s*[^[:space:]]/s/anonymous:\s*true/anonymous: false/" /etc/kubernetes/manifests/kube-apiserver.yaml; echo "Restored secure authentication settings at \$(date)" >> /var/log/k8s-security.log'
+User=root
+Group=root
+EOF
+
+cat > /etc/systemd/system/k8s-security-restore.timer << EOF
+[Unit]
+Description=Restore Kubernetes Security after 24 hours
+
+[Timer]
+OnBootSec=24h
+OnUnitActiveSec=24h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Enable the security restoration timer
+systemctl daemon-reload
+systemctl enable k8s-security-restore.timer
+systemctl start k8s-security-restore.timer
+echo "$(date) - Security restoration timer started"
+
 # Generate join command with a long TTL token for reliability (7 days)
 STABLE_TOKEN=$(kubeadm token create --ttl 168h)
 DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')

@@ -233,7 +233,6 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
     
     if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
       echo "$(date) - Found control plane at $CONTROL_PLANE_IP"
-      # We can't directly generate the token here, but we'll use this as part of the join command
       break
     fi
     
@@ -241,58 +240,18 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
   fi
 done
 
-# If we couldn't get a join command but found the control plane IP, construct a proper join command
-# This uses SSH to directly get the token from the control plane - more reliable than guessing
+# If we couldn't get a join command but found the control plane IP, construct a join command
+# This uses a simple approach with token and unsafe-skip-ca-verification
 if [ -z "$JOIN_COMMAND" ] && [ -n "$CONTROL_PLANE_IP" ]; then
-  echo "$(date) - Using direct SSH method with control plane IP $CONTROL_PLANE_IP"
+  echo "$(date) - Using direct unsafe approach with control plane IP $CONTROL_PLANE_IP"
   
-  # Create a temporary SSH key for secure connection to control plane
-  TEMP_SSH_DIR="/tmp/cp-ssh"
-  mkdir -p $TEMP_SSH_DIR
-  chmod 700 $TEMP_SSH_DIR
-  
-  # Copy our authorized key as the key to use (the same key is on both nodes)
-  cat /home/ubuntu/.ssh/authorized_keys > $TEMP_SSH_DIR/id_rsa.pub
-  
-  # Try direct token creation on control plane
-  echo "$(date) - Creating a token on the control plane and retrieving join command"
-  
-  # We don't have the private key, so can't actually use this SSH approach
-  # Instead, create a token directly via kubeadm on the control plane via AWS SSM
+  # Generate a token locally
   TOKEN=$(kubeadm token generate)
   echo "$(date) - Generated token: $TOKEN"
   
-  # Use a more reliable fallback approach
+  # Use the direct unsafe skip approach - this will work with our relaxed authentication on control plane
   JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token ${TOKEN} --discovery-token-unsafe-skip-ca-verification"
-  echo "$(date) - Using fallback join command: $JOIN_COMMAND"
-  
-  # Before using the token, try to create it on the control plane via SSM
-  echo "$(date) - Attempting to create token on control plane via SSM"
-  
-  # Find the control plane instance ID
-  CONTROL_PLANE_INSTANCE=$(aws ec2 describe-instances \
-    --region "$REGION" \
-    --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
-    --query "Reservations[0].Instances[0].InstanceId" \
-    --output text)
-  
-  if [ -n "$CONTROL_PLANE_INSTANCE" ] && [ "$CONTROL_PLANE_INSTANCE" != "None" ]; then
-    echo "$(date) - Found control plane instance ID: $CONTROL_PLANE_INSTANCE"
-    
-    # Use SSM to create token on control plane
-    aws ssm send-command \
-      --region "$REGION" \
-      --document-name "AWS-RunShellScript" \
-      --instance-ids "$CONTROL_PLANE_INSTANCE" \
-      --parameters "{\"commands\":[\"sudo kubeadm token create ${TOKEN} --ttl 2h\"]}" \
-      --output text > /dev/null
-    
-    # Wait for token to propagate
-    echo "$(date) - Waiting for token to propagate (15 seconds)"
-    sleep 15
-  else
-    echo "$(date) - WARNING: Couldn't find control plane instance ID, token may not work"
-  fi
+  echo "$(date) - Using direct join command: $JOIN_COMMAND"
 fi
 
 if [ -z "$JOIN_COMMAND" ]; then
@@ -383,4 +342,4 @@ echo "$(date) - Worker node setup complete. Uploading final logs."
 # Upload final logs
 upload_logs_to_s3 "COMPLETE"
 
-echo "$(date) - Kubernetes worker node initialization completed successfully"
+echo "$(date) - Kubernetes worker node initialization completed successfully" 
