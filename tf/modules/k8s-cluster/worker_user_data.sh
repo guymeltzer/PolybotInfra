@@ -205,11 +205,30 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     aws sts get-caller-identity >> "$LOGFILE" 2>&1 || echo "Failed to get caller identity" >> "$LOGFILE"
     
     # Check if we have network connectivity by pinging control plane
-    CONTROL_PLANE_IP="10.0.0.0/16"
+    # First try to look up the control plane instance
+    echo "$(date) - Looking up control plane instance..."
+    CONTROL_PLANE_IP=$(aws ec2 describe-instances \
+      --region "$REGION" \
+      --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
+      --query "Reservations[0].Instances[0].PrivateIpAddress" \
+      --output text 2>>"$LOGFILE" || echo "")
+
+    if [ -z "$CONTROL_PLANE_IP" ] || [ "$CONTROL_PLANE_IP" == "None" ]; then
+      echo "$(date) - Could not determine control plane IP, falling back to VPC CIDR" >> "$LOGFILE"
+      CONTROL_PLANE_IP="10.0.0.0"
+    fi
+
+    echo "$(date) - Pinging control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
     if ping -c 1 -W 2 $CONTROL_PLANE_IP > /dev/null 2>&1; then
-      echo "$(date) - Network connectivity to VPC confirmed" >> "$LOGFILE"
+      echo "$(date) - Network connectivity to control plane confirmed" >> "$LOGFILE"
     else
-      echo "$(date) - WARNING: Cannot ping VPC CIDR $CONTROL_PLANE_IP" >> "$LOGFILE"
+      echo "$(date) - WARNING: Cannot ping control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
+      # Try pinging the VPC CIDR as fallback
+      if ping -c 1 -W 2 10.0.0.0 > /dev/null 2>&1; then
+        echo "$(date) - Network connectivity to VPC CIDR confirmed" >> "$LOGFILE"
+      else
+        echo "$(date) - WARNING: Cannot ping VPC CIDR either" >> "$LOGFILE"
+      fi
     fi
     
     # Verify secretsmanager list permission specifically

@@ -9,8 +9,8 @@ def lambda_handler(event, context):
     autoscaling = boto3.client('autoscaling')
     ssm_client = boto3.client('ssm')
     secrets_client = boto3.client('secretsmanager')
-    region = 'us-east-1'
-    control_plane_instance_id = 'i-0766ed787297ada3d'
+    region = '${var.region}'
+    control_plane_instance_id = '${aws_instance.control_plane.id}'
     
     print(f"Event received: {json.dumps(event)}")
     
@@ -107,11 +107,46 @@ def lambda_handler(event, context):
     
     print("Running join command refresh logic")
     try:
+        # First check if the control plane is ready
+        check_command = "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes"
         response = ssm_client.send_command(
             InstanceIds=[control_plane_instance_id],
             DocumentName='AWS-RunShellScript',
-            Parameters={'commands': ['kubeadm token create --print-join-command']}
+            Parameters={'commands': [check_command]},
+            TimeoutSeconds=30
         )
+        
+        command_id = response['Command']['CommandId']
+        attempt = 0
+        max_attempts = 10
+        while attempt < max_attempts:
+            time.sleep(2)
+            try:
+                command_output = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=control_plane_instance_id
+                )
+                if command_output['Status'] in ['Success', 'Completed']:
+                    print("Kubernetes control plane verified as running")
+                    break
+                elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                    print(f"Control plane check failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
+                    return {'statusCode': 500, 'body': 'Control plane not ready'}
+            except Exception as e:
+                print(f"Error checking command status: {str(e)}")
+                attempt += 1
+                continue
+            
+            attempt += 1
+        
+        # Create a fresh token on the control plane
+        response = ssm_client.send_command(
+            InstanceIds=[control_plane_instance_id],
+            DocumentName='AWS-RunShellScript',
+            Parameters={'commands': ['kubeadm token create --print-join-command']},
+            TimeoutSeconds=60
+        )
+        
         command_id = response['Command']['CommandId']
         max_attempts = 15
         attempt = 0
@@ -132,47 +167,30 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
-        # Create a new secret with timestamp and random string
-        timestamp = time.strftime("%Y%m%d%H%M%S")
-        random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        new_secret_name = f"kubernetes-join-command-{timestamp}-{random_chars}"
-        
-        # Create the new secret
+        # Update the latest secret with the new join command
         try:
-            secrets_client.create_secret(
-                Name=new_secret_name,
-                Description='Kubernetes join command for worker nodes',
+            latest_secret = secrets_client.list_secrets(
+                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}],
+                SortOrder='desc'
+            )['SecretList'][0]['Name']
+            
+            print(f"Updating secret: {latest_secret}")
+            
+            secrets_client.put_secret_value(
+                SecretId=latest_secret,
                 SecretString=join_command
             )
-            print(f"Created new secret: {new_secret_name}")
-            
-            # List existing join command secrets to clean up old ones
-            response = secrets_client.list_secrets(
-                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}]
-            )
-            
-            # Sort secrets by creation date, newest first
-            if 'SecretList' in response:
-                secrets = sorted(response['SecretList'], 
-                                key=lambda x: x.get('CreatedDate', ''), 
-                                reverse=True)
+        except Exception as e:
+            print(f"Error updating latest secret, creating new value directly: {str(e)}")
+            # If we fail to find or update the latest secret, try a direct approach
+            try:
+                secrets_client.update_secret(
+                    SecretId="kubernetes-join-command-*",
+                    SecretString=join_command
+                )
+            except Exception as inner_e:
+                print(f"Direct secret update failed too: {str(inner_e)}")
                 
-                # Keep the newest 2 secrets, delete the rest
-                for secret in secrets[2:]:
-                    name = secret.get('Name', '')
-                    if re.match(r'kubernetes-join-command-\d+', name):
-                        try:
-                            print(f"Deleting old secret: {name}")
-                            secrets_client.delete_secret(
-                                SecretId=name,
-                                ForceDeleteWithoutRecovery=True
-                            )
-                        except Exception as del_err:
-                            print(f"Failed to delete secret {name}: {str(del_err)}")
-        except Exception as sec_err:
-            print(f"Error creating/managing secrets: {str(sec_err)}")
-            raise
-            
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
     except Exception as e:
         print(f"Error: {str(e)}")
