@@ -386,11 +386,11 @@ upload_logs_to_s3() {
   fi
   
   LOG_FILENAME="control-plane-init-$${INSTANCE_ID}-$${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
-  aws s3 cp "$LOGFILE" "s3://${worker_logs_bucket}/${LOG_FILENAME}" --region "${region}" || echo "Failed to upload logs to S3"
+  aws s3 cp "$${LOGFILE}" "s3://${worker_logs_bucket}/$${LOG_FILENAME}" --region "${region}" || echo "Failed to upload logs to S3"
 }
 
 # Set up trap to upload logs on exit
-trap 'upload_logs_to_s3 "ERROR_TRAP"; echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"' ERR
+trap 'upload_logs_to_s3 "ERROR_TRAP"; echo "Error occurred at line $${LINENO}. Command: $${BASH_COMMAND}"' ERR
 
 # Upload initial logs
 upload_logs_to_s3 "INIT"
