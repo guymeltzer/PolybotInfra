@@ -171,7 +171,7 @@ systemctl restart kubelet
 
 # Fetch join command from Secrets Manager with retry logic
 echo "$(date) - Fetching join command from Secrets Manager"
-MAX_SECRET_ATTEMPTS=10
+MAX_SECRET_ATTEMPTS=15
 JOIN_COMMAND=""
 
 for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++)); do
@@ -181,68 +181,52 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   echo "$(date) - Available kubernetes-join-command secrets:" >> "$LOGFILE"
   aws secretsmanager list-secrets \
     --region "$REGION" \
-    --filters Key=name,Values="kubernetes-join-command-*" \
+    --filters Key=name,Values="kubernetes-join-command*" \
     --query "SecretList[*].{Name:Name,CreatedDate:CreatedDate}" \
     --output json >> "$LOGFILE" || echo "Failed to list secrets" >> "$LOGFILE"
   
-  # Get the list of join command secrets, sorted by creation date (newest first)
-  SECRETS=$(aws secretsmanager list-secrets \
+  # Wait a bit longer at the start to ensure control plane has time to create the token
+  if [ $SECRET_ATTEMPT -le 3 ]; then
+    echo "$(date) - Initial waiting period to ensure control plane is ready - sleeping 60 seconds"
+    sleep 60
+  fi
+  
+  # Get the newest secret by sort_by and taking the last item (newest)
+  LATEST_SECRET=$(aws secretsmanager list-secrets \
     --region "$REGION" \
-    --filters Key=name,Values="kubernetes-join-command-*" \
+    --filters Key=name,Values="kubernetes-join-command*" \
     --query "sort_by(SecretList, &CreatedDate)[-1].Name" \
     --output text 2>>"$LOGFILE" || echo "")
   
-  echo "$(date) - Found secrets: $SECRETS" >> "$LOGFILE"
-  
-  if [ -z "$SECRETS" ] || [ "$SECRETS" == "None" ]; then
+  if [ -z "$LATEST_SECRET" ] || [ "$LATEST_SECRET" == "None" ]; then
     echo "$(date) - No kubernetes-join-command secrets found. Waiting to retry..."
     
-    # More extensive connectivity checks
+    # Run extensive connectivity and permissions checks
     echo "$(date) - Running connectivity checks..." >> "$LOGFILE"
     
-    # Check instance IAM role permissions
-    echo "$(date) - Checking IAM identity..." >> "$LOGFILE"
-    aws sts get-caller-identity >> "$LOGFILE" 2>&1 || echo "Failed to get caller identity" >> "$LOGFILE"
+    # Direct API connectivity test  
+    aws secretsmanager get-random-password --region "$REGION" --password-length 8 >> "$LOGFILE" 2>&1 || echo "Failed API test" >> "$LOGFILE"
     
-    # Check if we have network connectivity by pinging control plane
-    # First try to look up the control plane instance
-    echo "$(date) - Looking up control plane instance..."
+    # Echo the AWS identity
+    echo "$(date) - Current AWS identity:" >> "$LOGFILE"
+    aws sts get-caller-identity --region "$REGION" >> "$LOGFILE" 2>&1
+    
+    # Check connectivity to control plane
+    echo "$(date) - Checking connectivity to control plane:" >> "$LOGFILE"
     CONTROL_PLANE_IP=$(aws ec2 describe-instances \
       --region "$REGION" \
       --filters "Name=tag:Name,Values=k8s-control-plane" "Name=instance-state-name,Values=running" \
       --query "Reservations[0].Instances[0].PrivateIpAddress" \
       --output text 2>>"$LOGFILE" || echo "")
-
-    if [ -z "$CONTROL_PLANE_IP" ] || [ "$CONTROL_PLANE_IP" == "None" ]; then
-      echo "$(date) - Could not determine control plane IP, falling back to VPC CIDR" >> "$LOGFILE"
-      CONTROL_PLANE_IP="10.0.0.0"
-    fi
-
-    echo "$(date) - Pinging control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
-    if ping -c 1 -W 2 $CONTROL_PLANE_IP > /dev/null 2>&1; then
-      echo "$(date) - Network connectivity to control plane confirmed" >> "$LOGFILE"
+    
+    if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
+      echo "$(date) - Found control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
+      ping -c 3 "$CONTROL_PLANE_IP" >> "$LOGFILE" 2>&1
     else
-      echo "$(date) - WARNING: Cannot ping control plane at $CONTROL_PLANE_IP" >> "$LOGFILE"
-      # Try pinging the VPC CIDR as fallback
-      if ping -c 1 -W 2 10.0.0.0 > /dev/null 2>&1; then
-        echo "$(date) - Network connectivity to VPC CIDR confirmed" >> "$LOGFILE"
-      else
-        echo "$(date) - WARNING: Cannot ping VPC CIDR either" >> "$LOGFILE"
-      fi
+      echo "$(date) - Control plane not found" >> "$LOGFILE"
     fi
     
-    # Verify secretsmanager list permission specifically
-    echo "$(date) - Testing secretsmanager ListSecrets permission..." >> "$LOGFILE"
-    aws secretsmanager list-secrets --max-items 1 >> "$LOGFILE" 2>&1 || echo "Failed to list any secrets" >> "$LOGFILE"
-    
-    # Check AWS connectivity
-    if aws sts get-caller-identity --region "$REGION" > /dev/null 2>&1; then
-      echo "$(date) - AWS API connectivity confirmed" >> "$LOGFILE" 
-    else
-      echo "$(date) - WARNING: Cannot connect to AWS API" >> "$LOGFILE"
-    fi
-    
-    # Upload logs of the failure so far
+    # Upload logs of the current status
     upload_logs_to_s3 "SECRET_FETCH_ATTEMPT_${SECRET_ATTEMPT}"
     
     echo "$(date) - Waiting before retry..."
@@ -250,7 +234,6 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
     continue
   fi
   
-  LATEST_SECRET=$(echo "$SECRETS" | head -1)
   echo "$(date) - Found latest secret: $LATEST_SECRET"
   
   JOIN_COMMAND=$(aws secretsmanager get-secret-value \
@@ -261,6 +244,7 @@ for ((SECRET_ATTEMPT=1; SECRET_ATTEMPT<=MAX_SECRET_ATTEMPTS; SECRET_ATTEMPT++));
   
   if [ -n "$JOIN_COMMAND" ]; then
     echo "$(date) - Successfully retrieved join command"
+    echo "$(date) - Join command: $JOIN_COMMAND" >> "$LOGFILE"
     break
   else
     echo "$(date) - Join command not available yet. Waiting to retry..."

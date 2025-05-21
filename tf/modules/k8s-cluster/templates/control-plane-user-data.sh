@@ -336,3 +336,56 @@ chmod 644 /etc/kubernetes/admin.conf
 echo "$(date) - Verifying kubectl works with updated kubeconfig"
 export KUBECONFIG=/etc/kubernetes/admin.conf
 kubectl get nodes
+
+# Install AWS CLI early to ensure it's available for all subsequent steps
+echo "$(date) - Installing AWS CLI"
+apt-get install -y unzip
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+export PATH=$PATH:/usr/local/bin
+rm -rf awscliv2.zip aws/
+
+# Configure AWS CLI
+export AWS_DEFAULT_REGION="${region}"
+aws --version
+
+# Set up error logging to S3
+upload_logs_to_s3() {
+  LOG_STATUS=$1
+  echo "$(date) - $LOG_STATUS - Uploading logs to S3"
+  LOG_FILENAME="control-plane-init-${INSTANCE_ID}-${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
+  aws s3 cp "$LOGFILE" "s3://${worker_logs_bucket}/${LOG_FILENAME}" --region "${region}" || echo "Failed to upload logs to S3"
+}
+
+# Set up trap to upload logs on exit
+trap 'upload_logs_to_s3 "ERROR_TRAP"; echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"' ERR
+
+# Upload initial logs
+upload_logs_to_s3 "INIT"
+
+# Create kubeadm join command and store in Secrets Manager
+echo "$(date) - Creating join command and storing in Secrets Manager"
+JOIN_COMMAND=$(kubeadm token create --print-join-command)
+if [ -z "$JOIN_COMMAND" ]; then
+  echo "$(date) - Failed to create join command, retrying..."
+  sleep 10
+  JOIN_COMMAND=$(kubeadm token create --print-join-command)
+fi
+
+if [ -n "$JOIN_COMMAND" ]; then
+  echo "$(date) - Join command created: $JOIN_COMMAND"
+  # Create a new secret with timestamp and token parts to make it unique
+  SECRET_NAME="${kubernetes_join_command_secret}"
+  aws secretsmanager put-secret-value \
+    --secret-id "$SECRET_NAME" \
+    --secret-string "$JOIN_COMMAND" \
+    --region "${region}" || echo "Failed to update join command secret"
+  
+  echo "$(date) - Join command stored in Secrets Manager"
+else
+  echo "$(date) - CRITICAL ERROR: Failed to create join command after retry"
+fi
+
+# Upload final logs
+upload_logs_to_s3 "COMPLETE"

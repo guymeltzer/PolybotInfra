@@ -4,6 +4,7 @@ import time
 import re
 import random
 import string
+from datetime import datetime
 
 def lambda_handler(event, context):
     autoscaling = boto3.client('autoscaling')
@@ -113,14 +114,14 @@ def lambda_handler(event, context):
             InstanceIds=[control_plane_instance_id],
             DocumentName='AWS-RunShellScript',
             Parameters={'commands': [check_command]},
-            TimeoutSeconds=30
+            TimeoutSeconds=60
         )
         
         command_id = response['Command']['CommandId']
         attempt = 0
-        max_attempts = 10
+        max_attempts = 15
         while attempt < max_attempts:
-            time.sleep(2)
+            time.sleep(5)
             try:
                 command_output = ssm_client.get_command_invocation(
                     CommandId=command_id,
@@ -128,70 +129,85 @@ def lambda_handler(event, context):
                 )
                 if command_output['Status'] in ['Success', 'Completed']:
                     print("Kubernetes control plane verified as running")
+                    print(f"Nodes: {command_output.get('StandardOutputContent', 'No output')}")
                     break
                 elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
                     print(f"Control plane check failed: {command_output.get('StandardErrorContent', 'Unknown error')}")
-                    return {'statusCode': 500, 'body': 'Control plane not ready'}
+                    if attempt >= max_attempts - 1:
+                        return {'statusCode': 500, 'body': 'Control plane not ready'}
+                    # If failed, wait and try again
+                    time.sleep(5)
             except Exception as e:
                 print(f"Error checking command status: {str(e)}")
-                attempt += 1
-                continue
+                time.sleep(5)
             
             attempt += 1
         
         # Create a fresh token on the control plane
+        token_command = 'kubeadm token create --print-join-command'
+        print(f"Sending command to create token: {token_command}")
+        
         response = ssm_client.send_command(
             InstanceIds=[control_plane_instance_id],
             DocumentName='AWS-RunShellScript',
-            Parameters={'commands': ['kubeadm token create --print-join-command']},
-            TimeoutSeconds=60
+            Parameters={'commands': [token_command]},
+            TimeoutSeconds=120
         )
         
         command_id = response['Command']['CommandId']
-        max_attempts = 15
+        max_attempts = 20
         attempt = 0
         while attempt < max_attempts:
-            time.sleep(2)
-            command_output = ssm_client.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=control_plane_instance_id
-            )
-            if command_output['Status'] in ['Success', 'Completed']:
-                join_command = command_output['StandardOutputContent'].strip()
-                print(f"Join command updated: {join_command}")
-                break
-            elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
-                error = command_output.get('StandardErrorContent', 'Unknown error')
-                raise Exception(f"SSM command failed: {error}")
+            time.sleep(5)
+            try:
+                command_output = ssm_client.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=control_plane_instance_id
+                )
+                if command_output['Status'] in ['Success', 'Completed']:
+                    join_command = command_output['StandardOutputContent'].strip()
+                    print(f"Join command updated: {join_command}")
+                    break
+                elif command_output['Status'] in ['Failed', 'Cancelled', 'TimedOut']:
+                    error = command_output.get('StandardErrorContent', 'Unknown error')
+                    raise Exception(f"SSM command failed: {error}")
+                # Still running, wait longer
+                time.sleep(5)
+            except Exception as e:
+                print(f"Error checking token command: {str(e)}")
+                time.sleep(5)
             attempt += 1
         else:
-            raise Exception("SSM command did not complete within 30 seconds")
+            raise Exception("SSM command did not complete within reasonable time")
         
-        # Update the latest secret with the new join command
+        # Create a timestamp for the new secret
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        secret_name = '${aws_secretsmanager_secret.kubernetes_join_command.name}'
+        
+        # Store the join command in the secret
         try:
-            latest_secret = secrets_client.list_secrets(
-                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}],
-                SortOrder='desc'
-            )['SecretList'][0]['Name']
-            
-            print(f"Updating secret: {latest_secret}")
-            
+            # First try to update the existing secret
+            print(f"Updating secret: {secret_name}")
             secrets_client.put_secret_value(
-                SecretId=latest_secret,
+                SecretId=secret_name,
                 SecretString=join_command
             )
+            print(f"Secret {secret_name} updated successfully")
         except Exception as e:
-            print(f"Error updating latest secret, creating new value directly: {str(e)}")
-            # If we fail to find or update the latest secret, try a direct approach
+            # If that fails, try creating a new secret value
+            print(f"Error updating secret: {str(e)}")
             try:
-                secrets_client.update_secret(
-                    SecretId="kubernetes-join-command-*",
+                # Try a direct put-secret-value as fallback
+                secrets_client.put_secret_value(
+                    SecretId=secret_name,
                     SecretString=join_command
                 )
+                print(f"Secret updated via fallback method")
             except Exception as inner_e:
-                print(f"Direct secret update failed too: {str(inner_e)}")
-                
+                print(f"Both secret update methods failed: {str(inner_e)}")
+                return {'statusCode': 500, 'body': f"Failed to update secret: {str(inner_e)}"}
+        
         return {'statusCode': 200, 'body': 'Join command updated successfully'}
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error in token refresh: {str(e)}")
         return {'statusCode': 500, 'body': f"Error: {str(e)}"}
