@@ -1096,7 +1096,7 @@ resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
   name                   = "guy-scale-down-hook"
   autoscaling_group_name = aws_autoscaling_group.worker_asg.name
   default_result         = "CONTINUE"
-  heartbeat_timeout      = 600
+  heartbeat_timeout      = 300
   lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
 
   notification_target_arn = aws_sns_topic.lifecycle_topic.arn
@@ -1773,6 +1773,7 @@ resource "aws_lb_target_group" "http_tg" {
   protocol    = "HTTP"
   vpc_id      = module.vpc.vpc_id
   target_type = "instance"
+  deregistration_delay = 30
 }
 
 resource "aws_lb_target_group" "https_tg" {
@@ -1781,6 +1782,7 @@ resource "aws_lb_target_group" "https_tg" {
   protocol    = "HTTPS"
   vpc_id      = module.vpc.vpc_id
   target_type = "instance"
+  deregistration_delay = 30
 }
 
 resource "aws_lb_listener" "http" {
