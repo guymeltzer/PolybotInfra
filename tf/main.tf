@@ -117,15 +117,61 @@ resource "terraform_data" "init_environment" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      echo "Initializing environment with placeholder kubeconfig..."
       
-      # Create a minimal placeholder kubeconfig
+      # Look for control plane instance
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      
+      # Look for public IP if instance exists
+      if [ "$INSTANCE_ID" != "None" ] && [ ! -z "$INSTANCE_ID" ]; then
+        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+        
+        # If we have a public IP, try to get the real kubeconfig
+        if [ "$PUBLIC_IP" != "None" ] && [ ! -z "$PUBLIC_IP" ]; then
+          echo "Control plane found with IP: $PUBLIC_IP, checking for kubeconfig"
+          
+          if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+             --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+            
+            echo "Control plane has SSM available, retrieving kubeconfig"
+            # Try to get a real kubeconfig
+            aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" \
+              --instance-ids "$INSTANCE_ID" --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
+              --output text --query "Command.CommandId" > /tmp/command_id.txt
+            
+            sleep 5
+            
+            # Get the kubeconfig content
+            aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
+              --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text > /tmp/admin_conf.txt
+            
+            # Check if we got a valid kubeconfig
+            if [ -s /tmp/admin_conf.txt ] && grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
+              echo "Got valid kubeconfig, updating with correct IP"
+              cat /tmp/admin_conf.txt | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
+              chmod 600 ./kubeconfig.yaml
+              echo "Successfully created kubeconfig with real IP"
+              exit 0
+            fi
+          fi
+        fi
+      fi
+      
+      # If we're at this point, we didn't get a valid kubeconfig
+      echo "Creating placeholder kubeconfig"
+      
+      # Since we should only get here during initial setup, if a valid kubeconfig exists, DON'T overwrite it
+      if [ -f "./kubeconfig.yaml" ] && ! grep -q "server: https://placeholder:6443" ./kubeconfig.yaml; then
+        echo "Found existing valid kubeconfig, not overwriting with placeholder"
+        exit 0
+      fi
+      
+      # Create a minimal placeholder kubeconfig that won't cause connection errors
       cat > "./kubeconfig.yaml" << EOF
 apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://placeholder:6443
+    server: https://127.0.0.1:9999
     insecure-skip-tls-verify: true
   name: kubernetes
 contexts:
@@ -141,7 +187,7 @@ users:
 EOF
 
       chmod 600 "./kubeconfig.yaml"
-      echo "Placeholder kubeconfig created successfully"
+      echo "Created placeholder kubeconfig successfully with unused local address"
     EOT
   }
 }
@@ -737,24 +783,56 @@ resource "terraform_data" "deployment_completion_information" {
 
 # Configure providers with proper dependency handling
 provider "kubernetes" {
-  # Use config_path instead of trying to parse the YAML during plan
-  config_path    = "${path.module}/kubeconfig.yaml"
-  config_context = "kubernetes-admin@kubernetes"
+  # Skip trying to use placeholder configs by only loading valid ones
+  host = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+    "https://127.0.0.1:9999" : null
+  ) : "https://127.0.0.1:9999"
+  
+  # Only use config_path if it's a real config
+  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+    "/dev/null" : "${path.module}/kubeconfig.yaml"
+  ) : "/dev/null"
+  
+  # Skip TLS verification for development
+  insecure = true
 }
 
 provider "helm" {
+  # Skip trying to use placeholder configs
   kubernetes {
-    # Use config_path instead of trying to parse the YAML during plan
-    config_path    = "${path.module}/kubeconfig.yaml"
-    config_context = "kubernetes-admin@kubernetes"
+    host = fileexists("${path.module}/kubeconfig.yaml") ? (
+      contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+      "https://127.0.0.1:9999" : null
+    ) : "https://127.0.0.1:9999"
+    
+    # Only use config_path if it's a real config
+    config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+      contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+      "/dev/null" : "${path.module}/kubeconfig.yaml"
+    ) : "/dev/null"
+    
+    # Skip TLS verification for development
+    insecure = true
   }
 }
 
 provider "kubectl" {
-  # Use config_path instead of trying to parse the YAML during plan
-  config_path    = "${path.module}/kubeconfig.yaml"
-  config_context = "kubernetes-admin@kubernetes"
-  load_config_file = true
+  # Skip trying to use placeholder configs
+  host = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+    "https://127.0.0.1:9999" : null
+  ) : "https://127.0.0.1:9999"
+  
+  # Only use config_path if it's a real config
+  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
+    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
+    "/dev/null" : "${path.module}/kubeconfig.yaml"
+  ) : "/dev/null"
+  
+  # Skip TLS verification for development
+  insecure = true
 }
 
 # Special resource to clean up Kubernetes state
