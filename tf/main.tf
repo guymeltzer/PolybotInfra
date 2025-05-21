@@ -342,9 +342,9 @@ locals {
   kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml")
   # Only consider Kubernetes ready if we have a real kubeconfig (not the placeholder)
   k8s_ready = local.kubeconfig_exists && (
-    !contains(
-      try(split("\n", file("${path.module}/kubeconfig.yaml")), []),
-      "    server: https://placeholder:6443"
+    !strcontains(
+      try(file("${path.module}/kubeconfig.yaml"), ""),
+      "server: https://placeholder:6443"
     )
   )
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
@@ -783,56 +783,24 @@ resource "terraform_data" "deployment_completion_information" {
 
 # Configure providers with proper dependency handling
 provider "kubernetes" {
-  # Skip trying to use placeholder configs by only loading valid ones
-  host = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-    "https://127.0.0.1:9999" : null
-  ) : "https://127.0.0.1:9999"
-  
-  # Only use config_path if it's a real config
-  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-    "/dev/null" : "${path.module}/kubeconfig.yaml"
-  ) : "/dev/null"
-  
-  # Skip TLS verification for development
-  insecure = true
+  # Simple configuration that works in both cases
+  host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
+  insecure = true  
 }
 
 provider "helm" {
-  # Skip trying to use placeholder configs
   kubernetes {
-    host = fileexists("${path.module}/kubeconfig.yaml") ? (
-      contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-      "https://127.0.0.1:9999" : null
-    ) : "https://127.0.0.1:9999"
-    
-    # Only use config_path if it's a real config
-    config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-      contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-      "/dev/null" : "${path.module}/kubeconfig.yaml"
-    ) : "/dev/null"
-    
-    # Skip TLS verification for development
+    # Simple configuration that works in both cases
+    host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
     insecure = true
   }
 }
 
 provider "kubectl" {
-  # Skip trying to use placeholder configs
-  host = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-    "https://127.0.0.1:9999" : null
-  ) : "https://127.0.0.1:9999"
-  
-  # Only use config_path if it's a real config
-  config_path = fileexists("${path.module}/kubeconfig.yaml") ? (
-    contains(file("${path.module}/kubeconfig.yaml"), "server: https://placeholder:6443") ?
-    "/dev/null" : "${path.module}/kubeconfig.yaml"
-  ) : "/dev/null"
-  
-  # Skip TLS verification for development
+  # Simple configuration that works in both cases
+  host = "https://127.0.0.1:9999" # Never actually used - prevents connection attempts during apply/destroy
   insecure = true
+  load_config_file = true
 }
 
 # Special resource to clean up Kubernetes state
