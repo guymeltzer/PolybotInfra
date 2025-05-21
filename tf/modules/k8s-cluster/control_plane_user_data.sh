@@ -156,12 +156,23 @@ for i in {1..10}; do
   fi
 done
 
-# Generate join command
-TOKEN=$(kubeadm token create)
+# Generate join command with a long TTL token for reliability (7 days)
+STABLE_TOKEN=$(kubeadm token create --ttl 168h)
 DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
+JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
 
 echo "$(date) - Generated join command with private IP: $JOIN_COMMAND"
+
+# Print token info for debugging
+echo "$(date) - Token information:"
+kubeadm token list
+
+# Also print the hash so it's in the logs for debugging
+echo "$(date) - CA cert hash: sha256:${DISCOVERY_HASH}"
+
+# For workers using the unsafe-skip-ca-verification option
+ALT_JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --discovery-token-unsafe-skip-ca-verification"
+echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name
 echo "$(date) - Creating Secret Manager secret kubernetes-join-command"
