@@ -385,7 +385,7 @@ upload_logs_to_s3() {
     fi
   fi
   
-  LOG_FILENAME="control-plane-init-$${INSTANCE_ID}-${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
+  LOG_FILENAME="control-plane-init-$${INSTANCE_ID}-$${LOG_STATUS}-$(date +%Y%m%d-%H%M%S).log"
   aws s3 cp "$LOGFILE" "s3://${worker_logs_bucket}/${LOG_FILENAME}" --region "${region}" || echo "Failed to upload logs to S3"
 }
 
