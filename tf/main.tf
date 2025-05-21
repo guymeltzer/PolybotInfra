@@ -340,28 +340,7 @@ locals {
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
 }
 
-# Configure the Kubernetes provider with proper authentication
-provider "kubernetes" {
-  config_path = local.kubeconfig_path
-  insecure    = true # Explicitly skip TLS verification
-}
-
-# Configure the Helm provider with proper authentication
-provider "helm" {
-  kubernetes {
-    config_path = local.kubeconfig_path
-    insecure    = true # Explicitly skip TLS verification
-  }
-}
-
-# Configure the kubectl provider with proper authentication
-provider "kubectl" {
-  config_path      = local.kubeconfig_path
-  load_config_file = true
-}
-
-# This is a workaround to ensure the providers are properly loaded with the kubeconfig
-# We can't use depends_on in provider blocks, so we use this resource to simulate that
+# This is a workaround to ensure the local-exec commands run in the right order
 resource "null_resource" "providers_ready" {
   depends_on = [
     terraform_data.kubectl_provider_config
@@ -375,7 +354,7 @@ resource "null_resource" "providers_ready" {
   }
 
   provisioner "local-exec" {
-    command = "echo 'Kubernetes providers ready with kubeconfig ${local.kubeconfig_path}'"
+    command = "echo 'Kubeconfig generated at ${local.kubeconfig_path}'"
   }
 }
 
@@ -511,10 +490,9 @@ module "k8s-cluster" {
   depends_on = [terraform_data.init_environment, terraform_data.deployment_information]
 }
 
-# Install EBS CSI Driver using local-exec when we can't use helm_release
+# Install EBS CSI Driver using local-exec only
 resource "null_resource" "install_ebs_csi_driver" {
-  count = local.k8s_ready ? 0 : 1
-  
+  # Only run after we have a valid kubeconfig
   depends_on = [
     module.k8s-cluster, 
     null_resource.wait_for_kubernetes, 
@@ -522,9 +500,11 @@ resource "null_resource" "install_ebs_csi_driver" {
     null_resource.providers_ready
   ]
   
-  # Only run when needed
+  # Only run when needed, based on resource changes
   triggers = {
     k8s_config_timestamp = terraform_data.kubectl_provider_config.id
+    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
+    always_run = timestamp() # Run on every apply
   }
   
   provisioner "local-exec" {
@@ -532,25 +512,30 @@ resource "null_resource" "install_ebs_csi_driver" {
     command     = <<-EOT
       #!/bin/bash
       echo "Checking if kubeconfig is valid before installing EBS CSI Driver..."
-      export KUBECONFIG="${local.kubeconfig_path}"
+      KUBECONFIG="${local.kubeconfig_path}"
       
-      # Check if kubeconfig exists and is valid
-      if [ -f "$KUBECONFIG" ] && grep -q "placeholder" "$KUBECONFIG"; then
-        echo "Kubeconfig contains placeholder values, skipping Helm installation"
+      if [ ! -f "$KUBECONFIG" ]; then
+        echo "Kubeconfig file not found, skipping installation"
+        exit 0
+      fi
+      
+      # Check if kubeconfig contains placeholder values
+      if grep -q "placeholder" "$KUBECONFIG"; then
+        echo "Kubeconfig contains placeholder values, skipping installation"
         exit 0
       fi
       
       # Check if we can connect to the Kubernetes API
-      if ! kubectl cluster-info >/dev/null 2>&1; then
-        echo "Cannot connect to Kubernetes cluster, skipping Helm installation"
+      if ! kubectl --kubeconfig="$KUBECONFIG" cluster-info >/dev/null 2>&1; then
+        echo "Cannot connect to Kubernetes cluster, skipping installation"
         exit 0
       fi
       
       echo "Installing EBS CSI Driver via Helm..."
-      helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
-      helm repo update
+      helm --kubeconfig="$KUBECONFIG" repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+      helm --kubeconfig="$KUBECONFIG" repo update
       
-      helm upgrade --install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver \
+      helm --kubeconfig="$KUBECONFIG" upgrade --install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver \
         --namespace kube-system \
         --set controller.serviceAccount.annotations."eks\\.amazonaws\\.com/role-arn"="${module.k8s-cluster.control_plane_iam_role_arn}" \
         --set storageClasses[0].name=ebs-sc \
@@ -563,101 +548,9 @@ resource "null_resource" "install_ebs_csi_driver" {
   }
 }
 
-# Install EBS CSI Driver for persistent storage using the Helm provider directly
-resource "helm_release" "aws_ebs_csi_driver" {
-  count      = local.k8s_ready ? 1 : 0
-  name       = "aws-ebs-csi-driver"
-  repository = "https://kubernetes-sigs.github.io/aws-ebs-csi-driver"
-  chart      = "aws-ebs-csi-driver"
-  namespace  = "kube-system"
-  version    = "2.23.0"  # Use a specific stable version
-
-  # Set shorter timeout to avoid long waits
-  timeout    = 300
-  wait       = false  # Don't wait for resources to be ready
-  
-  # Simplified values
-  values = [<<EOF
-controller:
-  serviceAccount:
-    annotations:
-      eks.amazonaws.com/role-arn: ${module.k8s-cluster.control_plane_iam_role_arn}
-storageClasses:
-  - name: ebs-sc
-    annotations:
-      storageclass.kubernetes.io/is-default-class: "true"
-    volumeBindingMode: WaitForFirstConsumer
-    parameters:
-      csi.storage.k8s.io/fstype: ext4
-      type: gp2
-      encrypted: "true"
-EOF
-  ]
-
-  depends_on = [
-    module.k8s-cluster, 
-    null_resource.wait_for_kubernetes, 
-    terraform_data.kubectl_provider_config,
-    null_resource.providers_ready
-  ]
-}
-
-# Install ArgoCD using local-exec when we can't use Helm provider
+# Install ArgoCD using local-exec only
 resource "null_resource" "install_argocd" {
-  count = (!local.skip_argocd && !local.k8s_ready) ? 1 : 0
-  
-  depends_on = [
-    module.k8s-cluster,
-    null_resource.wait_for_kubernetes,
-    terraform_data.kubectl_provider_config,
-    null_resource.create_namespaces,
-    null_resource.providers_ready
-  ]
-  
-  # Only run when needed
-  triggers = {
-    k8s_config_timestamp = terraform_data.kubectl_provider_config.id
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Checking if kubeconfig is valid before installing ArgoCD..."
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      # Check if kubeconfig exists and is valid
-      if [ -f "$KUBECONFIG" ] && grep -q "placeholder" "$KUBECONFIG"; then
-        echo "Kubeconfig contains placeholder values, skipping ArgoCD installation"
-        exit 0
-      fi
-      
-      # Check if we can connect to the Kubernetes API
-      if ! kubectl cluster-info >/dev/null 2>&1; then
-        echo "Cannot connect to Kubernetes cluster, skipping ArgoCD installation"
-        exit 0
-      fi
-      
-      echo "Ensuring argocd namespace exists..."
-      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply --validate=false -f -
-      
-      echo "Installing ArgoCD..."
-      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-    EOT
-  }
-}
-
-# ArgoCD deployment - only create after namespaces are ready
-module "argocd" {
-  count        = local.skip_argocd ? 0 : (local.k8s_ready ? 1 : 0)
-  source       = "./modules/argocd"
-  git_repo_url = var.git_repo_url
-  
-  providers = {
-    kubernetes = kubernetes
-    helm       = helm
-    kubectl    = kubectl
-  }
+  count = !local.skip_argocd ? 1 : 0
   
   depends_on = [
     module.k8s-cluster,
@@ -665,8 +558,56 @@ module "argocd" {
     terraform_data.kubectl_provider_config,
     null_resource.create_namespaces,
     null_resource.providers_ready,
-    helm_release.aws_ebs_csi_driver
+    null_resource.install_ebs_csi_driver
   ]
+  
+  # Only run when needed
+  triggers = {
+    k8s_config_timestamp = terraform_data.kubectl_provider_config.id
+    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "placeholder")
+    always_run = timestamp() # Run on every apply
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      echo "Checking if kubeconfig is valid before installing ArgoCD..."
+      KUBECONFIG="${local.kubeconfig_path}"
+      
+      if [ ! -f "$KUBECONFIG" ]; then
+        echo "Kubeconfig file not found, skipping installation"
+        exit 0
+      fi
+      
+      # Check if kubeconfig contains placeholder values
+      if grep -q "placeholder" "$KUBECONFIG"; then
+        echo "Kubeconfig contains placeholder values, skipping installation"
+        exit 0
+      fi
+      
+      # Check if we can connect to the Kubernetes API
+      if ! kubectl --kubeconfig="$KUBECONFIG" cluster-info >/dev/null 2>&1; then
+        echo "Cannot connect to Kubernetes cluster, skipping installation"
+        exit 0
+      fi
+      
+      echo "Ensuring argocd namespace exists..."
+      kubectl --kubeconfig="$KUBECONFIG" create namespace argocd --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply --validate=false -f -
+      
+      echo "Installing ArgoCD..."
+      kubectl --kubeconfig="$KUBECONFIG" apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      
+      # Configure ArgoCD with Git repository (optional)
+      # If you need to configure ArgoCD with specific Git repositories, add appropriate kubectl commands here
+      
+      # Example: Wait for ArgoCD to be ready
+      echo "Waiting for ArgoCD to be ready..."
+      kubectl --kubeconfig="$KUBECONFIG" -n argocd wait --for=condition=available --timeout=300s deployment/argocd-server || true
+      
+      echo "ArgoCD installation complete (or timeout reached)"
+    EOT
+  }
 }
 
 # Development environment resources
