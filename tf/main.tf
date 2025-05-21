@@ -328,7 +328,7 @@ locals {
     "kubernetes.default.svc"
   )
   skip_argocd = true # Set to true to skip ArgoCD deployment temporarily
-  skip_namespaces = false # Set to true to skip namespace creation if it's failing
+  skip_namespaces = true # Skip namespace creation until the cluster is fully ready
 }
 
 # Add a data source to ensure kubeconfig is ready
@@ -549,4 +549,40 @@ module "polybot_prod" {
   aws_secret_access_key = var.aws_secret_access_key
   docker_username = var.docker_username
   docker_password = var.docker_password
+}
+
+# Output commands for manual verification and namespace creation
+resource "null_resource" "cluster_readiness_info" {
+  depends_on = [
+    module.k8s-cluster,
+    terraform_data.kubectl_provider_config,
+    data.local_file.kubeconfig
+  ]
+  
+  # Run on each apply
+  triggers = {
+    always_run = timestamp()
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      echo "---------------------------------------------------------"
+      echo "KUBERNETES CLUSTER DEPLOYMENT INFORMATION"
+      echo "---------------------------------------------------------"
+      echo "Kubernetes control plane IP: ${try(module.k8s-cluster.control_plane_public_ip, "Not available yet")}"
+      echo "Kubeconfig file: ${path.module}/kubeconfig.yaml"
+      echo ""
+      echo "To manually verify the cluster and create namespaces, run:"
+      echo "export KUBECONFIG=${path.module}/kubeconfig.yaml"
+      echo "kubectl get nodes"
+      echo "kubectl create namespace dev --dry-run=client -o yaml | kubectl apply --validate=false -f -"
+      echo "kubectl create namespace prod --dry-run=client -o yaml | kubectl apply --validate=false -f -"
+      echo "kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply --validate=false -f -"
+      echo ""
+      echo "When cluster is verified as working, set skip_namespaces = false in locals"
+      echo "---------------------------------------------------------"
+    EOT
+  }
 }
