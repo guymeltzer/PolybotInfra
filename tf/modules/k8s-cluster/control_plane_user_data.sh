@@ -171,10 +171,10 @@ echo "Created token: \$TOKEN at \$(date)" >> /var/log/k8s-token-creator.log; \\
 DISCOVERY_HASH=\$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed "s/^.* //"); \\
 JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token \$TOKEN --discovery-token-ca-cert-hash sha256:\$DISCOVERY_HASH"; \\
 echo "Join command: \$JOIN_COMMAND" >> /var/log/k8s-token-creator.log; \\
-aws secretsmanager update-secret --secret-id kubernetes-join-command --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
-aws secretsmanager update-secret --secret-id kubernetes-join-command-latest --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id ${kubernetes_join_command_secret} --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
+aws secretsmanager update-secret --secret-id ${kubernetes_join_command_latest_secret} --secret-string "\$JOIN_COMMAND" --region '${REGION}' || true; \\
 TIMESTAMP=\$(date +"%Y%m%d%H%M%S"); \\
-aws secretsmanager create-secret --name "kubernetes-join-command-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region '${REGION}' || true;'
+aws secretsmanager create-secret --name "${kubernetes_join_command_secret}-\$TIMESTAMP" --secret-string "\$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region '${REGION}' || true;'
 User=root
 Group=root
 EOF
@@ -253,25 +253,25 @@ ALT_JOIN_COMMAND="kubeadm join ${PRIVATE_IP}:6443 --token ${STABLE_TOKEN} --disc
 echo "$(date) - Alternative join command: $ALT_JOIN_COMMAND" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name
-echo "$(date) - Creating Secret Manager secret kubernetes-join-command"
-aws secretsmanager describe-secret --secret-id "kubernetes-join-command" --region "$REGION" > /dev/null 2>&1
+echo "$(date) - Creating Secret Manager secret ${kubernetes_join_command_secret}"
+aws secretsmanager describe-secret --secret-id "${kubernetes_join_command_secret}" --region "$REGION" > /dev/null 2>&1
 if [ $? -eq 0 ]; then
   # Secret exists, update it
-  aws secretsmanager update-secret --secret-id "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --region "$REGION"
+  aws secretsmanager update-secret --secret-id "${kubernetes_join_command_secret}" --secret-string "$JOIN_COMMAND" --region "$REGION"
 else
   # Secret doesn't exist, create it
-  aws secretsmanager create-secret --name "kubernetes-join-command" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
+  aws secretsmanager create-secret --name "${kubernetes_join_command_secret}" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
 fi
 
 # Also create a timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-SECRET_NAME="kubernetes-join-command-${TIMESTAMP}"
+SECRET_NAME="${kubernetes_join_command_secret}-${TIMESTAMP}"
 
 echo "$(date) - Creating timestamped Secret Manager secret $SECRET_NAME"
 aws secretsmanager create-secret --name "$SECRET_NAME" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region "$REGION"
 
 # Also create a fixed-name secret that's easier to find
-FIXED_SECRET_NAME="kubernetes-join-command-latest"
+FIXED_SECRET_NAME="${kubernetes_join_command_latest_secret}"
 echo "$(date) - Creating/updating fixed name secret $FIXED_SECRET_NAME"
 aws secretsmanager describe-secret --secret-id "$FIXED_SECRET_NAME" --region "$REGION" > /dev/null 2>&1
 if [ $? -eq 0 ]; then
@@ -286,7 +286,7 @@ fi
 echo "$(date) - Verifying secrets are accessible"
 sleep 5  # Give AWS some time to propagate the secrets
 
-for SECRET_NAME in "kubernetes-join-command" "kubernetes-join-command-latest" "$SECRET_NAME"; do
+for SECRET_NAME in "${kubernetes_join_command_secret}" "${kubernetes_join_command_latest_secret}" "$SECRET_NAME"; do
   echo "$(date) - Verifying secret: $SECRET_NAME"
   STORED_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --region "$REGION" --query SecretString --output text)
   if [ -z "$STORED_JOIN_COMMAND" ]; then

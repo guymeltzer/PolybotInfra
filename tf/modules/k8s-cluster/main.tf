@@ -557,7 +557,8 @@ resource "aws_instance" "control_plane" {
     timestamp = formatdate("YYYYMMDDhhmmss", timestamp()),
     region = var.region,
     worker_logs_bucket = aws_s3_bucket.worker_logs.id,
-    kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name
+    kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name,
+    kubernetes_join_command_latest_secret = aws_secretsmanager_secret.kubernetes_join_command_latest.name
   }))
 
   root_block_device {
@@ -627,10 +628,15 @@ resource "local_file" "kubeconfig" {
 }
 
 # Secrets Manager for Kubernetes join command
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name                    = "kubernetes-join-command"
+  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
   description             = "Kubernetes join command for worker nodes"
   recovery_window_in_days = 0  # No recovery window for easy replacement
+  force_overwrite_replica_secret = true
 
   lifecycle {
     create_before_destroy = true
@@ -638,9 +644,10 @@ resource "aws_secretsmanager_secret" "kubernetes_join_command" {
 }
 
 resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
-  name                    = "kubernetes-join-command-latest"
+  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
   description             = "Latest Kubernetes join command for worker nodes"
   recovery_window_in_days = 0  # No recovery window for easy replacement
+  force_overwrite_replica_secret = true
 
   lifecycle {
     create_before_destroy = true
@@ -806,19 +813,61 @@ def lambda_handler(event, context):
         else:
             raise Exception("SSM command did not complete within 30 seconds")
         
-        # Update the latest secret with the new join command
-        latest_secret = secrets_client.list_secrets(
-            Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-*']}],
-            SortOrder='desc'
-        )['SecretList'][0]['Name']
-        
-        print(f"Updating secret: {latest_secret}")
-        
-        secrets_client.put_secret_value(
-            SecretId=latest_secret,
-            SecretString=join_command
-        )
-        return {'statusCode': 200, 'body': 'Join command updated successfully'}
+        # Find the current latest -latest secret
+        try:
+            latest_secrets = secrets_client.list_secrets(
+                Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-latest-']}]
+            )['SecretList']
+            
+            if latest_secrets:
+                latest_secret = sorted(latest_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]['Name']
+                print(f"Updating latest secret: {latest_secret}")
+                
+                secrets_client.put_secret_value(
+                    SecretId=latest_secret,
+                    SecretString=join_command
+                )
+                
+                # Also update the base secret if it exists
+                try:
+                    base_secrets = secrets_client.list_secrets(
+                        Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command-']}],
+                        MaxResults=10
+                    )['SecretList']
+                    
+                    # Filter out the -latest secrets
+                    base_secrets = [s for s in base_secrets if not s['Name'].endswith('-latest')]
+                    
+                    if base_secrets:
+                        base_secret = sorted(base_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]['Name']
+                        print(f"Also updating base secret: {base_secret}")
+                        
+                        secrets_client.put_secret_value(
+                            SecretId=base_secret,
+                            SecretString=join_command
+                        )
+                except Exception as e:
+                    print(f"Warning: Could not update base secret: {str(e)}")
+                
+                return {'statusCode': 200, 'body': 'Join command updated successfully'}
+            else:
+                raise Exception("No kubernetes-join-command-latest secrets found")
+                
+        except Exception as e:
+            print(f"Error finding latest secrets: {str(e)}")
+            # Create a timestamp in case we need to create a new secret
+            timestamp = int(time.time())
+            new_secret_name = f"kubernetes-join-command-{timestamp}"
+            
+            # Create a new secret as fallback
+            print(f"Creating new secret: {new_secret_name}")
+            secrets_client.create_secret(
+                Name=new_secret_name,
+                Description="Kubernetes join command created by Lambda",
+                SecretString=join_command
+            )
+            return {'statusCode': 200, 'body': f'Created new secret: {new_secret_name}'}
+            
     except Exception as e:
         print(f"Error: {str(e)}")
         return {'statusCode': 500, 'body': f"Error: {str(e)}"}
@@ -901,9 +950,10 @@ resource "aws_iam_policy" "node_management_lambda_policy" {
         Effect = "Allow"
         Action = [
           "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:ListSecrets"
         ]
-        Resource = aws_secretsmanager_secret.kubernetes_join_command.arn
+        Resource = "*"
       }
     ]
   })
@@ -1074,7 +1124,10 @@ resource "aws_launch_template" "worker_lt" {
   image_id      = "ami-0d7a0a6a6f9a66ea2" # Ubuntu 24.04 LTS for us-east-1
   instance_type = "t3.medium"
   
-  user_data = base64encode(file("${path.module}/worker_user_data.sh"))
+  user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", {
+    kubernetes_join_command_secret = aws_secretsmanager_secret.kubernetes_join_command.name,
+    kubernetes_join_command_latest_secret = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  }))
   
   iam_instance_profile {
     name = aws_iam_instance_profile.worker_profile.name

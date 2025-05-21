@@ -226,7 +226,7 @@ validate_and_fix_join_command() {
 # Fetch join command from Secrets Manager - using direct approach
 echo "$(date) - Fetching join command from Secrets Manager"
 MAX_ATTEMPTS=30
-SECRET_NAMES=("kubernetes-join-command" "kubernetes-join-command-latest")
+SECRET_NAMES=("${kubernetes_join_command_secret}" "${kubernetes_join_command_latest_secret}")
 JOIN_COMMAND=""
 
 for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
@@ -276,7 +276,7 @@ for ((ATTEMPT=1; ATTEMPT<=MAX_ATTEMPTS; ATTEMPT++)); do
     echo "$(date) - Failed to get join command from known secret names, looking for latest..."
     LATEST_SECRET=$(aws secretsmanager list-secrets \
       --region "$REGION" \
-      --query "sort_by(SecretList[?contains(Name, 'kubernetes-join-command')], &CreatedDate)[-1].Name" \
+      --query "sort_by(SecretList[?contains(Name, '${kubernetes_join_command_secret}')], &CreatedDate)[-1].Name" \
       --output text)
     
     if [ -n "$LATEST_SECRET" ] && [ "$LATEST_SECRET" != "None" ]; then
