@@ -25,7 +25,7 @@ output "load_balancer_address" {
 
 output "kubeconfig_command" {
   description = "Command to configure kubectl"
-  value       = "ssh ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml"
+  value       = "ssh ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$$(pwd)/kubeconfig.yaml"
 }
 
 output "polybot_dev_url" {

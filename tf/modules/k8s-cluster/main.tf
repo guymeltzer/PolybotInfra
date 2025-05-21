@@ -2049,10 +2049,10 @@ resource "terraform_data" "completion_progress" {
       
       # Check control plane status every minute for up to 5 minutes
       for i in {1..5}; do
-        echo -e "\\033[0;33m⏱️  Checking control plane status (attempt $i/5)...\\033[0m"
+        echo -e "\\033[0;33m⏱️  Checking control plane status (attempt $$i/5)...\\033[0m"
         # Try to SSH to the control plane and check if nodes are ready
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if [ $$? -eq 0 ]; then
           echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
           echo -e "\\033[1;34m========================================================\\033[0m"
           echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"

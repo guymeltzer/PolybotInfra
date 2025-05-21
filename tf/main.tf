@@ -12,7 +12,7 @@ resource "terraform_data" "clean_kubernetes_state" {
   }
 
   provisioner "local-exec" {
-    command = "bash -c 'RESOURCES=$(terraform state list 2>/dev/null | grep kubernetes_namespace || true); if [ -n \"$RESOURCES\" ]; then for resource in $RESOURCES; do echo \"Removing $resource from state...\"; terraform state rm \"$resource\" || echo \"Failed to remove $resource\"; done; else echo \"No kubernetes_namespace resources found in state.\"; fi'"
+    command = "bash -c 'RESOURCES=$$(terraform state list 2>/dev/null | grep kubernetes_namespace || true); if [ -n \"$$RESOURCES\" ]; then for resource in $$RESOURCES; do echo \"Removing $$resource from state...\"; terraform state rm \"$$resource\" || echo \"Failed to remove $$resource\"; done; else echo \"No kubernetes_namespace resources found in state.\"; fi'"
   }
 }
 
@@ -621,7 +621,7 @@ resource "terraform_data" "deployment_information" {
           ELAPSED=$((i * 30))
           MIN=$((ELAPSED / 60))
           SEC=$((ELAPSED % 60))
-          echo -e "\033[0;33m⏱️  Deployment in progress... Elapsed time: ${MIN}m ${SEC}s\033[0m"
+          echo -e "\033[0;33m⏱️  Deployment in progress... Elapsed time: $${MIN}m $${SEC}s\033[0m"
         done
       ) &
     EOT
@@ -644,18 +644,18 @@ resource "terraform_data" "deployment_completion_information" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      # Get elapsed time since start
+                   # Get elapsed time since start
       if [ -f /tmp/tf_start_time.txt ]; then
-        START_TIME=$(cat /tmp/tf_start_time.txt)
-        NOW=$(date +%s)
-        ELAPSED=$((NOW - START_TIME))
-        MINS=$((ELAPSED / 60))
-        SECS=$((ELAPSED % 60))
-        
-        echo -e "\033[1;34m========================================================\033[0m"
-        echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
-        echo -e "\033[1;34m========================================================\033[0m"
-        echo -e "\033[0;33m⏱️  Total deployment time: ${MINS}m ${SECS}s\033[0m"
+        START_TIME=$$(cat /tmp/tf_start_time.txt)
+        NOW=$$(date +%s)
+        ELAPSED=$$((NOW - START_TIME))
+        MINS=$$((ELAPSED / 60))
+        SECS=$$((ELAPSED % 60))
+         
+         echo -e "\033[1;34m========================================================\033[0m"
+         echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
+         echo -e "\033[1;34m========================================================\033[0m"
+         echo -e "\033[0;33m⏱️  Total deployment time: $${MINS}m $${SECS}s\033[0m"
       else
         echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
       fi
