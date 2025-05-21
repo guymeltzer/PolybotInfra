@@ -180,16 +180,34 @@ kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/
 
 # Wait for calico pods to be ready
 echo "$(date) - Waiting for Calico pods to become ready"
-kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers || true
+kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null || true
+
+# Disable the error trap for this section
+set +e
+
+# Wait for Calico pods to be ready
 for i in {1..10}; do
   echo "$(date) - Waiting for Calico to be ready (attempt $i/10)"
-  if kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | grep -q "Running"; then
-    echo "$(date) - Calico is ready"
+  
+  # Get pods and check for Running status - capture output to variable with no error exit
+  PODS=$(kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null || echo "")
+  echo "$(date) - Current Calico pods: $PODS"
+  
+  if echo "$PODS" | grep -q "Running"; then
+    echo "$(date) - ✅ Calico is ready!"
+    CALICO_READY=true
     break
   else
+    echo "$(date) - Calico not ready yet, waiting 15 seconds..."
     sleep 15
   fi
 done
+
+# Re-enable error handling
+set -e
+
+# Even if Calico isn't fully ready, continue with the script
+echo "$(date) - Continuing with setup - Calico initialization will complete in the background"
 
 # Create a service that runs every 10 minutes to ensure there's always a valid token AND updates the secret
 echo "$(date) - Setting up kubernetes token creation service"

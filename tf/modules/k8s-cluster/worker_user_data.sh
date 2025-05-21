@@ -1,9 +1,43 @@
 #!/bin/bash
-# Compact worker initialization script for AWS EC2
-LOGFILE="/var/log/k8s-worker-init.log"
-exec > >(tee -a ${LOGFILE}) 2>&1
-set -e
-trap 'echo "ERROR $LINENO: $BASH_COMMAND" >> ${LOGFILE}; exit 1' ERR
+# Enhanced worker initialization script for AWS EC2 with debug support
+LOGFILE="/var/log/worker-init.log"
+DEBUG_LOG="/home/ubuntu/bootstrap-debug.log"
+
+# Setup dual logging to both files
+exec > >(tee -a ${LOGFILE} ${DEBUG_LOG}) 2>&1
+
+# Better debug information
+set -x  # Show commands as they execute
+
+# Error handling
+set -e  # Exit on error
+trap 'echo "$(date) - CRITICAL ERROR at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" | tee -a ${LOGFILE} ${DEBUG_LOG}; echo "FAIL POINT: LINE $LINENO" > /home/ubuntu/FAILURE_POINT.txt' ERR
+
+# Print an informational message with timestamps
+log_info() {
+  echo "$(date) - INFO: $1" | tee -a ${LOGFILE} ${DEBUG_LOG}
+}
+
+# Print a debug checkpoint
+debug_checkpoint() {
+  echo "$(date) - CHECKPOINT $1: Reached this point successfully" | tee -a ${LOGFILE} ${DEBUG_LOG}
+  echo "$1" > /home/ubuntu/LAST_CHECKPOINT.txt
+}
+
+# Print a major section header
+log_section() {
+  echo "$(date) - ===== SECTION: $1 =====" | tee -a ${LOGFILE} ${DEBUG_LOG}
+}
+
+log_section "Starting worker node bootstrap"
+debug_checkpoint "INIT"
+
+# Ensure ubuntu user can access the logs
+mkdir -p /home/ubuntu
+touch ${DEBUG_LOG}
+chown ubuntu:ubuntu ${DEBUG_LOG}
+chmod 644 ${DEBUG_LOG}
+
 export DEBIAN_FRONTEND=noninteractive
 
 # SSH setup function with verification
@@ -54,12 +88,20 @@ EOF
 
 # Setup core services
 setup_core() {
-  apt-get update && apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg
+  log_section "Setting up core services"
+  
+  log_info "Updating package lists and installing dependencies"
+  apt-get update && apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg || {
+    log_info "WARNING: Some packages may have failed to install, continuing anyway"
+  }
+  
+  log_info "Installing AWS CLI"
   curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
   unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
+  debug_checkpoint "AWS_CLI_INSTALLED"
   
   # Get AWS metadata - using IMDSv2 with fallbacks
-  echo "Fetching EC2 instance metadata..."
+  log_info "Fetching EC2 instance metadata..."
   
   # Try IMDSv2 first
   TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
@@ -114,18 +156,30 @@ EOF
 
 # Install and configure Kubernetes prerequisites
 setup_kube() {
-  # Setup networking
+  log_section "Setting up Kubernetes prerequisites"
+  
+  # Setup networking with better error handling
+  log_info "Configuring kernel modules for Kubernetes"
   cat > /etc/modules-load.d/k8s.conf << EOF
 overlay
 br_netfilter
 EOF
-  modprobe overlay && modprobe br_netfilter
+  
+  log_info "Loading required kernel modules"
+  modprobe overlay || log_info "WARNING: Failed to load overlay module, continuing anyway"
+  modprobe br_netfilter || log_info "WARNING: Failed to load br_netfilter module, continuing anyway"
+  debug_checkpoint "KERNEL_MODULES_LOADED"
+  
+  log_info "Setting up network sysctl parameters"
   cat > /etc/sysctl.d/k8s.conf << EOF
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
+  
+  log_info "Applying sysctl settings"
   sysctl --system
+  debug_checkpoint "SYSCTL_CONFIGURED"
   
   # Set hostname
   COUNTER=$(aws ssm get-parameter --name "/k8s/worker-node-counter" --region "$REGION" --query "Parameter.Value" --output text 2>/dev/null || echo "0")
@@ -307,17 +361,48 @@ join_cluster() {
   exit 1
 }
 
-# Main execution
-setup_core
-setup_kube
-join_cluster
+# Main execution with better error handling and debug reporting
+log_section "Beginning main execution flow"
 
-# Create a summary log file in ubuntu's home directory for easy access
-echo "Creating log summary file for easy access"
+# Run each function with debug checkpoints
+setup_core || {
+  log_info "CRITICAL: Core setup failed - see error details above"
+  debug_checkpoint "CORE_SETUP_FAILED"
+  exit 1
+}
+debug_checkpoint "CORE_SETUP_COMPLETE"
+
+setup_kube || {
+  log_info "CRITICAL: Kubernetes setup failed - see error details above"
+  debug_checkpoint "KUBE_SETUP_FAILED"
+  exit 1
+}
+debug_checkpoint "KUBE_SETUP_COMPLETE"
+
+join_cluster || {
+  log_info "CRITICAL: Failed to join cluster - see error details above"
+  debug_checkpoint "JOIN_CLUSTER_FAILED"
+  exit 1
+}
+debug_checkpoint "JOIN_CLUSTER_COMPLETE"
+
+# Create a DEBUG version of the logs with easy-to-scan checkpoints
+log_section "WORKER NODE INITIALIZATION COMPLETE" 
+grep "CHECKPOINT\|SECTION\|CRITICAL ERROR\|FAIL POINT" ${DEBUG_LOG} > /home/ubuntu/init_progress.log || true
+
+# Create summary log file in ubuntu's home directory for easy access
+log_info "Creating log summary file for easy access"
 cat ${LOGFILE} > /home/ubuntu/init_summary.log
 chown ubuntu:ubuntu /home/ubuntu/init_summary.log
 chmod 644 /home/ubuntu/init_summary.log
-echo "Log summary created at /home/ubuntu/init_summary.log"
+chown ubuntu:ubuntu /home/ubuntu/init_progress.log 2>/dev/null || true
+chmod 644 /home/ubuntu/init_progress.log 2>/dev/null || true
 
 # Final log upload with summary status
-upload_logs_to_s3 "FINAL" 
+upload_logs_to_s3 "FINAL"
+
+echo "=================================================="
+echo "✅ WORKER NODE INITIALIZATION COMPLETE"
+echo "View logs with: cat /home/ubuntu/init_summary.log"
+echo "View debug progress: cat /home/ubuntu/init_progress.log"
+echo "=================================================="

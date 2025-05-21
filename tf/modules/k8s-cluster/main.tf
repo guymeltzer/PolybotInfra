@@ -536,6 +536,10 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 # Create a terraform_data resource that tracks changes to the script file
 resource "terraform_data" "control_plane_script_hash" {
   input = filesha256("${path.module}/control_plane_user_data.sh")
+  # Force rebuild due to script fix
+  triggers_replace = {
+    rebuild = timestamp()
+  }
 }
 
 # Progress reporter to show what's happening during deployment
