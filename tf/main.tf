@@ -155,9 +155,21 @@ EOF
 
 # Wait for Kubernetes API to be fully available
 resource "null_resource" "wait_for_kubernetes" {
+  # Completely disable this resource during destroy
   count = local.destroy_mode ? 0 : 1
-  
+  # Make sure this only runs after the cluster setup starts
   depends_on = [module.k8s-cluster]
+
+  # Run only when needed by adding a dynamic trigger
+  triggers = {
+    # This will ensure it runs only when needed
+    cluster_id = try(module.k8s-cluster.control_plane_id, "no-id-yet")
+    # Always run if the hash of the scripts changes
+    script_hash = join("", [
+      try(module.k8s-cluster.control_plane_script_hash, ""),
+      try(module.k8s-cluster.worker_script_hash, "")
+    ])
+  }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -752,39 +764,26 @@ resource "terraform_data" "deployment_completion_information" {
   }
 }
 
-# Add these dummy providers to prevent connection errors during destroy
+# Configure Kubernetes providers with intentionally invalid/unusable configurations
+# This block only appears in main.tf for reference but isn't actually used during destroy
 provider "kubernetes" {
-  # Configure a deliberately invalid configuration that won't attempt connections
-  host = "https://example.invalid"
-  
-  # Skip validation and prevent connection attempts
-  ignore_annotations = [".*"]
-  ignore_labels      = [".*"]
-  
-  # Only use insecure flag without certificates
+  # Never actually used - just to avoid provider errors without attempting connections
+  host = "https://127.0.0.1:1"
   insecure = true
-  token    = "no-connect"
 }
 
 provider "helm" {
-  # Configure a dummy setup that won't attempt connections
+  # Never actually used - just to avoid provider errors without attempting connections
   kubernetes {
-    # Configure a deliberately invalid configuration that won't attempt connections
-    host = "https://example.invalid"
-    
-    # Only use insecure flag without certificates
+    host = "https://127.0.0.1:1"
     insecure = true
-    token    = "no-connect"
   }
 }
 
 provider "kubectl" {
-  # Configure a deliberately invalid configuration that won't attempt connections
-  host = "https://example.invalid"
-  
-  # Only use insecure flag without certificates
-  insecure        = true
-  token           = "no-connect"
+  # Never actually used - just to avoid provider errors without attempting connections
+  host = "https://127.0.0.1:1"
+  insecure = true
   load_config_file = false
 }
 
