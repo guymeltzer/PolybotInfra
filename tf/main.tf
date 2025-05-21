@@ -426,10 +426,10 @@ resource "null_resource" "create_namespaces" {
         local spinstr='|/-\'
         echo -n "   "
         while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-          local temp=${spinstr#?}
+          local temp=$${spinstr#?}
           printf "\r\033[0;33m⏱️  Waiting for API server... %c\033[0m" "$spinstr"
-          local spinstr=$temp${spinstr%"$temp"}
-          sleep $delay
+          local spinstr=$temp$${spinstr%"$temp"}
+          sleep $$delay
         done
         printf "\r   \033[0;33m⏱️  Continuing...\033[0m                      \n"
       }
