@@ -588,8 +588,7 @@ resource "null_resource" "cluster_readiness_info" {
 }
 
 terraform {
-  # Speed up parallel operations
-  experiments = [dependency]
+  # Standard configuration without experimental features
 }
 
 # Display important information at the start of deployment
