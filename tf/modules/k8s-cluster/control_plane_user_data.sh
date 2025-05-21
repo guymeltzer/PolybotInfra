@@ -118,7 +118,7 @@ echo "Instance ID: $INSTANCE_ID"
 echo "Private IP: $PRIVATE_IP"
 echo "Public IP: $PUBLIC_IP"
 echo "Hostname: $(hostname -f)"
-
+#
 # Set up hostname if not already done
 if [ -n "$PRIVATE_IP" ]; then
   hostnamectl set-hostname "ip-${PRIVATE_IP//./-}.ec2.internal"
