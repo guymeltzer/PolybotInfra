@@ -513,7 +513,7 @@ resource "aws_iam_role_policy" "control_plane_secrets_manager_policy" {
         Action = [
           "secretsmanager:UpdateSecret"
         ]
-        Resource = "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command-*"
+        Resource = "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command*"
       },
       {
         Effect = "Allow"
@@ -536,6 +536,24 @@ resource "aws_iam_instance_profile" "control_plane_profile" {
 # Create a terraform_data resource that tracks changes to the script file
 resource "terraform_data" "control_plane_script_hash" {
   input = filesha256("${path.module}/control_plane_user_data.sh")
+}
+
+# Progress reporter to show what's happening during deployment
+resource "terraform_data" "deployment_progress" {
+  triggers_replace = {
+    # Always run at the beginning of every terraform apply
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      echo -e "\\033[1;34m========================================================\\033[0m"
+      echo -e "\\033[1;34m     🚀 Starting Kubernetes Cluster Deployment 🚀\\033[0m"
+      echo -e "\\033[1;34m========================================================\\033[0m"
+      echo -e "\\033[0;32m➡️  Step 1/4: Launching Control Plane Instance...\\033[0m"
+    EOT
+  }
 }
 
 resource "aws_instance" "control_plane" {
@@ -584,7 +602,8 @@ resource "aws_instance" "control_plane" {
   }
 
   depends_on = [
-    module.vpc
+    module.vpc,
+    terraform_data.deployment_progress
   ]
 
   lifecycle {
@@ -594,6 +613,12 @@ resource "aws_instance" "control_plane" {
     replace_triggered_by = [
       terraform_data.control_plane_script_hash
     ]
+  }
+
+  # Add a provisioner to report progress
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = "echo -e \"\\033[0;32m✅ Control Plane instance launched! Instance ID: ${self.id}\\033[0m\""
   }
 }
 
@@ -1191,6 +1216,21 @@ resource "terraform_data" "worker_script_hash" {
   input = filemd5("${path.module}/worker_user_data.sh")
 }
 
+# Progress reporter for worker nodes
+resource "terraform_data" "worker_progress" {
+  depends_on = [aws_instance.control_plane]
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      echo -e "\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes...\\033[0m"
+    EOT
+  }
+}
+
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
@@ -1238,6 +1278,12 @@ resource "aws_launch_template" "worker_lt" {
     null_resource.wait_for_control_plane,
     terraform_data.worker_script_hash
   ]
+
+  # Report progress
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = "echo -e \"\\033[0;32m✅ Worker launch template created! Template ID: ${self.id}\\033[0m\""
+  }
 }
 
 # Force update ASG when worker script changes
@@ -1300,7 +1346,8 @@ resource "aws_autoscaling_group" "worker_asg" {
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
-    terraform_data.force_asg_update
+    terraform_data.force_asg_update,
+    terraform_data.worker_progress
   ]
   
   lifecycle {
@@ -1308,6 +1355,12 @@ resource "aws_autoscaling_group" "worker_asg" {
     replace_triggered_by = [
       terraform_data.worker_script_hash
     ]
+  }
+
+  # Report progress after ASG is created
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = "echo -e \"\\033[0;32m✅ Worker node Auto Scaling Group '${var.cluster_name}-worker-asg' created!\\033[0m\""
   }
 }
 
@@ -1974,5 +2027,44 @@ resource "aws_s3_bucket_acl" "worker_logs" {
   depends_on = [aws_s3_bucket_ownership_controls.worker_logs]
   bucket = aws_s3_bucket.worker_logs.id
   acl    = "private"
+}
+
+# Final progress reporter
+resource "terraform_data" "completion_progress" {
+  depends_on = [
+    aws_autoscaling_group.worker_asg,
+    aws_instance.control_plane
+  ]
+  
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      echo -e "\\033[0;32m➡️  Step 3/4: All infrastructure created, waiting for cluster initialization...\\033[0m"
+      echo -e "\\033[0;33m⏱️  This may take 5-10 minutes. Kubernetes components are being installed.\\033[0m"
+      echo -e "\\033[0;33m⏱️  You can check the outputs for SSH commands to view initialization logs.\\033[0m"
+      
+      # Check control plane status every minute for up to 5 minutes
+      for i in {1..5}; do
+        echo -e "\\033[0;33m⏱️  Checking control plane status (attempt $i/5)...\\033[0m"
+        # Try to SSH to the control plane and check if nodes are ready
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@${aws_instance.control_plane.public_ip} "kubectl get nodes" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          echo -e "\\033[0;32m✅ Step 4/4: Kubernetes cluster is ready!\\033[0m"
+          echo -e "\\033[1;34m========================================================\\033[0m"
+          echo -e "\\033[1;34m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
+          echo -e "\\033[1;34m========================================================\\033[0m"
+          exit 0
+        fi
+        sleep 60
+      done
+      
+      echo -e "\\033[0;33m⚠️  Control plane still initializing. Check logs for progress.\\033[0m"
+      echo -e "\\033[1;34m========================================================\\033[0m"
+    EOT
+  }
 }
 

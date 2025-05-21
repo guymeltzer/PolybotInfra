@@ -461,7 +461,7 @@ module "k8s-cluster" {
   ]
 
   # Start with the initialization resource that creates a valid kubeconfig
-  depends_on = [terraform_data.init_environment]
+  depends_on = [terraform_data.init_environment, terraform_data.deployment_information]
 }
 
 # Install EBS CSI Driver for persistent storage
@@ -592,7 +592,76 @@ terraform {
   experiments = [dependency]
 }
 
-# Set Terraform parallelism in a supported location
-provider "terraform" {
-  parallelism = 10
+# Display important information at the start of deployment
+resource "terraform_data" "deployment_information" {
+  # Always run at the beginning of every terraform apply
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      # Save the start time for later tracking
+      date +%s > /tmp/tf_start_time.txt
+      
+      echo -e "\033[1;34m========================================================\033[0m"
+      echo -e "\033[1;34m     🚀 Polybot Kubernetes Deployment Started 🚀\033[0m"
+      echo -e "\033[1;34m========================================================\033[0m"
+      echo -e "\033[0;33m⏱️  This deployment takes approximately 10 minutes.\033[0m"
+      echo -e "\033[0;33m⏱️  Progress indicators will be displayed throughout.\033[0m"
+      echo -e "\033[0;33m⏱️  Colorful status updates will show deployment stages.\033[0m"
+      echo -e "\033[0;33m⏱️  The first 5 minutes are AWS resources creation.\033[0m"
+      echo -e "\033[0;33m⏱️  The next 5 minutes are Kubernetes initialization.\033[0m"
+      echo -e "\033[0;32m➡️  Beginning infrastructure deployment now...\033[0m"
+      
+      # Set up a progress monitor in the background
+      (
+        for i in {1..20}; do
+          sleep 30
+          ELAPSED=$((i * 30))
+          MIN=$((ELAPSED / 60))
+          SEC=$((ELAPSED % 60))
+          echo -e "\033[0;33m⏱️  Deployment in progress... Elapsed time: ${MIN}m ${SEC}s\033[0m"
+        done
+      ) &
+    EOT
+  }
 }
+
+# Final progress information and timing resource
+resource "terraform_data" "deployment_completion_information" {
+  depends_on = [
+    module.k8s-cluster,
+    module.polybot_dev,
+    module.polybot_prod
+  ]
+
+  # Always run at the end of every terraform apply
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      # Get elapsed time since start
+      if [ -f /tmp/tf_start_time.txt ]; then
+        START_TIME=$(cat /tmp/tf_start_time.txt)
+        NOW=$(date +%s)
+        ELAPSED=$((NOW - START_TIME))
+        MINS=$((ELAPSED / 60))
+        SECS=$((ELAPSED % 60))
+        
+        echo -e "\033[1;34m========================================================\033[0m"
+        echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
+        echo -e "\033[1;34m========================================================\033[0m"
+        echo -e "\033[0;33m⏱️  Total deployment time: ${MINS}m ${SECS}s\033[0m"
+      else
+        echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
+      fi
+    EOT
+  }
+}
+
+
