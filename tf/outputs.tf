@@ -294,26 +294,30 @@ resource "null_resource" "format_outputs" {
       
       # Create visually appealing output without ANSI color codes
       cat > /tmp/final_output.txt << 'EOF'
-🎉 =================================================================== 🎉
+=================================================================
                 POLYBOT KUBERNETES CLUSTER DEPLOYMENT
-🎉 =================================================================== 🎉
+=================================================================
 
 EOF
       
       # ----- ARGOCD INFO -----
-      if [ -f "/tmp/argocd-info.txt" ]; then
-        cat /tmp/argocd-info.txt >> /tmp/final_output.txt
-      else
-        echo -e "🔐 ArgoCD Access" >> /tmp/final_output.txt
-        echo -e "-------------------" >> /tmp/final_output.txt
-        echo -e "URL: https://localhost:8081" >> /tmp/final_output.txt
-        echo -e "Username: admin" >> /tmp/final_output.txt
-        echo -e "Password: Password managed automatically by Terraform" >> /tmp/final_output.txt
-        echo "" >> /tmp/final_output.txt
+      echo -e "🔐 ARGOCD ACCESS" >> /tmp/final_output.txt
+      echo -e "-------------------" >> /tmp/final_output.txt
+      
+      # Get password if available
+      ARGOCD_PASSWORD=""
+      if [ -f "/tmp/argocd-admin-password.txt" ]; then
+        ARGOCD_PASSWORD=$(cat /tmp/argocd-admin-password.txt)
       fi
       
+      echo -e "URL: https://localhost:8081" >> /tmp/final_output.txt
+      echo -e "Username: admin" >> /tmp/final_output.txt
+      echo -e "Password: $ARGOCD_PASSWORD" >> /tmp/final_output.txt
+      echo -e "Connection: Run ~/argocd-ssh-tunnel.sh" >> /tmp/final_output.txt
+      echo "" >> /tmp/final_output.txt
+      
       # ----- CONTROL PLANE INFO -----
-      echo -e "\n🔧 Control Plane" >> /tmp/final_output.txt
+      echo -e "🔧 CONTROL PLANE" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
       PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
@@ -332,53 +336,59 @@ EOF
       echo "" >> /tmp/final_output.txt
       
       # ----- WORKER NODES INFO -----
-      echo -e "🖥️ Worker Nodes" >> /tmp/final_output.txt
+      echo -e "🖥️ WORKER NODES" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
       
-      if [ -f "/tmp/worker_nodes_formatted.txt" ]; then
-        # Count the nodes by counting the separator pattern
-        NODE_COUNT=$(grep -c "\-\-\-" /tmp/worker_nodes_formatted.txt || echo 0)
-        echo -e "Worker Count: $NODE_COUNT" >> /tmp/final_output.txt
-        echo "" >> /tmp/final_output.txt
-        
-        # Format worker nodes without using ANSI escape sequences
-        echo -e "Worker Nodes Details:" >> /tmp/final_output.txt
-        
-        # Use a simple approach to format worker details
-        WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
-          --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
-          --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
-          --output json)
+      # Directly get worker node information from AWS to be more reliable
+      WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
+        --output json)
           
-        # Format without escape sequences
-        echo "$WORKER_DATA" | jq -r '.[][] | "- " + .Name + ": ID: " + .ID + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State' >> /tmp/final_output.txt
+      # Count the number of worker nodes
+      NODE_COUNT=$(echo "$WORKER_DATA" | jq -r '.[][][]' | grep "ID" | wc -l)
+      echo -e "Worker Count: $NODE_COUNT" >> /tmp/final_output.txt
+      
+      # Format worker details
+      if [ "$NODE_COUNT" -gt 0 ]; then
+        echo -e "\nWorker Node Details:" >> /tmp/final_output.txt
+        
+        # Get running worker nodes with their public IPs
+        WORKER_LINES=$(echo "$WORKER_DATA" | jq -r '.[][] | "- " + .Name + ": ID: " + .ID + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State')
+        echo "$WORKER_LINES" >> /tmp/final_output.txt
+        
+        # Extract worker node log commands for later use
+        echo -e "\nWorker Node SSH Commands:" >> /tmp/final_output.txt
+        echo "$WORKER_DATA" | jq -r '.[][] | "ssh -i polybot-key.pem ubuntu@" + .PublicIP + " # " + .Name' >> /tmp/final_output.txt
       else
-        echo -e "No worker node information available yet" >> /tmp/final_output.txt
+        echo -e "No worker nodes found. They may still be starting up." >> /tmp/final_output.txt
       fi
+      echo "" >> /tmp/final_output.txt
       
       # ----- LOGS AND TROUBLESHOOTING -----
-      echo -e "\n📜 Logs and Troubleshooting" >> /tmp/final_output.txt
+      echo -e "📜 LOGS AND TROUBLESHOOTING" >> /tmp/final_output.txt
       echo -e "----------------------------" >> /tmp/final_output.txt
       
       echo -e "Control Plane Init Log:" >> /tmp/final_output.txt
       echo -e "ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
-      # Add dynamic worker logs without escape sequences
-      if [ -f "/tmp/worker_log_commands.txt" ]; then
+      # Add worker node log commands
+      if [ "$NODE_COUNT" -gt 0 ]; then
         echo -e "Worker Node Init Logs:" >> /tmp/final_output.txt
-        grep -v "^#" /tmp/worker_log_commands.txt >> /tmp/final_output.txt
+        echo "$WORKER_DATA" | jq -r '.[][] | "ssh -i polybot-key.pem ubuntu@" + .PublicIP + " \"cat /home/ubuntu/init_summary.log\" # " + .Name' >> /tmp/final_output.txt
+        echo "" >> /tmp/final_output.txt
       fi
       
       # ----- KUBERNETES ACCESS -----
-      echo -e "\n☸️ Kubernetes Access" >> /tmp/final_output.txt
+      echo -e "☸️ KUBERNETES ACCESS" >> /tmp/final_output.txt
       echo -e "---------------------" >> /tmp/final_output.txt
       echo -e "API Endpoint: https://$PUBLIC_IP:6443" >> /tmp/final_output.txt
-      echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=\$\$(pwd)/kubeconfig.yaml" >> /tmp/final_output.txt
+      echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
       # ----- APPLICATION ENDPOINTS -----
-      echo -e "🌐 Application Endpoints" >> /tmp/final_output.txt
+      echo -e "🌐 APPLICATION ENDPOINTS" >> /tmp/final_output.txt
       echo -e "------------------------" >> /tmp/final_output.txt
       echo -e "Dev URL:  https://dev-polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
       echo -e "Prod URL: https://polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
@@ -392,8 +402,8 @@ EOF
       echo "" >> /tmp/final_output.txt
       
       # ----- CLOSING -----
-      echo -e "✅ Terraform Deployment Complete!" >> /tmp/final_output.txt
-      echo -e "=================================================================" >> /tmp/final_output.txt
+      echo -e "✅ TERRAFORM DEPLOYMENT COMPLETE" >> /tmp/final_output.txt
+      echo -e "==========================================" >> /tmp/final_output.txt
     EOT
   }
 
@@ -408,4 +418,75 @@ EOF
 output "complete_deployment_info" {
   description = "Complete formatted deployment information"
   value = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
+}
+
+# Define a clean local value with all the output information
+locals {
+  # Clean, complete deployment info that doesn't show heredoc markers
+  deployment_info = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
+  
+  # ArgoCD password for reference
+  argocd_password = fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet"
+}
+
+# Single consolidated output for all deployment information
+output "deployment_info" {
+  description = "Complete deployment information including access details, node information, and endpoints"
+  value = local.deployment_info
+}
+
+# Cleaner output just for ArgoCD (without heredoc markers)
+output "argocd" {
+  description = "ArgoCD access information"
+  value = trimspace(<<-EOF
+    URL: https://localhost:8081
+    Username: admin
+    Password: ${local.argocd_password}
+    Connect: Run ~/argocd-ssh-tunnel.sh to establish the connection
+  EOF
+  )
+}
+
+# For script access, provide important values as structured data
+output "cluster" {
+  description = "Essential cluster information for scripts"
+  value = {
+    api_endpoint = module.k8s-cluster.kubernetes_api_endpoint
+    control_plane = {
+      public_ip = module.k8s-cluster.control_plane_public_ip
+      ssh = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
+    }
+    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml"
+    alb_dns = module.k8s-cluster.alb_dns_name
+  }
+}
+
+# Endpoints for easy access
+output "endpoints" {
+  description = "Application endpoints"
+  value = {
+    dev = "https://dev-polybot.${terraform.workspace}.devops-int-college.com"
+    prod = "https://polybot.${terraform.workspace}.devops-int-college.com"
+    argocd = "https://localhost:8081 (Run ~/argocd-ssh-tunnel.sh first)"
+  }
+}
+
+# AWS resources
+output "aws_resources" {
+  description = "AWS resources created for the application"
+  value = {
+    vpc_id = module.k8s-cluster.vpc_id
+    subnets = module.k8s-cluster.public_subnet_ids
+    ssh_key = module.k8s-cluster.ssh_key_name
+    dev = {
+      s3_bucket = module.polybot_dev.s3_bucket_name
+      sqs_queue = module.polybot_dev.sqs_queue_url
+      domain = module.polybot_dev.domain_name
+    }
+    prod = {
+      s3_bucket = module.polybot_prod.s3_bucket_name
+      sqs_queue = module.polybot_prod.sqs_queue_url
+      domain = module.polybot_prod.domain_name
+    }
+  }
 }
