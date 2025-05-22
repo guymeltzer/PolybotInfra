@@ -336,19 +336,19 @@ EOF
       echo -e "-------------------" >> /tmp/final_output.txt
       
       if [ -f "/tmp/worker_nodes_formatted.txt" ]; then
-        # Count the nodes by counting the '---' separators plus 1
-        NODE_COUNT=$(grep -c "---" /tmp/worker_nodes_formatted.txt || echo 0)
+        # Count the nodes by counting the separator pattern
+        NODE_COUNT=$(grep -c "\-\-\-" /tmp/worker_nodes_formatted.txt || echo 0)
         echo -e "Worker Count: \033[1;32m$NODE_COUNT\033[0m" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
         
         # Replace the plain formatting with colorful output
         cat /tmp/worker_nodes_formatted.txt | \
-          sed 's/Name: /\\\033[1;33mName: \\\033[1;36m/' | \
-          sed 's/InstanceId: /\\\033[0m\\\033[1;33mInstanceId: \\\033[1;32m/' | \
-          sed 's/PrivateIP: /\\\033[0m\\\033[1;33mPrivateIP: \\\033[1;37m/' | \
-          sed 's/PublicIP: /\\\033[0m\\\033[1;33mPublicIP: \\\033[1;37m/' | \
-          sed 's/State: /\\\033[0m\\\033[1;33mState: \\\033[1;32m/' | \
-          sed 's/---/\\\033[0m\\\n/' >> /tmp/final_output.txt
+          sed 's/Name: /\\\\033[1;33mName: \\\\033[1;36m/' | \
+          sed 's/InstanceId: /\\\\033[0m\\\\033[1;33mInstanceId: \\\\033[1;32m/' | \
+          sed 's/PrivateIP: /\\\\033[0m\\\\033[1;33mPrivateIP: \\\\033[1;37m/' | \
+          sed 's/PublicIP: /\\\\033[0m\\\\033[1;33mPublicIP: \\\\033[1;37m/' | \
+          sed 's/State: /\\\\033[0m\\\\033[1;33mState: \\\\033[1;32m/' | \
+          sed 's/---/\\\\033[0m\\\\n/' >> /tmp/final_output.txt
       else
         echo -e "\033[1;33mNo worker node information available yet\033[0m" >> /tmp/final_output.txt
       fi
@@ -364,7 +364,7 @@ EOF
       # Add dynamic worker logs
       if [ -f "/tmp/worker_log_commands.txt" ]; then
         echo -e "\033[1;33mWorker Node Init Logs:\033[0m" >> /tmp/final_output.txt
-        cat /tmp/worker_log_commands.txt | sed 's/ssh -i/\\\033[1;36mssh -i/' | sed 's/log\'/log\\\033[0m\\\'\033[0m/' >> /tmp/final_output.txt
+        cat /tmp/worker_log_commands.txt | sed 's/ssh -i/\\\\033[1;36mssh -i/' | sed 's/log'\''/log\\\\033[0m'\''/g' >> /tmp/final_output.txt
       fi
       
       # ----- KUBERNETES ACCESS -----
