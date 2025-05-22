@@ -756,26 +756,23 @@ resource "null_resource" "argocd_port_forward_service" {
       KUBECONFIG="${local.kubeconfig_path}"
       CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
       
-      # Create service file
+      # Create service file with direct substitution
       mkdir -p ~/.config/systemd/user/
-      cat > ~/.config/systemd/user/argocd-port-forward.service << 'EOSVC'
+      cat > ~/.config/systemd/user/argocd-port-forward.service << EOF
 [Unit]
 Description=ArgoCD Port Forward
 After=network.target
 
 [Service]
 Type=simple
-Environment="KUBECONFIG=${KUBECONFIG_PATH}"
-ExecStart=/usr/bin/kubectl --kubeconfig=${KUBECONFIG_PATH} port-forward svc/argocd-server -n argocd 8080:443
+Environment="KUBECONFIG=$KUBECONFIG"
+ExecStart=/usr/bin/kubectl --kubeconfig=$KUBECONFIG port-forward svc/argocd-server -n argocd 8080:443
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=default.target
-EOSVC
-
-      # Replace the placeholder with the actual path
-      sed -i "s|\${KUBECONFIG_PATH}|$KUBECONFIG|g" ~/.config/systemd/user/argocd-port-forward.service
+EOF
       
       # Enable and start the service
       systemctl --user daemon-reload
