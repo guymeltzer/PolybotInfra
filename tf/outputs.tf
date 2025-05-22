@@ -137,16 +137,16 @@ resource "null_resource" "argocd_password_retriever" {
 ---------------------------
 INFOEOF
       
-      echo -e "🌐 URL: \033[1;36mhttps://localhost:8081\033[0m (Run ./argocd-connect.sh start to start port forwarding)" >> /tmp/argocd-info.txt
+      echo -e "🌐 URL: \033[1;36mhttps://localhost:8081\033[0m (Port forwarding running automatically)" >> /tmp/argocd-info.txt
       echo -e "👤 Username: \033[1;32madmin\033[0m" >> /tmp/argocd-info.txt
       echo -e "🔑 Password: \033[1;32m$(cat /tmp/argocd-password-output.txt)\033[0m" >> /tmp/argocd-info.txt
       echo "" >> /tmp/argocd-info.txt
-      echo -e "Note: If port forwarding isn't working, run: \033[1;33m./argocd-connect.sh\033[0m" >> /tmp/argocd-info.txt
+      echo -e "Note: Port forwarding is managed automatically by Terraform" >> /tmp/argocd-info.txt
     EOT
   }
 
   depends_on = [
-    null_resource.argocd_access_helper
+    null_resource.argocd_direct_access
   ]
 }
 
@@ -309,7 +309,7 @@ EOF
         echo -e "-------------------" >> /tmp/final_output.txt
         echo -e "URL: \033[1;36mhttps://localhost:8081\033[0m" >> /tmp/final_output.txt
         echo -e "Username: \033[1;32madmin\033[0m" >> /tmp/final_output.txt
-        echo -e "Password: Run argocd-connect.sh to retrieve" >> /tmp/final_output.txt
+        echo -e "Password: Password managed automatically by Terraform" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
       fi
       
@@ -397,7 +397,7 @@ EOF
     null_resource.argocd_password_retriever,
     null_resource.worker_node_details,
     null_resource.dynamic_worker_logs,
-    null_resource.argocd_access_helper
+    null_resource.argocd_direct_access
   ]
 }
 
