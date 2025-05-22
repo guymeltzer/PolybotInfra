@@ -765,8 +765,8 @@ After=network.target
 
 [Service]
 Type=simple
-Environment="KUBECONFIG=${KUBECONFIG}"
-ExecStart=/usr/bin/kubectl --kubeconfig=${KUBECONFIG} port-forward svc/argocd-server -n argocd 8080:443
+Environment="KUBECONFIG=${KUBECONFIG_PATH}"
+ExecStart=/usr/bin/kubectl --kubeconfig=${KUBECONFIG_PATH} port-forward svc/argocd-server -n argocd 8080:443
 Restart=always
 RestartSec=10
 
@@ -774,6 +774,9 @@ RestartSec=10
 WantedBy=default.target
 EOSVC
 
+      # Replace the placeholder with the actual path
+      sed -i "s|\${KUBECONFIG_PATH}|$KUBECONFIG|g" ~/.config/systemd/user/argocd-port-forward.service
+      
       # Enable and start the service
       systemctl --user daemon-reload
       systemctl --user enable argocd-port-forward.service
