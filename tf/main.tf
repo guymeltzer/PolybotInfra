@@ -496,42 +496,6 @@ EOF
   }
 }
 
-# Add cleanup resources for proper port forwarding termination during terraform destroy
-resource "terraform_data" "argocd_port_forward_cleanup" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [null_resource.argocd_direct_access]
-  
-  # Use only one trigger to avoid issues
-  triggers_replace = {
-    argocd_access_id = null_resource.argocd_direct_access[0].id
-  }
-  
-  # Empty provisioner for creation - this ensures nothing runs during apply
-  provisioner "local-exec" {
-    command = "echo 'ArgoCD SSH tunnel cleanup will happen during destroy'"
-  }
-  
-  # Add proper cleanup during destroy operations
-  provisioner "local-exec" {
-    when = destroy
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
-      echo "Cleaning up ArgoCD port forwarding..."
-      
-      # Safely check if there are processes to kill before attempting pkill
-      if pgrep -f "ssh.*-L 8081:localhost:8081" >/dev/null; then
-        echo "Found SSH tunnel processes, cleaning up..."
-        pkill -f "ssh.*-L 8081:localhost:8081" || true
-      else
-        echo "No SSH tunnel processes found to clean up"
-      fi
-      
-      echo "Cleanup complete."
-    EOT
-  }
-}
-
 # Configure kubectl provider with credentials after waiting for the API to be ready
 resource "terraform_data" "kubectl_provider_config" {
   # Use a static count value
