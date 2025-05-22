@@ -1143,4 +1143,221 @@ module "polybot_prod" {
   docker_password       = var.docker_password
 }
 
+# Install NGINX Ingress Controller after ArgoCD is ready
+resource "null_resource" "install_nginx_ingress" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.argocd_direct_access
+  ]
+  
+  # Only run when needed
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Check if NGINX Ingress is already installed
+      if kubectl get ns ingress-nginx &>/dev/null && kubectl get deployment -n ingress-nginx ingress-nginx-controller &>/dev/null; then
+        echo "NGINX Ingress Controller already installed, skipping installation"
+        exit 0
+      fi
+      
+      echo "Creating ingress-nginx namespace..."
+      kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+      
+      echo "Installing NGINX Ingress Controller..."
+      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/aws/deploy.yaml
+      
+      # Wait for the Ingress Controller to be ready
+      echo "Waiting for NGINX Ingress Controller to be ready..."
+      kubectl -n ingress-nginx wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller || true
+      
+      echo "NGINX Ingress Controller installation complete"
+    EOT
+  }
+}
+
+# Now let's set up ArgoCD applications for polybot and its dependencies
+resource "null_resource" "configure_argocd_apps" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.install_nginx_ingress
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    argocd_install = null_resource.install_argocd[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Create MongoDB namespace
+      echo "Creating MongoDB namespace..."
+      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Create ArgoCD application manifests directory
+      mkdir -p /tmp/argocd-apps
+      
+      # Create MongoDB ArgoCD application
+      cat > /tmp/argocd-apps/mongodb-app.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mongodb
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://charts.bitnami.com/bitnami
+    chart: mongodb
+    targetRevision: 13.6.0
+    helm:
+      values: |
+        architecture: replicaset
+        replicaCount: 3
+        auth:
+          enabled: true
+          rootPassword: mongopassword
+          username: polybot
+          password: polybot
+          database: polybot
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mongodb
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+EOF
+      
+             # Create Polybot ArgoCD application
+      cat > /tmp/argocd-apps/polybot-app.yaml << EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: polybot
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/guymelef/polybot-helm-charts.git
+    path: charts/polybot
+    targetRevision: HEAD
+    helm:
+      values: |
+        image:
+          repository: guymelef/polybot
+          tag: latest
+        mongodb:
+          host: mongodb-0.mongodb-headless.mongodb.svc.cluster.local,mongodb-1.mongodb-headless.mongodb.svc.cluster.local,mongodb-2.mongodb-headless.mongodb.svc.cluster.local
+          replicaSet: rs0
+          user: polybot
+          password: polybot
+          database: polybot
+        s3Bucket: "$(aws s3 ls | grep polybot-prod | awk '{print $3}')"
+        sqsQueueUrl: "$(aws sqs list-queues --queue-name-prefix polybot-prod | jq -r '.QueueUrls[0]')"
+        telegramToken: ""
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+      
+      # Create Yolo5 ArgoCD application
+      cat > /tmp/argocd-apps/yolo5-app.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: yolo5
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/guymelef/yolo5-helm-charts.git
+    path: charts/yolo5
+    targetRevision: HEAD
+    helm:
+      values: |
+        image:
+          repository: guymelef/yolo5
+          tag: latest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+      
+      # Apply ArgoCD applications
+      echo "Applying ArgoCD applications..."
+      kubectl apply -f /tmp/argocd-apps/mongodb-app.yaml
+      kubectl apply -f /tmp/argocd-apps/polybot-app.yaml
+      kubectl apply -f /tmp/argocd-apps/yolo5-app.yaml
+      
+      echo "ArgoCD applications configured. They will start syncing automatically."
+      echo "Note: Update application sources with your own GitHub repositories as needed."
+    EOT
+  }
+}
+
+# Also install Calico as your CNI
+resource "null_resource" "install_calico" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.providers_ready,
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Check if Calico is already installed
+      if kubectl get ns tigera-operator &>/dev/null; then
+        echo "Calico already installed, skipping installation"
+        exit 0
+      fi
+      
+      echo "Installing Tigera Calico operator..."
+      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      
+      echo "Waiting a moment for the operator to start..."
+      sleep 10
+      
+      echo "Installing Calico custom resources..."
+      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
+      
+      echo "Calico installation initiated. It may take a few minutes to be fully operational."
+    EOT
+  }
+}
+
 
