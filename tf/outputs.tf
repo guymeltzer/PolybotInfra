@@ -15,9 +15,10 @@
 # Dynamically get worker node details (attempts to get them if available)
 resource "null_resource" "worker_node_details" {
   triggers = {
-    # Use meaningful changes as triggers instead of timestamp to avoid unnecessary runs
+    # Use meaningful triggers instead of timestamp
     worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
+    # Don't use filemd5 on kubeconfig as it changes during apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
   provisioner "local-exec" {
@@ -59,7 +60,8 @@ resource "null_resource" "argocd_password_retriever" {
   triggers = {
     # Only trigger when ArgoCD is installed or kubeconfig changes
     argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
+    # Don't use filemd5 on kubeconfig as it changes during apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
   provisioner "local-exec" {
@@ -153,7 +155,8 @@ resource "null_resource" "dynamic_worker_logs" {
   triggers = {
     # Use meaningful triggers instead of timestamp
     worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
+    # Don't use filemd5 on kubeconfig as it changes during apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
   provisioner "local-exec" {
@@ -272,7 +275,8 @@ resource "null_resource" "format_outputs" {
     worker_nodes = null_resource.worker_node_details.id
     argocd_password = null_resource.argocd_password_retriever.id
     worker_logs = null_resource.dynamic_worker_logs.id
-    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
+    # Don't use filemd5 on kubeconfig as it changes during apply
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
   provisioner "local-exec" {
