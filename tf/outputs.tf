@@ -1,16 +1,12 @@
+# REORGANIZED OUTPUTS - Structured into logical sections
+
+# ------------------------------------------------------------------------
+# Section 1: Kubernetes Infrastructure
+# ------------------------------------------------------------------------
+
 output "kubernetes_api_endpoint" {
   description = "Kubernetes API endpoint"
   value       = module.k8s-cluster.kubernetes_api_endpoint
-}
-
-output "control_plane_public_ip" {
-  description = "Control plane public IP address"
-  value       = module.k8s-cluster.control_plane_public_ip
-}
-
-output "control_plane_private_ip" {
-  description = "Control plane private IP address"
-  value       = module.k8s-cluster.control_plane_private_ip
 }
 
 output "vpc_id" {
@@ -23,10 +19,104 @@ output "load_balancer_address" {
   value       = module.k8s-cluster.alb_dns_name
 }
 
+output "subnet_ids" {
+  description = "Subnet IDs created for the Kubernetes cluster"
+  value       = module.k8s-cluster.public_subnet_ids
+}
+
+# ------------------------------------------------------------------------
+# Section 2: Control Plane Node Details
+# ------------------------------------------------------------------------
+
+output "control_plane_details" {
+  description = "Details of the control plane node"
+  value = {
+    instance_id = module.k8s-cluster.control_plane_instance_id
+    public_ip   = module.k8s-cluster.control_plane_public_ip
+    private_ip  = module.k8s-cluster.control_plane_private_ip
+    ssh_command = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
+  }
+}
+
+# ------------------------------------------------------------------------
+# Section 3: Worker Node Details
+# ------------------------------------------------------------------------
+
+output "worker_nodes_overview" {
+  description = "Overview of worker nodes"
+  value = <<-EOT
+    Worker Node Auto Scaling Group: ${module.k8s-cluster.worker_asg_name}
+    Worker Count: 2
+    Get detailed worker info with: 
+    aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-worker-node*" --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" --output table
+  EOT
+}
+
+output "worker_node_ssh_command" {
+  description = "SSH command template for worker nodes"
+  value       = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@WORKER_PUBLIC_IP (replace WORKER_PUBLIC_IP with the IP from the worker nodes list)"
+}
+
+# Dynamically get worker node details (attempts to get them if available)
+resource "null_resource" "worker_node_details" {
+  triggers = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    command = "aws ec2 describe-instances --region ${var.region} --filters \"Name=tag:Name,Values=guy-worker-node*\" --query \"Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PublicIP:PublicIpAddress}\" --output json > /tmp/worker_nodes.json || echo '[]' > /tmp/worker_nodes.json"
+  }
+}
+
+output "worker_nodes" {
+  description = "Worker node details"
+  value = fileexists("/tmp/worker_nodes.json") ? jsondecode(file("/tmp/worker_nodes.json")) : "Worker node details not available yet. Run the command in worker_nodes_overview"
+}
+
+# ------------------------------------------------------------------------
+# Section 4: Kubernetes Access Commands
+# ------------------------------------------------------------------------
+
 output "kubeconfig_command" {
   description = "Command to configure kubectl"
-  value       = "ssh ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$$(pwd)/kubeconfig.yaml"
+  value       = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$$(pwd)/kubeconfig.yaml"
 }
+
+output "init_logs_commands" {
+  description = "Commands to view initialization logs on control plane and worker nodes"
+  value       = module.k8s-cluster.init_logs_commands
+}
+
+# ------------------------------------------------------------------------
+# Section 5: ArgoCD Information
+# ------------------------------------------------------------------------
+
+output "argocd_url" {
+  description = "URL of the ArgoCD server (port forwarded)"
+  value       = "https://localhost:8080 (Automatically forwarded via: kubectl port-forward svc/argocd-server -n argocd 8080:443)"
+}
+
+output "argocd_admin_credentials" {
+  description = "ArgoCD admin credentials"
+  value = <<-EOT
+    Username: admin
+    Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo "Password will be available after deployment. Get it with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d; echo")
+  EOT
+}
+
+output "argocd_port_forward_command" {
+  description = "Manual command to port-forward ArgoCD UI"
+  value       = "kubectl port-forward svc/argocd-server -n argocd 8080:443"
+}
+
+output "argocd_password_command" {
+  description = "Command to get ArgoCD admin password"
+  value       = "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d; echo"
+}
+
+# ------------------------------------------------------------------------
+# Section 6: Polybot Application URLs
+# ------------------------------------------------------------------------
 
 output "polybot_dev_url" {
   description = "URL for accessing Polybot dev environment"
@@ -38,59 +128,38 @@ output "polybot_prod_url" {
   value       = "https://polybot.${terraform.workspace}.devops-int-college.com"
 }
 
-# Development Environment Outputs
-output "polybot_dev_s3_bucket" {
-  description = "Polybot Dev S3 bucket name"
-  value       = module.polybot_dev.s3_bucket_name
-}
-
-output "polybot_dev_sqs_queue_url" {
-  description = "Polybot Dev SQS queue URL"
-  value       = module.polybot_dev.sqs_queue_url
-}
-
-output "polybot_dev_domain" {
-  description = "Polybot Dev domain name"
-  value       = module.polybot_dev.domain_name
-}
-
-# Production Environment Outputs
-output "polybot_prod_s3_bucket" {
-  description = "Polybot Prod S3 bucket name"
-  value       = module.polybot_prod.s3_bucket_name
-}
-
-output "polybot_prod_sqs_queue_url" {
-  description = "Polybot Prod SQS queue URL"
-  value       = module.polybot_prod.sqs_queue_url
-}
-
-output "polybot_prod_domain" {
-  description = "Polybot Prod domain name"
-  value       = module.polybot_prod.domain_name
-}
-
 output "polybot_alb_dns" {
   description = "Polybot ALB DNS name"
   value       = module.k8s-cluster.alb_dns_name
 }
 
-output "subnet_ids" {
-  description = "Subnet IDs created for the Kubernetes cluster"
-  value       = module.k8s-cluster.public_subnet_ids
+# ------------------------------------------------------------------------
+# Section 7: Polybot AWS Resources
+# ------------------------------------------------------------------------
+
+# Development Environment Outputs
+output "polybot_dev_resources" {
+  description = "Development environment resources"
+  value = {
+    s3_bucket   = module.polybot_dev.s3_bucket_name
+    sqs_queue   = module.polybot_dev.sqs_queue_url
+    domain_name = module.polybot_dev.domain_name
+  }
 }
 
-# Conditional outputs for ArgoCD, using try() to handle potential errors
-output "argocd_url" {
-  description = "URL of the ArgoCD server"
-  value       = "https://${module.k8s-cluster.control_plane_public_ip}:30080 (Once ArgoCD is deployed)"
+# Production Environment Outputs
+output "polybot_prod_resources" {
+  description = "Production environment resources"
+  value = {
+    s3_bucket   = module.polybot_prod.s3_bucket_name
+    sqs_queue   = module.polybot_prod.sqs_queue_url
+    domain_name = module.polybot_prod.domain_name
+  }
 }
 
-output "argocd_applications" {
-  description = "ArgoCD applications deployed"
-  value       = "Deploy applications manually through ArgoCD UI"
-  sensitive   = false
-}
+# ------------------------------------------------------------------------
+# Section 8: SSH Access Details
+# ------------------------------------------------------------------------
 
 output "ssh_key_name" {
   value       = module.k8s-cluster.ssh_key_name
@@ -102,12 +171,12 @@ output "ssh_private_key_path" {
 }
 
 output "ssh_command_control_plane" {
-  value = module.k8s-cluster.ssh_command_control_plane
+  value = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
 }
 
-output "ssh_command_worker_nodes" {
-  value = module.k8s-cluster.ssh_command_worker_nodes
-}
+# ------------------------------------------------------------------------
+# Section 9: Troubleshooting Commands
+# ------------------------------------------------------------------------
 
 output "worker_logs_command" {
   value = module.k8s-cluster.worker_logs_command
@@ -115,9 +184,4 @@ output "worker_logs_command" {
 
 output "worker_node_info" {
   value = module.k8s-cluster.worker_node_info
-}
-
-output "init_logs_commands" {
-  description = "Commands to view initialization logs on control plane and worker nodes"
-  value       = module.k8s-cluster.init_logs_commands
 }

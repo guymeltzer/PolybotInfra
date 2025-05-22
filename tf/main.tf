@@ -679,6 +679,112 @@ resource "null_resource" "install_argocd" {
   }
 }
 
+# Start ArgoCD port forwarding and get admin password
+resource "null_resource" "argocd_setup" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd
+  ]
+  
+  # Run on every apply to ensure port forwarding is active
+  triggers = {
+    always_run = timestamp()
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      echo "Setting up ArgoCD access..."
+      KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Kill any existing port-forward processes
+      pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
+      
+      # Start port forwarding in the background
+      nohup kubectl --kubeconfig="$KUBECONFIG" port-forward svc/argocd-server -n argocd 8080:443 > /tmp/argocd-port-forward.log 2>&1 &
+      echo $! > /tmp/argocd-port-forward.pid
+      
+      # Wait for port forward to be established
+      echo "Waiting for port-forward to be established..."
+      sleep 5
+      
+      # Get admin password and save to file
+      echo "Retrieving ArgoCD admin password..."
+      ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+      
+      if [ -n "$ADMIN_PASSWORD" ]; then
+        echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
+        echo "ArgoCD admin password retrieved and saved to /tmp/argocd-admin-password.txt"
+        echo "ArgoCD UI is available at: https://localhost:8080"
+        echo "Username: admin"
+        echo "Password: $ADMIN_PASSWORD"
+      else
+        echo "Failed to retrieve ArgoCD admin password. Please check if ArgoCD is fully deployed."
+        echo "You can manually retrieve it with:"
+        echo "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"
+      fi
+    EOT
+  }
+  
+  # Clean up port-forward when terraform is destroyed
+  provisioner "local-exec" {
+    when = destroy
+    command = "pkill -f 'kubectl.*port-forward.*svc/argocd-server' || true"
+  }
+}
+
+# Add ArgoCD port forwarding service with systemd (optional, more persistent approach)
+resource "null_resource" "argocd_port_forward_service" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    instance_id = module.k8s-cluster.control_plane_id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      # Create systemd user service for more persistent port forwarding
+      KUBECONFIG="${local.kubeconfig_path}"
+      CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
+      
+      # Create service file
+      mkdir -p ~/.config/systemd/user/
+      cat > ~/.config/systemd/user/argocd-port-forward.service << 'EOSVC'
+[Unit]
+Description=ArgoCD Port Forward
+After=network.target
+
+[Service]
+Type=simple
+Environment="KUBECONFIG=${KUBECONFIG}"
+ExecStart=/usr/bin/kubectl --kubeconfig=${KUBECONFIG} port-forward svc/argocd-server -n argocd 8080:443
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOSVC
+
+      # Enable and start the service
+      systemctl --user daemon-reload
+      systemctl --user enable argocd-port-forward.service
+      systemctl --user restart argocd-port-forward.service
+      
+      echo "Set up systemd user service for ArgoCD port-forward. Status:"
+      systemctl --user status argocd-port-forward.service || true
+    EOT
+  }
+}
+
 # Development environment resources
 module "polybot_dev" {
   source                = "./modules/polybot"
