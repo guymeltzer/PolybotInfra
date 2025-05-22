@@ -93,25 +93,34 @@ output "init_logs_commands" {
 
 output "argocd_url" {
   description = "URL of the ArgoCD server (port forwarded)"
-  value       = "https://localhost:8080 (Automatically forwarded via: kubectl port-forward svc/argocd-server -n argocd 8080:443)"
+  value       = "https://localhost:8080 (Run ./argocd-access.sh start to start port forwarding)"
 }
 
 output "argocd_admin_credentials" {
   description = "ArgoCD admin credentials"
   value = <<-EOT
     Username: admin
-    Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo "Password will be available after deployment. Get it with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d; echo")
+    Password: Run ./argocd-access.sh password to retrieve
   EOT
 }
 
-output "argocd_port_forward_command" {
-  description = "Manual command to port-forward ArgoCD UI"
-  value       = "kubectl port-forward svc/argocd-server -n argocd 8080:443"
-}
-
-output "argocd_password_command" {
-  description = "Command to get ArgoCD admin password"
-  value       = "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d; echo"
+output "argocd_access_script" {
+  description = "ArgoCD access script usage"
+  value = <<-EOT
+    ✅ ArgoCD Access Helper Script
+    
+    To access ArgoCD UI:
+    1. Run: ./argocd-access.sh start
+    2. Open: https://localhost:8080
+    3. Username: admin
+    4. Password: Will be displayed by the script
+    
+    To stop port forwarding:
+    Run: ./argocd-access.sh stop
+    
+    To just get the password:
+    Run: ./argocd-access.sh password
+  EOT
 }
 
 # ------------------------------------------------------------------------

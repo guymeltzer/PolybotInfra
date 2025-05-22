@@ -679,70 +679,15 @@ resource "null_resource" "install_argocd" {
   }
 }
 
-# Start ArgoCD port forwarding and get admin password
-resource "null_resource" "argocd_setup" {
+# Create ArgoCD access helper script (instead of automated port forwarding that might fail)
+resource "null_resource" "argocd_helper" {
   count = local.skip_argocd ? 0 : 1
   
   depends_on = [
     null_resource.install_argocd
   ]
   
-  # Run on every apply to ensure port forwarding is active
-  triggers = {
-    always_run = timestamp()
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Setting up ArgoCD access..."
-      KUBECONFIG="${local.kubeconfig_path}"
-      
-      # Kill any existing port-forward processes
-      pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
-      
-      # Start port forwarding in the background
-      nohup kubectl --kubeconfig="$KUBECONFIG" port-forward svc/argocd-server -n argocd 8080:443 > /tmp/argocd-port-forward.log 2>&1 &
-      echo $! > /tmp/argocd-port-forward.pid
-      
-      # Wait for port forward to be established
-      echo "Waiting for port-forward to be established..."
-      sleep 5
-      
-      # Get admin password and save to file
-      echo "Retrieving ArgoCD admin password..."
-      ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-      
-      if [ -n "$ADMIN_PASSWORD" ]; then
-        echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
-        echo "ArgoCD admin password retrieved and saved to /tmp/argocd-admin-password.txt"
-        echo "ArgoCD UI is available at: https://localhost:8080"
-        echo "Username: admin"
-        echo "Password: $ADMIN_PASSWORD"
-      else
-        echo "Failed to retrieve ArgoCD admin password. Please check if ArgoCD is fully deployed."
-        echo "You can manually retrieve it with:"
-        echo "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"
-      fi
-    EOT
-  }
-  
-  # Clean up port-forward when terraform is destroyed
-  provisioner "local-exec" {
-    when = destroy
-    command = "pkill -f 'kubectl.*port-forward.*svc/argocd-server' || true"
-  }
-}
-
-# Add ArgoCD port forwarding service with systemd (optional, more persistent approach)
-resource "null_resource" "argocd_port_forward_service" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd
-  ]
-  
+  # Only run when needed
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     instance_id = module.k8s-cluster.control_plane_id
@@ -752,35 +697,119 @@ resource "null_resource" "argocd_port_forward_service" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      # Create systemd user service for more persistent port forwarding
+      echo "Creating ArgoCD helper script..."
       KUBECONFIG="${local.kubeconfig_path}"
       CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
       
-      # Create service file with direct substitution
-      mkdir -p ~/.config/systemd/user/
-      cat > ~/.config/systemd/user/argocd-port-forward.service << EOF
-[Unit]
-Description=ArgoCD Port Forward
-After=network.target
+      # Create a helper script to manage ArgoCD access
+      cat > ./argocd-access.sh << 'EOF'
+#!/bin/bash
+# ArgoCD Access Helper Script
 
-[Service]
-Type=simple
-Environment="KUBECONFIG=$KUBECONFIG"
-ExecStart=/usr/bin/kubectl --kubeconfig=$KUBECONFIG port-forward svc/argocd-server -n argocd 8080:443
-Restart=always
-RestartSec=10
+KUBECONFIG="./kubeconfig.yaml"
 
-[Install]
-WantedBy=default.target
+function check_kubectl() {
+  if ! command -v kubectl &> /dev/null; then
+    echo "Error: kubectl not found. Please install kubectl first."
+    exit 1
+  fi
+  
+  if [ ! -f "$KUBECONFIG" ]; then
+    echo "Error: kubeconfig not found at $KUBECONFIG"
+    exit 1
+  fi
+}
+
+function port_forward() {
+  echo "Starting port-forward to ArgoCD server..."
+  
+  # Kill any existing port-forward processes
+  pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
+  
+  # Start port forwarding in the background
+  kubectl --kubeconfig="$KUBECONFIG" port-forward svc/argocd-server -n argocd 8080:443 &
+  PORT_FORWARD_PID=$!
+  
+  echo "Port-forward started with PID: $PORT_FORWARD_PID"
+  echo "ArgoCD UI is available at: https://localhost:8080"
+  
+  # Save the PID for later cleanup
+  echo $PORT_FORWARD_PID > /tmp/argocd-port-forward.pid
+}
+
+function get_password() {
+  echo "Retrieving ArgoCD admin password..."
+  ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+  
+  if [ -n "$ADMIN_PASSWORD" ]; then
+    echo "ArgoCD admin password: $ADMIN_PASSWORD"
+    echo "Username: admin"
+    echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
+    echo "Password also saved to /tmp/argocd-admin-password.txt"
+  else
+    echo "Failed to retrieve ArgoCD admin password."
+    echo "ArgoCD might not be fully deployed yet. Try again in a few minutes."
+  fi
+}
+
+function stop_port_forward() {
+  echo "Stopping port-forward..."
+  pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
+  rm -f /tmp/argocd-port-forward.pid
+  echo "Port-forward stopped."
+}
+
+function show_help() {
+  echo "ArgoCD Access Helper"
+  echo "--------------------"
+  echo "Usage: $0 [command]"
+  echo ""
+  echo "Commands:"
+  echo "  start    - Start port-forward and get admin password"
+  echo "  stop     - Stop port-forward"
+  echo "  password - Get admin password"
+  echo "  help     - Show this help message"
+  echo ""
+}
+
+# Process command line arguments
+case "$1" in
+  start)
+    check_kubectl
+    port_forward
+    get_password
+    echo ""
+    echo "Port-forward is running in the background."
+    echo "Access ArgoCD at https://localhost:8080"
+    echo "To stop it, run: $0 stop"
+    ;;
+  stop)
+    stop_port_forward
+    ;;
+  password)
+    check_kubectl
+    get_password
+    ;;
+  *)
+    show_help
+    ;;
+esac
 EOF
       
-      # Enable and start the service
-      systemctl --user daemon-reload
-      systemctl --user enable argocd-port-forward.service
-      systemctl --user restart argocd-port-forward.service
+      # Make the script executable
+      chmod +x ./argocd-access.sh
       
-      echo "Set up systemd user service for ArgoCD port-forward. Status:"
-      systemctl --user status argocd-port-forward.service || true
+      # Create a marker file that the helper script can check for password
+      # Don't try to get password now as ArgoCD might not be ready yet
+      touch /tmp/argocd-helper-created.txt
+      
+      echo "ArgoCD helper script created at ./argocd-access.sh"
+      echo "To access ArgoCD:"
+      echo "  1. Run: ./argocd-access.sh start"
+      echo "  2. Open: https://localhost:8080"
+      echo "  3. Username: admin"
+      echo "  4. To get password: ./argocd-access.sh password"
+      echo "  5. To stop port-forward: ./argocd-access.sh stop"
     EOT
   }
 }
