@@ -572,24 +572,46 @@ resource "null_resource" "install_ebs_csi_driver" {
       fi
       
       # Check if we can connect to the Kubernetes API
-      if ! kubectl --kubeconfig="$KUBECONFIG" cluster-info >/dev/null 2>&1; then
+      if ! kubectl --kubeconfig="$KUBECONFIG" get nodes >/dev/null 2>&1; then
         echo "Cannot connect to Kubernetes cluster, skipping installation"
         exit 0
       fi
       
-      echo "Installing EBS CSI Driver via Helm..."
-      helm --kubeconfig="$KUBECONFIG" repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
-      helm --kubeconfig="$KUBECONFIG" repo update
+      # Install EBS CSI Driver using kubectl
+      echo "Creating kube-system namespace if it doesn't exist..."
+      kubectl --kubeconfig="$KUBECONFIG" create namespace kube-system --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
       
-      helm --kubeconfig="$KUBECONFIG" upgrade --install aws-ebs-csi-driver aws-ebs-csi-driver/aws-ebs-csi-driver \
-        --namespace kube-system \
-        --set controller.serviceAccount.annotations."eks\\.amazonaws\\.com/role-arn"="${module.k8s-cluster.control_plane_iam_role_arn}" \
-        --set storageClasses[0].name=ebs-sc \
-        --set storageClasses[0].annotations."storageclass\\.kubernetes\\.io/is-default-class"="true" \
-        --set storageClasses[0].volumeBindingMode=WaitForFirstConsumer \
-        --set storageClasses[0].parameters."csi\\.storage\\.k8s\\.io/fstype"=ext4 \
-        --set storageClasses[0].parameters.type=gp2 \
-        --set storageClasses[0].parameters.encrypted="true"
+      echo "Creating EBS CSI Driver service account..."
+      cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebs-csi-controller-sa
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: "${module.k8s-cluster.control_plane_iam_role_arn}"
+EOF
+      
+      echo "Installing EBS CSI Driver..."
+      kubectl --kubeconfig="$KUBECONFIG" apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master"
+      
+      echo "Creating storage class..."
+      cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  csi.storage.k8s.io/fstype: ext4
+  type: gp2
+  encrypted: "true"
+EOF
+      
+      echo "EBS CSI Driver installation completed"
     EOT
   }
 }

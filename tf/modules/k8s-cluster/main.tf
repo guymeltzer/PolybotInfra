@@ -1241,7 +1241,12 @@ resource "aws_iam_instance_profile" "worker_profile" {
 
 # Also create a terraform_data resource for worker script
 resource "terraform_data" "worker_script_hash" {
-  input = filemd5("${path.module}/worker_user_data.sh")
+  input  = md5(file("${path.module}/worker_user_data.sh"))
+  output = md5(file("${path.module}/worker_user_data.sh"))
+  
+  triggers_replace = {
+    rebuild = var.rebuild_workers ? timestamp() : "static"
+  }
 }
 
 # Progress reporter for worker nodes
@@ -1289,15 +1294,22 @@ resource "aws_launch_template" "worker_lt" {
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name = "guy-worker-node"
+      Name = "guy-worker-node-${random_id.suffix.hex}"
       "kubernetes.io/cluster/kubernetes" = "owned"
       "k8s.io/cluster-autoscaler/enabled" = "true"
       "k8s.io/role/node" = "true"
+      "ClusterIdentifier" = "${var.cluster_name}-${random_id.suffix.hex}"
     }
   }
   
   lifecycle {
     create_before_destroy = true
+    # Prevent replacement: Ignore changes to user_data since we want to preserve the existing worker nodes
+    ignore_changes = [user_data]
+    # Only replace when script content changes
+    replace_triggered_by = [
+      terraform_data.worker_script_hash
+    ]
   }
   
   depends_on = [
@@ -1354,7 +1366,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   
   tag {
     key                 = "Name"
-    value               = "guy-worker-node"
+    value               = "guy-worker-node-${random_id.suffix.hex}"
     propagate_at_launch = true
   }
   
@@ -1370,6 +1382,12 @@ resource "aws_autoscaling_group" "worker_asg" {
     propagate_at_launch = true
   }
   
+  tag {
+    key                 = "ClusterIdentifier" 
+    value               = "${var.cluster_name}-${random_id.suffix.hex}"
+    propagate_at_launch = true
+  }
+  
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
@@ -1381,7 +1399,12 @@ resource "aws_autoscaling_group" "worker_asg" {
   lifecycle {
     # Force replacement when worker script hash changes
     replace_triggered_by = [
-      terraform_data.worker_script_hash
+      terraform_data.force_asg_update
+    ]
+    # Ignore certain changes that would cause replacement
+    ignore_changes = [
+      desired_capacity,
+      launch_template[0].version
     ]
   }
 
