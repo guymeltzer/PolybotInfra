@@ -230,7 +230,7 @@ output "cluster" {
       public_ip = module.k8s-cluster.control_plane_public_ip
       ssh = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
     }
-    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml"
+    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=./kubeconfig.yaml"
     alb_dns = module.k8s-cluster.alb_dns_name
   }
 }
@@ -271,61 +271,21 @@ output "aws_resources" {
 # Resource to format all outputs into a single file
 resource "null_resource" "format_outputs" {
   triggers = {
+    # Create meaningful triggers that depend on actual resources
     worker_nodes = null_resource.worker_node_details.id
     argocd_password = null_resource.argocd_password_retriever.id
     worker_logs = null_resource.dynamic_worker_logs.id
+    # Don't use filemd5 on kubeconfig as it changes during apply
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
+      #!/bin/bash
+      
+      # Create visually appealing output without ANSI color codes
       cat > /tmp/final_output.txt << 'EOF'
-\033[1;34m=================================================================\033[0m
-\033[1;34m                POLYBOT KUBERNETES CLUSTER DEPLOYMENT\033[0m
-\033[1;34m=================================================================\033[0m
-
-\033[1;32m🔐 ARGOCD ACCESS\033[0m
-\033[1;32m-------------------\033[0m
-URL: https://localhost:8081
-Username: admin
-Password: $ARGOCD_PASSWORD
-Connection: Run ~/argocd-connect.sh
-
-\033[1;32m🔧 CONTROL PLANE\033[0m
-\033[1;32m-------------------\033[0m
-Instance ID: $INSTANCE_ID
-Public IP:   $PUBLIC_IP
-Private IP:  $PRIVATE_IP
-SSH Command: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP
-
-\033[1;32m🖥️ WORKER NODES\033[0m
-\033[1;32m-------------------\033[0m
-Worker Count: $NODE_COUNT
-$WORKER_LINES
-
-\033[1;32m📜 LOGS AND TROUBLESHOOTING\033[0m
-\033[1;32m----------------------------\033[0m
-Control Plane Init Log:
-ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'
-
-\033[1;32m☸️ KUBERNETES ACCESS\033[0m
-\033[1;32m---------------------\033[0m
-API Endpoint: https://$PUBLIC_IP:6443
-Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml
-
-\033[1;32m🌐 APPLICATION ENDPOINTS\033[0m
-\033[1;32m------------------------\033[0m
-Dev URL:  https://dev-polybot.${terraform.workspace}.devops-int-college.com
-Prod URL: https://polybot.${terraform.workspace}.devops-int-college.com
-Load Balancer DNS: $ALB_DNS
-
-\033[1;32m✅ TERRAFORM DEPLOYMENT COMPLETE\033[0m
-\033[1;32m==========================================\033[0m
-EOF
-    EOT
-  }
-}
 =================================================================
                 POLYBOT KUBERNETES CLUSTER DEPLOYMENT
 =================================================================
@@ -416,7 +376,7 @@ EOF
       echo -e "☸️ KUBERNETES ACCESS" >> /tmp/final_output.txt
       echo -e "---------------------" >> /tmp/final_output.txt
       echo -e "API Endpoint: https://$PUBLIC_IP:6443" >> /tmp/final_output.txt
-      echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml" >> /tmp/final_output.txt
+      echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=./kubeconfig.yaml" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
       # ----- APPLICATION ENDPOINTS -----
