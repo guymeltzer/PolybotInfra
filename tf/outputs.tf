@@ -70,7 +70,7 @@ resource "null_resource" "worker_node_details" {
 
 output "worker_nodes" {
   description = "Worker node details"
-  value = fileexists("/tmp/worker_nodes.json") ? jsondecode(file("/tmp/worker_nodes.json")) : "Worker node details not available yet. Run the command in worker_nodes_overview"
+  value = fileexists("/tmp/worker_nodes.json") ? jsondecode(file("/tmp/worker_nodes.json")) : []
 }
 
 # ------------------------------------------------------------------------
