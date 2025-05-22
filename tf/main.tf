@@ -1332,13 +1332,14 @@ EOF
   }
 }
 
-# Also install Calico as your CNI
+# Modify Calico/Tigera installation to be more robust
 resource "null_resource" "install_calico" {
   count = local.skip_argocd ? 0 : 1
   
   depends_on = [
     null_resource.providers_ready,
     null_resource.wait_for_kubernetes,
+    null_resource.cleanup_worker_nodes,
     terraform_data.kubectl_provider_config
   ]
   
@@ -1352,22 +1353,62 @@ resource "null_resource" "install_calico" {
       #!/bin/bash
       export KUBECONFIG="${local.kubeconfig_path}"
       
+      # First check if worker nodes have disk pressure
+      echo "Checking node status before Calico installation..."
+      NODES_WITH_PRESSURE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="DiskPressure")].status}{"\n"}{end}' | grep True || echo "")
+      
+      if [ ! -z "$NODES_WITH_PRESSURE" ]; then
+        echo "Some nodes have disk pressure, running cleanup before Calico installation..."
+        kubectl delete --all pods --namespace=tigera-operator || true
+        kubectl delete namespace tigera-operator --ignore-not-found=true || true
+        sleep 5
+      fi
+      
       # Check if Calico is already installed
       if kubectl get ns tigera-operator &>/dev/null; then
-        echo "Calico already installed, skipping installation"
-        exit 0
+        echo "Tigera operator namespace exists, checking if operator is functional..."
+        if kubectl -n tigera-operator get pods | grep -q "Running"; then
+          echo "Calico already installed and running, skipping installation"
+          exit 0
+        else
+          echo "Tigera operator exists but pods aren't running, cleaning up..."
+          kubectl delete --all pods --namespace=tigera-operator
+          kubectl delete namespace tigera-operator --ignore-not-found=true
+          sleep 5
+        fi
       fi
       
       echo "Installing Tigera Calico operator..."
       kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
       
-      echo "Waiting a moment for the operator to start..."
-      sleep 10
+      echo "Waiting 30 seconds for operator to initialize..."
+      sleep 30
       
-      echo "Installing Calico custom resources..."
-      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
+      echo "Checking if operator is running..."
+      if ! kubectl -n tigera-operator get pods | grep -q "Running"; then
+        echo "Operator isn't running yet, will continue but installation may fail"
+      fi
       
-      echo "Calico installation initiated. It may take a few minutes to be fully operational."
+      echo "Installing Calico custom resources with minimal configuration..."
+      cat <<EOF | kubectl apply -f -
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+    - blockSize: 26
+      cidr: 192.168.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+  nodeMetricsPort: 9091
+  typhaMetricsPort: 9093
+EOF
+      
+      echo "Calico installation initiated with minimal config."
+      echo "Note: Full Calico startup can take several minutes. Check with: kubectl get pods -A"
     EOT
   }
 }
@@ -1413,238 +1454,10 @@ EOF
   }
 }
 
-# Resource to fix ArgoCD internal connectivity issues
-resource "null_resource" "fix_argocd_connectivity" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd,
-    null_resource.configure_argocd_repositories,
-    null_resource.configure_argocd_apps
-  ]
-  
-  triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    time = timestamp()  # Run this every time to ensure it applies
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      echo "Checking ArgoCD pod status..."
-      kubectl -n argocd get pods
-      
-      echo "Restarting ArgoCD components to fix connectivity issues..."
-      # Delete the repo server pod to force a restart
-      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-repo-server --force --grace-period=0 || true
-      
-      # Restart the argocd-server
-      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-server --force --grace-period=0 || true
-      
-      # Restart the application controller
-      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-application-controller --force --grace-period=0 || true
-      
-      echo "Waiting for ArgoCD pods to restart..."
-      sleep 10
-      
-      # Wait for repo server to be ready
-      echo "Waiting for argocd-repo-server to be ready..."
-      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-repo-server --timeout=120s || true
-      
-      # Wait for server to be ready
-      echo "Waiting for argocd-server to be ready..."
-      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=120s || true
-      
-      # Wait for application controller to be ready
-      echo "Waiting for argocd-application-controller to be ready..."
-      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-application-controller --timeout=120s || true
-      
-      echo "Checking final ArgoCD pod status..."
-      kubectl -n argocd get pods
-      
-      echo "Refreshing ArgoCD applications..."
-      APPS=$(kubectl -n argocd get applications -o name)
-      for APP in $APPS; do
-        echo "Refreshing $APP..."
-        kubectl -n argocd patch $APP -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' --type=merge || true
-      done
-      
-      echo "ArgoCD connectivity issues should be fixed. Check the ArgoCD UI in a few moments."
-    EOT
-  }
-}
-
-# Create MongoDB directly without ArgoCD
-resource "null_resource" "deploy_mongodb_directly" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.fix_argocd_connectivity,
-    null_resource.install_ebs_csi_driver
-  ]
-  
-  triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      echo "Creating MongoDB namespace if it doesn't exist..."
-      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
-      
-      echo "Creating MongoDB StatefulSet directly..."
-      kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mongodb-config
-  namespace: mongodb
-data:
-  mongo.conf: |
-    storage:
-      dbPath: /data/db
-    net:
-      bindIp: 0.0.0.0
-    replication:
-      replSetName: rs0
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: mongodb-secret
-  namespace: mongodb
-type: Opaque
-data:
-  MONGO_INITDB_ROOT_USERNAME: YWRtaW4=
-  MONGO_INITDB_ROOT_PASSWORD: cGFzc3dvcmQ=
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb-headless
-  namespace: mongodb
-  labels:
-    app: mongodb
-spec:
-  clusterIP: None
-  selector:
-    app: mongodb
-  ports:
-  - port: 27017
-    targetPort: 27017
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb
-  namespace: mongodb
-  labels:
-    app: mongodb
-spec:
-  selector:
-    app: mongodb
-  ports:
-  - port: 27017
-    targetPort: 27017
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: mongodb
-  namespace: mongodb
-spec:
-  serviceName: mongodb-headless
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mongodb
-  template:
-    metadata:
-      labels:
-        app: mongodb
-    spec:
-      containers:
-      - name: mongodb
-        image: mongo:4.4
-        env:
-        - name: MONGO_INITDB_ROOT_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: MONGO_INITDB_ROOT_USERNAME
-        - name: MONGO_INITDB_ROOT_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: MONGO_INITDB_ROOT_PASSWORD
-        ports:
-        - containerPort: 27017
-        volumeMounts:
-        - name: data
-          mountPath: /data/db
-        - name: config
-          mountPath: /config
-        command:
-        - "mongod"
-        - "--config=/config/mongo.conf"
-      volumes:
-      - name: config
-        configMap:
-          name: mongodb-config
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      storageClassName: "ebs-sc"
-      resources:
-        requests:
-          storage: 1Gi
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mongodb-init
-  namespace: mongodb
-spec:
-  template:
-    spec:
-      containers:
-      - name: mongo-init
-        image: mongo:4.4
-        command:
-        - /bin/bash
-        - -c
-        - |
-          echo "Waiting for MongoDB to be ready..."
-          sleep 30
-          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017'}]})"
-          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "db.getSiblingDB('polybot').createUser({user: 'polybot', pwd: 'polybot', roles: [{role: 'readWrite', db: 'polybot'}]})"
-          echo "MongoDB initialized successfully"
-      restartPolicy: OnFailure
-EOF
-      
-      echo "Waiting for MongoDB StatefulSet to be ready..."
-      kubectl -n mongodb rollout status statefulset/mongodb --timeout=300s || true
-      
-      echo "Checking MongoDB pod status..."
-      kubectl -n mongodb get pods
-      
-      echo "MongoDB has been deployed directly. Check its status using: kubectl -n mongodb get pods"
-    EOT
-  }
-}
-
 # Add this resource after the null_resource.fix_argocd_connectivity resource
 resource "null_resource" "cleanup_worker_nodes" {
-  depends_on = [null_resource.fix_argocd_connectivity]
+  # Remove dependency on fix_argocd_connectivity
+  depends_on = [null_resource.install_ebs_csi_driver]
 
   count = local.skip_argocd ? 0 : 1
 
@@ -1654,7 +1467,7 @@ resource "null_resource" "cleanup_worker_nodes" {
       export KUBECONFIG="./kubeconfig.yaml"
       
       echo "Cleaning up evicted pods..."
-      kubectl get pods --all-namespaces | grep Evicted | awk '{print $2 " --namespace=" $1}' | xargs -L1 kubectl delete pod
+      kubectl get pods --all-namespaces | grep Evicted | awk '{print $2 " --namespace=" $1}' | xargs -L1 kubectl delete pod || true
       
       echo "Setting up node disk cleanup job..."
       cat <<EOF | kubectl apply -f -
@@ -1721,31 +1534,264 @@ spec:
           hostPID: true
 EOF
       
-      echo "Checking node status..."
-      kubectl describe nodes
+      # Execute a disk cleanup job immediately
+      echo "Running immediate disk cleanup on worker nodes..."
+      cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: disk-cleanup-now
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      containers:
+      - name: cleanup
+        image: ubuntu:20.04
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apt-get update && apt-get install -y docker.io
+          echo "Emergency cleanup - freeing disk space..."
+          docker system prune -af
+          find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+          find /var/log -type f -size +10M -delete
+          journalctl --vacuum-time=1d
+          rm -rf /tmp/*
+          echo "Emergency cleanup completed"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: var-log
+          mountPath: /var/log
+        - name: var-lib-docker
+          mountPath: /var/lib/docker
+        - name: run
+          mountPath: /run
+        - name: tmp 
+          mountPath: /tmp
+      volumes:
+      - name: var-log
+        hostPath:
+          path: /var/log
+      - name: var-lib-docker
+        hostPath:
+          path: /var/lib/docker
+      - name: run
+        hostPath:
+          path: /run
+      - name: tmp
+        hostPath:
+          path: /tmp
+      restartPolicy: Never
+      hostNetwork: true
+      hostPID: true
+EOF
+      
+      echo "Waiting for emergency disk cleanup to complete..."
+      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=120s || true
+      
+      echo "Disk cleanup completed, checking node status..."
+      kubectl get nodes
+      
       echo "Cleanup job created successfully."
     EOT
   }
 }
 
-# Add this after deploy_mongodb_directly if it exists, otherwise after cleanup_worker_nodes
-resource "null_resource" "restart_tigera_operator" {
-  depends_on = [null_resource.cleanup_worker_nodes]
-
+# Create MongoDB directly without ArgoCD, but with simpler implementation
+resource "null_resource" "deploy_mongodb_directly" {
   count = local.skip_argocd ? 0 : 1
-
+  
+  depends_on = [
+    null_resource.install_ebs_csi_driver,
+    null_resource.cleanup_worker_nodes
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
   provisioner "local-exec" {
-    command = <<-EOT
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
       #!/bin/bash
-      export KUBECONFIG="./kubeconfig.yaml"
+      export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "Restarting Tigera Operator deployment..."
-      kubectl -n tigera-operator rollout restart deployment tigera-operator
+      echo "Creating MongoDB namespace if it doesn't exist..."
+      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
       
-      echo "Waiting for Tigera Operator to restart..."
-      kubectl -n tigera-operator rollout status deployment tigera-operator --timeout=180s
+      echo "Checking if MongoDB is already deployed..."
+      if kubectl -n mongodb get statefulset mongodb &>/dev/null; then
+        echo "MongoDB is already deployed, skipping creation"
+      else
+        echo "Creating MongoDB StatefulSet directly..."
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-config
+  namespace: mongodb
+data:
+  mongo.conf: |
+    storage:
+      dbPath: /data/db
+    net:
+      bindIp: 0.0.0.0
+    replication:
+      replSetName: rs0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+  namespace: mongodb
+type: Opaque
+data:
+  MONGO_INITDB_ROOT_USERNAME: YWRtaW4=
+  MONGO_INITDB_ROOT_PASSWORD: cGFzc3dvcmQ=
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mongodb-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  csi.storage.k8s.io/fstype: ext4
+  type: gp2
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: mongodb
+spec:
+  serviceName: mongodb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo:4.4
+        resources:
+          limits:
+            cpu: "0.5"
+            memory: "512Mi"
+          requests:
+            cpu: "0.2"
+            memory: "256Mi"
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: MONGO_INITDB_ROOT_USERNAME
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: MONGO_INITDB_ROOT_PASSWORD
+        ports:
+        - containerPort: 27017
+        volumeMounts:
+        - name: data
+          mountPath: /data/db
+        - name: config
+          mountPath: /config
+        command:
+        - "mongod"
+        - "--config=/config/mongo.conf"
+      volumes:
+      - name: config
+        configMap:
+          name: mongodb-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "mongodb-sc"
+      resources:
+        requests:
+          storage: 1Gi
+EOF
+      fi
+
+      # The initialization job is only necessary if statefulset exists but isn't initialized
+      echo "Checking if MongoDB needs initialization..."
+      POD_STATUS=$(kubectl -n mongodb get pods -l app=mongodb -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Not Found")
       
-      echo "Tigera Operator has been restarted."
+      if [ "$POD_STATUS" == "Running" ]; then
+        echo "Creating MongoDB initialization job..."
+        kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-init
+  namespace: mongodb
+spec:
+  ttlSecondsAfterFinished: 100
+  template:
+    spec:
+      containers:
+      - name: mongo-init
+        image: mongo:4.4
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Waiting for MongoDB to be ready..."
+          sleep 10
+          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017'}]})" || true
+          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "db.getSiblingDB('polybot').createUser({user: 'polybot', pwd: 'polybot', roles: [{role: 'readWrite', db: 'polybot'}]})" || true
+          echo "MongoDB initialized successfully"
+      restartPolicy: OnFailure
+EOF
+      fi
+      
+      echo "MongoDB deployment completed. Monitor status with: kubectl -n mongodb get pods"
     EOT
   }
 }
