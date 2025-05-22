@@ -507,18 +507,26 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
     argocd_access_id = null_resource.argocd_direct_access[0].id
   }
   
+  # Empty provisioner for creation - this ensures nothing runs during apply
+  provisioner "local-exec" {
+    command = "echo 'ArgoCD SSH tunnel cleanup will happen during destroy'"
+  }
+  
   # Add proper cleanup during destroy operations
   provisioner "local-exec" {
     when = destroy
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       echo "Cleaning up ArgoCD port forwarding..."
-      # Kill any SSH tunnels that might be running
-      pkill -f "ssh.*-L 8081:localhost:8081" > /dev/null 2>&1 || true
       
-      # Cleaner approach that doesn't depend on external variables or state
-      echo "Note: Control plane resources may have already been destroyed."
-      echo "The SSH tunnel will terminate automatically if the instances are gone." 
+      # Safely check if there are processes to kill before attempting pkill
+      if pgrep -f "ssh.*-L 8081:localhost:8081" >/dev/null; then
+        echo "Found SSH tunnel processes, cleaning up..."
+        pkill -f "ssh.*-L 8081:localhost:8081" || true
+      else
+        echo "No SSH tunnel processes found to clean up"
+      fi
+      
       echo "Cleanup complete."
     EOT
   }
