@@ -679,17 +679,17 @@ resource "null_resource" "install_argocd" {
   }
 }
 
-# Create ArgoCD access helper script (instead of automated port forwarding that might fail)
-resource "null_resource" "argocd_helper" {
+# Automatic ArgoCD access setup with port forwarding
+resource "null_resource" "argocd_access" {
   count = local.skip_argocd ? 0 : 1
   
   depends_on = [
     null_resource.install_argocd
   ]
   
-  # Only run when needed
+  # Run on every apply to ensure port forwarding is active
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    always_run = timestamp()
     instance_id = module.k8s-cluster.control_plane_id
   }
   
@@ -697,120 +697,121 @@ resource "null_resource" "argocd_helper" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      echo "Creating ArgoCD helper script..."
+      # ArgoCD automatic port forwarding and password retrieval
       KUBECONFIG="${local.kubeconfig_path}"
       CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
+      PORT=8080
       
-      # Create a helper script to manage ArgoCD access
-      cat > ./argocd-access.sh << 'EOF'
+      echo -e "\033[1;34m🔄 Setting up automated ArgoCD access...\033[0m"
+      
+      # Check if ArgoCD is deployed
+      if ! kubectl --kubeconfig="$KUBECONFIG" get deployment -n argocd argocd-server &>/dev/null; then
+        echo -e "\033[1;33m⚠️ ArgoCD server not found. It may still be deploying...\033[0m"
+        exit 0
+      fi
+      
+      # Check if port is in use
+      PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
+      if [ -n "$PORT_PID" ]; then
+        echo -e "\033[1;33m⚠️ Port $PORT is already in use by PID $PORT_PID\033[0m"
+        echo -e "\033[1;34m🔄 Stopping existing port-forward...\033[0m"
+        kill -9 $PORT_PID 2>/dev/null || true
+        sleep 2
+      fi
+      
+      # Kill any existing kubectl port-forwards to avoid conflicts
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      
+      # Start port forwarding in the background
+      echo -e "\033[1;34m🔄 Starting ArgoCD port forwarding on port $PORT...\033[0m"
+      nohup kubectl --kubeconfig="$KUBECONFIG" port-forward svc/argocd-server -n argocd $PORT:443 > /tmp/argocd-port-forward.log 2>&1 &
+      PORT_FORWARD_PID=$!
+      echo $PORT_FORWARD_PID > /tmp/argocd-port-forward.pid
+      
+      # Give it time to establish
+      sleep 5
+      
+      # Verify port-forward is running
+      if ! ps -p $PORT_FORWARD_PID > /dev/null; then
+        echo -e "\033[1;31m❌ Port forwarding failed to start\033[0m"
+        cat /tmp/argocd-port-forward.log
+        echo -e "\033[1;33m⚠️ You may need to manually run: kubectl port-forward svc/argocd-server -n argocd 8080:443 &\033[0m"
+      else
+        echo -e "\033[1;32m✅ ArgoCD port forwarding started successfully on port $PORT\033[0m"
+      fi
+      
+      # Get admin password
+      echo -e "\033[1;34m🔑 Retrieving ArgoCD admin password...\033[0m"
+      ATTEMPTS=0
+      MAX_ATTEMPTS=5
+      
+      while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
+        ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+        
+        if [ -n "$ADMIN_PASSWORD" ]; then
+          echo -e "\033[1;32m✅ ArgoCD admin password retrieved successfully\033[0m"
+          echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
+          chmod 600 /tmp/argocd-admin-password.txt
+          echo -e "\033[1;34m🌐 ArgoCD is now accessible at: \033[1;32mhttps://localhost:$PORT\033[0m"
+          echo -e "\033[1;34m👤 Username: \033[1;37madmin\033[0m"
+          echo -e "\033[1;34m🔑 Password: \033[1;37m$ADMIN_PASSWORD\033[0m"
+          break
+        else
+          ATTEMPTS=$((ATTEMPTS+1))
+          echo -e "\033[1;33m⚠️ Password not found yet. Attempt $ATTEMPTS/$MAX_ATTEMPTS\033[0m"
+          if [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; then
+            echo -e "\033[1;34m🔄 Waiting 10 seconds before retrying...\033[0m"
+            sleep 10
+          fi
+        fi
+      done
+      
+      if [ $ATTEMPTS -eq $MAX_ATTEMPTS ]; then
+        echo -e "\033[1;33m⚠️ Could not retrieve ArgoCD password after $MAX_ATTEMPTS attempts\033[0m"
+        echo -e "\033[1;33m⚠️ ArgoCD may still be initializing. Try again later with:\033[0m"
+        echo -e "\033[1;37m   kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d; echo\033[0m"
+      fi
+      
+      # Create an auto-connect script for future use (backup method)
+      cat > ./argocd-connect.sh << 'EOSCRIPT'
 #!/bin/bash
-# ArgoCD Access Helper Script
+PORT=8080
 
-KUBECONFIG="./kubeconfig.yaml"
+# Check if port is in use
+PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
+if [ -n "$PORT_PID" ]; then
+  echo -e "\033[1;33m⚠️ Port $PORT is already in use by PID $PORT_PID\033[0m"
+  echo -e "\033[1;34m🔄 Stopping existing process...\033[0m"
+  kill -9 $PORT_PID 2>/dev/null || true
+  sleep 2
+fi
 
-function check_kubectl() {
-  if ! command -v kubectl &> /dev/null; then
-    echo "Error: kubectl not found. Please install kubectl first."
-    exit 1
-  fi
-  
-  if [ ! -f "$KUBECONFIG" ]; then
-    echo "Error: kubeconfig not found at $KUBECONFIG"
-    exit 1
-  fi
-}
+# Kill any existing kubectl port-forwards
+pkill -f "kubectl.*port-forward.*argocd-server" || true
 
-function port_forward() {
-  echo "Starting port-forward to ArgoCD server..."
-  
-  # Kill any existing port-forward processes
-  pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
-  
-  # Start port forwarding in the background
-  kubectl --kubeconfig="$KUBECONFIG" port-forward svc/argocd-server -n argocd 8080:443 &
-  PORT_FORWARD_PID=$!
-  
-  echo "Port-forward started with PID: $PORT_FORWARD_PID"
-  echo "ArgoCD UI is available at: https://localhost:8080"
-  
-  # Save the PID for later cleanup
-  echo $PORT_FORWARD_PID > /tmp/argocd-port-forward.pid
-}
+# Start port forwarding
+echo -e "\033[1;34m🔄 Starting ArgoCD port forwarding...\033[0m"
+kubectl port-forward svc/argocd-server -n argocd $PORT:443 &
+PORT_FORWARD_PID=$!
+echo $PORT_FORWARD_PID > /tmp/argocd-port-forward.pid
 
-function get_password() {
-  echo "Retrieving ArgoCD admin password..."
-  ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-  
-  if [ -n "$ADMIN_PASSWORD" ]; then
-    echo "ArgoCD admin password: $ADMIN_PASSWORD"
-    echo "Username: admin"
-    echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
-    echo "Password also saved to /tmp/argocd-admin-password.txt"
-  else
-    echo "Failed to retrieve ArgoCD admin password."
-    echo "ArgoCD might not be fully deployed yet. Try again in a few minutes."
-  fi
-}
+# Get the password
+PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
 
-function stop_port_forward() {
-  echo "Stopping port-forward..."
-  pkill -f "kubectl.*port-forward.*svc/argocd-server" || true
-  rm -f /tmp/argocd-port-forward.pid
-  echo "Port-forward stopped."
-}
-
-function show_help() {
-  echo "ArgoCD Access Helper"
-  echo "--------------------"
-  echo "Usage: $0 [command]"
-  echo ""
-  echo "Commands:"
-  echo "  start    - Start port-forward and get admin password"
-  echo "  stop     - Stop port-forward"
-  echo "  password - Get admin password"
-  echo "  help     - Show this help message"
-  echo ""
-}
-
-# Process command line arguments
-case "$1" in
-  start)
-    check_kubectl
-    port_forward
-    get_password
-    echo ""
-    echo "Port-forward is running in the background."
-    echo "Access ArgoCD at https://localhost:8080"
-    echo "To stop it, run: $0 stop"
-    ;;
-  stop)
-    stop_port_forward
-    ;;
-  password)
-    check_kubectl
-    get_password
-    ;;
-  *)
-    show_help
-    ;;
-esac
-EOF
+echo -e "\033[1;32m✅ ArgoCD is now accessible at: \033[1;37mhttps://localhost:$PORT\033[0m"
+echo -e "\033[1;32m✅ Username: \033[1;37madmin\033[0m" 
+echo -e "\033[1;32m✅ Password: \033[1;37m$PASSWORD\033[0m"
+EOSCRIPT
       
-      # Make the script executable
-      chmod +x ./argocd-access.sh
-      
-      # Create a marker file that the helper script can check for password
-      # Don't try to get password now as ArgoCD might not be ready yet
-      touch /tmp/argocd-helper-created.txt
-      
-      echo "ArgoCD helper script created at ./argocd-access.sh"
-      echo "To access ArgoCD:"
-      echo "  1. Run: ./argocd-access.sh start"
-      echo "  2. Open: https://localhost:8080"
-      echo "  3. Username: admin"
-      echo "  4. To get password: ./argocd-access.sh password"
-      echo "  5. To stop port-forward: ./argocd-access.sh stop"
+      chmod +x ./argocd-connect.sh
+      echo -e "\033[1;34m📝 Created backup connection script: ./argocd-connect.sh\033[0m"
     EOT
+  }
+  
+  # Clean up port forward when destroyed
+  provisioner "local-exec" {
+    when = destroy
+    command = "pkill -f 'kubectl.*port-forward.*argocd-server' || true"
   }
 }
 

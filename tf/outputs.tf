@@ -64,13 +64,29 @@ resource "null_resource" "worker_node_details" {
   }
 
   provisioner "local-exec" {
-    command = "aws ec2 describe-instances --region ${var.region} --filters \"Name=tag:Name,Values=guy-worker-node*\" --query \"Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PublicIP:PublicIpAddress}\" --output json > /tmp/worker_nodes.json || echo '[]' > /tmp/worker_nodes.json"
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      # Get running worker nodes with full details
+      aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
+        --output json > /tmp/worker_nodes.json || echo '[]' > /tmp/worker_nodes.json
+      
+      # Create a formatted text version for output display
+      echo "" > /tmp/worker_nodes_formatted.txt
+      jq -r '.[][] | "Name: \(.Name)\nInstanceId: \(.InstanceId)\nPrivateIP: \(.PrivateIP)\nPublicIP: \(.PublicIP)\nState: \(.State)\n---"' /tmp/worker_nodes.json > /tmp/worker_nodes_formatted.txt
+    EOT
   }
 }
 
 output "worker_nodes" {
-  description = "Worker node details"
+  description = "Worker node details (running instances only)"
   value = fileexists("/tmp/worker_nodes.json") ? jsondecode(file("/tmp/worker_nodes.json")) : []
+}
+
+output "worker_nodes_formatted" {
+  description = "Formatted worker node details for easy reading"
+  value = fileexists("/tmp/worker_nodes_formatted.txt") ? file("/tmp/worker_nodes_formatted.txt") : "No worker nodes information available"
 }
 
 # ------------------------------------------------------------------------
@@ -91,35 +107,59 @@ output "init_logs_commands" {
 # Section 5: ArgoCD Information
 # ------------------------------------------------------------------------
 
-output "argocd_url" {
-  description = "URL of the ArgoCD server (port forwarded)"
-  value       = "https://localhost:8080 (Run ./argocd-access.sh start to start port forwarding)"
+# Resource to retrieve ArgoCD password for output display
+resource "null_resource" "argocd_password_retriever" {
+  triggers = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      # Retrieve ArgoCD password if available
+      if [ -f "/tmp/argocd-admin-password.txt" ]; then
+        cat /tmp/argocd-admin-password.txt > /tmp/argocd-password-output.txt
+      elif [ -f "${local.kubeconfig_path}" ]; then
+        # Try to get it directly if file not found
+        PASSWORD=$(KUBECONFIG="${local.kubeconfig_path}" kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+        if [ -n "$PASSWORD" ]; then
+          echo "$PASSWORD" > /tmp/argocd-password-output.txt
+        else
+          echo "Password not available yet. ArgoCD may still be initializing." > /tmp/argocd-password-output.txt
+        fi
+      else
+        echo "Password not available yet. Kubeconfig not found." > /tmp/argocd-password-output.txt
+      fi
+      
+      # Create colorful ArgoCD info
+      cat > /tmp/argocd-info.txt << 'INFOEOF'
+🔐 ArgoCD Access Information
+---------------------------
+INFOEOF
+      
+      echo -e "🌐 URL: \033[1;36mhttps://localhost:8080\033[0m (Port forwarding automatically started)" >> /tmp/argocd-info.txt
+      echo -e "👤 Username: \033[1;32madmin\033[0m" >> /tmp/argocd-info.txt
+      echo -e "🔑 Password: \033[1;32m$(cat /tmp/argocd-password-output.txt)\033[0m" >> /tmp/argocd-info.txt
+      echo "" >> /tmp/argocd-info.txt
+      echo -e "Note: If port forwarding isn't working, run: \033[1;33m./argocd-connect.sh\033[0m" >> /tmp/argocd-info.txt
+    EOT
+  }
+
+  depends_on = [
+    null_resource.argocd_access
+  ]
 }
 
-output "argocd_admin_credentials" {
-  description = "ArgoCD admin credentials"
-  value = <<-EOT
+output "argocd_info" {
+  description = "Detailed ArgoCD access information"
+  value = fileexists("/tmp/argocd-info.txt") ? file("/tmp/argocd-info.txt") : <<-EOT
+    🔐 ArgoCD Access Information
+    ---------------------------
+    URL: https://localhost:8080 
     Username: admin
-    Password: Run ./argocd-access.sh password to retrieve
-  EOT
-}
-
-output "argocd_access_script" {
-  description = "ArgoCD access script usage"
-  value = <<-EOT
-    ✅ ArgoCD Access Helper Script
+    Password: Not available yet. ArgoCD may still be initializing.
     
-    To access ArgoCD UI:
-    1. Run: ./argocd-access.sh start
-    2. Open: https://localhost:8080
-    3. Username: admin
-    4. Password: Will be displayed by the script
-    
-    To stop port forwarding:
-    Run: ./argocd-access.sh stop
-    
-    To just get the password:
-    Run: ./argocd-access.sh password
+    If ArgoCD isn't accessible, run: ./argocd-connect.sh
   EOT
 }
 
@@ -193,4 +233,175 @@ output "worker_logs_command" {
 
 output "worker_node_info" {
   value = module.k8s-cluster.worker_node_info
+}
+
+# New dynamic worker logs command that uses actual worker public IPs
+resource "null_resource" "dynamic_worker_logs" {
+  triggers = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      # Get running worker nodes
+      WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,PublicIP:PublicIpAddress}" \
+        --output json)
+      
+      echo "# Dynamic Worker Node Log Commands" > /tmp/worker_log_commands.txt
+      echo "# Generated $(date)" >> /tmp/worker_log_commands.txt
+      echo "" >> /tmp/worker_log_commands.txt
+      
+      # Generate dynamic log commands with actual IPs
+      for row in $(echo "$WORKER_DATA" | jq -r '.[][] | @base64'); do
+        _jq() {
+          echo $row | base64 --decode | jq -r $1
+        }
+        
+        NAME=$(_jq '.Name')
+        IP=$(_jq '.PublicIP')
+        
+        if [ -n "$IP" ]; then
+          echo "# Worker: $NAME" >> /tmp/worker_log_commands.txt
+          echo "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@$IP 'cat /home/ubuntu/init_summary.log'" >> /tmp/worker_log_commands.txt
+          echo "" >> /tmp/worker_log_commands.txt
+        fi
+      done
+    EOT
+  }
+}
+
+output "dynamic_worker_logs" {
+  description = "Commands to view logs on each worker node with actual IPs"
+  value = fileexists("/tmp/worker_log_commands.txt") ? file("/tmp/worker_log_commands.txt") : "Worker log commands not available yet"
+}
+
+# ------------------------------------------------------------------------
+# Section 10: Complete Deployment Output
+# ------------------------------------------------------------------------
+
+resource "null_resource" "format_outputs" {
+  triggers = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      
+      # Create visually appealing, colorful output
+      cat > /tmp/final_output.txt << 'EOF'
+🎉 =================================================================== 🎉
+                POLYBOT KUBERNETES CLUSTER DEPLOYMENT
+🎉 =================================================================== 🎉
+
+EOF
+      
+      # ----- ARGOCD INFO -----
+      if [ -f "/tmp/argocd-info.txt" ]; then
+        cat /tmp/argocd-info.txt >> /tmp/final_output.txt
+      else
+        echo -e "🔐 \033[1;34mArgoCD Access\033[0m" >> /tmp/final_output.txt
+        echo -e "-------------------" >> /tmp/final_output.txt
+        echo -e "URL: \033[1;36mhttps://localhost:8080\033[0m" >> /tmp/final_output.txt
+        echo -e "Username: \033[1;32madmin\033[0m" >> /tmp/final_output.txt
+        echo -e "Password: Run argocd-connect.sh to retrieve" >> /tmp/final_output.txt
+        echo "" >> /tmp/final_output.txt
+      fi
+      
+      # ----- CONTROL PLANE INFO -----
+      echo -e "\n\033[1;34m🔧 Control Plane\033[0m" >> /tmp/final_output.txt
+      echo -e "-------------------" >> /tmp/final_output.txt
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
+        --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
+        --query "Reservations[0].Instances[0].InstanceId" --output text)
+      PRIVATE_IP=$(aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
+        --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
+        
+      echo -e "Instance ID: \033[1;32m$INSTANCE_ID\033[0m" >> /tmp/final_output.txt
+      echo -e "Public IP:   \033[1;32m$PUBLIC_IP\033[0m" >> /tmp/final_output.txt
+      echo -e "Private IP:  \033[1;32m$PRIVATE_IP\033[0m" >> /tmp/final_output.txt
+      echo -e "SSH Command: \033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP\033[0m" >> /tmp/final_output.txt
+      echo "" >> /tmp/final_output.txt
+      
+      # ----- WORKER NODES INFO -----
+      echo -e "\033[1;34m🖥️ Worker Nodes\033[0m" >> /tmp/final_output.txt
+      echo -e "-------------------" >> /tmp/final_output.txt
+      
+      if [ -f "/tmp/worker_nodes_formatted.txt" ]; then
+        # Count the nodes by counting the '---' separators plus 1
+        NODE_COUNT=$(grep -c "---" /tmp/worker_nodes_formatted.txt || echo 0)
+        echo -e "Worker Count: \033[1;32m$NODE_COUNT\033[0m" >> /tmp/final_output.txt
+        echo "" >> /tmp/final_output.txt
+        
+        # Replace the plain formatting with colorful output
+        cat /tmp/worker_nodes_formatted.txt | \
+          sed 's/Name: /\\\033[1;33mName: \\\033[1;36m/' | \
+          sed 's/InstanceId: /\\\033[0m\\\033[1;33mInstanceId: \\\033[1;32m/' | \
+          sed 's/PrivateIP: /\\\033[0m\\\033[1;33mPrivateIP: \\\033[1;37m/' | \
+          sed 's/PublicIP: /\\\033[0m\\\033[1;33mPublicIP: \\\033[1;37m/' | \
+          sed 's/State: /\\\033[0m\\\033[1;33mState: \\\033[1;32m/' | \
+          sed 's/---/\\\033[0m\\\n/' >> /tmp/final_output.txt
+      else
+        echo -e "\033[1;33mNo worker node information available yet\033[0m" >> /tmp/final_output.txt
+      fi
+      
+      # ----- LOGS AND TROUBLESHOOTING -----
+      echo -e "\n\033[1;34m📜 Logs and Troubleshooting\033[0m" >> /tmp/final_output.txt
+      echo -e "----------------------------" >> /tmp/final_output.txt
+      
+      echo -e "\033[1;33mControl Plane Init Log:\033[0m" >> /tmp/final_output.txt
+      echo -e "\033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'\033[0m" >> /tmp/final_output.txt
+      echo "" >> /tmp/final_output.txt
+      
+      # Add dynamic worker logs
+      if [ -f "/tmp/worker_log_commands.txt" ]; then
+        echo -e "\033[1;33mWorker Node Init Logs:\033[0m" >> /tmp/final_output.txt
+        cat /tmp/worker_log_commands.txt | sed 's/ssh -i/\\\033[1;36mssh -i/' | sed 's/log\'/log\\\033[0m\\\'\033[0m/' >> /tmp/final_output.txt
+      fi
+      
+      # ----- KUBERNETES ACCESS -----
+      echo -e "\n\033[1;34m☸️ Kubernetes Access\033[0m" >> /tmp/final_output.txt
+      echo -e "---------------------" >> /tmp/final_output.txt
+      echo -e "API Endpoint: \033[1;36mhttps://$PUBLIC_IP:6443\033[0m" >> /tmp/final_output.txt
+      echo -e "Kubeconfig:   \033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=\$\$(pwd)/kubeconfig.yaml\033[0m" >> /tmp/final_output.txt
+      echo "" >> /tmp/final_output.txt
+      
+      # ----- APPLICATION ENDPOINTS -----
+      echo -e "\033[1;34m🌐 Application Endpoints\033[0m" >> /tmp/final_output.txt
+      echo -e "------------------------" >> /tmp/final_output.txt
+      echo -e "Dev URL:  \033[1;36mhttps://dev-polybot.${terraform.workspace}.devops-int-college.com\033[0m" >> /tmp/final_output.txt
+      echo -e "Prod URL: \033[1;36mhttps://polybot.${terraform.workspace}.devops-int-college.com\033[0m" >> /tmp/final_output.txt
+      
+      # Get ALB DNS from AWS
+      ALB_DNS=$(aws elbv2 describe-load-balancers --region ${var.region} \
+        --query "LoadBalancers[?contains(LoadBalancerName, 'guy-polybot-lb')].DNSName" \
+        --output text)
+      
+      echo -e "Load Balancer DNS: \033[1;32m$ALB_DNS\033[0m" >> /tmp/final_output.txt
+      echo "" >> /tmp/final_output.txt
+      
+      # ----- CLOSING -----
+      echo -e "\033[1;32m✅ Terraform Deployment Complete!\033[0m" >> /tmp/final_output.txt
+      echo -e "\033[1;34m=================================================================\033[0m" >> /tmp/final_output.txt
+    EOT
+  }
+
+  depends_on = [
+    null_resource.argocd_password_retriever,
+    null_resource.worker_node_details,
+    null_resource.dynamic_worker_logs
+  ]
+}
+
+output "complete_deployment_info" {
+  description = "Complete formatted deployment information"
+  value = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
 }

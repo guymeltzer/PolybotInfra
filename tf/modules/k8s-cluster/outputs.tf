@@ -241,5 +241,13 @@ output "deployment_summary" {
 
 output "init_logs_commands" {
   description = "Commands to view initialization logs on control plane and worker nodes"
-  value = "🧪 Init Logs\n------------------------------\n📄 Control Plane Init Log:\nView with: ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip} 'cat /home/ubuntu/init_summary.log'\n\n📄 Worker Node Init Logs:\nView with: ssh -i ${local.actual_key_name}.pem ubuntu@WORKER_PUBLIC_IP 'cat /home/ubuntu/init_summary.log'\n(Replace WORKER_PUBLIC_IP with the IP from worker_node_info command)\n\nNote: These logs contain full initialization process details for troubleshooting."
+  value = <<-EOT
+    # Control Plane Init Log
+    ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip} 'cat /home/ubuntu/init_summary.log'
+    
+    # Worker Nodes: Get worker IPs with the command below, then view logs:
+    # aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=${aws_autoscaling_group.worker_nodes.name}*" "Name=instance-state-name,Values=running" --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,PublicIP:PublicIpAddress}" --output table
+    # Then for each worker:
+    # ssh -i ${local.actual_key_name}.pem ubuntu@WORKER_PUBLIC_IP 'cat /home/ubuntu/init_summary.log'
+  EOT
 }
