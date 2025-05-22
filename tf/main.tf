@@ -1413,4 +1413,233 @@ EOF
   }
 }
 
+# Resource to fix ArgoCD internal connectivity issues
+resource "null_resource" "fix_argocd_connectivity" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.configure_argocd_repositories,
+    null_resource.configure_argocd_apps
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    time = timestamp()  # Run this every time to ensure it applies
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "Checking ArgoCD pod status..."
+      kubectl -n argocd get pods
+      
+      echo "Restarting ArgoCD components to fix connectivity issues..."
+      # Delete the repo server pod to force a restart
+      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-repo-server --force --grace-period=0 || true
+      
+      # Restart the argocd-server
+      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-server --force --grace-period=0 || true
+      
+      # Restart the application controller
+      kubectl -n argocd delete pod -l app.kubernetes.io/name=argocd-application-controller --force --grace-period=0 || true
+      
+      echo "Waiting for ArgoCD pods to restart..."
+      sleep 10
+      
+      # Wait for repo server to be ready
+      echo "Waiting for argocd-repo-server to be ready..."
+      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-repo-server --timeout=120s || true
+      
+      # Wait for server to be ready
+      echo "Waiting for argocd-server to be ready..."
+      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=120s || true
+      
+      # Wait for application controller to be ready
+      echo "Waiting for argocd-application-controller to be ready..."
+      kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-application-controller --timeout=120s || true
+      
+      echo "Checking final ArgoCD pod status..."
+      kubectl -n argocd get pods
+      
+      echo "Refreshing ArgoCD applications..."
+      APPS=$(kubectl -n argocd get applications -o name)
+      for APP in $APPS; do
+        echo "Refreshing $APP..."
+        kubectl -n argocd patch $APP -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' --type=merge || true
+      done
+      
+      echo "ArgoCD connectivity issues should be fixed. Check the ArgoCD UI in a few moments."
+    EOT
+  }
+}
+
+# Create MongoDB directly without ArgoCD
+resource "null_resource" "deploy_mongodb_directly" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.fix_argocd_connectivity,
+    null_resource.install_ebs_csi_driver
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "Creating MongoDB namespace if it doesn't exist..."
+      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
+      
+      echo "Creating MongoDB StatefulSet directly..."
+      kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-config
+  namespace: mongodb
+data:
+  mongo.conf: |
+    storage:
+      dbPath: /data/db
+    net:
+      bindIp: 0.0.0.0
+    replication:
+      replSetName: rs0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-secret
+  namespace: mongodb
+type: Opaque
+data:
+  MONGO_INITDB_ROOT_USERNAME: YWRtaW4=
+  MONGO_INITDB_ROOT_PASSWORD: cGFzc3dvcmQ=
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: mongodb
+  labels:
+    app: mongodb
+spec:
+  selector:
+    app: mongodb
+  ports:
+  - port: 27017
+    targetPort: 27017
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: mongodb
+spec:
+  serviceName: mongodb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo:4.4
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: MONGO_INITDB_ROOT_USERNAME
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-secret
+              key: MONGO_INITDB_ROOT_PASSWORD
+        ports:
+        - containerPort: 27017
+        volumeMounts:
+        - name: data
+          mountPath: /data/db
+        - name: config
+          mountPath: /config
+        command:
+        - "mongod"
+        - "--config=/config/mongo.conf"
+      volumes:
+      - name: config
+        configMap:
+          name: mongodb-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "ebs-sc"
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-init
+  namespace: mongodb
+spec:
+  template:
+    spec:
+      containers:
+      - name: mongo-init
+        image: mongo:4.4
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Waiting for MongoDB to be ready..."
+          sleep 30
+          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017'}]})"
+          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "db.getSiblingDB('polybot').createUser({user: 'polybot', pwd: 'polybot', roles: [{role: 'readWrite', db: 'polybot'}]})"
+          echo "MongoDB initialized successfully"
+      restartPolicy: OnFailure
+EOF
+      
+      echo "Waiting for MongoDB StatefulSet to be ready..."
+      kubectl -n mongodb rollout status statefulset/mongodb --timeout=300s || true
+      
+      echo "Checking MongoDB pod status..."
+      kubectl -n mongodb get pods
+      
+      echo "MongoDB has been deployed directly. Check its status using: kubectl -n mongodb get pods"
+    EOT
+  }
+}
+
 
