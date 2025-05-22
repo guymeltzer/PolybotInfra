@@ -1241,8 +1241,7 @@ resource "aws_iam_instance_profile" "worker_profile" {
 
 # Also create a terraform_data resource for worker script
 resource "terraform_data" "worker_script_hash" {
-  input  = md5(file("${path.module}/worker_user_data.sh"))
-  output = md5(file("${path.module}/worker_user_data.sh"))
+  input = md5(file("${path.module}/worker_user_data.sh"))
   
   triggers_replace = {
     rebuild = var.rebuild_workers ? timestamp() : "static"
