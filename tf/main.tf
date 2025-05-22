@@ -106,10 +106,10 @@ resource "terraform_data" "manage_secrets" {
 resource "terraform_data" "init_environment" {
   depends_on = [terraform_data.manage_secrets]
 
-  # Only run if the kubeconfig doesn't exist or cluster has changed
+  # Use a more deterministic trigger that won't cause cycles
   triggers_replace = {
-    # Only run when kubeconfig doesn't exist or cluster has changed
-    run_kubeconfig = !fileexists("./kubeconfig.yaml") || module.k8s-cluster.control_plane_id
+    # Trigger on kubeconfig presence/absence without referencing module.k8s-cluster
+    run_kubeconfig = fileexists("./kubeconfig.yaml") ? filemd5("./kubeconfig.yaml") : "notexists"
   }
 
   # Create a valid kubeconfig before any resources are created
@@ -196,15 +196,12 @@ EOF
 resource "null_resource" "wait_for_kubernetes" {
   count = 1
 
-  # Only trigger when the control plane changes, not on every apply
+  # Only trigger when the kubeconfig changes, not directly on module.k8s-cluster
   triggers = {
-    # Only run when the control plane ID changes
-    instance_id = module.k8s-cluster.control_plane_id
+    # Ensure this runs when the kubeconfig is updated
+    kubeconfig_md5 = fileexists("${local.kubeconfig_path}") ? filemd5("${local.kubeconfig_path}") : "nonexistent"
   }
 
-  depends_on = [module.k8s-cluster]
-
-  # Check if the control plane API is actually accessible
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
@@ -266,9 +263,9 @@ resource "null_resource" "check_argocd_status" {
     terraform_data.kubectl_provider_config
   ]
   
-  # Only trigger on control plane changes, not every apply
+  # Only trigger on kubeconfig changes, not directly on control plane changes
   triggers = {
-    instance_id = module.k8s-cluster.control_plane_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
   
   provisioner "local-exec" {
@@ -294,7 +291,7 @@ resource "null_resource" "check_argocd_status" {
 resource "null_resource" "install_argocd" {
   count = local.skip_argocd ? 0 : 1
   
-  # Ensure all prerequisites are met
+  # Ensure all prerequisites are met but avoid direct module references
   depends_on = [
     null_resource.create_namespaces,
     null_resource.providers_ready,
@@ -303,10 +300,12 @@ resource "null_resource" "install_argocd" {
   ]
   
   # Only run when needed based on whether ArgoCD is already installed
+  # Avoid direct references to the cluster module to prevent cycles
   triggers = {
-    instance_id = module.k8s-cluster.control_plane_id
-    # Force run if check_argocd indicates it's not installed
-    needs_install = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") != "true" : true
+    # Use the check_argocd_status resource as the trigger
+    needs_install = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") != "true" : true,
+    # Also trigger on kubeconfig changes
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
   
   provisioner "local-exec" {
@@ -352,9 +351,10 @@ resource "null_resource" "argocd_direct_access" {
     null_resource.install_argocd
   ]
   
-  # Only run when ArgoCD changes
+  # Only run when ArgoCD changes or kubeconfig changes - don't reference cluster directly
   triggers = {
     argocd_install = null_resource.install_argocd[0].id
+    kubeconfig = terraform_data.kubectl_provider_config[0].id
   }
   
   provisioner "local-exec" {
@@ -954,9 +954,9 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
   
   depends_on = [null_resource.argocd_direct_access]
   
-  # Always run cleanup on destroy
+  # Use a more controlled trigger that won't create cycles
   triggers_replace = {
-    time = timestamp()
+    argocd_access_id = null_resource.argocd_direct_access[0].id
   }
   
   provisioner "local-exec" {
