@@ -1642,4 +1642,112 @@ EOF
   }
 }
 
+# Add this resource after the null_resource.fix_argocd_connectivity resource
+resource "null_resource" "cleanup_worker_nodes" {
+  depends_on = [null_resource.fix_argocd_connectivity]
+
+  count = local.skip_argocd ? 0 : 1
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="./kubeconfig.yaml"
+      
+      echo "Cleaning up evicted pods..."
+      kubectl get pods --all-namespaces | grep Evicted | awk '{print $2 " --namespace=" $1}' | xargs -L1 kubectl delete pod
+      
+      echo "Setting up node disk cleanup job..."
+      cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-cleanup
+  namespace: kube-system
+spec:
+  schedule: "0 */6 * * *"  # Run every 6 hours
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          tolerations:
+          - key: node-role.kubernetes.io/master
+            effect: NoSchedule
+          - key: node-role.kubernetes.io/control-plane
+            effect: NoSchedule
+          containers:
+          - name: cleanup
+            image: ubuntu:20.04
+            command:
+            - /bin/sh
+            - -c
+            - |
+              apt-get update && apt-get install -y docker.io
+              echo "Cleaning up Docker system..."
+              docker system prune -af
+              echo "Clearing logs..."
+              find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+              echo "Clearing journal logs..."
+              journalctl --vacuum-time=1d
+              echo "Clearing temp files..."
+              rm -rf /tmp/*
+              echo "Node cleanup completed"
+            securityContext:
+              privileged: true
+            volumeMounts:
+            - name: var-log
+              mountPath: /var/log
+            - name: var-lib-docker
+              mountPath: /var/lib/docker
+            - name: run
+              mountPath: /run
+            - name: tmp 
+              mountPath: /tmp
+          volumes:
+          - name: var-log
+            hostPath:
+              path: /var/log
+          - name: var-lib-docker
+            hostPath:
+              path: /var/lib/docker
+          - name: run
+            hostPath:
+              path: /run
+          - name: tmp
+            hostPath:
+              path: /tmp
+          restartPolicy: OnFailure
+          hostNetwork: true
+          hostPID: true
+EOF
+      
+      echo "Checking node status..."
+      kubectl describe nodes
+      echo "Cleanup job created successfully."
+    EOT
+  }
+}
+
+# Add this after deploy_mongodb_directly if it exists, otherwise after cleanup_worker_nodes
+resource "null_resource" "restart_tigera_operator" {
+  depends_on = [null_resource.cleanup_worker_nodes]
+
+  count = local.skip_argocd ? 0 : 1
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="./kubeconfig.yaml"
+      
+      echo "Restarting Tigera Operator deployment..."
+      kubectl -n tigera-operator rollout restart deployment tigera-operator
+      
+      echo "Waiting for Tigera Operator to restart..."
+      kubectl -n tigera-operator rollout status deployment tigera-operator --timeout=180s
+      
+      echo "Tigera Operator has been restarted."
+    EOT
+  }
+}
+
 
