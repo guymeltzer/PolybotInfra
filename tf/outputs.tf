@@ -146,7 +146,7 @@ INFOEOF
   }
 
   depends_on = [
-    null_resource.argocd_access
+    null_resource.argocd_access_helper
   ]
 }
 
@@ -397,7 +397,8 @@ EOF
   depends_on = [
     null_resource.argocd_password_retriever,
     null_resource.worker_node_details,
-    null_resource.dynamic_worker_logs
+    null_resource.dynamic_worker_logs,
+    null_resource.argocd_access_helper
   ]
 }
 
