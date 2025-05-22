@@ -1067,45 +1067,33 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
   
   provisioner "local-exec" {
     when = destroy
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
-      # Run the established cleanup script if it exists
-      if [ -f "/tmp/argocd-tunnel-cleanup.sh" ]; then
-        echo "Running ArgoCD SSH tunnel cleanup script..."
-        bash /tmp/argocd-tunnel-cleanup.sh
-      else
-        echo "Creating a minimal cleanup script..."
-        # Create a minimal cleanup script that just kills SSH tunnels
-        cat > /tmp/minimal-ssh-cleanup.sh <<'EOF'
-#!/bin/bash
-# Minimal SSH tunnel cleanup
-echo "Cleaning up any ArgoCD SSH tunnels..."
+    # Use direct bash command instead of complex script
+    command = "pkill -f 'ssh.*-L 8081:localhost:8081' || true"
+  }
+}
 
-# Kill SSH tunnels
-pkill -f "ssh.*-L 8081:localhost:8081.*ubuntu@" 2>/dev/null || true
-
-# Try to find the control plane to clean up there too
-CONTROL_PLANE_IP=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-
-if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-  echo "Cleaning up remote processes on control plane..."
-  ssh -i polybot-key.pem -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP \
-    "pkill -f 'kubectl.*port-forward.*argocd-server' 2>/dev/null || true" 2>/dev/null || true
-fi
-
-# Clean up temporary files
-rm -f /tmp/argocd-ssh-tunnel.pid /tmp/argocd-ssh-tunnel.log \
-      /tmp/argocd-admin-password.txt /tmp/argocd-forward-command
-EOF
-
-        chmod +x /tmp/minimal-ssh-cleanup.sh
-        bash /tmp/minimal-ssh-cleanup.sh
-      fi
-      
-      echo "ArgoCD cleanup complete"
-    EOT
+# Add a separate cleanup for any remaining processes
+resource "terraform_data" "final_cleanup" {
+  count = 1
+  
+  # This will run last during destroy
+  depends_on = [
+    terraform_data.argocd_port_forward_cleanup,
+    module.k8s-cluster,
+    module.polybot_dev,
+    module.polybot_prod
+  ]
+  
+  # Simple trigger to run on every apply
+  triggers_replace = {
+    timestamp = timestamp()
+  }
+  
+  # Run a very simple cleanup during destroy
+  provisioner "local-exec" {
+    when = destroy
+    interpreter = ["bash", "-c"]
+    command = "rm -f /tmp/argocd-*.{txt,log,pid,sh} || true"
   }
 }
 
