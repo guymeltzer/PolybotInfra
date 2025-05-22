@@ -361,7 +361,7 @@ resource "null_resource" "argocd_direct_access" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      set -e
+      # Do NOT use set -e as it causes premature termination
       
       # Set up connection to the cluster
       export KUBECONFIG="${local.kubeconfig_path}"
@@ -388,30 +388,8 @@ resource "null_resource" "argocd_direct_access" {
         fi
       done
       
-      # Set up the automatic port forward in a systemd service
+      # Save the URL and credentials to a file for easy access - do this BEFORE port forwarding
       PORT=8081
-      
-      # Check if any port forwarding is already running and stop it
-      echo "Setting up port forwarding for ArgoCD..."
-      pkill -f "kubectl.*port-forward.*argocd-server" || true
-      
-      # Check if port is in use
-      PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
-      if [ -n "$PORT_PID" ]; then
-        echo "Port $PORT is already in use, stopping process..."
-        kill -9 $PORT_PID 2>/dev/null || true
-        sleep 2
-      fi
-      
-      # Start the port forward in a way that will survive after Terraform exits
-      nohup kubectl port-forward -n argocd svc/argocd-server $PORT:443 >/tmp/argocd-port-forward.log 2>&1 &
-      
-      echo "ArgoCD port forwarding started on port $PORT"
-      echo "ArgoCD URL: https://localhost:$PORT"
-      echo "Username: admin"
-      echo "Password: $ADMIN_PASSWORD"
-      
-      # Save the URL and credentials to a file for easy access
       cat > /tmp/argocd-access-info.txt <<- ACCESS
         ArgoCD Access Information
         ------------------------
@@ -423,12 +401,33 @@ resource "null_resource" "argocd_direct_access" {
         kubectl port-forward -n argocd svc/argocd-server $PORT:443
       ACCESS
       
-      # Record the PID
-      PID=$!
-      echo $PID > /tmp/argocd-port-forward.pid
+      # Create the port forwarding script separately to avoid issues with Terraform terminating it
+      cat > /tmp/start-argocd-portforward.sh <<EOF
+#!/bin/bash
+# ArgoCD port forwarding script
+
+# Kill any existing port forwards
+pkill -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
+
+# Check if port is in use
+PORT_PID=\$(lsof -ti:${PORT} 2>/dev/null)
+if [ -n "\$PORT_PID" ]; then
+  echo "Port ${PORT} is already in use, stopping process..."
+  kill -9 \$PORT_PID 2>/dev/null || true
+  sleep 2
+fi
+
+# Start port forwarding in the background 
+export KUBECONFIG="${local.kubeconfig_path}"
+nohup kubectl port-forward -n argocd svc/argocd-server ${PORT}:443 >/tmp/argocd-port-forward.log 2>&1 &
+echo \$! > /tmp/argocd-port-forward.pid
+echo "ArgoCD port forwarding started on port ${PORT}"
+EOF
       
-      # Add a hook to ensure port forwarding is properly closed during terraform destroy
-      # This uses the Bash trap command to register a cleanup function
+      # Make the script executable
+      chmod +x /tmp/start-argocd-portforward.sh
+      
+      # Create the cleanup script
       cat > /tmp/port-forward-cleanup.sh <<EOF
 #!/bin/bash
 # ArgoCD port forward cleanup
@@ -439,14 +438,29 @@ EOF
       
       chmod +x /tmp/port-forward-cleanup.sh
       
-      echo "Port forwarding set up successfully. Access ArgoCD at: https://localhost:$PORT"
+      # Now run the port forwarding script and allow it to complete
+      # This approach ensures the Terraform provisioner completes normally
+      echo "Starting port forwarding for ArgoCD..."
+      bash /tmp/start-argocd-portforward.sh
+      
+      # Wait a moment to ensure port forwarding starts
+      sleep 3
+      
+      # Check if port forwarding is running
+      if ps -p $(cat /tmp/argocd-port-forward.pid 2>/dev/null) >/dev/null 2>&1; then
+        echo "Port forwarding is running successfully"
+      else
+        echo "Port forwarding might not have started correctly, check /tmp/argocd-port-forward.log"
+      fi
+      
+      echo "ArgoCD setup complete. Access at https://localhost:$PORT"
     EOT
   }
   
   # Clean up port forwarding during terraform destroy
   provisioner "local-exec" {
     when = destroy
-    command = "/tmp/port-forward-cleanup.sh || true"
+    command = "bash /tmp/port-forward-cleanup.sh || true"
   }
 }
 
