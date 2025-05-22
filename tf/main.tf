@@ -388,7 +388,7 @@ resource "null_resource" "argocd_direct_access" {
         fi
       done
       
-      # Save the URL and credentials to a file for easy access - do this BEFORE port forwarding
+      # Save the URL and credentials to a file for easy access
       PORT=8081
       cat > /tmp/argocd-access-info.txt <<- ACCESS
         ArgoCD Access Information
@@ -401,66 +401,97 @@ resource "null_resource" "argocd_direct_access" {
         kubectl port-forward -n argocd svc/argocd-server $PORT:443
       ACCESS
       
-      # Create the port forwarding script separately to avoid issues with Terraform terminating it
-      cat > /tmp/start-argocd-portforward.sh <<EOF
+      # Create an improved, more robust port forwarding script that persists 
+      # outside of Terraform's lifecycle
+      cat > /tmp/start-argocd-portforward.sh <<'EOF'
 #!/bin/bash
-# ArgoCD port forwarding script
+# Robust ArgoCD port forwarding script
 
 # Kill any existing port forwards
 pkill -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
 
+# Define port and paths
+PORT=8081
+KUBECONFIG=$(pwd)/kubeconfig.yaml
+LOG_FILE=/tmp/argocd-port-forward.log
+PID_FILE=/tmp/argocd-port-forward.pid
+
 # Check if port is in use
-PORT_PID=\$(lsof -ti:$${PORT} 2>/dev/null)
-if [ -n "\$PORT_PID" ]; then
-  echo "Port $${PORT} is already in use, stopping process..."
-  kill -9 \$PORT_PID 2>/dev/null || true
+PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
+if [ -n "$PORT_PID" ]; then
+  echo "Port $PORT is already in use, stopping process..."
+  kill -9 $PORT_PID 2>/dev/null || true
   sleep 2
 fi
 
-# Start port forwarding in the background 
-export KUBECONFIG="${local.kubeconfig_path}"
-nohup kubectl port-forward -n argocd svc/argocd-server $${PORT}:443 >/tmp/argocd-port-forward.log 2>&1 &
-echo \$! > /tmp/argocd-port-forward.pid
-echo "ArgoCD port forwarding started on port $${PORT}"
+# Make sure KUBECONFIG exists
+if [ ! -f "$KUBECONFIG" ]; then
+  echo "Error: Kubeconfig file not found at $KUBECONFIG" >&2
+  exit 1
+fi
+
+# Start port forwarding with nohup to ensure it survives after terminal closes
+export KUBECONFIG="$KUBECONFIG"
+
+# The key is to use disown to completely detach the process
+nohup kubectl port-forward -n argocd svc/argocd-server $PORT:443 >$LOG_FILE 2>&1 &
+PID=$!
+echo $PID > $PID_FILE
+
+# Detach the process from terminal session
+disown $PID
+
+# Verify it's running
+sleep 2
+if ps -p $PID >/dev/null; then
+  echo "ArgoCD port forwarding started successfully on port $PORT (PID: $PID)"
+else
+  echo "Failed to start port forwarding. Check $LOG_FILE for details." >&2
+  exit 1
+fi
 EOF
       
-      # Make the script executable
       chmod +x /tmp/start-argocd-portforward.sh
       
       # Create the cleanup script
-      cat > /tmp/port-forward-cleanup.sh <<EOF
+      cat > /tmp/port-forward-cleanup.sh <<'EOF'
 #!/bin/bash
 # ArgoCD port forward cleanup
+echo "Stopping ArgoCD port forwarding..."
 pkill -f "kubectl.*port-forward.*argocd-server" || true
-rm -f /tmp/argocd-port-forward.pid
-rm -f /tmp/argocd-port-forward.log
+rm -f /tmp/argocd-port-forward.pid /tmp/argocd-port-forward.log
 EOF
       
       chmod +x /tmp/port-forward-cleanup.sh
       
-      # Now run the port forwarding script and allow it to complete
-      # This approach ensures the Terraform provisioner completes normally
+      # Now run the port forwarding script
       echo "Starting port forwarding for ArgoCD..."
-      bash /tmp/start-argocd-portforward.sh
+      /tmp/start-argocd-portforward.sh
       
-      # Wait a moment to ensure port forwarding starts
-      sleep 3
+      # Wait for port to become available
+      echo "Waiting for port 8081 to be available..."
+      for i in {1..5}; do
+        if curl -k -s https://localhost:8081 >/dev/null; then
+          echo "✅ ArgoCD port forwarding is active and responding on port 8081"
+          break
+        elif [ $i -eq 5 ]; then
+          echo "⚠️ Port forwarding might not be working. Please check logs at /tmp/argocd-port-forward.log"
+        else
+          echo "Waiting for port to respond... ($i/5)"
+          sleep 3
+        fi
+      done
       
-      # Check if port forwarding is running
-      if ps -p $(cat /tmp/argocd-port-forward.pid 2>/dev/null) >/dev/null 2>&1; then
-        echo "Port forwarding is running successfully"
-      else
-        echo "Port forwarding might not have started correctly, check /tmp/argocd-port-forward.log"
-      fi
-      
-      echo "ArgoCD setup complete. Access at https://localhost:$PORT"
+      echo "✅ ArgoCD setup complete. Access at https://localhost:8081"
+      echo "✅ Username: admin"
+      echo "✅ Password: $ADMIN_PASSWORD"
     EOT
   }
   
   # Clean up port forwarding during terraform destroy
   provisioner "local-exec" {
     when = destroy
-    command = "bash /tmp/port-forward-cleanup.sh || true"
+    command = "/tmp/port-forward-cleanup.sh || true"
   }
 }
 
