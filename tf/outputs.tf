@@ -137,7 +137,7 @@ resource "null_resource" "argocd_password_retriever" {
 ---------------------------
 INFOEOF
       
-      echo -e "🌐 URL: \033[1;36mhttps://localhost:8080\033[0m (Run ./argocd-connect.sh start to start port forwarding)" >> /tmp/argocd-info.txt
+      echo -e "🌐 URL: \033[1;36mhttps://localhost:8081\033[0m (Run ./argocd-connect.sh start to start port forwarding)" >> /tmp/argocd-info.txt
       echo -e "👤 Username: \033[1;32madmin\033[0m" >> /tmp/argocd-info.txt
       echo -e "🔑 Password: \033[1;32m$(cat /tmp/argocd-password-output.txt)\033[0m" >> /tmp/argocd-info.txt
       echo "" >> /tmp/argocd-info.txt
@@ -152,14 +152,15 @@ INFOEOF
 
 output "argocd_info" {
   description = "Detailed ArgoCD access information"
-  value = fileexists("/tmp/argocd-info.txt") ? file("/tmp/argocd-info.txt") : <<-EOT
+  value = <<-EOT
     🔐 ArgoCD Access Information
     ---------------------------
-    URL: https://localhost:8080 
+    URL: https://localhost:8081 (Port forwarding should be running automatically)
     Username: admin
-    Password: Not available yet. ArgoCD may still be initializing.
+    Password: ${fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet. Run: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"}
     
-    If ArgoCD isn't accessible, run: ./argocd-connect.sh
+    To manually restart port forwarding if needed:
+    kubectl port-forward -n argocd svc/argocd-server 8081:443
   EOT
 }
 
@@ -306,7 +307,7 @@ EOF
       else
         echo -e "🔐 \033[1;34mArgoCD Access\033[0m" >> /tmp/final_output.txt
         echo -e "-------------------" >> /tmp/final_output.txt
-        echo -e "URL: \033[1;36mhttps://localhost:8080\033[0m" >> /tmp/final_output.txt
+        echo -e "URL: \033[1;36mhttps://localhost:8081\033[0m" >> /tmp/final_output.txt
         echo -e "Username: \033[1;32madmin\033[0m" >> /tmp/final_output.txt
         echo -e "Password: Run argocd-connect.sh to retrieve" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
@@ -341,9 +342,12 @@ EOF
         echo -e "Worker Count: \033[1;32m$NODE_COUNT\033[0m" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
         
-        # Format worker nodes in a cleaner way without excessive escape sequences
+        # Format worker nodes without using ANSI escape sequences in jq
         echo -e "\033[1;33mWorker Nodes Details:\033[0m" >> /tmp/final_output.txt
-        jq -r '.[][] | "\033[1;36m- \(.Name):\033[0m ID: \033[1;32m\(.InstanceId)\033[0m, Private IP: \033[1;37m\(.PrivateIP)\033[0m, Public IP: \033[1;37m\(.PublicIP)\033[0m, State: \033[1;32m\(.State)\033[0m"' /tmp/worker_nodes.json >> /tmp/final_output.txt
+        # Use a simpler approach that doesn't rely on escape sequences in jq
+        jq -r '.[][] | "- " + .Name + ": ID: " + .InstanceId + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State' /tmp/worker_nodes.json > /tmp/worker_details.txt
+        # Then add formatting with sed instead
+        cat /tmp/worker_details.txt | sed 's/^-/\\033[1;36m-/g' | sed 's/: ID:/:\\033[0m ID:/g' | sed 's/ID: /ID: \\033[1;32m/g' | sed 's/, Private/\\033[0m, Private/g' | sed 's/Private IP: /Private IP: \\033[1;37m/g' | sed 's/, Public/\\033[0m, Public/g' | sed 's/Public IP: /Public IP: \\033[1;37m/g' | sed 's/, State:/\\033[0m, State:/g' | sed 's/State: /State: \\033[1;32m/g' | sed 's/$/\\033[0m/g' >> /tmp/final_output.txt
       else
         echo -e "\033[1;33mNo worker node information available yet\033[0m" >> /tmp/final_output.txt
       fi

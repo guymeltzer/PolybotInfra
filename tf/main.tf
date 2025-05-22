@@ -106,10 +106,10 @@ resource "terraform_data" "manage_secrets" {
 resource "terraform_data" "init_environment" {
   depends_on = [terraform_data.manage_secrets]
 
-  # This will run on every apply
+  # Only run if the kubeconfig doesn't exist or cluster has changed
   triggers_replace = {
-    # Always run at the beginning of every terraform apply
-    timestamp = timestamp()
+    # Only run when kubeconfig doesn't exist or cluster has changed
+    run_kubeconfig = !fileexists("./kubeconfig.yaml") || module.k8s-cluster.control_plane_id
   }
 
   # Create a valid kubeconfig before any resources are created
@@ -192,19 +192,17 @@ EOF
   }
 }
 
-# Wait for Kubernetes API to be fully available
+# Resource to wait for Kubernetes API to be fully available - with improved triggers
 resource "null_resource" "wait_for_kubernetes" {
-  # Use a static count value
   count = 1
 
-  # Make sure this only runs after the cluster setup starts
-  depends_on = [module.k8s-cluster]
-
-  # Run only when needed by tracking the control plane
+  # Only trigger when the control plane changes, not on every apply
   triggers = {
-    # This will trigger a recreation if the cluster config changes
+    # Only run when the control plane ID changes
     instance_id = module.k8s-cluster.control_plane_id
   }
+
+  depends_on = [module.k8s-cluster]
 
   # Check if the control plane API is actually accessible
   provisioner "local-exec" {
@@ -255,6 +253,223 @@ resource "null_resource" "wait_for_kubernetes" {
           sleep 10
         fi
       done
+    EOT
+  }
+}
+
+# Resource that checks if ArgoCD is already deployed before spending time installing it
+resource "null_resource" "check_argocd_status" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  # Only trigger on control plane changes, not every apply
+  triggers = {
+    instance_id = module.k8s-cluster.control_plane_id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Check if argocd is already deployed
+      if kubectl get deployments -n argocd argocd-server &>/dev/null; then
+        echo "ArgoCD server already deployed, skipping installation"
+        # Mark as already installed
+        echo "true" > /tmp/argocd_already_installed
+      else
+        echo "ArgoCD not found, will proceed with installation"
+        echo "false" > /tmp/argocd_already_installed
+      fi
+    EOT
+  }
+}
+
+# Install ArgoCD only if not already installed
+resource "null_resource" "install_argocd" {
+  count = local.skip_argocd ? 0 : 1
+  
+  # Ensure all prerequisites are met
+  depends_on = [
+    null_resource.create_namespaces,
+    null_resource.providers_ready,
+    null_resource.check_argocd_status,
+    null_resource.install_ebs_csi_driver
+  ]
+  
+  # Only run when needed based on whether ArgoCD is already installed
+  triggers = {
+    instance_id = module.k8s-cluster.control_plane_id
+    # Force run if check_argocd indicates it's not installed
+    needs_install = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") != "true" : true
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      echo "Checking if ArgoCD needs to be installed..."
+      KUBECONFIG="${local.kubeconfig_path}"
+      
+      if [ -f "/tmp/argocd_already_installed" ] && [ "$(cat /tmp/argocd_already_installed)" == "true" ]; then
+        echo "ArgoCD already installed, skipping installation"
+        exit 0
+      fi
+      
+      echo "Ensuring argocd namespace exists..."
+      kubectl --kubeconfig="$KUBECONFIG" create namespace argocd --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply --validate=false -f -
+      
+      echo "Installing ArgoCD..."
+      kubectl --kubeconfig="$KUBECONFIG" apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      
+      # Wait for ArgoCD to be ready
+      echo "Waiting for ArgoCD to be ready..."
+      for i in {1..30}; do
+        if kubectl --kubeconfig="$KUBECONFIG" -n argocd get deployment/argocd-server &>/dev/null; then
+          echo "ArgoCD server deployment found, waiting for it to be ready..."
+          kubectl --kubeconfig="$KUBECONFIG" -n argocd wait --for=condition=available --timeout=300s deployment/argocd-server || true
+          break
+        fi
+        echo "Waiting for ArgoCD server deployment to appear... ($i/30)"
+        sleep 10
+      done
+      
+      echo "ArgoCD installation complete"
+    EOT
+  }
+}
+
+# Get ArgoCD admin password and set up automatic port forwarding directly in Terraform
+resource "null_resource" "argocd_direct_access" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd
+  ]
+  
+  # Only run when ArgoCD changes
+  triggers = {
+    argocd_install = null_resource.install_argocd[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      # Set up connection to the cluster
+      export KUBECONFIG="${local.kubeconfig_path}"
+      echo "Retrieving ArgoCD credentials..."
+      
+      # Wait for the ArgoCD server and admin secret to be available
+      for i in {1..10}; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
+          ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          if [ -n "$ADMIN_PASSWORD" ]; then
+            echo "ArgoCD admin password: $ADMIN_PASSWORD"
+            echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
+            chmod 600 /tmp/argocd-admin-password.txt
+            break
+          fi
+        fi
+        
+        if [ $i -eq 10 ]; then
+          echo "Failed to retrieve ArgoCD password after multiple attempts"
+          echo "You can manually retrieve it with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"
+        else
+          echo "Waiting for ArgoCD admin secret to be available... Attempt $i/10"
+          sleep 15
+        fi
+      done
+      
+      # Set up the automatic port forward in a systemd service
+      PORT=8081
+      
+      # Check if any port forwarding is already running and stop it
+      echo "Setting up port forwarding for ArgoCD..."
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      
+      # Check if port is in use
+      PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
+      if [ -n "$PORT_PID" ]; then
+        echo "Port $PORT is already in use, stopping process..."
+        kill -9 $PORT_PID 2>/dev/null || true
+        sleep 2
+      fi
+      
+      # Start the port forward in a way that will survive after Terraform exits
+      nohup kubectl port-forward -n argocd svc/argocd-server $PORT:443 >/tmp/argocd-port-forward.log 2>&1 &
+      
+      echo "ArgoCD port forwarding started on port $PORT"
+      echo "ArgoCD URL: https://localhost:$PORT"
+      echo "Username: admin"
+      echo "Password: $ADMIN_PASSWORD"
+      
+      # Save the URL and credentials to a file for easy access
+      cat > /tmp/argocd-access-info.txt <<- ACCESS
+        ArgoCD Access Information
+        ------------------------
+        URL: https://localhost:$PORT
+        Username: admin
+        Password: $ADMIN_PASSWORD
+        
+        To restart port forwarding if needed:
+        kubectl port-forward -n argocd svc/argocd-server $PORT:443
+      ACCESS
+      
+      # Record the PID
+      PID=$!
+      echo $PID > /tmp/argocd-port-forward.pid
+      
+      # Add a hook to ensure port forwarding is properly closed during terraform destroy
+      # This uses the Bash trap command to register a cleanup function
+      cat > /tmp/port-forward-cleanup.sh <<EOF
+#!/bin/bash
+# ArgoCD port forward cleanup
+pkill -f "kubectl.*port-forward.*argocd-server" || true
+rm -f /tmp/argocd-port-forward.pid
+rm -f /tmp/argocd-port-forward.log
+EOF
+      
+      chmod +x /tmp/port-forward-cleanup.sh
+      
+      echo "Port forwarding set up successfully. Access ArgoCD at: https://localhost:$PORT"
+    EOT
+  }
+  
+  # Clean up port forwarding during terraform destroy
+  provisioner "local-exec" {
+    when = destroy
+    command = "/tmp/port-forward-cleanup.sh || true"
+  }
+}
+
+# Add an output message that clearly explains where ArgoCD admin password and URL are stored
+resource "null_resource" "argocd_access_info" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [null_resource.argocd_direct_access]
+  
+  triggers = {
+    argocd_direct_access = null_resource.argocd_direct_access[0].id
+  }
+  
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "✅ ArgoCD is now accessible at: https://localhost:8081"
+      echo "✅ Username: admin"
+      if [ -f "/tmp/argocd-admin-password.txt" ]; then
+        echo "✅ Password: $(cat /tmp/argocd-admin-password.txt)"
+      else
+        echo "❌ Password not available yet. Get it with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"
+      fi
+      echo ""
     EOT
   }
 }
@@ -616,391 +831,6 @@ EOF
   }
 }
 
-# Install ArgoCD using local-exec only
-resource "null_resource" "install_argocd" {
-  # Use a static count value based on the skip_argocd flag
-  count = local.skip_argocd ? 0 : 1
-  
-  # Ensure all prerequisites are met
-  depends_on = [
-    module.k8s-cluster,
-    null_resource.wait_for_kubernetes,
-    terraform_data.kubectl_provider_config,
-    null_resource.create_namespaces,
-    null_resource.providers_ready,
-    null_resource.install_ebs_csi_driver
-  ]
-  
-  # Only run when needed
-  triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    instance_id = module.k8s-cluster.control_plane_id
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Checking if kubeconfig is valid before installing ArgoCD..."
-      KUBECONFIG="${local.kubeconfig_path}"
-      
-      if [ ! -f "$KUBECONFIG" ]; then
-        echo "Kubeconfig file not found, skipping installation"
-        exit 0
-      fi
-      
-      # Check if kubeconfig contains placeholder values
-      if grep -q "placeholder" "$KUBECONFIG"; then
-        echo "Kubeconfig contains placeholder values, skipping installation"
-        exit 0
-      fi
-      
-      # Check if we can connect to the Kubernetes API
-      if ! kubectl --kubeconfig="$KUBECONFIG" cluster-info >/dev/null 2>&1; then
-        echo "Cannot connect to Kubernetes cluster, skipping installation"
-        exit 0
-      fi
-      
-      echo "Ensuring argocd namespace exists..."
-      kubectl --kubeconfig="$KUBECONFIG" create namespace argocd --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply --validate=false -f -
-      
-      echo "Installing ArgoCD..."
-      kubectl --kubeconfig="$KUBECONFIG" apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-      
-      # Configure ArgoCD with Git repository (optional)
-      # If you need to configure ArgoCD with specific Git repositories, add appropriate kubectl commands here
-      
-      # Example: Wait for ArgoCD to be ready
-      echo "Waiting for ArgoCD to be ready..."
-      kubectl --kubeconfig="$KUBECONFIG" -n argocd wait --for=condition=available --timeout=300s deployment/argocd-server || true
-      
-      echo "ArgoCD installation complete (or timeout reached)"
-    EOT
-  }
-}
-
-# Automatic ArgoCD access setup with port forwarding
-resource "null_resource" "argocd_access_helper" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd,
-    null_resource.create_namespaces,
-    terraform_data.kubectl_provider_config
-  ]
-  
-  # Run on every apply to ensure port forwarding is active
-  triggers = {
-    always_run = timestamp()
-    instance_id = module.k8s-cluster.control_plane_id
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-  }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      # Just create a helper script - avoid direct port forwarding
-      KUBECONFIG="${local.kubeconfig_path}"
-      CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
-      PORT=8080
-      
-      echo -e "\033[1;34m📝 Creating ArgoCD access helper script...\033[0m"
-      
-      # Try to get the ArgoCD password for the output
-      if kubectl --kubeconfig="$KUBECONFIG" get secret -n argocd argocd-initial-admin-secret &>/dev/null; then
-        echo -e "\033[1;32m✅ ArgoCD secret found, retrieving password...\033[0m"
-        ADMIN_PASSWORD=$(kubectl --kubeconfig="$KUBECONFIG" -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-        if [ -n "$ADMIN_PASSWORD" ]; then
-          echo -e "\033[1;32m✅ ArgoCD admin password retrieved: $ADMIN_PASSWORD\033[0m"
-          echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
-          chmod 600 /tmp/argocd-admin-password.txt
-        fi
-      else
-        echo -e "\033[1;33m⚠️ ArgoCD not fully deployed yet. Password will be available later.\033[0m"
-      fi
-      
-      # Create the connect script without starting port forwarding
-      cat > ./argocd-connect.sh << 'EOSCRIPT'
-#!/bin/bash
-# ArgoCD Connection Helper
-PORT=8080
-
-# Function to check if kubectl is available
-check_kubectl() {
-  if ! command -v kubectl &> /dev/null; then
-    echo -e "\033[1;31m❌ ERROR: kubectl not found. Please install kubectl first.\033[0m"
-    exit 1
-  fi
-}
-
-# Function to check if kubeconfig is valid
-check_kubeconfig() {
-  if ! kubectl get nodes &>/dev/null; then
-    echo -e "\033[1;33m⚠️ WARNING: Cannot connect to Kubernetes cluster with current kubeconfig.\033[0m"
-    echo -e "\033[1;33m⚠️ If you're running this locally, make sure your kubeconfig is valid.\033[0m"
-    echo -e "\033[1;33m⚠️ Try: export KUBECONFIG=$(pwd)/kubeconfig.yaml\033[0m"
-    return 1
-  fi
-  return 0
-}
-
-# Function to check if ArgoCD is deployed
-check_argocd() {
-  if ! kubectl get namespace argocd &>/dev/null; then
-    echo -e "\033[1;33m⚠️ ArgoCD namespace not found. Creating it...\033[0m"
-    kubectl create namespace argocd
-  fi
-  
-  if ! kubectl get deployment -n argocd argocd-server &>/dev/null; then
-    echo -e "\033[1;33m⚠️ ArgoCD server not deployed.\033[0m"
-    echo -e "\033[1;33m⚠️ It might still be installing or failed to install.\033[0m"
-    
-    echo -e "\033[1;34m🔄 Checking ArgoCD pods...\033[0m"
-    kubectl get pods -n argocd
-    
-    echo -e "\033[1;34m🔄 Would you like to install ArgoCD now? (y/n)\033[0m"
-    read -r answer
-    
-    if [[ "$answer" == "y" ]]; then
-      echo -e "\033[1;34m🔄 Installing ArgoCD...\033[0m"
-      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-      echo -e "\033[1;34m🔄 Waiting for ArgoCD server to start (this might take a few minutes)...\033[0m"
-      kubectl -n argocd wait --for=condition=available --timeout=300s deployment/argocd-server || true
-    else
-      echo -e "\033[1;33m⚠️ ArgoCD installation skipped. Cannot proceed with port forwarding.\033[0m"
-      return 1
-    fi
-  fi
-  return 0
-}
-
-# Function to handle port forwarding
-start_port_forward() {
-  # Check if port is in use
-  PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
-  if [ -n "$PORT_PID" ]; then
-    echo -e "\033[1;33m⚠️ Port $PORT is already in use by PID $PORT_PID\033[0m"
-    echo -e "\033[1;34m🔄 Stopping existing process...\033[0m"
-    kill -9 $PORT_PID 2>/dev/null || true
-    sleep 2
-  fi
-  
-  # Kill any existing kubectl port-forwards
-  pkill -f "kubectl.*port-forward.*argocd-server" || true
-  
-  # Check if ArgoCD service exists
-  if ! kubectl get svc -n argocd argocd-server &>/dev/null; then
-    echo -e "\033[1;31m❌ ArgoCD server service not found. Cannot start port forwarding.\033[0m"
-    return 1
-  fi
-  
-  # Start port forwarding
-  echo -e "\033[1;34m🔄 Starting ArgoCD port forwarding on port $PORT...\033[0m"
-  kubectl port-forward svc/argocd-server -n argocd $PORT:443 &
-  PORT_FORWARD_PID=$!
-  echo $PORT_FORWARD_PID > /tmp/argocd-port-forward.pid
-  
-  # Give it time to establish
-  sleep 3
-  
-  # Verify port-forward is running
-  if ! ps -p $PORT_FORWARD_PID > /dev/null; then
-    echo -e "\033[1;31m❌ Port forwarding failed to start\033[0m"
-    return 1
-  fi
-  
-  echo -e "\033[1;32m✅ ArgoCD port forwarding started successfully on port $PORT\033[0m"
-  return 0
-}
-
-# Function to retrieve and display password
-get_password() {
-  echo -e "\033[1;34m🔑 Retrieving ArgoCD admin password...\033[0m"
-  ATTEMPTS=0
-  MAX_ATTEMPTS=3
-  
-  while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
-    ADMIN_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
-    
-    if [ -n "$ADMIN_PASSWORD" ]; then
-      echo -e "\033[1;32m✅ Password retrieved successfully\033[0m"
-      echo "$ADMIN_PASSWORD" > /tmp/argocd-admin-password.txt
-      chmod 600 /tmp/argocd-admin-password.txt
-      break
-    else
-      ATTEMPTS=$((ATTEMPTS+1))
-      echo -e "\033[1;33m⚠️ Password not found yet. Attempt $ATTEMPTS/$MAX_ATTEMPTS\033[0m"
-      if [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; then
-        echo -e "\033[1;34m🔄 Waiting 10 seconds before retrying...\033[0m"
-        sleep 10
-      fi
-    fi
-  done
-  
-  if [ -z "$ADMIN_PASSWORD" ]; then
-    echo -e "\033[1;33m⚠️ Could not retrieve password after $MAX_ATTEMPTS attempts\033[0m"
-    echo -e "\033[1;33m⚠️ ArgoCD may still be initializing or the password secret might not exist yet\033[0m"
-    return 1
-  fi
-  
-  return 0
-}
-
-# Function to stop port forwarding
-stop_port_forward() {
-  echo -e "\033[1;34m🔄 Stopping ArgoCD port forwarding...\033[0m"
-  pkill -f "kubectl.*port-forward.*argocd-server" || true
-  rm -f /tmp/argocd-port-forward.pid
-  echo -e "\033[1;32m✅ Port forwarding stopped\033[0m"
-}
-
-# Main execution
-check_kubectl
-
-case "$1" in
-  start)
-    if check_kubeconfig && check_argocd && start_port_forward && get_password; then
-      echo -e "\033[1;32m=======================================\033[0m"
-      echo -e "\033[1;32m✅ ArgoCD is now accessible at: \033[1;37mhttps://localhost:$PORT\033[0m"
-      echo -e "\033[1;32m✅ Username: \033[1;37madmin\033[0m" 
-      echo -e "\033[1;32m✅ Password: \033[1;37m$(cat /tmp/argocd-admin-password.txt)\033[0m"
-      echo -e "\033[1;32m=======================================\033[0m"
-    else
-      echo -e "\033[1;31m❌ Failed to set up ArgoCD access completely\033[0m"
-      echo -e "\033[1;33m⚠️ You may need to wait for ArgoCD to fully deploy\033[0m"
-      echo -e "\033[1;33m⚠️ Try running this script again in a few minutes\033[0m"
-    fi
-    ;;
-  stop)
-    stop_port_forward
-    ;;
-  password)
-    if check_kubeconfig && check_argocd && get_password; then
-      echo -e "\033[1;32m✅ Username: \033[1;37madmin\033[0m" 
-      echo -e "\033[1;32m✅ Password: \033[1;37m$(cat /tmp/argocd-admin-password.txt)\033[0m"
-    fi
-    ;;
-  *)
-    echo -e "\033[1;34m=======================================\033[0m"
-    echo -e "\033[1;34m       ArgoCD Access Helper\033[0m"
-    echo -e "\033[1;34m=======================================\033[0m"
-    echo -e "\033[1;37mUsage: $0 [command]\033[0m"
-    echo -e "\033[1;37mCommands:\033[0m"
-    echo -e "  \033[1;37mstart    - Start port forwarding and get admin password\033[0m"
-    echo -e "  \033[1;37mstop     - Stop port forwarding\033[0m"
-    echo -e "  \033[1;37mpassword - Get admin password only\033[0m"
-    echo -e "\033[1;34m=======================================\033[0m"
-    ;;
-esac
-EOSCRIPT
-      
-      chmod +x ./argocd-connect.sh
-      echo -e "\033[1;32m✅ ArgoCD helper script created: ./argocd-connect.sh\033[0m"
-      echo -e "\033[1;34mℹ️ To access ArgoCD, run: \033[1;36m./argocd-connect.sh start\033[0m"
-      echo -e "\033[1;34mℹ️ This will set up port forwarding to: \033[1;36mhttps://localhost:$PORT\033[0m"
-      echo -e "\033[1;34mℹ️ Username: \033[1;36madmin\033[0m"
-      
-      # Display password if we have it
-      if [ -f "/tmp/argocd-admin-password.txt" ]; then
-        echo -e "\033[1;34mℹ️ Password: \033[1;36m$(cat /tmp/argocd-admin-password.txt)\033[0m"
-      else
-        echo -e "\033[1;34mℹ️ Password: \033[1;36mRun ./argocd-connect.sh password to retrieve\033[0m"
-      fi
-      
-      # Create a simple README file for ArgoCD access
-      cat > ./ARGOCD-ACCESS.md << 'READMEEOF'
-# 🔐 ArgoCD Access Instructions
-
-ArgoCD is a GitOps continuous delivery tool installed on your Kubernetes cluster.
-
-## Quick Access
-
-1. **Start ArgoCD access:**
-   ```
-   ./argocd-connect.sh start
-   ```
-   This will:
-   - Set up port forwarding to the ArgoCD server
-   - Retrieve the admin password
-   - Display the login credentials
-
-2. **Access the ArgoCD UI:**
-   - Open [https://localhost:8080](https://localhost:8080) in your browser
-   - Username: `admin`
-   - Password: Will be displayed by the script (also stored in /tmp/argocd-admin-password.txt)
-
-3. **Stop port forwarding when done:**
-   ```
-   ./argocd-connect.sh stop
-   ```
-
-## Troubleshooting
-
-If ArgoCD access fails:
-- Wait a few minutes - it might still be initializing
-- Ensure your kubeconfig is correctly set: `export KUBECONFIG=$(pwd)/kubeconfig.yaml`
-- Check if ArgoCD is running: `kubectl get pods -n argocd`
-- For detailed logs: `kubectl logs -n argocd deployment/argocd-server`
-
-## Manual Setup (if needed)
-
-If the automated script fails, you can manually set up port forwarding:
-```
-kubectl port-forward svc/argocd-server -n argocd 8080:443
-```
-
-To manually get the password:
-```
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
-```
-READMEEOF
-      
-      echo -e "\033[1;32m✅ Created ArgoCD access documentation: ARGOCD-ACCESS.md\033[0m"
-    EOT
-  }
-  
-  # Use a simple cleanup approach for destroy
-  provisioner "local-exec" {
-    when = destroy
-    # Use a simple command that's less likely to fail
-    command = "echo 'Cleaning up ArgoCD port forwarding (if any)...'"
-  }
-}
-
-# No separate cleanup resource to avoid termination signal issues
-# The ArgoCD access helper will manage its own cleanup
-
-# Development environment resources
-module "polybot_dev" {
-  source                = "./modules/polybot"
-  region                = var.region
-  route53_zone_id       = var.route53_zone_id
-  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment           = "dev"
-  telegram_token        = var.telegram_token_dev
-  aws_access_key_id     = var.aws_access_key_id
-  aws_secret_access_key = var.aws_secret_access_key
-  docker_username       = var.docker_username
-  docker_password       = var.docker_password
-}
-
-# Production environment resources
-module "polybot_prod" {
-  source                = "./modules/polybot"
-  region                = var.region
-  route53_zone_id       = var.route53_zone_id
-  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment           = "prod"
-  telegram_token        = var.telegram_token_prod
-  aws_access_key_id     = var.aws_access_key_id
-  aws_secret_access_key = var.aws_secret_access_key
-  docker_username       = var.docker_username
-  docker_password       = var.docker_password
-}
-
 # Output commands for manual verification and namespace creation
 resource "null_resource" "cluster_readiness_info" {
   # Use a static count value
@@ -1116,6 +946,59 @@ resource "terraform_data" "kubernetes_state_clean" {
       echo "Kubernetes resources cleaned up from state."
     EOT
   }
+}
+
+# Add cleanup resources for proper port forwarding termination during terraform destroy
+resource "terraform_data" "argocd_port_forward_cleanup" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [null_resource.argocd_direct_access]
+  
+  # Always run cleanup on destroy
+  triggers_replace = {
+    time = timestamp()
+  }
+  
+  provisioner "local-exec" {
+    when = destroy
+    command = <<-EOT
+      #!/bin/bash
+      echo "Cleaning up ArgoCD port forwarding..."
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      rm -f /tmp/argocd-port-forward.pid /tmp/argocd-port-forward.log /tmp/argocd-admin-password.txt
+      echo "Port forwarding cleaned up"
+    EOT
+  }
+}
+
+# Development environment resources
+module "polybot_dev" {
+  source                = "./modules/polybot"
+  region                = var.region
+  route53_zone_id       = var.route53_zone_id
+  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
+  environment           = "dev"
+  telegram_token        = var.telegram_token_dev
+  aws_access_key_id     = var.aws_access_key_id
+  aws_secret_access_key = var.aws_secret_access_key
+  docker_username       = var.docker_username
+  docker_password       = var.docker_password
+}
+
+# Production environment resources
+module "polybot_prod" {
+  source                = "./modules/polybot"
+  region                = var.region
+  route53_zone_id       = var.route53_zone_id
+  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
+  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
+  environment           = "prod"
+  telegram_token        = var.telegram_token_prod
+  aws_access_key_id     = var.aws_access_key_id
+  aws_secret_access_key = var.aws_secret_access_key
+  docker_username       = var.docker_username
+  docker_password       = var.docker_password
 }
 
 
