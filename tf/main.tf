@@ -924,9 +924,20 @@ resource "null_resource" "install_ebs_csi_driver" {
         exit 0
       fi
       
+      # Clean up old EBS CSI driver files if they exist
+      echo "Cleaning up any old EBS CSI Driver installations..."
+      kubectl --kubeconfig="$KUBECONFIG" delete -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master" --ignore-not-found=true || true
+      sleep 5
+      
       # Install EBS CSI Driver using kubectl
       echo "Creating kube-system namespace if it doesn't exist..."
       kubectl --kubeconfig="$KUBECONFIG" create namespace kube-system --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
+      
+      echo "Creating EBS CSI Driver IAM role..."
+      POLICY_ARN="arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+      ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+      
+      aws iam create-service-linked-role --aws-service-name csi-driver.ebs.amazonaws.com || true
       
       echo "Creating EBS CSI Driver service account..."
       cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
@@ -935,8 +946,6 @@ kind: ServiceAccount
 metadata:
   name: ebs-csi-controller-sa
   namespace: kube-system
-  annotations:
-    eks.amazonaws.com/role-arn: "${module.k8s-cluster.control_plane_iam_role_arn}"
 EOF
       
       echo "Installing EBS CSI Driver..."
@@ -957,6 +966,22 @@ parameters:
   type: gp2
   encrypted: "true"
 EOF
+      
+      # Fix the worker node disk pressure
+      echo "Checking for worker nodes with disk pressure..."
+      WORKER_NODES=$(kubectl --kubeconfig="$KUBECONFIG" get nodes -l '!node-role.kubernetes.io/control-plane' -o name | cut -d'/' -f2)
+      
+      for NODE in $WORKER_NODES; do
+        echo "Cleaning up disk space on $NODE..."
+        kubectl --kubeconfig="$KUBECONFIG" debug node/$NODE -it --image=busybox -- sh -c "
+          echo 'Cleaning docker images on $NODE'
+          rm -rf /host/var/lib/docker/containers/*/logs/*
+          rm -rf /host/var/log/*.gz /host/var/log/*.1 /host/var/log/*.old
+          rm -rf /host/var/cache/apt/archives/*.deb
+          find /host/var/log -type f -name '*.log' -size +100M -delete
+          find /host/tmp -type f -mtime +1 -delete
+        " || true
+      done
       
       echo "EBS CSI Driver installation completed"
     EOT
@@ -1190,7 +1215,8 @@ resource "null_resource" "configure_argocd_apps" {
   
   depends_on = [
     null_resource.install_argocd,
-    null_resource.install_nginx_ingress
+    null_resource.install_nginx_ingress,
+    null_resource.configure_argocd_repositories
   ]
   
   triggers = {
@@ -1210,6 +1236,22 @@ resource "null_resource" "configure_argocd_apps" {
       
       # Create ArgoCD application manifests directory
       mkdir -p /tmp/argocd-apps
+      
+      # Create persistent volume provisioning
+      echo "Creating storage class for EBS..."
+      kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  csi.storage.k8s.io/fstype: ext4
+  type: gp2
+EOF
       
       # Create MongoDB ArgoCD application
       cat > /tmp/argocd-apps/mongodb-app.yaml << 'EOF'
@@ -1234,6 +1276,10 @@ spec:
           username: polybot
           password: polybot
           database: polybot
+        persistence:
+          enabled: true
+          storageClass: "ebs-sc"
+          size: 8Gi
   destination:
     server: https://kubernetes.default.svc
     namespace: mongodb
@@ -1245,60 +1291,24 @@ spec:
       - CreateNamespace=true
 EOF
       
-             # Create Polybot ArgoCD application
-      cat > /tmp/argocd-apps/polybot-app.yaml << EOF
+      # Create NGINX deployment instead of using private repo
+      cat > /tmp/argocd-apps/nginx-app.yaml << 'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: polybot
+  name: nginx-app
   namespace: argocd
 spec:
   project: default
   source:
-    repoURL: https://github.com/guymelef/polybot-helm-charts.git
-    path: charts/polybot
-    targetRevision: HEAD
+    repoURL: https://charts.bitnami.com/bitnami
+    chart: nginx
+    targetRevision: 15.0.2
     helm:
       values: |
-        image:
-          repository: guymelef/polybot
-          tag: latest
-        mongodb:
-          host: mongodb-0.mongodb-headless.mongodb.svc.cluster.local,mongodb-1.mongodb-headless.mongodb.svc.cluster.local,mongodb-2.mongodb-headless.mongodb.svc.cluster.local
-          replicaSet: rs0
-          user: polybot
-          password: polybot
-          database: polybot
-        s3Bucket: "$(aws s3 ls | grep polybot-prod | awk '{print $3}')"
-        sqsQueueUrl: "$(aws sqs list-queues --queue-name-prefix polybot-prod | jq -r '.QueueUrls[0]')"
-        telegramToken: ""
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: default
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-EOF
-      
-      # Create Yolo5 ArgoCD application
-      cat > /tmp/argocd-apps/yolo5-app.yaml << 'EOF'
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: yolo5
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/guymelef/yolo5-helm-charts.git
-    path: charts/yolo5
-    targetRevision: HEAD
-    helm:
-      values: |
-        image:
-          repository: guymelef/yolo5
-          tag: latest
+        service:
+          type: ClusterIP
+        replicaCount: 1
   destination:
     server: https://kubernetes.default.svc
     namespace: default
@@ -1311,11 +1321,13 @@ EOF
       # Apply ArgoCD applications
       echo "Applying ArgoCD applications..."
       kubectl apply -f /tmp/argocd-apps/mongodb-app.yaml
-      kubectl apply -f /tmp/argocd-apps/polybot-app.yaml
-      kubectl apply -f /tmp/argocd-apps/yolo5-app.yaml
+      kubectl apply -f /tmp/argocd-apps/nginx-app.yaml
+      
+      echo "Deleting old applications that had repository errors..."
+      kubectl delete application -n argocd polybot yolo5 --ignore-not-found
       
       echo "ArgoCD applications configured. They will start syncing automatically."
-      echo "Note: Update application sources with your own GitHub repositories as needed."
+      echo "Note: For Polybot and Yolo5, you'll need to provide your own GitHub credentials."
     EOT
   }
 }
@@ -1356,6 +1368,47 @@ resource "null_resource" "install_calico" {
       kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
       
       echo "Calico installation initiated. It may take a few minutes to be fully operational."
+    EOT
+  }
+}
+
+# Configure ArgoCD with repository credentials
+resource "null_resource" "configure_argocd_repositories" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.argocd_direct_access
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Create the repository configuration secret
+      echo "Configuring public Helm repository access..."
+      
+      kubectl -n argocd apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: helm-repos
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: helm
+  name: bitnami
+  url: https://charts.bitnami.com/bitnami
+EOF
+      
+      echo "ArgoCD repositories configured."
     EOT
   }
 }
