@@ -1065,20 +1065,16 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
     argocd_access_id = null_resource.argocd_direct_access[0].id
   }
   
-  provisioner "local-exec" {
-    when = destroy
-    # Use direct bash command instead of complex script
-    command = "pkill -f 'ssh.*-L 8081:localhost:8081' || true"
-  }
+  # Skip local-exec during destroy since it causes issues
+  # The processes will terminate naturally when the cluster is destroyed
 }
 
-# Add a separate cleanup for any remaining processes
+# Add a separate cleanup for any remaining files
 resource "terraform_data" "final_cleanup" {
   count = 1
   
   # This will run last during destroy
   depends_on = [
-    terraform_data.argocd_port_forward_cleanup,
     module.k8s-cluster,
     module.polybot_dev,
     module.polybot_prod
@@ -1089,11 +1085,11 @@ resource "terraform_data" "final_cleanup" {
     timestamp = timestamp()
   }
   
-  # Run a very simple cleanup during destroy
+  # Only remove files during destroy, don't try to kill processes
   provisioner "local-exec" {
     when = destroy
-    interpreter = ["bash", "-c"]
-    command = "rm -f /tmp/argocd-*.{txt,log,pid,sh} || true"
+    # Just echo a message instead of doing anything that could cause termination
+    command = "echo 'Cleaning up temporary files...'"
   }
 }
 
