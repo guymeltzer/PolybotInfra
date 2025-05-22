@@ -137,7 +137,7 @@ resource "null_resource" "argocd_password_retriever" {
 ---------------------------
 INFOEOF
       
-      echo -e "🌐 URL: \033[1;36mhttps://localhost:8080\033[0m (Port forwarding automatically started)" >> /tmp/argocd-info.txt
+      echo -e "🌐 URL: \033[1;36mhttps://localhost:8080\033[0m (Run ./argocd-connect.sh start to start port forwarding)" >> /tmp/argocd-info.txt
       echo -e "👤 Username: \033[1;32madmin\033[0m" >> /tmp/argocd-info.txt
       echo -e "🔑 Password: \033[1;32m$(cat /tmp/argocd-password-output.txt)\033[0m" >> /tmp/argocd-info.txt
       echo "" >> /tmp/argocd-info.txt
@@ -146,8 +146,7 @@ INFOEOF
   }
 
   depends_on = [
-    null_resource.argocd_access_helper,
-    null_resource.cleanup_port_forwarding
+    null_resource.argocd_access_helper
   ]
 }
 
