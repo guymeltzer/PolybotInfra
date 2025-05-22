@@ -146,7 +146,8 @@ INFOEOF
   }
 
   depends_on = [
-    null_resource.argocd_access_helper
+    null_resource.argocd_access_helper,
+    null_resource.cleanup_port_forwarding
   ]
 }
 

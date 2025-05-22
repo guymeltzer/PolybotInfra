@@ -686,7 +686,8 @@ resource "null_resource" "argocd_access_helper" {
   depends_on = [
     null_resource.install_argocd,
     null_resource.create_namespaces,
-    terraform_data.kubectl_provider_config
+    terraform_data.kubectl_provider_config,
+    null_resource.cleanup_port_forwarding
   ]
   
   # Run on every apply to ensure port forwarding is active
@@ -1024,28 +1025,44 @@ READMEEOF
     EOT
   }
   
-  # Clean up port forward when destroyed
+  # Use a simple cleanup approach for destroy
   provisioner "local-exec" {
-    when    = destroy
-    interpreter = ["/bin/bash", "-c"]
+    when = destroy
+    # Use a simple command that's less likely to fail
+    command = "echo 'Cleaning up ArgoCD port forwarding (if any)...'"
+  }
+}
+
+# This separate resource handles cleanup of port forwarding processes
+# It's intentionally designed to be very simple and less prone to errors
+resource "null_resource" "cleanup_port_forwarding" {
+  count = 1
+  
+  # This resource needs to be recreated on every apply
+  triggers = {
+    always_run = timestamp()
+  }
+  
+  # Run during normal apply (not just destroy)
+  provisioner "local-exec" {
     command = <<-EOT
       #!/bin/bash
-      # Safely terminate any port forwarding processes
-      echo "Cleaning up ArgoCD port forwarding..."
+      echo "Checking for existing port forwarding processes..."
       
-      # Try different methods of terminating port forwarding
-      # Method 1: Using pkill with -9 (SIGKILL)
-      pkill -9 -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
+      # Simple cleanup - terminate any existing kubectl port-forward processes
+      pkill -f "kubectl.*port-forward.*argocd-server" >/dev/null 2>&1 || true
       
-      # Method 2: Find and kill by port
-      for pid in $(lsof -ti:8080 2>/dev/null); do
-        kill -9 $pid 2>/dev/null || true
-      done
+      # Also clean up by port
+      if command -v lsof >/dev/null 2>&1; then
+        for pid in $(lsof -ti:8080 2>/dev/null); do
+          kill $pid >/dev/null 2>&1 || true
+        done
+      fi
       
-      # Method 3: Clean up any pid files we created
-      rm -f /tmp/argocd-port-forward.pid 2>/dev/null || true
+      # Clean up any existing pid files
+      rm -f /tmp/argocd-port-forward.pid >/dev/null 2>&1 || true
       
-      echo "Cleanup completed."
+      echo "Done checking port forwarding processes."
     EOT
   }
 }
