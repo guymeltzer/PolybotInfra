@@ -404,36 +404,36 @@ resource "null_resource" "argocd_direct_access" {
 # Simple SSH tunnel script for ArgoCD
 
 # Configuration
-SSH_KEY=\${HOME}/polybot-key.pem
+SSH_KEY=$${HOME}/polybot-key.pem
 CONTROL_PLANE_IP=$CONTROL_PLANE_IP
 LOCAL_PORT=8081
 
 # Kill existing tunnels
 echo "Killing any existing SSH tunnels..."
-pkill -f "ssh.*-L \$LOCAL_PORT:localhost:\$LOCAL_PORT.*" >/dev/null 2>&1 || true
+pkill -f "ssh.*-L $${LOCAL_PORT}:localhost:$${LOCAL_PORT}.*" >/dev/null 2>&1 || true
 
 # Check if port is in use
-if lsof -ti:\$LOCAL_PORT >/dev/null ; then
-    echo "Port \$LOCAL_PORT is already in use. Please close any applications using it."
+if lsof -ti:$${LOCAL_PORT} >/dev/null ; then
+    echo "Port $${LOCAL_PORT} is already in use. Please close any applications using it."
     exit 1
 fi
 
 # Ensure SSH key has correct permissions
-chmod 600 \$SSH_KEY
+chmod 600 $${SSH_KEY}
 
 # First, set up port-forwarding on the control plane server
 echo "Setting up port forwarding on the control plane..."
-ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP "kubectl port-forward -n argocd svc/argocd-server \$LOCAL_PORT:443 --address 0.0.0.0 > /dev/null 2>&1 &"
+ssh -i $${SSH_KEY} -o StrictHostKeyChecking=no ubuntu@$${CONTROL_PLANE_IP} "kubectl port-forward -n argocd svc/argocd-server $${LOCAL_PORT}:443 --address 0.0.0.0 > /dev/null 2>&1 &"
 
 # Wait for port-forwarding to start
 sleep 3
 
 # Now establish SSH tunnel
 echo "Starting SSH tunnel to ArgoCD..."
-ssh -i \$SSH_KEY -L \$LOCAL_PORT:localhost:\$LOCAL_PORT -N -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP
+ssh -i $${SSH_KEY} -L $${LOCAL_PORT}:localhost:$${LOCAL_PORT} -N -o StrictHostKeyChecking=no ubuntu@$${CONTROL_PLANE_IP}
 
 # If SSH exits, kill port-forwarding
-ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP "pkill -f 'kubectl.*port-forward.*argocd-server' || true"
+ssh -i $${SSH_KEY} -o StrictHostKeyChecking=no ubuntu@$${CONTROL_PLANE_IP} "pkill -f 'kubectl.*port-forward.*argocd-server' || true"
 EOF
 
       chmod 755 ~/argocd-ssh-tunnel.sh
