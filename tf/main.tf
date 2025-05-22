@@ -198,61 +198,75 @@ EOF
 # Resource to wait for Kubernetes API to be fully available - with improved triggers
 resource "null_resource" "wait_for_kubernetes" {
   count = 1
-
-  # Only trigger when the kubeconfig changes, not directly on module.k8s-cluster
+  
+  depends_on = [
+    module.k8s-cluster,
+    terraform_data.init_environment
+  ]
+  
   triggers = {
-    # Ensure this runs when the kubeconfig is updated
-    kubeconfig_md5 = fileexists("${local.kubeconfig_path}") ? filemd5("${local.kubeconfig_path}") : "nonexistent"
+    control_plane_id = try(module.k8s-cluster.control_plane_id, "none")
   }
-
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    command = <<-EOT
       #!/bin/bash
-      set -e
       
-      # Get the control plane instance ID
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      # Define key path and set proper permissions
+      KEY_PATH="${var.key_name == "" ? "${path.module}/polybot-key.pem" : "~/.ssh/${var.key_name}.pem"}"
+      echo "Setting correct permissions on SSH key: $KEY_PATH"
+      chmod 600 "$KEY_PATH" || echo "Warning: Could not set permissions on key"
       
-      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
-        echo "No running control plane instance found"
-        exit 0
+      # Define variables
+      CONTROL_PLANE_IP="${try(module.k8s-cluster.control_plane_public_ip, "")}"
+      MAX_RETRIES=30
+      RETRY_INTERVAL=20
+      
+      # Verify control plane IP is available
+      if [ -z "$CONTROL_PLANE_IP" ]; then
+        echo "Error: No running control plane instance found"
+        exit 0  # Don't fail, let Terraform handle retries
       fi
       
-      # Get the public IP of the control plane
-      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+      echo "Control plane IP: $CONTROL_PLANE_IP"
+      echo "Waiting for Kubernetes API to become available..."
       
-      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
-        echo "Control plane instance doesn't have a public IP yet"
-        exit 0
-      fi
-      
-      echo "Found control plane public IP: $PUBLIC_IP"
-      
-      echo "Waiting for Kubernetes API at https://$PUBLIC_IP:6443 to be ready..."
-      
-      # Function to test if API is reachable
-      test_api() {
-        curl -k -s --max-time 5 https://$PUBLIC_IP:6443/healthz
-      }
-      
-      # Wait for API to be ready with retries
-      MAX_ATTEMPTS=10
-      for ((i=1; i<=MAX_ATTEMPTS; i++)); do
-        echo "Attempt $i/$MAX_ATTEMPTS - Testing API connection..."
-        if test_api | grep -q "ok"; then
-          echo "API server is ready!"
-          exit 0
+      # Try to connect to the Kubernetes API with retries
+      for ((i=1; i<=MAX_RETRIES; i++)); do
+        echo "Attempt $i/$MAX_RETRIES: Testing SSH connectivity..."
+        
+        # Test SSH connectivity first
+        if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@$CONTROL_PLANE_IP "echo SSH connection successful"; then
+          echo "SSH connection successful!"
+          
+          # Now check if Kubernetes API is responding
+          if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "sudo kubectl get nodes"; then
+            echo "Kubernetes API is responding!"
+            
+            # Copy kubeconfig and fix permissions
+            echo "Copying kubeconfig from control plane..."
+            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/home/ubuntu/.kube/config "${path.module}/kubeconfig.yaml"
+            chmod 600 "${path.module}/kubeconfig.yaml"
+            
+            # Update kubeconfig with correct IP
+            echo "Updating kubeconfig with control plane public IP..."
+            sed -i.bak "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml"
+            
+            echo "Kubernetes is ready and kubeconfig is updated"
+            exit 0
+          else
+            echo "Kubernetes API not ready yet, will retry..."
+          fi
+        else
+          echo "SSH connection failed, will retry..."
         fi
         
-        if [ $i -eq $MAX_ATTEMPTS ]; then
-          echo "WARNING: API server not responding after $MAX_ATTEMPTS attempts, but continuing..."
-          exit 0
-        else
-          echo "API not ready yet, waiting 10 seconds..."
-          sleep 10
-        fi
+        sleep $RETRY_INTERVAL
       done
+      
+      echo "Warning: Maximum retries reached. Kubernetes API might not be ready yet."
+      exit 0  # Don't fail, let Terraform continue
     EOT
   }
 }
@@ -937,7 +951,9 @@ resource "null_resource" "install_ebs_csi_driver" {
       POLICY_ARN="arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
       ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
       
-      aws iam create-service-linked-role --aws-service-name csi-driver.ebs.amazonaws.com || true
+      # Fix: Use correct service name and add error handling
+      echo "Creating service-linked role for EBS CSI driver..."
+      aws iam create-service-linked-role --aws-service-name ebs.amazonaws.com || echo "Service-linked role may already exist or couldn't be created - continuing..."
       
       echo "Creating EBS CSI Driver service account..."
       cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
@@ -951,8 +967,13 @@ EOF
       echo "Installing EBS CSI Driver..."
       kubectl --kubeconfig="$KUBECONFIG" apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master"
       
-      echo "Creating storage class..."
-      cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
+      # Fix: Check if storage class exists first to avoid update error
+      echo "Checking if storage class ebs-sc exists..."
+      if kubectl --kubeconfig="$KUBECONFIG" get storageclass ebs-sc &>/dev/null; then
+        echo "Storage class ebs-sc already exists, skipping creation"
+      else
+        echo "Creating storage class..."
+        cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -966,19 +987,20 @@ parameters:
   type: gp2
   encrypted: "true"
 EOF
+      fi
       
-      # Fix the worker node disk pressure
+      # Fix the worker node disk pressure - fix find command syntax
       echo "Checking for worker nodes with disk pressure..."
       WORKER_NODES=$(kubectl --kubeconfig="$KUBECONFIG" get nodes -l '!node-role.kubernetes.io/control-plane' -o name | cut -d'/' -f2)
       
       for NODE in $WORKER_NODES; do
         echo "Cleaning up disk space on $NODE..."
-        kubectl --kubeconfig="$KUBECONFIG" debug node/$NODE -it --image=busybox -- sh -c "
+        kubectl --kubeconfig="$KUBECONFIG" debug node/$NODE --image=busybox -- sh -c "
           echo 'Cleaning docker images on $NODE'
           rm -rf /host/var/lib/docker/containers/*/logs/*
           rm -rf /host/var/log/*.gz /host/var/log/*.1 /host/var/log/*.old
           rm -rf /host/var/cache/apt/archives/*.deb
-          find /host/var/log -type f -name '*.log' -size +100M -delete
+          find /host/var/log -type f -name '*.log' -size +100000000c -delete
           find /host/tmp -type f -mtime +1 -delete
         " || true
       done
@@ -998,11 +1020,12 @@ resource "null_resource" "cluster_readiness_info" {
     terraform_data.kubectl_provider_config
   ]
 
-  # Only trigger when kubernetes-related resources change
+  # Fix for inconsistent final plan by using a more stable trigger
   triggers = {
-    # Track changes to the control plane or kubeconfig
+    # Only track the control plane ID, not the kubeconfig which changes too often
     control_plane_id = try(module.k8s-cluster.control_plane_id, "none")
-    kubeconfig_status = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "not_exists"
+    # Use timestamp instead of file hash to avoid plan/apply inconsistency
+    apply_time = timestamp()
   }
 
   provisioner "local-exec" {
@@ -1200,9 +1223,16 @@ resource "null_resource" "install_nginx_ingress" {
       echo "Installing NGINX Ingress Controller..."
       kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/aws/deploy.yaml
       
-      # Wait for the Ingress Controller to be ready
-      echo "Waiting for NGINX Ingress Controller to be ready..."
-      kubectl -n ingress-nginx wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller || true
+      # Wait for the Ingress Controller to be ready - increase timeout
+      echo "Waiting for NGINX Ingress Controller to be ready (may take up to 10 minutes)..."
+      for i in {1..20}; do
+        if kubectl -n ingress-nginx get deployment ingress-nginx-controller | grep -q "1/1"; then
+          echo "NGINX Ingress Controller is ready!"
+          break
+        fi
+        echo "Waiting for NGINX Ingress Controller to be ready, attempt $i/20..."
+        sleep 30
+      done
       
       echo "NGINX Ingress Controller installation complete"
     EOT
@@ -1534,7 +1564,7 @@ spec:
           hostPID: true
 EOF
       
-      # Execute a disk cleanup job immediately
+      # Execute a disk cleanup job immediately - fix find command syntax
       echo "Running immediate disk cleanup on worker nodes..."
       cat <<EOF | kubectl apply -f -
 apiVersion: batch/v1
@@ -1546,10 +1576,7 @@ spec:
   template:
     spec:
       tolerations:
-      - key: node-role.kubernetes.io/master
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/control-plane
-        effect: NoSchedule
+      - operator: Exists
       containers:
       - name: cleanup
         image: ubuntu:20.04
@@ -1561,7 +1588,7 @@ spec:
           echo "Emergency cleanup - freeing disk space..."
           docker system prune -af
           find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
-          find /var/log -type f -size +10M -delete
+          find /var/log -type f -size +10000000c -delete
           journalctl --vacuum-time=1d
           rm -rf /tmp/*
           echo "Emergency cleanup completed"
@@ -1594,8 +1621,9 @@ spec:
       hostPID: true
 EOF
       
-      echo "Waiting for emergency disk cleanup to complete..."
-      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=120s || true
+      # Increase timeout for cleanup job
+      echo "Waiting for emergency disk cleanup to complete (may take several minutes)..."
+      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=300s || true
       
       echo "Disk cleanup completed, checking node status..."
       kubectl get nodes
