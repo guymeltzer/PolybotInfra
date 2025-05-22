@@ -152,16 +152,15 @@ INFOEOF
 
 output "argocd_info" {
   description = "Detailed ArgoCD access information"
-  value = <<-EOT
-    🔐 ArgoCD Access Information
-    ---------------------------
-    URL: https://localhost:8081 (Port forwarding should be running automatically)
-    Username: admin
-    Password: ${fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet. Run: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"}
-    
-    To manually restart port forwarding if needed:
-    kubectl port-forward -n argocd svc/argocd-server 8081:443
-  EOT
+  value = <<EOT
+🔐 ArgoCD Access Information
+---------------------------
+To access ArgoCD, run the script: ~/argocd-ssh-tunnel.sh
+
+URL: https://localhost:8081 
+Username: admin
+Password: ${fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet. Run: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"}
+EOT
 }
 
 # ------------------------------------------------------------------------
@@ -293,7 +292,7 @@ resource "null_resource" "format_outputs" {
     command = <<-EOT
       #!/bin/bash
       
-      # Create visually appealing, colorful output
+      # Create visually appealing output without ANSI color codes
       cat > /tmp/final_output.txt << 'EOF'
 🎉 =================================================================== 🎉
                 POLYBOT KUBERNETES CLUSTER DEPLOYMENT
@@ -305,16 +304,16 @@ EOF
       if [ -f "/tmp/argocd-info.txt" ]; then
         cat /tmp/argocd-info.txt >> /tmp/final_output.txt
       else
-        echo -e "🔐 \033[1;34mArgoCD Access\033[0m" >> /tmp/final_output.txt
+        echo -e "🔐 ArgoCD Access" >> /tmp/final_output.txt
         echo -e "-------------------" >> /tmp/final_output.txt
-        echo -e "URL: \033[1;36mhttps://localhost:8081\033[0m" >> /tmp/final_output.txt
-        echo -e "Username: \033[1;32madmin\033[0m" >> /tmp/final_output.txt
+        echo -e "URL: https://localhost:8081" >> /tmp/final_output.txt
+        echo -e "Username: admin" >> /tmp/final_output.txt
         echo -e "Password: Password managed automatically by Terraform" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
       fi
       
       # ----- CONTROL PLANE INFO -----
-      echo -e "\n\033[1;34m🔧 Control Plane\033[0m" >> /tmp/final_output.txt
+      echo -e "\n🔧 Control Plane" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
       PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
@@ -326,70 +325,75 @@ EOF
         --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
         --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
         
-      echo -e "Instance ID: \033[1;32m$INSTANCE_ID\033[0m" >> /tmp/final_output.txt
-      echo -e "Public IP:   \033[1;32m$PUBLIC_IP\033[0m" >> /tmp/final_output.txt
-      echo -e "Private IP:  \033[1;32m$PRIVATE_IP\033[0m" >> /tmp/final_output.txt
-      echo -e "SSH Command: \033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP\033[0m" >> /tmp/final_output.txt
+      echo -e "Instance ID: $INSTANCE_ID" >> /tmp/final_output.txt
+      echo -e "Public IP:   $PUBLIC_IP" >> /tmp/final_output.txt
+      echo -e "Private IP:  $PRIVATE_IP" >> /tmp/final_output.txt
+      echo -e "SSH Command: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
       # ----- WORKER NODES INFO -----
-      echo -e "\033[1;34m🖥️ Worker Nodes\033[0m" >> /tmp/final_output.txt
+      echo -e "🖥️ Worker Nodes" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
       
       if [ -f "/tmp/worker_nodes_formatted.txt" ]; then
         # Count the nodes by counting the separator pattern
         NODE_COUNT=$(grep -c "\-\-\-" /tmp/worker_nodes_formatted.txt || echo 0)
-        echo -e "Worker Count: \033[1;32m$NODE_COUNT\033[0m" >> /tmp/final_output.txt
+        echo -e "Worker Count: $NODE_COUNT" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
         
-        # Format worker nodes without using ANSI escape sequences in jq
-        echo -e "\033[1;33mWorker Nodes Details:\033[0m" >> /tmp/final_output.txt
-        # Use a simpler approach that doesn't rely on escape sequences in jq
-        jq -r '.[][] | "- " + .Name + ": ID: " + .InstanceId + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State' /tmp/worker_nodes.json > /tmp/worker_details.txt
-        # Then add formatting with sed instead
-        cat /tmp/worker_details.txt | sed 's/^-/\\033[1;36m-/g' | sed 's/: ID:/:\\033[0m ID:/g' | sed 's/ID: /ID: \\033[1;32m/g' | sed 's/, Private/\\033[0m, Private/g' | sed 's/Private IP: /Private IP: \\033[1;37m/g' | sed 's/, Public/\\033[0m, Public/g' | sed 's/Public IP: /Public IP: \\033[1;37m/g' | sed 's/, State:/\\033[0m, State:/g' | sed 's/State: /State: \\033[1;32m/g' | sed 's/$/\\033[0m/g' >> /tmp/final_output.txt
+        # Format worker nodes without using ANSI escape sequences
+        echo -e "Worker Nodes Details:" >> /tmp/final_output.txt
+        
+        # Use a simple approach to format worker details
+        WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
+          --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
+          --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
+          --output json)
+          
+        # Format without escape sequences
+        echo "$WORKER_DATA" | jq -r '.[][] | "- " + .Name + ": ID: " + .ID + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State' >> /tmp/final_output.txt
       else
-        echo -e "\033[1;33mNo worker node information available yet\033[0m" >> /tmp/final_output.txt
+        echo -e "No worker node information available yet" >> /tmp/final_output.txt
       fi
       
       # ----- LOGS AND TROUBLESHOOTING -----
-      echo -e "\n\033[1;34m📜 Logs and Troubleshooting\033[0m" >> /tmp/final_output.txt
+      echo -e "\n📜 Logs and Troubleshooting" >> /tmp/final_output.txt
       echo -e "----------------------------" >> /tmp/final_output.txt
       
-      echo -e "\033[1;33mControl Plane Init Log:\033[0m" >> /tmp/final_output.txt
-      echo -e "\033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'\033[0m" >> /tmp/final_output.txt
+      echo -e "Control Plane Init Log:" >> /tmp/final_output.txt
+      echo -e "ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
-      # Add dynamic worker logs
+      # Add dynamic worker logs without escape sequences
       if [ -f "/tmp/worker_log_commands.txt" ]; then
-        echo -e "\033[1;33mWorker Node Init Logs:\033[0m" >> /tmp/final_output.txt
-        cat /tmp/worker_log_commands.txt | sed 's/ssh -i/\\\\033[1;36mssh -i/' | sed 's/log'\''/log\\\\033[0m'\''/g' >> /tmp/final_output.txt
+        echo -e "Worker Node Init Logs:" >> /tmp/final_output.txt
+        grep -v "^#" /tmp/worker_log_commands.txt >> /tmp/final_output.txt
       fi
       
       # ----- KUBERNETES ACCESS -----
-      echo -e "\n\033[1;34m☸️ Kubernetes Access\033[0m" >> /tmp/final_output.txt
+      echo -e "\n☸️ Kubernetes Access" >> /tmp/final_output.txt
       echo -e "---------------------" >> /tmp/final_output.txt
-      echo -e "API Endpoint: \033[1;36mhttps://$PUBLIC_IP:6443\033[0m" >> /tmp/final_output.txt
-      echo -e "Kubeconfig:   \033[1;36mssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=\$\$(pwd)/kubeconfig.yaml\033[0m" >> /tmp/final_output.txt
+      echo -e "API Endpoint: https://$PUBLIC_IP:6443" >> /tmp/final_output.txt
+      echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=\$\$(pwd)/kubeconfig.yaml" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
       # ----- APPLICATION ENDPOINTS -----
-      echo -e "\033[1;34m🌐 Application Endpoints\033[0m" >> /tmp/final_output.txt
+      echo -e "🌐 Application Endpoints" >> /tmp/final_output.txt
       echo -e "------------------------" >> /tmp/final_output.txt
-      echo -e "Dev URL:  \033[1;36mhttps://dev-polybot.${terraform.workspace}.devops-int-college.com\033[0m" >> /tmp/final_output.txt
-      echo -e "Prod URL: \033[1;36mhttps://polybot.${terraform.workspace}.devops-int-college.com\033[0m" >> /tmp/final_output.txt
+      echo -e "Dev URL:  https://dev-polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
+      echo -e "Prod URL: https://polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
       
       # Get ALB DNS from AWS
       ALB_DNS=$(aws elbv2 describe-load-balancers --region ${var.region} \
         --query "LoadBalancers[?contains(LoadBalancerName, 'guy-polybot-lb')].DNSName" \
         --output text)
       
-      echo -e "Load Balancer DNS: \033[1;32m$ALB_DNS\033[0m" >> /tmp/final_output.txt
+      echo -e "Load Balancer DNS: $ALB_DNS" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
       
       # ----- CLOSING -----
-      echo -e "\033[1;32m✅ Terraform Deployment Complete!\033[0m" >> /tmp/final_output.txt
-      echo -e "\033[1;34m=================================================================\033[0m" >> /tmp/final_output.txt
+      echo -e "✅ Terraform Deployment Complete!" >> /tmp/final_output.txt
+      echo -e "=================================================================" >> /tmp/final_output.txt
     EOT
   }
 

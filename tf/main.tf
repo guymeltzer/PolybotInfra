@@ -398,161 +398,87 @@ resource "null_resource" "argocd_direct_access" {
         exit 1
       fi
       
-      # Save the URL and credentials to a file for easy access
-      PORT=8081
+      # Create a simple, reliable SSH tunnel script
+      cat > ~/argocd-ssh-tunnel.sh <<EOF
+#!/bin/bash
+# Simple SSH tunnel script for ArgoCD
+
+# Configuration
+SSH_KEY=\${HOME}/polybot-key.pem
+CONTROL_PLANE_IP=$CONTROL_PLANE_IP
+LOCAL_PORT=8081
+
+# Kill existing tunnels
+echo "Killing any existing SSH tunnels..."
+pkill -f "ssh.*-L \$LOCAL_PORT:localhost:\$LOCAL_PORT.*" >/dev/null 2>&1 || true
+
+# Check if port is in use
+if lsof -ti:\$LOCAL_PORT >/dev/null ; then
+    echo "Port \$LOCAL_PORT is already in use. Please close any applications using it."
+    exit 1
+fi
+
+# Ensure SSH key has correct permissions
+chmod 600 \$SSH_KEY
+
+# First, set up port-forwarding on the control plane server
+echo "Setting up port forwarding on the control plane..."
+ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP "kubectl port-forward -n argocd svc/argocd-server \$LOCAL_PORT:443 --address 0.0.0.0 > /dev/null 2>&1 &"
+
+# Wait for port-forwarding to start
+sleep 3
+
+# Now establish SSH tunnel
+echo "Starting SSH tunnel to ArgoCD..."
+ssh -i \$SSH_KEY -L \$LOCAL_PORT:localhost:\$LOCAL_PORT -N -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP
+
+# If SSH exits, kill port-forwarding
+ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@\$CONTROL_PLANE_IP "pkill -f 'kubectl.*port-forward.*argocd-server' || true"
+EOF
+
+      chmod 755 ~/argocd-ssh-tunnel.sh
+      
+      # Save the URL and credentials for easy access
       cat > /tmp/argocd-access-info.txt <<- ACCESS
         ArgoCD Access Information
         ------------------------
-        URL: https://localhost:$PORT
+        URL: https://localhost:8081
         Username: admin
         Password: $ADMIN_PASSWORD
         
-        The SSH tunnel is set up automatically. If you need to restart it manually:
-        ssh -i polybot-key.pem -L $PORT:localhost:$PORT ubuntu@$CONTROL_PLANE_IP
+        To access ArgoCD, run the provided script:
+        ~/argocd-ssh-tunnel.sh
         
-        After SSH connects:
-        kubectl port-forward -n argocd svc/argocd-server $PORT:443
+        The script will establish an SSH tunnel to the ArgoCD server.
+        Press Ctrl+C to terminate when done.
       ACCESS
       
-      # Create an SSH tunnel script that uses a known port
-      cat > /tmp/argocd-ssh-tunnel.sh <<'EOF'
-#!/bin/bash
-# ArgoCD SSH tunnel script
+      # Create a instructions file for the user
+      cat > /tmp/argocd-instructions.txt <<EOF
+=====================================================
+🔐 HOW TO ACCESS ARGOCD 🔐
+=====================================================
 
-set -e
+A script has been created at ~/argocd-ssh-tunnel.sh
 
-# Configuration 
-PORT=8081
-SSH_KEY="polybot-key.pem"
-LOG_FILE="/tmp/argocd-ssh-tunnel.log"
-PID_FILE="/tmp/argocd-ssh-tunnel.pid"
-FORWARD_CMD_FILE="/tmp/argocd-forward-command"
+To access ArgoCD:
+1. Open a terminal window
+2. Run: ~/argocd-ssh-tunnel.sh
+3. Keep the terminal window open
+4. In your browser, visit https://localhost:8081
+5. Username: admin
+6. Password: $ADMIN_PASSWORD
 
-# Get control plane IP from AWS
-CONTROL_PLANE_IP=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-
-if [ -z "$CONTROL_PLANE_IP" ] || [ "$CONTROL_PLANE_IP" == "None" ]; then
-  echo "❌ Could not retrieve control plane IP address" | tee -a "$LOG_FILE"
-  exit 1
-fi
-
-echo "Starting ArgoCD access via SSH tunnel to $CONTROL_PLANE_IP" | tee -a "$LOG_FILE"
-
-# Kill any existing SSH tunnels
-echo "Killing any existing SSH tunnels..." | tee -a "$LOG_FILE"
-pkill -f "ssh.*-L $PORT:localhost:$PORT.*ubuntu@" 2>/dev/null || true
-
-# Check if port is in use
-PORT_PID=$(lsof -ti:$PORT 2>/dev/null)
-if [ -n "$PORT_PID" ]; then
-  echo "Port $PORT is already in use, stopping process..." | tee -a "$LOG_FILE"
-  kill -9 $PORT_PID 2>/dev/null || true
-  sleep 2
-fi
-
-# Create the port-forwarding command to run on the control plane
-cat > "$FORWARD_CMD_FILE" <<CMD
-#!/bin/bash
-echo "Starting port-forwarding on control plane..."
-nohup kubectl port-forward -n argocd svc/argocd-server $PORT:443 > /tmp/argocd-port-forward.log 2>&1 &
-echo \$! > /tmp/argocd-port-forward.pid
-echo "Started port-forwarding with PID: \$(cat /tmp/argocd-port-forward.pid)"
-CMD
-
-chmod +x "$FORWARD_CMD_FILE"
-
-# SSH to control plane and run the port-forwarding command
-echo "Copying port-forwarding script to control plane..." | tee -a "$LOG_FILE"
-scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$FORWARD_CMD_FILE" ubuntu@$CONTROL_PLANE_IP:/tmp/argocd-forward-command >/dev/null 2>&1
-
-echo "Starting port-forwarding on control plane..." | tee -a "$LOG_FILE"
-ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "bash /tmp/argocd-forward-command" >> "$LOG_FILE" 2>&1
-
-# Now start the SSH tunnel in the background
-echo "Setting up SSH tunnel to $CONTROL_PLANE_IP:$PORT..." | tee -a "$LOG_FILE"
-nohup ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -L $PORT:localhost:$PORT ubuntu@$CONTROL_PLANE_IP "sleep 86400" > "$LOG_FILE" 2>&1 &
-SSH_PID=$!
-echo $SSH_PID > "$PID_FILE"
-
-# Wait for a moment to ensure SSH tunnel is established
-sleep 5
-
-# Check if SSH process is still running
-if ps -p $SSH_PID >/dev/null 2>&1; then
-  echo "✅ SSH tunnel established successfully! ArgoCD available at: https://localhost:$PORT" | tee -a "$LOG_FILE"
-  echo "✅ Process is running with PID: $SSH_PID" | tee -a "$LOG_FILE"
-else
-  echo "❌ Failed to establish SSH tunnel. Check $LOG_FILE for details." | tee -a "$LOG_FILE"
-  exit 1
-fi
+When you're done with ArgoCD, press Ctrl+C in the terminal window
+to close the SSH tunnel.
+=====================================================
 EOF
+
+      cat /tmp/argocd-instructions.txt
       
-      chmod +x /tmp/argocd-ssh-tunnel.sh
-      
-      # Create cleanup script
-      cat > /tmp/argocd-tunnel-cleanup.sh <<'EOF'
-#!/bin/bash
-# ArgoCD SSH tunnel cleanup script
-
-echo "Cleaning up ArgoCD SSH tunnel..."
-
-# Kill SSH tunnel
-SSH_PID=$(cat /tmp/argocd-ssh-tunnel.pid 2>/dev/null)
-if [ -n "$SSH_PID" ]; then
-  echo "Killing SSH tunnel with PID: $SSH_PID"
-  kill $SSH_PID 2>/dev/null || kill -9 $SSH_PID 2>/dev/null || true
-  sleep 1
-fi
-
-# Get control plane IP to clean up remote processes
-CONTROL_PLANE_IP=$(aws ec2 describe-instances \
-  --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-
-if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-  echo "Cleaning up port-forwarding on control plane..."
-  ssh -i polybot-key.pem -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP \
-    "pkill -f 'kubectl.*port-forward.*argocd-server' || true; rm -f /tmp/argocd-port-forward.pid /tmp/argocd-forward-command" >/dev/null 2>&1 || true
-fi
-
-# Clean up all SSH tunnels
-pkill -f "ssh.*-L 8081:localhost:8081.*ubuntu@" 2>/dev/null || true
-
-# Clean up files
-echo "Removing temporary files..."
-rm -f /tmp/argocd-ssh-tunnel.pid /tmp/argocd-ssh-tunnel.log \
-      /tmp/argocd-forward-command /tmp/argocd-admin-password.txt
-
-echo "SSH tunnel cleanup complete"
-EOF
-      
-      chmod +x /tmp/argocd-tunnel-cleanup.sh
-      
-      # Start the SSH tunnel
-      echo "Starting ArgoCD SSH tunnel..."
-      bash /tmp/argocd-ssh-tunnel.sh
-      
-      # Wait for tunnel to be established
-      sleep 5
-      
-      # Verify tunnel is working
-      if curl -k -s https://localhost:$PORT >/dev/null; then
-        echo "✅ ArgoCD is now accessible via SSH tunnel at https://localhost:$PORT"
-        echo "✅ Username: admin"
-        echo "✅ Password: $ADMIN_PASSWORD"
-      else
-        echo "⚠️ ArgoCD might not be accessible yet. Please check logs at /tmp/argocd-ssh-tunnel.log"
-        echo "Access information has been saved to /tmp/argocd-access-info.txt"
-      fi
+      echo "✅ ArgoCD access script created at ~/argocd-ssh-tunnel.sh"
+      echo "✅ Run the script in a separate terminal window to connect"
     EOT
-  }
-  
-  # Clean up port forwarding during terraform destroy
-  provisioner "local-exec" {
-    when = destroy
-    command = "bash /tmp/argocd-tunnel-cleanup.sh || true"
   }
 }
 
