@@ -1027,7 +1027,26 @@ READMEEOF
   # Clean up port forward when destroyed
   provisioner "local-exec" {
     when    = destroy
-    command = "pkill -f 'kubectl.*port-forward.*argocd-server' || true"
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      # Safely terminate any port forwarding processes
+      echo "Cleaning up ArgoCD port forwarding..."
+      
+      # Try different methods of terminating port forwarding
+      # Method 1: Using pkill with -9 (SIGKILL)
+      pkill -9 -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
+      
+      # Method 2: Find and kill by port
+      for pid in $(lsof -ti:8080 2>/dev/null); do
+        kill -9 $pid 2>/dev/null || true
+      done
+      
+      # Method 3: Clean up any pid files we created
+      rm -f /tmp/argocd-port-forward.pid 2>/dev/null || true
+      
+      echo "Cleanup completed."
+    EOT
   }
 }
 

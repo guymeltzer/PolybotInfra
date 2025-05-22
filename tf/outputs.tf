@@ -341,14 +341,9 @@ EOF
         echo -e "Worker Count: \033[1;32m$NODE_COUNT\033[0m" >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
         
-        # Replace the plain formatting with colorful output
-        cat /tmp/worker_nodes_formatted.txt | \
-          sed 's/Name: /\\\\033[1;33mName: \\\\033[1;36m/' | \
-          sed 's/InstanceId: /\\\\033[0m\\\\033[1;33mInstanceId: \\\\033[1;32m/' | \
-          sed 's/PrivateIP: /\\\\033[0m\\\\033[1;33mPrivateIP: \\\\033[1;37m/' | \
-          sed 's/PublicIP: /\\\\033[0m\\\\033[1;33mPublicIP: \\\\033[1;37m/' | \
-          sed 's/State: /\\\\033[0m\\\\033[1;33mState: \\\\033[1;32m/' | \
-          sed 's/---/\\\\033[0m\\\\n/' >> /tmp/final_output.txt
+        # Format worker nodes in a cleaner way without excessive escape sequences
+        echo -e "\033[1;33mWorker Nodes Details:\033[0m" >> /tmp/final_output.txt
+        jq -r '.[][] | "\033[1;36m- \(.Name):\033[0m ID: \033[1;32m\(.InstanceId)\033[0m, Private IP: \033[1;37m\(.PrivateIP)\033[0m, Public IP: \033[1;37m\(.PublicIP)\033[0m, State: \033[1;32m\(.State)\033[0m"' /tmp/worker_nodes.json >> /tmp/final_output.txt
       else
         echo -e "\033[1;33mNo worker node information available yet\033[0m" >> /tmp/final_output.txt
       fi
