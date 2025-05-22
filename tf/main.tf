@@ -410,18 +410,18 @@ resource "null_resource" "argocd_direct_access" {
 pkill -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
 
 # Check if port is in use
-PORT_PID=\$(lsof -ti:${PORT} 2>/dev/null)
+PORT_PID=\$(lsof -ti:$${PORT} 2>/dev/null)
 if [ -n "\$PORT_PID" ]; then
-  echo "Port ${PORT} is already in use, stopping process..."
+  echo "Port $${PORT} is already in use, stopping process..."
   kill -9 \$PORT_PID 2>/dev/null || true
   sleep 2
 fi
 
 # Start port forwarding in the background 
 export KUBECONFIG="${local.kubeconfig_path}"
-nohup kubectl port-forward -n argocd svc/argocd-server ${PORT}:443 >/tmp/argocd-port-forward.log 2>&1 &
+nohup kubectl port-forward -n argocd svc/argocd-server $${PORT}:443 >/tmp/argocd-port-forward.log 2>&1 &
 echo \$! > /tmp/argocd-port-forward.pid
-echo "ArgoCD port forwarding started on port ${PORT}"
+echo "ArgoCD port forwarding started on port $${PORT}"
 EOF
       
       # Make the script executable
