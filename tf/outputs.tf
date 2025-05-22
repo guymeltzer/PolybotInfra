@@ -4,63 +4,20 @@
 # Section 1: Kubernetes Infrastructure
 # ------------------------------------------------------------------------
 
-output "kubernetes_api_endpoint" {
-  description = "Kubernetes API endpoint"
-  value       = module.k8s-cluster.kubernetes_api_endpoint
-}
-
-output "vpc_id" {
-  description = "VPC ID"
-  value       = module.k8s-cluster.vpc_id
-}
-
-output "load_balancer_address" {
-  description = "DNS name of the application load balancer"
-  value       = module.k8s-cluster.alb_dns_name
-}
-
-output "subnet_ids" {
-  description = "Subnet IDs created for the Kubernetes cluster"
-  value       = module.k8s-cluster.public_subnet_ids
-}
-
 # ------------------------------------------------------------------------
 # Section 2: Control Plane Node Details
 # ------------------------------------------------------------------------
-
-output "control_plane_details" {
-  description = "Details of the control plane node"
-  value = {
-    instance_id = module.k8s-cluster.control_plane_instance_id
-    public_ip   = module.k8s-cluster.control_plane_public_ip
-    private_ip  = module.k8s-cluster.control_plane_private_ip
-    ssh_command = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
-  }
-}
 
 # ------------------------------------------------------------------------
 # Section 3: Worker Node Details
 # ------------------------------------------------------------------------
 
-output "worker_nodes_overview" {
-  description = "Overview of worker nodes"
-  value = <<-EOT
-    Worker Node Auto Scaling Group: ${module.k8s-cluster.worker_asg_name}
-    Worker Count: 2
-    Get detailed worker info with: 
-    aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-worker-node*" --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" --output table
-  EOT
-}
-
-output "worker_node_ssh_command" {
-  description = "SSH command template for worker nodes"
-  value       = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@WORKER_PUBLIC_IP (replace WORKER_PUBLIC_IP with the IP from the worker nodes list)"
-}
-
 # Dynamically get worker node details (attempts to get them if available)
 resource "null_resource" "worker_node_details" {
   triggers = {
-    always_run = timestamp()
+    # Use meaningful changes as triggers instead of timestamp to avoid unnecessary runs
+    worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
   }
 
   provisioner "local-exec" {
@@ -93,16 +50,6 @@ output "worker_nodes_formatted" {
 # Section 4: Kubernetes Access Commands
 # ------------------------------------------------------------------------
 
-output "kubeconfig_command" {
-  description = "Command to configure kubectl"
-  value       = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$$(pwd)/kubeconfig.yaml"
-}
-
-output "init_logs_commands" {
-  description = "Commands to view initialization logs on control plane and worker nodes"
-  value       = module.k8s-cluster.init_logs_commands
-}
-
 # ------------------------------------------------------------------------
 # Section 5: ArgoCD Information
 # ------------------------------------------------------------------------
@@ -110,7 +57,9 @@ output "init_logs_commands" {
 # Resource to retrieve ArgoCD password for output display
 resource "null_resource" "argocd_password_retriever" {
   triggers = {
-    always_run = timestamp()
+    # Only trigger when ArgoCD is installed or kubeconfig changes
+    argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
   }
 
   provisioner "local-exec" {
@@ -167,21 +116,6 @@ EOT
 # Section 6: Polybot Application URLs
 # ------------------------------------------------------------------------
 
-output "polybot_dev_url" {
-  description = "URL for accessing Polybot dev environment"
-  value       = "https://dev-polybot.${terraform.workspace}.devops-int-college.com"
-}
-
-output "polybot_prod_url" {
-  description = "URL for accessing Polybot production environment"
-  value       = "https://polybot.${terraform.workspace}.devops-int-college.com"
-}
-
-output "polybot_alb_dns" {
-  description = "Polybot ALB DNS name"
-  value       = module.k8s-cluster.alb_dns_name
-}
-
 # ------------------------------------------------------------------------
 # Section 7: Polybot AWS Resources
 # ------------------------------------------------------------------------
@@ -210,35 +144,16 @@ output "polybot_prod_resources" {
 # Section 8: SSH Access Details
 # ------------------------------------------------------------------------
 
-output "ssh_key_name" {
-  value       = module.k8s-cluster.ssh_key_name
-  description = "SSH key name used for the instances"
-}
-
-output "ssh_private_key_path" {
-  value = module.k8s-cluster.ssh_private_key_path
-}
-
-output "ssh_command_control_plane" {
-  value = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
-}
-
 # ------------------------------------------------------------------------
 # Section 9: Troubleshooting Commands
 # ------------------------------------------------------------------------
 
-output "worker_logs_command" {
-  value = module.k8s-cluster.worker_logs_command
-}
-
-output "worker_node_info" {
-  value = module.k8s-cluster.worker_node_info
-}
-
 # New dynamic worker logs command that uses actual worker public IPs
 resource "null_resource" "dynamic_worker_logs" {
   triggers = {
-    always_run = timestamp()
+    # Use meaningful triggers instead of timestamp
+    worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
   }
 
   provisioner "local-exec" {
@@ -282,9 +197,82 @@ output "dynamic_worker_logs" {
 # Section 10: Complete Deployment Output
 # ------------------------------------------------------------------------
 
+# Define local values for clean output formatting
+locals {
+  # Clean, complete deployment info that doesn't show heredoc markers
+  deployment_info = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
+  
+  # ArgoCD password for reference
+  argocd_password = fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet"
+}
+
+# Main consolidated output for all deployment information
+output "deployment_info" {
+  description = "Complete deployment information including access details, node information, and endpoints"
+  value = local.deployment_info
+}
+
+# Clean ArgoCD access information
+output "argocd" {
+  description = "ArgoCD access information"
+  value = trimspace("URL: https://localhost:8081\nUsername: admin\nPassword: ${local.argocd_password}\nConnect: Run ~/argocd-ssh-tunnel.sh to establish the connection")
+}
+
+# Essential cluster information in structured format
+output "cluster" {
+  description = "Essential cluster information for scripts"
+  value = {
+    api_endpoint = module.k8s-cluster.kubernetes_api_endpoint
+    control_plane = {
+      public_ip = module.k8s-cluster.control_plane_public_ip
+      ssh = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
+    }
+    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml"
+    alb_dns = module.k8s-cluster.alb_dns_name
+  }
+}
+
+# Application endpoints
+output "endpoints" {
+  description = "Application endpoints"
+  value = {
+    dev = "https://dev-polybot.${terraform.workspace}.devops-int-college.com"
+    prod = "https://polybot.${terraform.workspace}.devops-int-college.com"
+    argocd = "https://localhost:8081 (Run ~/argocd-ssh-tunnel.sh first)"
+  }
+}
+
+# AWS resources
+output "aws_resources" {
+  description = "AWS resources created for the application"
+  value = {
+    vpc_id = module.k8s-cluster.vpc_id
+    subnets = module.k8s-cluster.public_subnet_ids
+    ssh_key = module.k8s-cluster.ssh_key_name
+    dev = {
+      s3_bucket = module.polybot_dev.s3_bucket_name
+      sqs_queue = module.polybot_dev.sqs_queue_url
+      domain = module.polybot_dev.domain_name
+    }
+    prod = {
+      s3_bucket = module.polybot_prod.s3_bucket_name
+      sqs_queue = module.polybot_prod.sqs_queue_url
+      domain = module.polybot_prod.domain_name
+    }
+  }
+}
+
+# RESOURCES FOR GENERATING OUTPUT FILES
+# These resources don't create outputs directly but generate the files used by outputs
+
+# Resource to format all outputs into a single file
 resource "null_resource" "format_outputs" {
   triggers = {
-    always_run = timestamp()
+    # Create meaningful triggers that depend on actual resources
+    worker_nodes = null_resource.worker_node_details.id
+    argocd_password = null_resource.argocd_password_retriever.id
+    worker_logs = null_resource.dynamic_worker_logs.id
+    kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "notexists"
   }
 
   provisioner "local-exec" {
@@ -413,80 +401,4 @@ EOF
     null_resource.dynamic_worker_logs,
     null_resource.argocd_direct_access
   ]
-}
-
-output "complete_deployment_info" {
-  description = "Complete formatted deployment information"
-  value = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
-}
-
-# Define a clean local value with all the output information
-locals {
-  # Clean, complete deployment info that doesn't show heredoc markers
-  deployment_info = fileexists("/tmp/final_output.txt") ? file("/tmp/final_output.txt") : "Deployment information not available yet"
-  
-  # ArgoCD password for reference
-  argocd_password = fileexists("/tmp/argocd-admin-password.txt") ? file("/tmp/argocd-admin-password.txt") : "Not available yet"
-}
-
-# Single consolidated output for all deployment information
-output "deployment_info" {
-  description = "Complete deployment information including access details, node information, and endpoints"
-  value = local.deployment_info
-}
-
-# Cleaner output just for ArgoCD (without heredoc markers)
-output "argocd" {
-  description = "ArgoCD access information"
-  value = trimspace(<<-EOF
-    URL: https://localhost:8081
-    Username: admin
-    Password: ${local.argocd_password}
-    Connect: Run ~/argocd-ssh-tunnel.sh to establish the connection
-  EOF
-  )
-}
-
-# For script access, provide important values as structured data
-output "cluster" {
-  description = "Essential cluster information for scripts"
-  value = {
-    api_endpoint = module.k8s-cluster.kubernetes_api_endpoint
-    control_plane = {
-      public_ip = module.k8s-cluster.control_plane_public_ip
-      ssh = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
-    }
-    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=$(pwd)/kubeconfig.yaml"
-    alb_dns = module.k8s-cluster.alb_dns_name
-  }
-}
-
-# Endpoints for easy access
-output "endpoints" {
-  description = "Application endpoints"
-  value = {
-    dev = "https://dev-polybot.${terraform.workspace}.devops-int-college.com"
-    prod = "https://polybot.${terraform.workspace}.devops-int-college.com"
-    argocd = "https://localhost:8081 (Run ~/argocd-ssh-tunnel.sh first)"
-  }
-}
-
-# AWS resources
-output "aws_resources" {
-  description = "AWS resources created for the application"
-  value = {
-    vpc_id = module.k8s-cluster.vpc_id
-    subnets = module.k8s-cluster.public_subnet_ids
-    ssh_key = module.k8s-cluster.ssh_key_name
-    dev = {
-      s3_bucket = module.polybot_dev.s3_bucket_name
-      sqs_queue = module.polybot_dev.sqs_queue_url
-      domain = module.polybot_dev.domain_name
-    }
-    prod = {
-      s3_bucket = module.polybot_prod.s3_bucket_name
-      sqs_queue = module.polybot_prod.sqs_queue_url
-      domain = module.polybot_prod.domain_name
-    }
-  }
 }
