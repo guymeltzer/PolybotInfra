@@ -502,11 +502,9 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
   
   depends_on = [null_resource.argocd_direct_access]
   
-  # Store values needed for destroy in triggers
+  # Use only one trigger to avoid issues
   triggers_replace = {
     argocd_access_id = null_resource.argocd_direct_access[0].id
-    region = var.region
-    ssh_key_path = "${path.module}/polybot-key.pem"
   }
   
   # Add proper cleanup during destroy operations
@@ -518,17 +516,9 @@ resource "terraform_data" "argocd_port_forward_cleanup" {
       # Kill any SSH tunnels that might be running
       pkill -f "ssh.*-L 8081:localhost:8081" > /dev/null 2>&1 || true
       
-      # Get control plane IP if available
-      CONTROL_PLANE_IP=$(aws ec2 describe-instances --region ${self.triggers_replace.region} \
-        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-        --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null)
-      
-      # If we have an IP, try to clean up port-forwarding on the control plane
-      if [ -n "$CONTROL_PLANE_IP" ] && [ "$CONTROL_PLANE_IP" != "None" ]; then
-        echo "Attempting to clean up remote port forwarding..."
-        ssh -i "${self.triggers_replace.ssh_key_path}" -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "pkill -f 'kubectl.*port-forward.*argocd-server';" > /dev/null 2>&1 || true
-      fi
-      
+      # Cleaner approach that doesn't depend on external variables or state
+      echo "Note: Control plane resources may have already been destroyed."
+      echo "The SSH tunnel will terminate automatically if the instances are gone." 
       echo "Cleanup complete."
     EOT
   }
