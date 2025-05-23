@@ -1269,25 +1269,96 @@ resource "terraform_data" "worker_progress" {
   }
 }
 
+# Create S3 bucket for worker scripts if it doesn't exist
+resource "aws_s3_bucket" "worker_scripts" {
+  bucket = "guy-polybot-scripts"
+  force_destroy = true
+  
+  tags = {
+    Name = "Worker Node Scripts Bucket"
+    "kubernetes.io/cluster/kubernetes" = "owned"
+  }
+}
+
+# Create bucket for worker logs
+resource "aws_s3_bucket" "worker_logs" {
+  bucket = "guy-polybot-logs"
+  force_destroy = true
+  
+  tags = {
+    Name = "Worker Node Logs Bucket"
+    "kubernetes.io/cluster/kubernetes" = "owned"
+  }
+}
+
+# Upload the full worker initialization script to S3
+resource "aws_s3_object" "worker_full_init" {
+  bucket = aws_s3_bucket.worker_scripts.bucket
+  key    = "worker_full_init.sh"
+  content = templatefile(
+    "${path.module}/worker_user_data.sh",
+    {
+      ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 temp-key",
+      KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
+      KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
+      # Add explicit empty variables for heredoc escape
+      PRIVATE_IP = "",
+      PUBLIC_IP = "",
+      TOKEN = "",
+      DISCOVERY_HASH = "",
+      CONTROL_PLANE_IP = ""
+    }
+  )
+  content_type = "text/x-shellscript"
+  acl = "private"
+}
+
+# Allow worker nodes to access the S3 buckets
+resource "aws_iam_policy" "worker_s3_access" {
+  name        = "guy-worker-s3-access"
+  description = "Policy allowing workers to access S3 buckets for scripts and logs"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "${aws_s3_bucket.worker_scripts.arn}",
+          "${aws_s3_bucket.worker_scripts.arn}/*",
+          "${aws_s3_bucket.worker_logs.arn}",
+          "${aws_s3_bucket.worker_logs.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+# Attach the S3 access policy to the worker role
+resource "aws_iam_role_policy_attachment" "worker_s3_access" {
+  role       = aws_iam_role.worker_role.name
+  policy_arn = aws_iam_policy.worker_s3_access.arn
+}
+
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
   key_name      = local.actual_key_name
 
+  # This bootstrap script is a minimal version that downloads and executes the full script from S3
   user_data = base64encode(
     templatefile(
-      "${path.module}/worker_user_data.sh",
+      "${path.module}/bootstrap_worker.sh",
       {
         ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 temp-key",
         KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
-        KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-        # Add explicit empty variables for heredoc escape
-        PRIVATE_IP = "",
-        PUBLIC_IP = "",
-        TOKEN = "",
-        DISCOVERY_HASH = "",
-        CONTROL_PLANE_IP = ""
+        KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
       }
     )
   )
@@ -1312,29 +1383,11 @@ resource "aws_launch_template" "worker_lt" {
     }
   }
   
-  lifecycle {
-    create_before_destroy = true
-    # Prevent replacement: Ignore changes to user_data since we want to preserve the existing worker nodes
-    ignore_changes = [user_data]
-    # Only replace when script content changes
-    replace_triggered_by = [
-      terraform_data.worker_script_hash
-    ]
-  }
-  
   depends_on = [
-    aws_instance.control_plane,
+    aws_s3_object.worker_full_init,
     aws_secretsmanager_secret.kubernetes_join_command,
-    null_resource.wait_for_control_plane,
-    terraform_data.worker_script_hash,
-    null_resource.update_join_command
+    aws_secretsmanager_secret.kubernetes_join_command_latest
   ]
-
-  # Report progress
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = "echo -e \"\\033[0;32m✅ Worker launch template created! Template ID: ${self.id}\\033[0m\""
-  }
 }
 
 # Force update ASG when worker script changes
@@ -2080,25 +2133,6 @@ resource "aws_key_pair" "generated_key" {
 locals {
   # Use provided key name if set, otherwise use the auto-generated key
   actual_key_name = var.key_name != "" ? var.key_name : aws_key_pair.generated_key[0].key_name
-}
-
-# S3 bucket for worker node logs
-resource "aws_s3_bucket" "worker_logs" {
-  bucket = "guy-polybot-logs"
-  force_destroy = true
-}
-
-resource "aws_s3_bucket_ownership_controls" "worker_logs" {
-  bucket = aws_s3_bucket.worker_logs.id
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
-}
-
-resource "aws_s3_bucket_acl" "worker_logs" {
-  depends_on = [aws_s3_bucket_ownership_controls.worker_logs]
-  bucket = aws_s3_bucket.worker_logs.id
-  acl    = "private"
 }
 
 # Final progress reporter

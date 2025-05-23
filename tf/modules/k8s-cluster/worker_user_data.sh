@@ -1,5 +1,64 @@
 #!/bin/bash
+# Bootstrap script for worker nodes - uses minimal footprint to stay under user-data limit
+# This is a minimal bootstrap script that will download and execute the full initialization script
+
+# Initialize logging
+LOG_DIR="/var/log"
+LOGFILE="$LOG_DIR/worker-init.log"
+DEBUG_LOG="/home/ubuntu/bootstrap-debug.log"
+
+# Create directories
+mkdir -p /home/ubuntu
+touch $LOGFILE $DEBUG_LOG
+chmod 644 $LOGFILE $DEBUG_LOG
+chown ubuntu:ubuntu $DEBUG_LOG
+
+# Start logging
+exec > >(tee -a $LOGFILE $DEBUG_LOG) 2>&1
+echo "$(date) - Starting worker node bootstrap (minimal version)"
+
+# Error handling
+set -e
+trap 'echo "$(date) - CRITICAL ERROR at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?"' ERR
+
+# Install basic dependencies
+echo "$(date) - Installing minimal dependencies..."
+apt-get update && apt-get install -y curl unzip jq ca-certificates || {
+    echo "WARNING: Basic package install failed, continuing anyway"
+}
+
+# Get instance metadata
+echo "$(date) - Fetching EC2 instance metadata..."
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
+export AWS_DEFAULT_REGION="$REGION"
+
+# Download and run the full script
+echo "$(date) - Downloading full worker initialization script..."
+
+# Set S3 bucket and script name 
+S3_BUCKET="guy-polybot-scripts"
+SCRIPT_NAME="worker_full_init.sh"
+LOCAL_SCRIPT="/tmp/$SCRIPT_NAME"
+
+# Create the full initialization script in S3 if it doesn't exist
+cat > "$LOCAL_SCRIPT" << 'FULLSCRIPT'
+#!/bin/bash
 # Enhanced worker initialization script for AWS EC2 with debug support
+
+# Check if arguments were provided
+if [ "$#" -eq 3 ]; then
+  # Get parameters from command line
+  SSH_PUBLIC_KEY="$1"
+  JOIN_COMMAND_SECRET="$2"
+  JOIN_COMMAND_LATEST_SECRET="$3"
+else
+  # Default values (template placeholders)
+  SSH_PUBLIC_KEY="${ssh_public_key}"
+  JOIN_COMMAND_SECRET="${KUBERNETES_JOIN_COMMAND_SECRET}"
+  JOIN_COMMAND_LATEST_SECRET="${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}"
+fi
+
 LOGFILE="/var/log/worker-init.log"
 DEBUG_LOG="/home/ubuntu/bootstrap-debug.log"
 
@@ -29,14 +88,8 @@ log_section() {
   echo "$(date) - ===== SECTION: $1 =====" | tee -a $${LOGFILE} $${DEBUG_LOG}
 }
 
-log_section "Starting worker node bootstrap"
+log_section "Starting worker node bootstrap (full script)"
 debug_checkpoint "INIT"
-
-# Ensure ubuntu user can access the logs
-mkdir -p /home/ubuntu
-touch $${DEBUG_LOG}
-chown ubuntu:ubuntu $${DEBUG_LOG}
-chmod 644 $${DEBUG_LOG}
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -50,7 +103,7 @@ setup_ssh() {
   
   # Add authorized key with explicit newline and hash
   cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
-${ssh_public_key}
+$SSH_PUBLIC_KEY
 EOF
   
   # Set correct ownership and permissions
@@ -248,8 +301,8 @@ EOF
 # Join the Kubernetes cluster
 join_cluster() {
   # Define secret names
-  KUBERNETES_JOIN_COMMAND_SECRET="${KUBERNETES_JOIN_COMMAND_SECRET}"
-  KUBERNETES_JOIN_COMMAND_LATEST_SECRET="${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}"
+  KUBERNETES_JOIN_COMMAND_SECRET="$JOIN_COMMAND_SECRET"
+  KUBERNETES_JOIN_COMMAND_LATEST_SECRET="$JOIN_COMMAND_LATEST_SECRET"
   SECRET_NAMES=("$${KUBERNETES_JOIN_COMMAND_SECRET}" "$${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}")
   
   echo "Attempting to join Kubernetes cluster..."
@@ -429,3 +482,19 @@ echo "✅ WORKER NODE INITIALIZATION COMPLETE"
 echo "View logs with: cat /home/ubuntu/init_summary.log"
 echo "View debug progress: cat /home/ubuntu/init_progress.log"
 echo "=================================================="
+FULLSCRIPT
+
+# Make the script executable
+chmod +x "$LOCAL_SCRIPT"
+
+# Execute the full script, passing in all the required variables
+echo "$(date) - Starting full worker initialization..."
+$LOCAL_SCRIPT \
+  "${SSH_PUBLIC_KEY}" \
+  "${JOIN_COMMAND_SECRET}" \
+  "${JOIN_COMMAND_LATEST_SECRET}"
+
+# Exit with the exit code of the full script
+EXIT_CODE=$?
+echo "$(date) - Worker initialization completed with exit code: $EXIT_CODE"
+exit $EXIT_CODE
