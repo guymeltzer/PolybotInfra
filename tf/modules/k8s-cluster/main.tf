@@ -1280,7 +1280,19 @@ resource "aws_s3_bucket" "worker_logs" {
   }
 }
 
+# Configure bucket to allow ACLs
+resource "aws_s3_bucket_ownership_controls" "worker_logs_ownership" {
+  bucket = aws_s3_bucket.worker_logs.id
+  
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+# Set the bucket ACL to private
 resource "aws_s3_bucket_acl" "worker_logs_acl" {
+  depends_on = [aws_s3_bucket_ownership_controls.worker_logs_ownership]
+  
   bucket = aws_s3_bucket.worker_logs.id
   acl    = "private"
 }
