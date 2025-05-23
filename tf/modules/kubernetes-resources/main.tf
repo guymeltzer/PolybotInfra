@@ -92,6 +92,8 @@ metadata:
   name: disk-cleanup-now
   namespace: kube-system
 spec:
+  ttlSecondsAfterFinished: 100
+  activeDeadlineSeconds: 300  # Add 5-minute timeout to prevent job from hanging
   template:
     spec:
       tolerations:
@@ -183,10 +185,12 @@ spec:
           hostPID: true
 EOFJOB
       
-      # Wait with increased timeout
-      echo "Waiting for emergency cleanup job to complete (timeout: 10 minutes)..."
-      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=600s || true
+      # Wait with reduced timeout
+      echo "Waiting for emergency cleanup job to complete (timeout: 3 minutes)..."
+      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=180s || true
       
+      # Continue even if job hasn't completed
+      echo "Continuing deployment regardless of cleanup job status..."
       echo "Disk cleanup jobs created. Regular maintenance will happen every 6 hours."
     EOT
   }

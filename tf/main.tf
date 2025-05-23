@@ -1103,7 +1103,16 @@ resource "null_resource" "configure_argocd_apps" {
       
       # Create persistent volume provisioning
       echo "Creating storage class for EBS..."
-      kubectl apply -f - <<EOF
+      
+      # Check if the storage class already exists
+      if kubectl get storageclass ebs-sc &>/dev/null; then
+        echo "Storage class ebs-sc already exists, removing it first to avoid parameter update errors..."
+        kubectl delete storageclass ebs-sc --wait=false
+        sleep 5  # Give Kubernetes some time to process the deletion
+      fi
+      
+      # Create the storage class with replace if it exists
+      kubectl apply -f - --force --grace-period=0 <<EOF
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -1203,7 +1212,7 @@ resource "null_resource" "install_calico" {
   depends_on = [
     null_resource.providers_ready,
     null_resource.wait_for_kubernetes,
-    null_resource.cleanup_worker_nodes,
+    module.kubernetes_resources.null_resource.improved_disk_cleanup,
     terraform_data.kubectl_provider_config
   ]
   
@@ -1356,10 +1365,11 @@ EOF
 
 # Add this resource after the null_resource.fix_argocd_connectivity resource
 resource "null_resource" "cleanup_worker_nodes" {
+  # Skip this resource since it's duplicated in the kubernetes_resources module
+  count = 0  # Set to 0 to disable as we're using the module version instead
+
   # Remove dependency on fix_argocd_connectivity
   depends_on = [null_resource.install_ebs_csi_driver]
-
-  count = local.skip_argocd ? 0 : 1
 
   provisioner "local-exec" {
     command = <<-EOT
@@ -1450,6 +1460,8 @@ metadata:
   name: disk-cleanup-now
   namespace: kube-system
 spec:
+  ttlSecondsAfterFinished: 100
+  activeDeadlineSeconds: 300  # Add 5-minute timeout to prevent job from hanging
   template:
     spec:
       tolerations:
@@ -1506,10 +1518,11 @@ spec:
 EOF
       
       # Increase timeout for cleanup job
-      echo "Waiting for emergency disk cleanup to complete (may take several minutes)..."
-      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=600s || true
+      echo "Waiting for emergency disk cleanup to complete (max 3 minutes)..."
+      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=180s || true
       
-      echo "Disk cleanup completed, checking node status..."
+      # Force continue even if job hasn't completed
+      echo "Continuing deployment whether cleanup is done or not..."
       kubectl get nodes
       
       echo "Cleanup job created successfully."
@@ -1523,7 +1536,7 @@ resource "null_resource" "deploy_mongodb_directly" {
   
   depends_on = [
     null_resource.install_ebs_csi_driver,
-    null_resource.cleanup_worker_nodes,
+    module.kubernetes_resources.null_resource.improved_disk_cleanup,
     null_resource.install_calico
   ]
   
@@ -1559,7 +1572,26 @@ parameters:
   type: gp2
 EOF
         else
-          echo "MongoDB storage class already exists"
+          echo "MongoDB storage class already exists, checking if it needs to be updated..."
+          # Check if the existing storage class has the correct parameters
+          if ! kubectl get storageclass mongodb-sc -o yaml | grep -q "csi.storage.k8s.io/fstype: ext4"; then
+            echo "Storage class needs updating, deleting and recreating..."
+            kubectl delete storageclass mongodb-sc --wait=false
+            sleep 5  # Give Kubernetes some time to process the deletion
+            kubectl apply -f - --force --grace-period=0 <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mongodb-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  csi.storage.k8s.io/fstype: ext4
+  type: gp2
+EOF
+          else
+            echo "MongoDB storage class has correct parameters, skipping update"
+          fi
         fi
         
         echo "Creating MongoDB StatefulSet directly..."
