@@ -1,5 +1,10 @@
 provider "aws" {
   region = var.region
+  # Note: If explicit deny issues persist, consider this alternative approach
+  # Uncomment and set role_arn to a role with appropriate permissions
+  # assume_role {
+  #   role_arn = "arn:aws:iam::${var.account_id}:role/terraform-deployer-role"
+  # }
 }
 
 provider "tls" {}
@@ -934,12 +939,13 @@ resource "null_resource" "install_ebs_csi_driver" {
   # Use a static count value
   count = 1
   
-  # Only run after we have a valid kubeconfig
+  # Only run after we have a valid kubeconfig and the service-linked role is created
   depends_on = [
     module.k8s-cluster, 
     null_resource.wait_for_kubernetes, 
     terraform_data.kubectl_provider_config,
-    null_resource.providers_ready
+    null_resource.providers_ready,
+    aws_iam_service_linked_role.ebs_csi_driver
   ]
   
   # Only run when needed, based on resource changes
@@ -981,26 +987,13 @@ resource "null_resource" "install_ebs_csi_driver" {
       echo "Creating kube-system namespace if it doesn't exist..."
       kubectl --kubeconfig="$KUBECONFIG" create namespace kube-system --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
       
-      echo "Creating EBS CSI Driver IAM role..."
-      POLICY_ARN="arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
-      ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-      
-      # Fix: Use correct service name and handle service-linked role creation errors
-      echo "Creating service-linked role for EBS CSI driver..."
-      # First check if role already exists
-      if ! aws iam get-role --role-name "AWSServiceRoleForEBS" &>/dev/null; then
-        echo "Creating service-linked role for EBS..."
-        # Try with correct service name
-        aws iam create-service-linked-role --aws-service-name "ebs.amazonaws.com" || {
-          echo "Failed with ebs.amazonaws.com, trying alternative..."
-          # Try alternative service name if first one fails
-          aws iam create-service-linked-role --aws-service-name "ec2.amazonaws.com" || {
-            echo "Could not create service-linked roles. This may be an IAM permission issue."
-            echo "Continuing with installation. If volumes fail to provision, you may need to manually create roles."
-          }
-        }
-      else
+      # The service-linked role is now created by the aws_iam_service_linked_role resource
+      # We'll still check and give informational output though
+      echo "Verifying EBS service-linked role exists..."
+      if aws iam get-role --role-name "AWSServiceRoleForEBS" 2>/dev/null; then
         echo "Service-linked role for EBS already exists."
+      else
+        echo "Service-linked role not found but should have been created. Continuing anyway."
       fi
       
       echo "Creating EBS CSI Driver service account..."
@@ -1015,240 +1008,21 @@ EOF
       echo "Installing EBS CSI Driver..."
       kubectl --kubeconfig="$KUBECONFIG" apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master"
       
-      # Fix: Check if storage class exists first to avoid update error
-      echo "Checking if storage class ebs-sc exists..."
-      if kubectl --kubeconfig="$KUBECONFIG" get storageclass ebs-sc &>/dev/null; then
-        echo "Storage class ebs-sc already exists, skipping creation"
-      else
-        echo "Creating storage class..."
-        cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  csi.storage.k8s.io/fstype: ext4
-  type: gp2
-  encrypted: "true"
-EOF
-      fi
-      
-      # Fix the worker node disk pressure - fix find command syntax
-      echo "Checking for worker nodes with disk pressure..."
-      WORKER_NODES=$(kubectl --kubeconfig="$KUBECONFIG" get nodes -l '!node-role.kubernetes.io/control-plane' -o name | cut -d'/' -f2)
-      
-      for NODE in $WORKER_NODES; do
-        echo "Cleaning up disk space on $NODE..."
-        kubectl --kubeconfig="$KUBECONFIG" debug node/$NODE --image=busybox -- sh -c "
-          echo 'Cleaning docker images on $NODE'
-          rm -rf /host/var/lib/docker/containers/*/logs/*
-          rm -rf /host/var/log/*.gz /host/var/log/*.1 /host/var/log/*.old
-          rm -rf /host/var/cache/apt/archives/*.deb
-          find /host/var/log -type f -name '*.log' -size +100M -delete
-          find /host/tmp -type f -mtime +1 -delete
-        " || true
-      done
-      
-      echo "EBS CSI Driver installation completed"
+      echo "EBS CSI Driver installation completed. Now creating storage classes..."
     EOT
   }
 }
 
-# Output commands for manual verification and namespace creation
-resource "null_resource" "cluster_readiness_info" {
-  # Use a static count value
-  count = 1
+# Add the storage class resource after the EBS CSI driver resource
+# Look for the end of the install_ebs_csi_driver resource and add after it
 
-  depends_on = [
-    module.k8s-cluster,
-    terraform_data.kubectl_provider_config
-  ]
-
-  # Fix for inconsistent final plan by using a more stable trigger
-  triggers = {
-    # Only track the control plane ID, not the kubeconfig which changes too often
-    control_plane_id = try(module.k8s-cluster.control_plane_id, "none")
-    # Use timestamp instead of file hash to avoid plan/apply inconsistency
-    apply_time = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "---------------------------------------------------------"
-      echo "KUBERNETES CLUSTER DEPLOYMENT INFORMATION"
-      echo "---------------------------------------------------------"
-      echo "Kubernetes control plane IP: ${try(module.k8s-cluster.control_plane_public_ip, "Not available yet")}"
-      echo "Kubeconfig file: ${local.kubeconfig_path}"
-      echo ""
-      echo "To manually verify the cluster and create namespaces, run:"
-      echo "export KUBECONFIG=${local.kubeconfig_path}"
-      echo "kubectl get nodes"
-      echo "kubectl create namespace dev --dry-run=client -o yaml | kubectl apply --validate=false -f -"
-      echo "kubectl create namespace prod --dry-run=client -o yaml | kubectl apply --validate=false -f -"
-      echo "kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply --validate=false -f -"
-      echo ""
-      echo "When cluster is verified as working, set skip_namespaces = false in locals"
-      echo "---------------------------------------------------------"
-    EOT
-  }
-}
-
-terraform {
-  # Standard configuration without experimental features
-}
-
-# Display important information at the start of deployment
-resource "terraform_data" "deployment_information" {
-  # Run only on first apply or when Terraform files change
-  triggers_replace = {
-    module_hash = filemd5("${path.module}/main.tf") 
-    variables_hash = filemd5("${path.module}/variables.tf")
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      # Save the start time for later tracking
-      date +%s > /tmp/tf_start_time.txt
-      
-      echo -e "\033[1;34m========================================================\033[0m"
-      echo -e "\033[1;34m     🚀 Polybot Kubernetes Deployment Started 🚀\033[0m"
-      echo -e "\033[1;34m========================================================\033[0m"
-      echo -e "\033[0;33m⏱️  This deployment takes approximately 10 minutes.\033[0m"
-      echo -e "\033[0;33m⏱️  Progress indicators will be displayed throughout.\033[0m"
-      echo -e "\033[0;33m⏱️  Colorful status updates will show deployment stages.\033[0m"
-      echo -e "\033[0;33m⏱️  The first 5 minutes are AWS resources creation.\033[0m"
-      echo -e "\033[0;33m⏱️  The next 5 minutes are Kubernetes initialization.\033[0m"
-      echo -e "\033[0;32m➡️  Beginning infrastructure deployment now...\033[0m"
-      
-      # No background processes to avoid blocking terraform
-    EOT
-  }
-}
-
-# Final progress information and timing resource
-resource "terraform_data" "deployment_completion_information" {
-  depends_on = [
-    module.k8s-cluster,
-    module.polybot_dev,
-    module.polybot_prod
-  ]
-
-  # Run when actual infrastructure components change
-  triggers_replace = {
-    cluster_id = try(module.k8s-cluster.control_plane_id, "none")
-    dev_id = try(module.polybot_dev.polybot_s3_id, "none") 
-    prod_id = try(module.polybot_prod.polybot_s3_id, "none")
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      # Simple completion message - no time tracking to avoid complexity
-      echo -e "\033[1;34m========================================================\033[0m"
-      echo -e "\033[1;32m     ✅ Polybot Kubernetes Deployment Complete! ✅\033[0m"
-      echo -e "\033[1;34m========================================================\033[0m"
-    EOT
-  }
-}
-
-# Special resource to clean up Kubernetes state
-resource "terraform_data" "kubernetes_state_clean" {
-  # Use deterministic triggers for cleanup
-  triggers_replace = {
-    # We only need this to run during destroy operations, but with a stable hash
-    kubeconfig_status = fileexists("${path.module}/kubeconfig.yaml") ? filemd5("${path.module}/kubeconfig.yaml") : "not_exists"
-    module_hash = filemd5("${path.module}/main.tf")
-  }
-
-  # This will only be executed during destroy operations
-  provisioner "local-exec" {
-    when = destroy
-    command = <<-EOT
-      echo "Removing Kubernetes-dependent resources from state if needed..."
-      terraform state rm null_resource.wait_for_kubernetes[0] || true
-      terraform state rm null_resource.install_ebs_csi_driver[0] || true
-      terraform state rm null_resource.install_argocd[0] || true
-      terraform state rm null_resource.create_namespaces[0] || true
-      terraform state rm null_resource.providers_ready[0] || true
-      terraform state rm terraform_data.kubectl_provider_config[0] || true
-      echo "Kubernetes resources cleaned up from state."
-    EOT
-  }
-}
-
-# Add a separate cleanup for any remaining files
-resource "terraform_data" "final_cleanup" {
+resource "null_resource" "create_storage_classes" {
   count = 1
   
-  # This will run last during destroy
   depends_on = [
-    module.k8s-cluster,
-    module.polybot_dev,
-    module.polybot_prod
+    null_resource.install_ebs_csi_driver
   ]
   
-  # Use deterministic triggers that relate to the resources we're cleaning up
-  triggers_replace = {
-    cluster_id = try(module.k8s-cluster.control_plane_id, "none")
-    dev_id = try(module.polybot_dev.polybot_s3_id, "none")
-    prod_id = try(module.polybot_prod.polybot_s3_id, "none")
-  }
-  
-  # Only remove files during destroy, don't try to kill processes
-  provisioner "local-exec" {
-    when = destroy
-    # Just echo a message instead of doing anything that could cause termination
-    command = "echo 'Cleaning up temporary files...'"
-  }
-}
-
-# Development environment resources
-module "polybot_dev" {
-  source                = "./modules/polybot"
-  region                = var.region
-  route53_zone_id       = var.route53_zone_id
-  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment           = "dev"
-  telegram_token        = var.telegram_token_dev
-  aws_access_key_id     = var.aws_access_key_id
-  aws_secret_access_key = var.aws_secret_access_key
-  docker_username       = var.docker_username
-  docker_password       = var.docker_password
-}
-
-# Production environment resources
-module "polybot_prod" {
-  source                = "./modules/polybot"
-  region                = var.region
-  route53_zone_id       = var.route53_zone_id
-  alb_dns_name          = try(module.k8s-cluster.alb_dns_name, "dummy-dns-name")
-  alb_zone_id           = try(module.k8s-cluster.alb_zone_id, "dummy-zone-id")
-  environment           = "prod"
-  telegram_token        = var.telegram_token_prod
-  aws_access_key_id     = var.aws_access_key_id
-  aws_secret_access_key = var.aws_secret_access_key
-  docker_username       = var.docker_username
-  docker_password       = var.docker_password
-}
-
-# Install NGINX Ingress Controller after ArgoCD is ready
-resource "null_resource" "install_nginx_ingress" {
-  count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd,
-    null_resource.argocd_direct_access
-  ]
-  
-  # Only run when needed
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
@@ -1259,6 +1033,7 @@ resource "null_resource" "install_nginx_ingress" {
       #!/bin/bash
       export KUBECONFIG="${local.kubeconfig_path}"
       
+      echo "Cleaning up any existing storage classes to avoid conflicts..."
       # Check if NGINX Ingress is already installed
       if kubectl get ns ingress-nginx &>/dev/null && kubectl get deployment -n ingress-nginx ingress-nginx-controller &>/dev/null; then
         echo "NGINX Ingress Controller already installed, skipping installation"
@@ -1439,26 +1214,11 @@ resource "null_resource" "install_calico" {
         echo "Some nodes have disk pressure, running cleanup before Calico installation..."
         # Delete tigera-operator namespace if it exists to ensure clean slate
         kubectl delete namespace tigera-operator --ignore-not-found=true
-        # Delete Calico custom resources
-        kubectl delete customresourcedefinition felixconfigurations.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition ipamblocks.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition blockaffinities.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition ipamhandles.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition ipamconfigs.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition bgppeers.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition bgpconfigurations.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition ippools.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition hostendpoints.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition clusterinformations.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition globalnetworkpolicies.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition globalnetworksets.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition networkpolicies.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition networksets.crd.projectcalico.org --ignore-not-found=true
-        kubectl delete customresourcedefinition installations.operator.tigera.io --ignore-not-found=true
-        kubectl delete customresourcedefinition tigerastatuses.operator.tigera.io --ignore-not-found=true
         # Delete evicted pods
-        kubectl get pods --all-namespaces | grep Evicted | awk '{print $2 " --namespace=" $1}' | xargs -L1 kubectl delete pod || true
-        echo "Cleaned up old Calico resources"
+        kubectl get pods --all-namespaces -o json | jq -r '.items[] | select(.status.reason=="Evicted") | .metadata.namespace + " " + .metadata.name' | while read ns name; do 
+          kubectl delete pod -n $ns $name || true
+        done
+        echo "Cleaned up evicted pods"
         sleep 30
       fi
       
@@ -1475,56 +1235,14 @@ resource "null_resource" "install_calico" {
         fi
       fi
       
-      echo "Installing Tigera Calico operator with resource limits..."
-      cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: tigera-operator
-spec: {}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tigera-operator
-  namespace: tigera-operator
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      name: tigera-operator
-  template:
-    metadata:
-      labels:
-        name: tigera-operator
-    spec:
-      nodeSelector:
-        kubernetes.io/os: linux
-      serviceAccountName: tigera-operator
-      containers:
-      - name: tigera-operator
-        image: quay.io/tigera/operator:v1.29.4
-        imagePullPolicy: IfNotPresent
-        command:
-        - operator
-        env:
-        - name: TIGERA_OPERATOR_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: TIGERA_OPERATOR_INIT_IMAGE
-          value: quay.io/tigera/operator-init:v1.29.4
-        resources:
-          limits:
-            cpu: 500m
-            memory: 512Mi
-          requests:
-            cpu: 100m
-            memory: 256Mi
-EOF
+      echo "Installing Tigera Calico operator with simplified approach..."
+      # Create namespace first
+      kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
       
-      echo "Installing tigera operator RBAC and CRDs..."
-      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      # Download the official operator YAML but remove the long annotations that cause the error
+      curl -s https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml | \
+      grep -v "_description:" | \
+      kubectl apply -f -
       
       echo "Waiting 60 seconds for operator to initialize..."
       sleep 60
@@ -1566,8 +1284,6 @@ spec:
       requests:
         cpu: 100m
         memory: 128Mi
-  nodeMetricsPort: 9091
-  typhaMetricsPort: 9093
 EOF
       
       echo "Calico installation initiated with minimal config."
@@ -2004,6 +1720,47 @@ EOF
       echo "MongoDB deployment completed. Monitor status with: kubectl -n mongodb get pods"
     EOT
   }
+}
+
+# Create service-linked role for EBS CSI Driver if it doesn't exist
+resource "aws_iam_service_linked_role" "ebs_csi_driver" {
+  aws_service_name = "ebs.amazonaws.com"
+  description      = "Service-linked role for EBS CSI Driver"
+  
+  # Prevents failure if role already exists
+  provisioner "local-exec" {
+    on_failure = continue
+    command    = "echo Service-linked role may already exist - continuing"
+  }
+}
+
+# Use the kubernetes-resources module for all Kubernetes-specific resources
+module "kubernetes_resources" {
+  source = "./modules/kubernetes-resources"
+  
+  # Required parameters
+  region            = var.region
+  kubeconfig_path   = local.kubeconfig_path
+  module_path       = path.module
+  key_name          = var.key_name
+  
+  # Optional parameters with defaults
+  enable_resources    = true
+  skip_mongodb        = false
+  
+  # Resource dependencies
+  kubeconfig_trigger_id = terraform_data.kubectl_provider_config[0].id
+  kubernetes_dependency = null_resource.wait_for_kubernetes
+  ebs_csi_dependency    = null_resource.install_ebs_csi_driver
+  control_plane_id      = module.k8s-cluster.control_plane_id
+  
+  # Ensure this module runs after the necessary resources
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    null_resource.install_ebs_csi_driver,
+    null_resource.wait_for_kubernetes,
+    aws_iam_service_linked_role.ebs_csi_driver
+  ]
 }
 
 

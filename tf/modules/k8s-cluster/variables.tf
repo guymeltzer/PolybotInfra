@@ -77,3 +77,9 @@ variable "rebuild_control_plane" {
   type        = bool
   default     = false
 }
+
+variable "instance_type" {
+  description = "EC2 instance type for the cluster nodes"
+  type        = string
+  default     = "t3.medium"
+}

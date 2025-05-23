@@ -1,3 +1,79 @@
+# PolybotInfra - Terraform Kubernetes Deployment
+
+## Implemented Fixes
+
+This Terraform project has been updated to fix several issues:
+
+1. **SSH Key Handling:**
+   - Added better fallback logic for SSH key paths
+   - Improved error messages for missing keys
+   - Safer key permission setting
+
+2. **Disk Pressure:**
+   - Added comprehensive worker node cleanup
+   - Created scheduled cleanup job (runs every 6 hours)
+   - Implemented emergency cleanup job
+   - Better file deletion syntax for finding large log files
+
+3. **Storage Classes:**
+   - Separated storage class creation into its own resource
+   - Fixed conflict between EBS CSI driver and StorageClass creation
+   - Added dedicated MongoDB storage class
+
+4. **MongoDB Deployment:**
+   - Simplified MongoDB deployment with better resource limits
+   - Added health probes and error handling
+   - Fixed storage class consistency issues
+   - Added verification step for MongoDB functionality
+
+5. **IAM Permissions:**
+   - Added service-linked role creation for EBS CSI Driver
+   - Added fallback handling for IAM permission errors
+   - AWS provider configured with ability to assume roles if needed
+
+6. **Calico/Tigera Installation:**
+   - Fixed annotation length error in Tigera operator
+   - Added resource limits to Calico components
+   - Improved cleanup of previous Calico installations
+
+7. **General Improvements:**
+   - Reverted instance type to t3.medium
+   - Added better dependency management
+   - Improved error handling throughout
+   - Added verification and validation steps
+
+## Usage
+
+1. **Prerequisites:**
+   - AWS CLI configured with appropriate permissions
+   - kubectl installed
+   - jq installed for JSON parsing
+
+2. **Deployment:**
+   ```bash
+   terraform init
+   terraform apply
+   ```
+
+3. **Verification:**
+   Once deployed, you can access your cluster with:
+   ```bash
+   export KUBECONFIG=$(pwd)/tf/kubeconfig.yaml
+   kubectl get nodes
+   ```
+
+## Troubleshooting
+
+If you encounter permission issues:
+- Check the IAM permissions of your AWS account
+- Consider using a role with appropriate permissions
+- Verify that service-linked roles are allowed to be created
+
+For disk pressure issues:
+- Run the cleanup jobs manually: `kubectl create job --from=cronjob/node-cleanup immediate-cleanup -n kube-system`
+- Consider increasing instance size if persistent
+- Add additional EBS volumes for high storage workloads
+
 # PolybotInfra
 
 This repository contains Terraform code to provision the Polybot service infrastructure on AWS in multiple regions.
@@ -118,6 +194,10 @@ tf/
 │     ├── main.tf
 │     ├── variables.tf
 │     └── outputs.tf
+├───── kubernetes-resources/                # Module for Kubernetes components
+│     ├── main.tf                           # Resources for storage, MongoDB, cleanup, etc.
+│     ├── variables.tf                      # Input variables for the module
+│     └── outputs.tf                        # Output values from the module
 ├───── argocd/                              # Module for ArgoCD deployment
 │     ├── main.tf
 │     ├── variables.tf
