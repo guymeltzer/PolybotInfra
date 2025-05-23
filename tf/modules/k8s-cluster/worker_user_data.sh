@@ -49,8 +49,8 @@ setup_ssh() {
   chmod 700 /home/ubuntu/.ssh
   
   # Add authorized key with explicit newline and hash
-  cat > /home/ubuntu/.ssh/authorized_keys << 'EOF'
-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqLhoAqLycARtV0Xv65goCLInDlmiAayIzTuMpLKpUIRQpgVx6hKm2Wyn0/4js5UcAZtM8cHcuKaU52rM1B4c116uW8qIctkcwWPShx11DfVl/bv90qmj0NWBr71jysQZlR52YjytwaimBeqtNRyzpxyg3+s3AHBbe4Tv5EKg8q5pu+bZqRxmOuJqM0tO1w4DzPCum5OG40zlcrt52KZE6ARSpfO2mdc+drTH7w5HIpTRUlOsRkH0GyYFU6XQVQ5/oVWJ09VhxLvuzEjDyGbZiV+uVH18b97e1e949/EkBjfRM1iNIIdYu4bmtKSqaZuUzdILOf4sGvVqc4IEdi7pJ polybot-key
+  cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
+${ssh_public_key}
 EOF
   
   # Set correct ownership and permissions
@@ -214,9 +214,9 @@ EOF
 # Join the Kubernetes cluster
 join_cluster() {
   # Define secret names
-  MAIN_SECRET="##KUBERNETES_JOIN_COMMAND_SECRET##"
-  LATEST_SECRET="##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##"
-  SECRET_NAMES=("$MAIN_SECRET" "$LATEST_SECRET")
+  KUBERNETES_JOIN_COMMAND_SECRET="${KUBERNETES_JOIN_COMMAND_SECRET}"
+  KUBERNETES_JOIN_COMMAND_LATEST_SECRET="${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}"
+  SECRET_NAMES=("$KUBERNETES_JOIN_COMMAND_SECRET" "$KUBERNETES_JOIN_COMMAND_LATEST_SECRET")
   
   echo "Attempting to join Kubernetes cluster..."
   

@@ -67,13 +67,28 @@ jobs:
         
       - name: Extract Kubernetes Info
         run: |
-          echo "Getting kubeconfig from control plane instance..."
-          CONTROL_PLANE_IP=$(terraform output -raw kubernetes_api_server_endpoint)
-          mkdir -p ~/.kube
-          aws s3 cp s3://polybot-tfstate-bucket/kubeconfig/config ~/.kube/config || echo "Kubeconfig not available in S3"
+          echo "Getting kubeconfig from terraform output..."
+          KUBECONFIG_OUTPUT=$(terraform output -raw cluster_kubeconfig 2>/dev/null || echo "")
           
-          echo "ArgoCD server URL: $(terraform output -raw argocd_url)"
-          echo "ArgoCD applications deployed: $(terraform output -raw argocd_applications)"
+          if [ -n "$KUBECONFIG_OUTPUT" ]; then
+            mkdir -p ~/.kube
+            echo "$KUBECONFIG_OUTPUT" > ~/.kube/config
+            chmod 600 ~/.kube/config
+            echo "Kubeconfig successfully retrieved from Terraform output"
+          else
+            echo "Kubeconfig not available in Terraform output, falling back to S3..."
+            mkdir -p ~/.kube
+            aws s3 cp s3://polybot-tfstate-bucket/kubeconfig/${{ inputs.region }}/config ~/.kube/config || echo "Kubeconfig not available in S3"
+          fi
+          
+          # Get and display important cluster information
+          CONTROL_PLANE_IP=$(terraform output -raw kubernetes_info 2>/dev/null | jq -r '.control_plane_ip // ""' || echo "")
+          if [ -n "$CONTROL_PLANE_IP" ]; then
+            echo "Kubernetes control plane IP: $CONTROL_PLANE_IP"
+          fi
+          
+          echo "ArgoCD server URL: $(terraform output -raw argocd_url 2>/dev/null || echo "Not available")"
+          echo "ArgoCD applications deployed: $(terraform output -raw argocd_applications 2>/dev/null || echo "Not available")"
           
       - name: Check Application Status
         run: |

@@ -83,3 +83,16 @@ variable "instance_type" {
   type        = string
   default     = "t3.medium"
 }
+
+variable "tags" {
+  description = "A map of tags to add to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+variable "ssh_public_key" {
+  description = "The SSH public key content to be installed on instances"
+  type        = string
+  default     = ""
+  sensitive   = true
+}

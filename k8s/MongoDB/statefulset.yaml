@@ -34,7 +34,7 @@ spec:
         name: data
       spec:
         accessModes: [ "ReadWriteOnce" ]
-        storageClassName: mongodb-storage
+        storageClassName: "mongodb-storage"
         resources:
           requests:
-            storage: 10Gi
+            storage: 5Gi

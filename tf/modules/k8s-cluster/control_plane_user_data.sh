@@ -35,11 +35,11 @@ rm -rf awscliv2.zip aws/
 echo "$(date) - Verifying AWS CLI installation"
 aws --version
 
-# Set up SSH access (using your existing key).
-echo "$(date) - Setting up SSH access"
+# Set up SSH access (using dynamic key from Terraform).
+echo "$(date) - Setting up SSH access with Terraform-provided key"
 mkdir -p /home/ubuntu/.ssh
 cat >> /home/ubuntu/.ssh/authorized_keys << 'EOF'
-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCqLhoAqLycARtV0Xv65goCLInDlmiAayIzTuMpLKpUIRQpgVx6hKm2Wyn0/4js5UcAZtM8cHcuKaU52rM1B4c116uW8qIctkcwWPShx11DfVl/bv90qmj0NWBr71jysQZlR52YjytwaimBeqtNRyzpxyg3+s3AHBbe4Tv5EKg8q5pu+bZqRxmOuJqM0tO1w4DzPCum5OG40zlcrt52KZE6ARSpfO2mdc+drTH7w5HIpTRUlOsRkH0GyYFU6XQVQ5/oVWJ09VhxLvuzEjDyGbZiV+uVH18b97e1e949/EkBjfRM1iNIIdYu4bmtKSqaZuUzdILOf4sGvVqc4IEdi7pJ polybot-key
+${ssh_public_key}
 EOF
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh

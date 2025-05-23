@@ -24,6 +24,7 @@ variable "key_name" {
   description = "SSH key name for EC2 instances"
   type        = string
   default     = ""
+  sensitive   = true
 }
 
 variable "control_plane_ami" {

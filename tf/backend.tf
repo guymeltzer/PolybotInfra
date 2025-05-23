@@ -34,6 +34,10 @@ terraform {
     bucket = "polybot-tfstate-bucket"
     key    = "polybot/terraform.tfstate"
     region = "us-east-1"
+    dynamodb_table = "polybot-tfstate-lock"
+    # Use workspaces to separate state for different regions
+    workspace_key_prefix = "environments"
+    encrypt = true
   }
   required_version = ">= 1.7.0"
 }

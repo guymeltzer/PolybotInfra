@@ -428,3 +428,10 @@ output "cluster_readiness" {
     ebs_csi_ready    = try(null_resource.install_ebs_csi_driver[0].id, "")
   }
 }
+
+# Add cluster_kubeconfig output that provides the kubeconfig content
+output "cluster_kubeconfig" {
+  description = "Kubeconfig content for accessing the cluster"
+  value       = fileexists("${path.module}/kubeconfig.yaml") ? file("${path.module}/kubeconfig.yaml") : "Kubeconfig not available yet"
+  sensitive   = true
+}
