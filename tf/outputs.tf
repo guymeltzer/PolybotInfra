@@ -239,8 +239,8 @@ output "cluster" {
 output "endpoints" {
   description = "Application endpoints"
   value = {
-    dev = "https://dev-polybot.${terraform.workspace}.devops-int-college.com"
-    prod = "https://polybot.${terraform.workspace}.devops-int-college.com"
+    dev = "Not available - polybot_dev module not loaded"
+    prod = "Not available - polybot_prod module not loaded"
     argocd = "https://localhost:8081 (Run ~/argocd-ssh-tunnel.sh first)"
   }
 }
@@ -252,6 +252,9 @@ output "aws_resources" {
     vpc_id = module.k8s-cluster.vpc_id
     subnets = module.k8s-cluster.public_subnet_ids
     ssh_key = module.k8s-cluster.ssh_key_name
+    # Remove references to polybot_dev and polybot_prod modules
+    # Since these modules are no longer available
+    /*
     dev = {
       s3_bucket = module.polybot_dev.s3_bucket_name
       sqs_queue = module.polybot_dev.sqs_queue_url
@@ -262,6 +265,7 @@ output "aws_resources" {
       sqs_queue = module.polybot_prod.sqs_queue_url
       domain = module.polybot_prod.domain_name
     }
+    */
   }
 }
 
@@ -382,8 +386,8 @@ EOF
       # ----- APPLICATION ENDPOINTS -----
       echo -e "🌐 APPLICATION ENDPOINTS" >> /tmp/final_output.txt
       echo -e "------------------------" >> /tmp/final_output.txt
-      echo -e "Dev URL:  https://dev-polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
-      echo -e "Prod URL: https://polybot.${terraform.workspace}.devops-int-college.com" >> /tmp/final_output.txt
+      echo -e "Dev URL:  Not available (polybot_dev module not loaded)" >> /tmp/final_output.txt
+      echo -e "Prod URL: Not available (polybot_prod module not loaded)" >> /tmp/final_output.txt
       
       # Get ALB DNS from AWS
       ALB_DNS=$(aws elbv2 describe-load-balancers --region ${var.region} \

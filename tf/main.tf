@@ -1068,7 +1068,7 @@ resource "null_resource" "configure_argocd_apps" {
   
   depends_on = [
     null_resource.install_argocd,
-    null_resource.install_nginx_ingress,
+    # null_resource.install_nginx_ingress,  # Commented out since this resource no longer exists
     null_resource.configure_argocd_repositories
   ]
   
