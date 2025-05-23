@@ -224,7 +224,7 @@ Group=root
 EOF
 
 # Create the refresh token script separately to avoid shell escaping issues
-cat > /usr/local/bin/refresh-join-token.sh << 'EOF'
+cat > /usr/local/bin/refresh-join-token.sh << 'EOFSCRIPT'
 #!/bin/bash
 set -e
 
@@ -272,7 +272,7 @@ TIMESTAMP=$(date +"%Y%m%d%H%M%S")
 aws secretsmanager create-secret --name "##KUBERNETES_JOIN_COMMAND_SECRET##-$TIMESTAMP" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region ##REGION## || true
 
 exit 0
-EOF
+EOFSCRIPT
 
 chmod +x /usr/local/bin/refresh-join-token.sh
 
