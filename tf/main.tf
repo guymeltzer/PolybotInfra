@@ -945,7 +945,7 @@ resource "null_resource" "install_ebs_csi_driver" {
     null_resource.wait_for_kubernetes, 
     terraform_data.kubectl_provider_config,
     null_resource.providers_ready,
-    aws_iam_service_linked_role.ebs_csi_driver,
+    terraform_data.ebs_service_role_setup,
     null_resource.verify_ebs_role
   ]
   
@@ -1733,18 +1733,41 @@ EOF
   }
 }
 
-# Create service-linked role for EBS CSI Driver with correct service name
-resource "aws_iam_service_linked_role" "ebs_csi_driver" {
-  aws_service_name = "ec2.amazonaws.com"  # Changed from ebs.amazonaws.com to the correct service name
-  description      = "Service-linked role for EBS CSI Driver"
-  
-  # Better error handling for permission issues
+# Instead of creating a service-linked role directly (which may fail due to permissions),
+# use a terraform_data resource to check for or create the role using the AWS CLI
+resource "terraform_data" "ebs_service_role_setup" {
+  # This doesn't depend on other resources to avoid circular dependencies
+  # It's meant to run early in the process
+
+  triggers_replace = {
+    # Only run once per deployment
+    run_id = timestamp()
+  }
+
   provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    # Use on_failure = continue to ensure this doesn't stop the deployment
     on_failure = continue
-    command    = <<-EOT
-      echo "Note: Service-linked role creation attempted but may have failed."
-      echo "This is often due to permissions or because the role already exists."
-      echo "If deployment fails due to missing EBS permissions, manually create the role or grant iam:CreateServiceLinkedRole permission."
+    command = <<-EOT
+      #!/bin/bash
+      echo "Checking for AWS EBS service role..."
+      
+      # Check if the role already exists
+      if aws iam get-role --role-name AWSServiceRoleForEBS 2>/dev/null; then
+        echo "✅ EBS service role already exists, no action needed."
+        exit 0
+      fi
+      
+      echo "⚠️ EBS service role not found, attempting to create it..."
+      
+      # Try to create the role, but continue even if it fails
+      if aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com 2>/dev/null; then
+        echo "✅ Successfully created EBS service role."
+      else
+        echo "⚠️ Could not create service role for EBS. This might be due to insufficient permissions."
+        echo "⚠️ EBS volume provisioning might fail later. Manual role creation may be required."
+        echo "⚠️ Run: aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com"
+      fi
     EOT
   }
 }
@@ -1752,7 +1775,7 @@ resource "aws_iam_service_linked_role" "ebs_csi_driver" {
 # Alternative EBS role check that doesn't require role creation permissions
 resource "null_resource" "verify_ebs_role" {
   depends_on = [
-    aws_iam_service_linked_role.ebs_csi_driver
+    terraform_data.ebs_service_role_setup
   ]
   
   provisioner "local-exec" {
@@ -1794,7 +1817,7 @@ module "kubernetes_resources" {
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
     null_resource.wait_for_kubernetes,
-    aws_iam_service_linked_role.ebs_csi_driver,
+    terraform_data.ebs_service_role_setup,
     null_resource.verify_ebs_role
   ]
 }
