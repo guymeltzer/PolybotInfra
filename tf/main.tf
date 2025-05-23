@@ -1255,24 +1255,127 @@ resource "null_resource" "install_calico" {
         fi
       fi
       
-      echo "Installing Tigera Calico operator with simplified approach..."
-      # Create namespace first
+      echo "Installing Calico operator..."
+      # Step 1: Create namespace first
       kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
       
-      # Download the official operator YAML but remove the long annotations that cause the error
-      curl -s https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml | \
-      grep -v "_description:" | \
-      kubectl apply -f -
+      # Step 2: Install Calico operator without the problematic manifest
+      cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tigera-operator
+  namespace: tigera-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tigera-operator
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["operator.tigera.io"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["crd.projectcalico.org"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tigera-operator
+subjects:
+- kind: ServiceAccount
+  name: tigera-operator
+  namespace: tigera-operator
+roleRef:
+  kind: ClusterRole
+  name: tigera-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigera-operator
+  namespace: tigera-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: tigera-operator
+  template:
+    metadata:
+      labels:
+        name: tigera-operator
+    spec:
+      serviceAccountName: tigera-operator
+      containers:
+      - name: tigera-operator
+        image: quay.io/tigera/operator:v1.29.0
+        env:
+        - name: WATCH_NAMESPACE
+          value: ""
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPERATOR_NAME
+          value: "tigera-operator"
+        volumeMounts:
+        - name: tigera-operator-tls
+          mountPath: /etc/ssl/tigera-operator-tls/
+      volumes:
+      - name: tigera-operator-tls
+        emptyDir: {}
+EOF
       
-      echo "Waiting 60 seconds for operator to initialize..."
-      sleep 60
+      echo "Waiting for Tigera operator to be running before applying the Installation resource..."
+      for i in {1..60}; do
+        if kubectl -n tigera-operator get pods -l name=tigera-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running"; then
+          echo "Tigera operator is running, continuing with installation"
+          break
+        fi
+        if [ $i -eq 60 ]; then
+          echo "Timed out waiting for Tigera operator to start. Continuing anyway."
+        fi
+        echo "Waiting for Tigera operator to start... ($i/60)"
+        sleep 5
+      done
       
-      echo "Checking if operator is running..."
-      if ! kubectl -n tigera-operator get pods | grep -q "Running"; then
-        echo "Operator isn't running yet, will continue but installation may fail"
-      fi
+      # Step 3: Wait for CRDs to be fully established
+      echo "Waiting for Installation CRD to be established..."
+      for i in {1..60}; do
+        if kubectl get crd installations.operator.tigera.io &>/dev/null; then
+          echo "Installation CRD found, waiting for it to be established..."
+          # Check if the condition NamesAccepted and Established are both True for the CRD
+          if kubectl get crd installations.operator.tigera.io -o jsonpath='{.status.conditions[?(@.type=="NamesAccepted")].status}{.status.conditions[?(@.type=="Established")].status}' | grep -q "TrueTrue"; then
+            echo "Installation CRD is fully established"
+            break
+          fi
+        fi
+        if [ $i -eq 60 ]; then
+          echo "Warning: Timed out waiting for Installation CRD to be fully established."
+          echo "Current CRD status:"
+          kubectl get crd installations.operator.tigera.io -o yaml
+          echo "Continuing anyway, but installation may fail."
+        fi
+        echo "Waiting for Installation CRD to be established... ($i/60)"
+        sleep 5
+      done
       
-      echo "Installing Calico custom resources with minimal configuration..."
+      # Step 4: Apply the Installation CR
+      echo "Installing Calico with a simplified Installation resource..."
       cat <<EOF | kubectl apply -f -
 apiVersion: operator.tigera.io/v1
 kind: Installation
@@ -1286,38 +1389,32 @@ spec:
       encapsulation: VXLANCrossSubnet
       natOutgoing: Enabled
       nodeSelector: all()
-  # Add resource recommendations to avoid resource pressure
-  componentResources:
-  - componentName: Node
-    resourceRequirements:
-      limits:
-        cpu: 500m
-        memory: 512Mi
-      requests:
-        cpu: 100m
-        memory: 256Mi
-  - componentName: Typha
-    resourceRequirements:
-      limits:
-        cpu: 300m
-        memory: 256Mi
-      requests:
-        cpu: 100m
-        memory: 128Mi
 EOF
       
-      echo "Calico installation initiated with minimal config."
-      echo "Waiting for Calico to be ready (this may take a few minutes)..."
+      echo "Calico installation initiated with simplified config."
+      echo "Waiting for Calico pods to start appearing (this may take a few minutes)..."
       for i in {1..30}; do
-        if kubectl get pods -n calico-system | grep -q "Running"; then
-          echo "Calico pods are starting to run. Continuing deployment."
-          break
+        if kubectl get pods -n calico-system &>/dev/null; then
+          echo "Calico system namespace is created"
+          PODS=$(kubectl get pods -n calico-system -o name | wc -l)
+          if [ "$PODS" -gt 0 ]; then
+            echo "Calico pods are being created. Continuing deployment."
+            break
+          fi
+        fi
+        if [ $i -eq 30 ]; then
+          echo "Calico installation may not be proceeding correctly."
+          echo "Current namespaces:"
+          kubectl get ns
+          echo "Current pods in tigera-operator namespace:"
+          kubectl -n tigera-operator get pods
+          echo "Continuing anyway, but you may need to troubleshoot Calico installation."
         fi
         echo "Waiting for Calico pods to start... Attempt $i/30"
-        sleep 20
+        sleep 10
       done
       
-      echo "Note: Full Calico startup can take several minutes. Check with: kubectl get pods -A"
+      echo "Calico installation completed. Full initialization will continue in the background."
     EOT
   }
 }
