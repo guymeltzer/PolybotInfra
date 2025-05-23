@@ -621,8 +621,9 @@ resource "null_resource" "providers_ready" {
       for i in {1..30}; do
         if kubectl -n kube-system get deployments coredns &>/dev/null; then
           # Check if pods are ready
-          READY=$(kubectl -n kube-system get deployments coredns -o jsonpath='{.status.readyReplicas}')
-          if [ "$READY" -gt 0 ]; then
+          READY=$(kubectl -n kube-system get deployments coredns -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          # Use bash parameter expansion to provide a default value of 0 if READY is empty
+          if [ "${READY}" -gt 0 ] 2>/dev/null || [ "${READY}" == "1" ]; then
             echo "CoreDNS is ready!"
             break
           fi

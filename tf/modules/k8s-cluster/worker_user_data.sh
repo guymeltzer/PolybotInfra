@@ -70,18 +70,19 @@ EOF
   if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config; then
     echo "Configuring sshd to disallow password authentication"
     sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-    systemctl restart ssh
+    systemctl restart ssh || systemctl restart sshd || echo "WARNING: Failed to restart SSH service"
   fi
   
   # Verify PubkeyAuthentication is enabled
   if ! grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config; then
     echo "Ensuring PubkeyAuthentication is enabled"
     echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-    systemctl restart sshd
+    # Try both service names for different distros
+    systemctl restart ssh || systemctl restart sshd || echo "WARNING: Failed to restart SSH service"
   fi
   
-  # Ensure sshd is running
-  systemctl status ssh
+  # Ensure sshd is running - try both service names
+  systemctl status ssh || systemctl status sshd || echo "WARNING: SSH service status check failed"
   
   echo "SSH setup completed successfully"
 }
@@ -91,13 +92,46 @@ setup_core() {
   log_section "Setting up core services"
   
   log_info "Updating package lists and installing dependencies"
-  apt-get update && apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg netcat || {
-    log_info "WARNING: Some packages may have failed to install, continuing anyway"
+  # Make sure to install unzip first for AWS CLI
+  apt-get update && apt-get install -y curl apt-transport-https ca-certificates gnupg || {
+    log_info "WARNING: Basic package install failed, attempting individually"
+    apt-get install -y curl || log_info "WARNING: Failed to install curl"
+    apt-get install -y apt-transport-https || log_info "WARNING: Failed to install apt-transport-https"
+    apt-get install -y ca-certificates || log_info "WARNING: Failed to install ca-certificates"
+    apt-get install -y gnupg || log_info "WARNING: Failed to install gnupg"
+  }
+  
+  # Install unzip separately (critical for AWS CLI)
+  log_info "Installing unzip (required for AWS CLI)"
+  apt-get install -y unzip || {
+    log_info "ERROR: Failed to install unzip, trying alternative approach"
+    # Try to fix package lists and retry
+    apt-get update --fix-missing
+    apt-get install -y unzip
+  }
+  
+  # Install jq (critical for parsing AWS responses)
+  log_info "Installing jq (required for AWS response parsing)"
+  apt-get install -y jq || log_info "WARNING: Failed to install jq, some AWS functionality may fail"
+  
+  # Try to install netcat with correct package name
+  log_info "Installing netcat for connectivity tests"
+  apt-get install -y netcat-openbsd || {
+    log_info "WARNING: Failed to install netcat-openbsd, falling back to netcat-traditional"
+    apt-get install -y netcat-traditional || log_info "WARNING: Failed to install netcat, connectivity tests may fail"
   }
   
   log_info "Installing AWS CLI"
   curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-  unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
+  # Check if unzip is actually available
+  if command -v unzip &> /dev/null; then
+    unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws/
+  else
+    log_info "ERROR: unzip command not available after attempted install. Using alternative method."
+    # Alternative installation method if unzip failed
+    apt-get install -y python3-pip
+    pip3 install awscli
+  fi
   debug_checkpoint "AWS_CLI_INSTALLED"
   
   # Get AWS metadata - using IMDSv2 with fallbacks
