@@ -1241,7 +1241,7 @@ resource "aws_security_group" "control_plane_sg" {
 
 # IAM Instance Profile for Worker Nodes
 resource "aws_iam_instance_profile" "worker_profile" {
-  name = "Guy-K8S-Worker-Profile"
+  name = "guy-worker-profile"
   role = aws_iam_role.worker_role.name
 }
 
@@ -1266,17 +1266,6 @@ resource "terraform_data" "worker_progress" {
     command     = <<-EOT
       echo -e "\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes...\\033[0m"
     EOT
-  }
-}
-
-# Create S3 bucket for worker scripts if it doesn't exist
-resource "aws_s3_bucket" "worker_scripts" {
-  bucket = "guy-polybot-scripts"
-  force_destroy = true
-  
-  tags = {
-    Name = "Worker Node Scripts Bucket"
-    "kubernetes.io/cluster/kubernetes" = "owned"
   }
 }
 
@@ -1316,10 +1305,10 @@ resource "aws_s3_object" "worker_full_init" {
   acl = "private"
 }
 
-# Allow worker nodes to access the S3 buckets
+# IAM policy for access to S3 logs bucket
 resource "aws_iam_policy" "worker_s3_access" {
   name        = "guy-worker-s3-access"
-  description = "Policy allowing workers to access S3 buckets for scripts and logs"
+  description = "Policy allowing workers to access S3 bucket for logs"
   
   policy = jsonencode({
     Version = "2012-10-17"
@@ -1332,8 +1321,6 @@ resource "aws_iam_policy" "worker_s3_access" {
           "s3:ListBucket"
         ]
         Resource = [
-          "${aws_s3_bucket.worker_scripts.arn}",
-          "${aws_s3_bucket.worker_scripts.arn}/*",
           "${aws_s3_bucket.worker_logs.arn}",
           "${aws_s3_bucket.worker_logs.arn}/*"
         ]
@@ -1354,7 +1341,7 @@ resource "aws_launch_template" "worker_lt" {
   instance_type = var.worker_instance_type
   key_name      = local.actual_key_name
 
-  # This bootstrap script is a minimal version that downloads and executes the full script from S3
+  # This bootstrap script has the full initialization content embedded
   user_data = base64encode(
     templatefile(
       "${path.module}/bootstrap_worker.sh",
@@ -1390,7 +1377,6 @@ resource "aws_launch_template" "worker_lt" {
   }
   
   depends_on = [
-    aws_s3_object.worker_full_init,
     aws_secretsmanager_secret.kubernetes_join_command,
     aws_secretsmanager_secret.kubernetes_join_command_latest
   ]
