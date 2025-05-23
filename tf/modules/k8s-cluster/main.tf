@@ -75,6 +75,16 @@ resource "aws_security_group" "k8s_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  # Explicitly allow outbound traffic to Kubernetes API server
+  egress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow outbound traffic to Kubernetes API server"
   }
 
   tags = {
@@ -1280,7 +1290,7 @@ resource "aws_launch_template" "worker_lt" {
   }
   
   network_interfaces {
-    security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id]
+    security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id, aws_security_group.control_plane_sg.id]
     associate_public_ip_address = true
   }
   
@@ -1467,6 +1477,15 @@ resource "aws_security_group" "worker_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
     description = "Allow all outbound traffic"
+  }
+
+  # Explicitly allow outbound traffic to Kubernetes API server
+  egress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow outbound traffic to Kubernetes API server"
   }
 
   tags = {
