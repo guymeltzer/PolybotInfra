@@ -1347,7 +1347,12 @@ EOF
           break
         fi
         if [ $i -eq 60 ]; then
-          echo "Timed out waiting for Tigera operator to start. Continuing anyway."
+          echo "ERROR: Timed out waiting for Tigera operator to start."
+          echo "Current pods in tigera-operator namespace:"
+          kubectl -n tigera-operator get pods -o wide
+          echo "Pod logs:"
+          kubectl -n tigera-operator logs -l name=tigera-operator --tail=50
+          exit 1
         fi
         echo "Waiting for Tigera operator to start... ($i/60)"
         sleep 5
@@ -1365,10 +1370,10 @@ EOF
           fi
         fi
         if [ $i -eq 60 ]; then
-          echo "Warning: Timed out waiting for Installation CRD to be fully established."
+          echo "ERROR: Timed out waiting for Installation CRD to be fully established."
           echo "Current CRD status:"
           kubectl get crd installations.operator.tigera.io -o yaml
-          echo "Continuing anyway, but installation may fail."
+          exit 1
         fi
         echo "Waiting for Installation CRD to be established... ($i/60)"
         sleep 5
@@ -1392,29 +1397,40 @@ spec:
 EOF
       
       echo "Calico installation initiated with simplified config."
-      echo "Waiting for Calico pods to start appearing (this may take a few minutes)..."
-      for i in {1..30}; do
+      echo "Waiting for Calico pods to start running (this may take a few minutes)..."
+      for i in {1..45}; do
         if kubectl get pods -n calico-system &>/dev/null; then
-          echo "Calico system namespace is created"
-          PODS=$(kubectl get pods -n calico-system -o name | wc -l)
-          if [ "$PODS" -gt 0 ]; then
-            echo "Calico pods are being created. Continuing deployment."
+          # Count running pods
+          RUNNING_PODS=$(kubectl get pods -n calico-system --field-selector=status.phase=Running 2>/dev/null | grep -v NAME | wc -l)
+          TOTAL_PODS=$(kubectl get pods -n calico-system 2>/dev/null | grep -v NAME | wc -l)
+          
+          echo "Calico system has $RUNNING_PODS running pods out of $TOTAL_PODS total pods"
+          
+          # If we have at least 3 running pods or more than half the pods running, consider it a success
+          if [ "$RUNNING_PODS" -ge 3 ] || [ "$RUNNING_PODS" -gt $(($TOTAL_PODS / 2)) ]; then
+            echo "Sufficient Calico pods are running. Continuing deployment."
+            
+            # Verify with kubectl calico command
+            echo "Current node status:"
+            kubectl get nodes
+            
+            echo "Calico installation completed successfully."
             break
           fi
         fi
-        if [ $i -eq 30 ]; then
-          echo "Calico installation may not be proceeding correctly."
-          echo "Current namespaces:"
-          kubectl get ns
-          echo "Current pods in tigera-operator namespace:"
-          kubectl -n tigera-operator get pods
-          echo "Continuing anyway, but you may need to troubleshoot Calico installation."
+        
+        if [ $i -eq 45 ]; then
+          echo "ERROR: Timed out waiting for Calico pods to be running properly."
+          echo "Current pods in calico-system namespace:"
+          kubectl get pods -n calico-system -o wide
+          echo "Checking for any issues with nodes:"
+          kubectl get nodes -o wide
+          echo "Continuing because some worker nodes may need Calico to join, but installation may not be complete."
         fi
-        echo "Waiting for Calico pods to start... Attempt $i/30"
+        
+        echo "Waiting for Calico pods to be running... ($i/45)"
         sleep 10
       done
-      
-      echo "Calico installation completed. Full initialization will continue in the background."
     EOT
   }
 }

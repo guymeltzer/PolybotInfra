@@ -141,6 +141,10 @@ fi
 cat > /tmp/kubeadm-config.yaml << EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
+bootstrapTokens:
+- token: "${token_formatted}"
+  description: "initial token for worker join"
+  ttl: "24h"
 nodeRegistration:
   kubeletExtraArgs:
     cloud-provider: "external"
@@ -148,7 +152,7 @@ nodeRegistration:
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
 networking:
-  podSubnet: "192.168.0.0/16"
+  podSubnet: "${POD_CIDR}"
 apiServer:
   certSANs:
 $(echo -e "$${CERT_SANS}")
@@ -264,12 +268,12 @@ JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${TOKEN} --discovery-to
 echo "Join command: $JOIN_COMMAND" >> /var/log/k8s-token-creator.log
 
 # Update secrets using variable substitution
-aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_SECRET## --secret-string "$JOIN_COMMAND" --region ##REGION## || true
-aws secretsmanager update-secret --secret-id ##KUBERNETES_JOIN_COMMAND_LATEST_SECRET## --secret-string "$JOIN_COMMAND" --region ##REGION## || true
+aws secretsmanager update-secret --secret-id ${KUBERNETES_JOIN_COMMAND_SECRET} --secret-string "$JOIN_COMMAND" --region ${region} || true
+aws secretsmanager update-secret --secret-id ${KUBERNETES_JOIN_COMMAND_LATEST_SECRET} --secret-string "$JOIN_COMMAND" --region ${region} || true
 
 # Create a new timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-aws secretsmanager create-secret --name "##KUBERNETES_JOIN_COMMAND_SECRET##-$TIMESTAMP" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region ##REGION## || true
+aws secretsmanager create-secret --name "${KUBERNETES_JOIN_COMMAND_SECRET}-$TIMESTAMP" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region ${region} || true
 
 exit 0
 EOFSCRIPT
@@ -366,10 +370,10 @@ ALT_JOIN_COMMAND="kubeadm join $${API_SERVER_IP}:6443 --token $${STABLE_TOKEN} -
 echo "$(date) - Alternative join command: $${ALT_JOIN_COMMAND}" 
 
 # Store join command in AWS Secrets Manager - first create with a simple name
-MAIN_SECRET="##KUBERNETES_JOIN_COMMAND_SECRET##"
-LATEST_SECRET="##KUBERNETES_JOIN_COMMAND_LATEST_SECRET##"
-REGION="##REGION##"
-TOKEN_FORMATTED="##TOKEN_FORMATTED##"
+MAIN_SECRET="${KUBERNETES_JOIN_COMMAND_SECRET}"
+LATEST_SECRET="${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}"
+REGION="${region}"
+TOKEN_FORMATTED="${token_formatted}"
 WORKER_LOGS_BUCKET="##WORKER_LOGS_BUCKET##"
 TIMESTAMP="##TIMESTAMP##"
 
