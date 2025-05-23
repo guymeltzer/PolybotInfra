@@ -1279,7 +1279,10 @@ resource "aws_s3_bucket" "worker_logs" {
     "kubernetes.io/cluster/kubernetes" = "owned"
   }
 }
-  acl = "private"
+
+resource "aws_s3_bucket_acl" "worker_logs_acl" {
+  bucket = aws_s3_bucket.worker_logs.id
+  acl    = "private"
 }
 
 # IAM policy for access to S3 logs bucket
