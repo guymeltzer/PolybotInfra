@@ -4,29 +4,29 @@ LOGFILE="/var/log/worker-init.log"
 DEBUG_LOG="/home/ubuntu/bootstrap-debug.log"
 
 # Setup dual logging to both files
-exec > >(tee -a ${LOGFILE} ${DEBUG_LOG}) 2>&1
+exec > >(tee -a $${LOGFILE} $${DEBUG_LOG}) 2>&1
 
 # Better debug information
 set -x  # Show commands as they execute
 
 # Error handling
 set -e  # Exit on error
-trap 'echo "$(date) - CRITICAL ERROR at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" | tee -a ${LOGFILE} ${DEBUG_LOG}; echo "FAIL POINT: LINE $LINENO" > /home/ubuntu/FAILURE_POINT.txt' ERR
+trap 'echo "$(date) - CRITICAL ERROR at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" | tee -a $${LOGFILE} $${DEBUG_LOG}; echo "FAIL POINT: LINE $LINENO" > /home/ubuntu/FAILURE_POINT.txt' ERR
 
 # Print an informational message with timestamps
 log_info() {
-  echo "$(date) - INFO: $1" | tee -a ${LOGFILE} ${DEBUG_LOG}
+  echo "$(date) - INFO: $1" | tee -a $${LOGFILE} $${DEBUG_LOG}
 }
 
 # Print a debug checkpoint
 debug_checkpoint() {
-  echo "$(date) - CHECKPOINT $1: Reached this point successfully" | tee -a ${LOGFILE} ${DEBUG_LOG}
+  echo "$(date) - CHECKPOINT $1: Reached this point successfully" | tee -a $${LOGFILE} $${DEBUG_LOG}
   echo "$1" > /home/ubuntu/LAST_CHECKPOINT.txt
 }
 
 # Print a major section header
 log_section() {
-  echo "$(date) - ===== SECTION: $1 =====" | tee -a ${LOGFILE} ${DEBUG_LOG}
+  echo "$(date) - ===== SECTION: $1 =====" | tee -a $${LOGFILE} $${DEBUG_LOG}
 }
 
 log_section "Starting worker node bootstrap"
@@ -34,9 +34,9 @@ debug_checkpoint "INIT"
 
 # Ensure ubuntu user can access the logs
 mkdir -p /home/ubuntu
-touch ${DEBUG_LOG}
-chown ubuntu:ubuntu ${DEBUG_LOG}
-chmod 644 ${DEBUG_LOG}
+touch $${DEBUG_LOG}
+chown ubuntu:ubuntu $${DEBUG_LOG}
+chmod 644 $${DEBUG_LOG}
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -125,10 +125,10 @@ setup_core() {
     REGION="us-east-1"
     PRIVATE_IP=$(hostname -I | awk '{print $1}')
     INSTANCE_ID=$(hostname)
-    AZ="${REGION}a"
+    AZ="$${REGION}a"
   fi
   
-  PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
+  PROVIDER_ID="aws:///$${AZ}/$${INSTANCE_ID}"
   export AWS_DEFAULT_REGION="$REGION"
   
   echo "Instance metadata: Region=$REGION, IP=$PRIVATE_IP, ID=$INSTANCE_ID, AZ=$AZ"
@@ -147,7 +147,7 @@ EOF
   
   # S3 log upload helper
   upload_logs_to_s3() {
-    [ -n "$INSTANCE_ID" ] && aws s3 cp "$LOGFILE" "s3://guy-polybot-logs/worker-init-${INSTANCE_ID}-$1-$(date +%Y%m%d-%H%M%S).log" --region "$REGION" 2>/dev/null || true
+    [ -n "$INSTANCE_ID" ] && aws s3 cp "$LOGFILE" "s3://guy-polybot-logs/worker-init-$${INSTANCE_ID}-$1-$(date +%Y%m%d-%H%M%S).log" --region "$REGION" 2>/dev/null || true
   }
   
   # Upload init logs
@@ -204,7 +204,7 @@ EOF
   
   # Configure kubelet
   mkdir -p /var/lib/kubelet /etc/kubernetes
-  echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --cloud-provider=external --provider-id=${PROVIDER_ID}" > /var/lib/kubelet/kubeadm-flags.env
+  echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --cloud-provider=external --provider-id=$${PROVIDER_ID}" > /var/lib/kubelet/kubeadm-flags.env
   
   # Disable swap
   swapoff -a && sed -i '/swap/d' /etc/fstab
@@ -294,9 +294,9 @@ join_cluster() {
           
           # Create new join command with current control plane IP
           if [ -n "$DISCOVERY_HASH" ]; then
-            JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
+            JOIN_COMMAND="kubeadm join $${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
           else
-            JOIN_COMMAND="kubeadm join ${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
+            JOIN_COMMAND="kubeadm join $${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
           fi
           
           echo "Created new join command: $JOIN_COMMAND"
@@ -388,11 +388,11 @@ debug_checkpoint "JOIN_CLUSTER_COMPLETE"
 
 # Create a DEBUG version of the logs with easy-to-scan checkpoints
 log_section "WORKER NODE INITIALIZATION COMPLETE" 
-grep "CHECKPOINT\|SECTION\|CRITICAL ERROR\|FAIL POINT" ${DEBUG_LOG} > /home/ubuntu/init_progress.log || true
+grep "CHECKPOINT\|SECTION\|CRITICAL ERROR\|FAIL POINT" $${DEBUG_LOG} > /home/ubuntu/init_progress.log || true
 
 # Create summary log file in ubuntu's home directory for easy access
 log_info "Creating log summary file for easy access"
-cat ${LOGFILE} > /home/ubuntu/init_summary.log
+cat $${LOGFILE} > /home/ubuntu/init_summary.log
 chown ubuntu:ubuntu /home/ubuntu/init_summary.log
 chmod 644 /home/ubuntu/init_summary.log
 chown ubuntu:ubuntu /home/ubuntu/init_progress.log 2>/dev/null || true
