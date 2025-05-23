@@ -224,6 +224,7 @@ output "argocd" {
 # Essential cluster information in structured format
 output "cluster" {
   description = "Essential cluster information for scripts"
+  sensitive = true
   value = {
     api_endpoint = "https://${try(module.k8s-cluster.control_plane_public_ip, "localhost")}:6443"
     control_plane = {
@@ -248,6 +249,7 @@ output "endpoints" {
 # AWS resources
 output "aws_resources" {
   description = "AWS resources created for the application"
+  sensitive = true
   value = {
     vpc_id = module.k8s-cluster.vpc_id
     subnets = module.k8s-cluster.public_subnet_ids
