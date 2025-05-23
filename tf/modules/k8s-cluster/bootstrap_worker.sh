@@ -106,7 +106,8 @@ if [ -n "${JOIN_COMMAND_SECRET}" ]; then
   echo "$(date) - Trying to get join command from main secret: ${JOIN_COMMAND_SECRET}"
   JOIN_CMD=$(aws secretsmanager get-secret-value --region $REGION --secret-id "${JOIN_COMMAND_SECRET}" \
     --query "SecretString" --output text)
-  echo "$(date) - Join command from main secret (first 20 chars): ${JOIN_CMD:0:20}..."
+  # Use $$ to escape $ for Terraform
+  echo "$(date) - Join command from main secret (first 20 chars): $${JOIN_CMD:0:20}..."
 fi
 
 # Method 2: Try the latest secret if first method failed
@@ -114,7 +115,7 @@ if [ -z "$JOIN_CMD" ] && [ -n "${JOIN_COMMAND_LATEST_SECRET}" ]; then
   echo "$(date) - Trying to get join command from latest secret: ${JOIN_COMMAND_LATEST_SECRET}"
   JOIN_CMD=$(aws secretsmanager get-secret-value --region $REGION --secret-id "${JOIN_COMMAND_LATEST_SECRET}" \
     --query "SecretString" --output text)
-  echo "$(date) - Join command from latest secret (first 20 chars): ${JOIN_CMD:0:20}..."
+  echo "$(date) - Join command from latest secret (first 20 chars): $${JOIN_CMD:0:20}..."
 fi
 
 # Method 3: Try to list secrets with kubernetes-join-command in the name
@@ -128,7 +129,7 @@ if [ -z "$JOIN_CMD" ]; then
       --query "SecretString" --output text)
     
     if [ -n "$JOIN_CMD" ]; then
-      echo "$(date) - Found join command in secret: $SECRET (first 20 chars): ${JOIN_CMD:0:20}..."
+      echo "$(date) - Found join command in secret: $SECRET (first 20 chars): $${JOIN_CMD:0:20}..."
       break
     fi
   done
