@@ -911,8 +911,8 @@ module "k8s-cluster" {
   cluster_name                = "polybot-cluster"
   vpc_id                      = var.vpc_id
   subnet_ids                  = var.subnet_ids
-  control_plane_instance_type = "t3.large"  # Upgraded from t3.medium for more resources
-  worker_instance_type        = "t3.large"  # Upgraded from t3.medium for more resources
+  control_plane_instance_type = "t3.medium"  # Reverted back to original type
+  worker_instance_type        = "t3.medium"  # Reverted back to original type
   worker_count                = 2
   route53_zone_id             = var.route53_zone_id
   key_name                    = var.key_name
