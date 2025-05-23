@@ -1212,7 +1212,7 @@ resource "null_resource" "install_calico" {
   depends_on = [
     null_resource.providers_ready,
     null_resource.wait_for_kubernetes,
-    module.kubernetes_resources.null_resource.improved_disk_cleanup,
+    module.kubernetes_resources.disk_cleanup_id,
     terraform_data.kubectl_provider_config
   ]
   
@@ -1536,7 +1536,7 @@ resource "null_resource" "deploy_mongodb_directly" {
   
   depends_on = [
     null_resource.install_ebs_csi_driver,
-    module.kubernetes_resources.null_resource.improved_disk_cleanup,
+    module.kubernetes_resources.disk_cleanup_id,
     null_resource.install_calico
   ]
   
