@@ -91,7 +91,7 @@ setup_core() {
   log_section "Setting up core services"
   
   log_info "Updating package lists and installing dependencies"
-  apt-get update && apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg || {
+  apt-get update && apt-get install -y curl unzip jq apt-transport-https ca-certificates gnupg netcat || {
     log_info "WARNING: Some packages may have failed to install, continuing anyway"
   }
   
@@ -249,142 +249,131 @@ join_cluster() {
       
       # Try listing all secrets with kubernetes-join-command prefix
       echo "Listing all kubernetes-join-command secrets..."
-      ALL_SECRETS=$(aws secretsmanager list-secrets --region "$REGION" --filters Key=name,Values=kubernetes-join-command --query "SecretList[*].Name" --output text 2>/dev/null || echo "")
+      ALL_SECRETS=$(aws secretsmanager list-secrets --region "$REGION" --filters Key=name,Values=kubernetes-join-command --query 'SecretList[*].Name' --output text 2>/dev/null || echo "")
+      
       if [ -n "$ALL_SECRETS" ]; then
         echo "Found these secrets: $ALL_SECRETS"
-        # Try each secret to find a valid join command
+        # Try each secret until we find a valid join command
         for SECRET in $ALL_SECRETS; do
           echo "Trying secret: $SECRET"
           SECRET_VALUE=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET" --query SecretString --output text 2>/dev/null || echo "")
-          if [[ -n "$SECRET_VALUE" && "$SECRET_VALUE" =~ ^kubeadm\ join ]]; then
-            JOIN_COMMAND="$SECRET_VALUE"
-            echo "Found valid join command in $SECRET: $JOIN_COMMAND"
-            break
+          if [ -n "$SECRET_VALUE" ]; then
+            if [[ "$SECRET_VALUE" =~ ^kubeadm\ join ]]; then
+              JOIN_COMMAND="$SECRET_VALUE"
+              echo "Found valid join command in $SECRET: $JOIN_COMMAND"
+              break
+            fi
           fi
         done
-      else
-        echo "No kubernetes-join-command secrets found"
-      fi
-      
-      # If still no valid join command, query EC2 for control plane IP
-      if [[ -z "$JOIN_COMMAND" || ! "$JOIN_COMMAND" =~ --token ]]; then
-        CONTROL_PLANE_IP=$(aws ec2 describe-instances --region "$REGION" \
-                            --filters "Name=tag:Name,Values=k8s-control-plane" \
-                                      "Name=instance-state-name,Values=running" \
-                            --query "Reservations[0].Instances[0].PrivateIpAddress" \
-                            --output text)
-        
-        if [[ -n "$CONTROL_PLANE_IP" && "$CONTROL_PLANE_IP" != "None" ]]; then
-          echo "Found control plane IP: $CONTROL_PLANE_IP"
-          
-          # Try to get token from existing join command or generate new one
-          TOKEN=""
-          DISCOVERY_HASH=""
-          
-          if [[ -n "$JOIN_COMMAND" ]]; then
-            # Extract token and hash from existing command
-            TOKEN=$(echo "$JOIN_COMMAND" | grep -oP -- '--token \K[^ ]+' || echo "")
-            DISCOVERY_HASH=$(echo "$JOIN_COMMAND" | grep -oP -- '--discovery-token-ca-cert-hash \K[^ ]+' || echo "")
-          fi
-          
-          # Generate token if we couldn't extract it
-          if [ -z "$TOKEN" ]; then
-            TOKEN=$(kubeadm token generate)
-          fi
-          
-          # Create new join command with current control plane IP
-          if [ -n "$DISCOVERY_HASH" ]; then
-            JOIN_COMMAND="kubeadm join $${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-ca-cert-hash $DISCOVERY_HASH"
-          else
-            JOIN_COMMAND="kubeadm join $${CONTROL_PLANE_IP}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
-          fi
-          
-          echo "Created new join command: $JOIN_COMMAND"
-        else
-          echo "Failed to find control plane IP"
-        fi
       fi
     fi
     
-    # Exit if we can't get a join command
     if [ -z "$JOIN_COMMAND" ]; then
-      echo "Failed to retrieve join command, will retry in $((ATTEMPT * 5)) seconds..."
-      sleep $((ATTEMPT * 5))
+      echo "Could not find valid join command in any secret, will retry in 30 seconds..."
+      sleep 30
       continue
     fi
     
-    # Try executing the join command
+    if [[ ! "$JOIN_COMMAND" =~ --token ]]; then
+      echo "Join command does not contain a token, will retry in 30 seconds..."
+      sleep 30
+      continue
+    fi
+    
+    # Extract control plane IP from join command to verify connectivity
+    CP_IP=$(echo "$JOIN_COMMAND" | grep -oP '^\s*kubeadm\s+join\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+    if [ -n "$CP_IP" ]; then
+      echo "Extracted control plane IP: $CP_IP, testing connectivity..."
+      if nc -z -w 5 "$CP_IP" 6443; then
+        echo "Connection to control plane API server ($CP_IP:6443) successful!"
+      else
+        echo "Cannot connect to control plane API server ($CP_IP:6443), will retry in 30 seconds..."
+        sleep 30
+        continue
+      fi
+    fi
+    
+    # Execute join command with additional verbosity for logging
     echo "Executing join command: $JOIN_COMMAND"
     if eval $JOIN_COMMAND --v=5; then
       echo "Successfully joined the cluster!"
-      systemctl restart kubelet
-      
-      # Signal success after joining
-      if [ -f "/etc/kubernetes/kubelet.conf" ]; then
-        echo "Setting provider ID for the node..."
-        kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=/etc/kubernetes/kubelet.conf || true
-      fi
-      
-      # Complete lifecycle action
-      echo "Completing lifecycle action..."
-      aws autoscaling complete-lifecycle-action \
-        --lifecycle-hook-name "guy-scale-up-hook" \
-        --auto-scaling-group-name "guy-polybot-asg" \
-        --lifecycle-action-result "CONTINUE" \
-        --instance-id "$INSTANCE_ID" \
-        --region "$REGION" 2>/dev/null || true
-      
-      # Tag the instance
-      echo "Tagging instance..."
-      aws ec2 create-tags \
-        --region "$REGION" \
-        --resources "$INSTANCE_ID" \
-        --tags Key=node-role.kubernetes.io/worker,Value=true \
-               Key=k8s.io/autoscaled-node,Value=true \
-               Key=Name,Value="$NODE_NAME" 2>/dev/null || true
-      
-      upload_logs_to_s3 "COMPLETE"
-      echo "Kubernetes worker node initialization completed successfully"
-      
-      # Verify SSH is properly configured before ending
-      setup_ssh
-      
       return 0
     else
-      echo "Join command failed, will retry in $((ATTEMPT * 5)) seconds..."
-      sleep $((ATTEMPT * 5))
+      echo "Join command failed, will retry in 5 seconds..."
+      sleep 5
     fi
   done
   
-  echo "All join attempts failed after $MAX_RETRIES tries."
-  upload_logs_to_s3 "JOIN_FAILED"
-  exit 1
+  echo "Failed to join the cluster after $MAX_RETRIES attempts!"
+  return 1
 }
 
-# Main execution with better error handling and debug reporting
-log_section "Beginning main execution flow"
+# Main script
 
-# Run each function with debug checkpoints
-setup_core || {
-  log_info "CRITICAL: Core setup failed - see error details above"
-  debug_checkpoint "CORE_SETUP_FAILED"
-  exit 1
-}
-debug_checkpoint "CORE_SETUP_COMPLETE"
+# Set a maximum retry count for the whole script
+TOTAL_MAX_RETRIES=3
+TOTAL_RETRY=0
 
-setup_kube || {
-  log_info "CRITICAL: Kubernetes setup failed - see error details above"
-  debug_checkpoint "KUBE_SETUP_FAILED"
-  exit 1
-}
-debug_checkpoint "KUBE_SETUP_COMPLETE"
+setup_core
+setup_kube
 
-join_cluster || {
-  log_info "CRITICAL: Failed to join cluster - see error details above"
-  debug_checkpoint "JOIN_CLUSTER_FAILED"
-  exit 1
-}
-debug_checkpoint "JOIN_CLUSTER_COMPLETE"
+# Main init with retry
+while [ $TOTAL_RETRY -lt $TOTAL_MAX_RETRIES ]; do
+  log_section "Joining Kubernetes cluster (Attempt $((TOTAL_RETRY+1))/$TOTAL_MAX_RETRIES)"
+  
+  if join_cluster; then
+    log_section "Kubernetes worker initialization SUCCESSFUL"
+    
+    # Signal success after joining
+    log_info "Setting provider ID for the node..."
+    if [ -f "/etc/kubernetes/kubelet.conf" ]; then
+      systemctl restart kubelet
+      sleep 5
+      kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" --kubeconfig=/etc/kubernetes/kubelet.conf || true
+    fi
+    
+    # Complete lifecycle action
+    log_info "Completing lifecycle action..."
+    aws autoscaling complete-lifecycle-action \
+      --lifecycle-hook-name "guy-scale-up-hook" \
+      --auto-scaling-group-name "guy-polybot-asg" \
+      --lifecycle-action-result "CONTINUE" \
+      --instance-id "$INSTANCE_ID" \
+      --region "$REGION" 2>/dev/null || true
+    
+    # Tag the instance
+    log_info "Tagging instance..."
+    aws ec2 create-tags \
+      --region "$REGION" \
+      --resources "$INSTANCE_ID" \
+      --tags Key=node-role.kubernetes.io/worker,Value=true \
+             Key=k8s.io/autoscaled-node,Value=true \
+             Key=Name,Value="$NODE_NAME" 2>/dev/null || true
+    
+    upload_logs_to_s3 "COMPLETE"
+    log_info "Kubernetes worker node initialization completed successfully"
+    
+    # Verify SSH is properly configured before ending
+    setup_ssh
+    
+    # Final checkpoint
+    debug_checkpoint "COMPLETE"
+    exit 0
+  else
+    log_info "Join attempt $((TOTAL_RETRY+1)) failed, waiting before retry..."
+    TOTAL_RETRY=$((TOTAL_RETRY+1))
+    
+    if [ $TOTAL_RETRY -lt $TOTAL_MAX_RETRIES ]; then
+      log_info "Waiting 60 seconds before next retry..."
+      sleep 60
+    else
+      log_info "All join attempts failed."
+      upload_logs_to_s3 "JOIN_FAILED"
+      debug_checkpoint "FAILED"
+      exit 1
+    fi
+  fi
+done
 
 # Create a DEBUG version of the logs with easy-to-scan checkpoints
 log_section "WORKER NODE INITIALIZATION COMPLETE" 

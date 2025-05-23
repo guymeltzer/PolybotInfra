@@ -1319,7 +1319,8 @@ resource "aws_launch_template" "worker_lt" {
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
-    terraform_data.worker_script_hash
+    terraform_data.worker_script_hash,
+    null_resource.update_join_command
   ]
 
   # Report progress
@@ -1396,7 +1397,8 @@ resource "aws_autoscaling_group" "worker_asg" {
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
     terraform_data.force_asg_update,
-    terraform_data.worker_progress
+    terraform_data.worker_progress,
+    null_resource.update_join_command
   ]
   
   lifecycle {
@@ -2163,6 +2165,58 @@ resource "terraform_data" "completion_progress" {
       echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"sudo journalctl -u kubelet\"\\033[0m"
       echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"kubectl get nodes\"\\033[0m"
       echo -e "\\033[1;34m================================================================\\033[0m"
+    EOT
+  }
+}
+
+resource "null_resource" "update_join_command" {
+  depends_on = [
+    aws_instance.control_plane,
+    aws_secretsmanager_secret.kubernetes_join_command,
+    aws_secretsmanager_secret.kubernetes_join_command_latest
+  ]
+
+  # This will cause this resource to be recreated whenever the control plane IP changes
+  triggers = {
+    control_plane_ip = aws_instance.control_plane.public_ip
+    control_plane_id = aws_instance.control_plane.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      echo "Generating new Kubernetes join command with the current control plane IP: ${aws_instance.control_plane.public_ip}"
+      
+      # Wait for the control plane to be fully initialized (60 seconds)
+      sleep 60
+      
+      # Generate a new join command and save it to the secrets manager
+      JOIN_CMD=$(aws ssm send-command \
+        --instance-ids ${aws_instance.control_plane.id} \
+        --document-name "AWS-RunShellScript" \
+        --parameters commands="sudo kubeadm token create --print-join-command" \
+        --region ${var.region} \
+        --output text \
+        --query "CommandInvocations[].CommandPlugins[].Output" | tr -d '\n\r')
+      
+      if [ -n "$JOIN_CMD" ]; then
+        echo "Successfully generated join command from control plane"
+        
+        # Update both secrets with the new join command
+        aws secretsmanager put-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
+          --secret-string "$JOIN_CMD" \
+          --region ${var.region}
+          
+        aws secretsmanager put-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+          --secret-string "$JOIN_CMD" \
+          --region ${var.region}
+          
+        echo "Updated join command secrets with new token for control plane IP: ${aws_instance.control_plane.public_ip}"
+      else
+        echo "Failed to generate join command from control plane"
+      fi
     EOT
   }
 }
