@@ -213,14 +213,45 @@ resource "null_resource" "wait_for_kubernetes" {
     command = <<-EOT
       #!/bin/bash
       
-      # Define key path and set proper permissions
-      KEY_PATH="${var.key_name == "" ? "${path.module}/polybot-key.pem" : "~/.ssh/${var.key_name}.pem"}"
-      echo "Setting correct permissions on SSH key: $KEY_PATH"
+      # Define key path with better fallback logic and early validation
+      KEY_PATH=""
+      if [ -n "${var.key_name}" ]; then
+        # Try home directory first
+        if [ -f "$HOME/.ssh/${var.key_name}.pem" ]; then
+          KEY_PATH="$HOME/.ssh/${var.key_name}.pem"
+        # Then try current directory
+        elif [ -f "${path.module}/${var.key_name}.pem" ]; then
+          KEY_PATH="${path.module}/${var.key_name}.pem"
+        else
+          echo "WARNING: Specified key ${var.key_name}.pem not found in $HOME/.ssh or ${path.module}"
+        fi
+      fi
+      
+      # If key_name wasn't specified or wasn't found, use the generated key
+      if [ -z "$KEY_PATH" ] || [ ! -f "$KEY_PATH" ]; then
+        # Try polybot-key.pem in module path first
+        if [ -f "${path.module}/polybot-key.pem" ]; then
+          KEY_PATH="${path.module}/polybot-key.pem"
+        # Then try generated key if it exists
+        elif [ -f "${path.module}/generated-ssh-key.pem" ]; then
+          KEY_PATH="${path.module}/generated-ssh-key.pem"
+        else
+          echo "ERROR: No valid SSH key found! Cannot continue."
+          echo "Looking for key in: "
+          echo "  - $HOME/.ssh/${var.key_name}.pem"
+          echo "  - ${path.module}/${var.key_name}.pem"
+          echo "  - ${path.module}/polybot-key.pem"
+          echo "  - ${path.module}/generated-ssh-key.pem"
+          exit 0  # Don't fail Terraform, just log the error
+        fi
+      fi
+      
+      echo "Using SSH key: $KEY_PATH"
       chmod 600 "$KEY_PATH" || echo "Warning: Could not set permissions on key"
       
       # Define variables
       CONTROL_PLANE_IP="${try(module.k8s-cluster.control_plane_public_ip, "")}"
-      MAX_RETRIES=30
+      MAX_RETRIES=60  # Increased from 30
       RETRY_INTERVAL=20
       
       # Verify control plane IP is available
@@ -236,22 +267,25 @@ resource "null_resource" "wait_for_kubernetes" {
       for ((i=1; i<=MAX_RETRIES; i++)); do
         echo "Attempt $i/$MAX_RETRIES: Testing SSH connectivity..."
         
-        # Test SSH connectivity first
-        if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@$CONTROL_PLANE_IP "echo SSH connection successful"; then
+        # Test SSH connectivity first with better timeout and debugging
+        if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -v ubuntu@$CONTROL_PLANE_IP "echo SSH connection successful"; then
           echo "SSH connection successful!"
           
           # Now check if Kubernetes API is responding
-          if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "sudo kubectl get nodes"; then
+          if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "sudo kubectl get nodes --request-timeout=5s"; then
             echo "Kubernetes API is responding!"
             
             # Copy kubeconfig and fix permissions
             echo "Copying kubeconfig from control plane..."
-            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/home/ubuntu/.kube/config "${path.module}/kubeconfig.yaml"
+            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/home/ubuntu/.kube/config "${path.module}/kubeconfig.yaml" || \
+            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/etc/kubernetes/admin.conf "${path.module}/kubeconfig.yaml"
+            
             chmod 600 "${path.module}/kubeconfig.yaml"
             
             # Update kubeconfig with correct IP
             echo "Updating kubeconfig with control plane public IP..."
-            sed -i.bak "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml"
+            sed -i.bak "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml" || \
+            sed -i "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml"
             
             echo "Kubernetes is ready and kubeconfig is updated"
             exit 0
@@ -510,7 +544,7 @@ ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@$CONTRO
 # Wait for ArgoCD pod to be ready
 echo "Checking if ArgoCD pod is ready..."
 READY_STATUS=$(ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP \
-  "kubectl get pod -n $ARGOCD_NAMESPACE -l $ARGOCD_LABEL -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null)
+  "kubectl get pod -n $ARGOCD_NAMESPACE -l $ARGOCD_LABEL -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready\")].status}'" 2>/dev/null)
 
 if [ "$READY_STATUS" != "True" ]; then
   echo "ArgoCD pod not ready. Waiting up to $TIMEOUT_SECONDS seconds..."
@@ -525,7 +559,7 @@ if [ "$READY_STATUS" != "True" ]; then
     fi
     
     READY_STATUS=$(ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP \
-      "kubectl get pod -n $ARGOCD_NAMESPACE -l $ARGOCD_LABEL -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}'" 2>/dev/null)
+      "kubectl get pod -n $ARGOCD_NAMESPACE -l $ARGOCD_LABEL -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready\")].status}'" 2>/dev/null)
     
     if [ "$READY_STATUS" = "True" ]; then
       echo "ArgoCD pod is ready!"
@@ -877,8 +911,8 @@ module "k8s-cluster" {
   cluster_name                = "polybot-cluster"
   vpc_id                      = var.vpc_id
   subnet_ids                  = var.subnet_ids
-  control_plane_instance_type = "t3.medium"
-  worker_instance_type        = "t3.medium"
+  control_plane_instance_type = "t3.large"  # Upgraded from t3.medium for more resources
+  worker_instance_type        = "t3.large"  # Upgraded from t3.medium for more resources
   worker_count                = 2
   route53_zone_id             = var.route53_zone_id
   key_name                    = var.key_name
@@ -951,9 +985,23 @@ resource "null_resource" "install_ebs_csi_driver" {
       POLICY_ARN="arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
       ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
       
-      # Fix: Use correct service name and add error handling
+      # Fix: Use correct service name and handle service-linked role creation errors
       echo "Creating service-linked role for EBS CSI driver..."
-      aws iam create-service-linked-role --aws-service-name ebs.amazonaws.com || echo "Service-linked role may already exist or couldn't be created - continuing..."
+      # First check if role already exists
+      if ! aws iam get-role --role-name "AWSServiceRoleForEBS" &>/dev/null; then
+        echo "Creating service-linked role for EBS..."
+        # Try with correct service name
+        aws iam create-service-linked-role --aws-service-name "ebs.amazonaws.com" || {
+          echo "Failed with ebs.amazonaws.com, trying alternative..."
+          # Try alternative service name if first one fails
+          aws iam create-service-linked-role --aws-service-name "ec2.amazonaws.com" || {
+            echo "Could not create service-linked roles. This may be an IAM permission issue."
+            echo "Continuing with installation. If volumes fail to provision, you may need to manually create roles."
+          }
+        }
+      else
+        echo "Service-linked role for EBS already exists."
+      fi
       
       echo "Creating EBS CSI Driver service account..."
       cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
@@ -1000,7 +1048,7 @@ EOF
           rm -rf /host/var/lib/docker/containers/*/logs/*
           rm -rf /host/var/log/*.gz /host/var/log/*.1 /host/var/log/*.old
           rm -rf /host/var/cache/apt/archives/*.deb
-          find /host/var/log -type f -name '*.log' -size +100000000c -delete
+          find /host/var/log -type f -name '*.log' -size +100M -delete
           find /host/tmp -type f -mtime +1 -delete
         " || true
       done
@@ -1389,9 +1437,29 @@ resource "null_resource" "install_calico" {
       
       if [ ! -z "$NODES_WITH_PRESSURE" ]; then
         echo "Some nodes have disk pressure, running cleanup before Calico installation..."
-        kubectl delete --all pods --namespace=tigera-operator || true
-        kubectl delete namespace tigera-operator --ignore-not-found=true || true
-        sleep 5
+        # Delete tigera-operator namespace if it exists to ensure clean slate
+        kubectl delete namespace tigera-operator --ignore-not-found=true
+        # Delete Calico custom resources
+        kubectl delete customresourcedefinition felixconfigurations.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition ipamblocks.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition blockaffinities.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition ipamhandles.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition ipamconfigs.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition bgppeers.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition bgpconfigurations.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition ippools.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition hostendpoints.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition clusterinformations.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition globalnetworkpolicies.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition globalnetworksets.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition networkpolicies.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition networksets.crd.projectcalico.org --ignore-not-found=true
+        kubectl delete customresourcedefinition installations.operator.tigera.io --ignore-not-found=true
+        kubectl delete customresourcedefinition tigerastatuses.operator.tigera.io --ignore-not-found=true
+        # Delete evicted pods
+        kubectl get pods --all-namespaces | grep Evicted | awk '{print $2 " --namespace=" $1}' | xargs -L1 kubectl delete pod || true
+        echo "Cleaned up old Calico resources"
+        sleep 30
       fi
       
       # Check if Calico is already installed
@@ -1402,17 +1470,64 @@ resource "null_resource" "install_calico" {
           exit 0
         else
           echo "Tigera operator exists but pods aren't running, cleaning up..."
-          kubectl delete --all pods --namespace=tigera-operator
-          kubectl delete namespace tigera-operator --ignore-not-found=true
-          sleep 5
+          kubectl delete namespace tigera-operator
+          sleep 30
         fi
       fi
       
-      echo "Installing Tigera Calico operator..."
-      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      echo "Installing Tigera Calico operator with resource limits..."
+      cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tigera-operator
+spec: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigera-operator
+  namespace: tigera-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: tigera-operator
+  template:
+    metadata:
+      labels:
+        name: tigera-operator
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: tigera-operator
+      containers:
+      - name: tigera-operator
+        image: quay.io/tigera/operator:v1.29.4
+        imagePullPolicy: IfNotPresent
+        command:
+        - operator
+        env:
+        - name: TIGERA_OPERATOR_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: TIGERA_OPERATOR_INIT_IMAGE
+          value: quay.io/tigera/operator-init:v1.29.4
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+EOF
       
-      echo "Waiting 30 seconds for operator to initialize..."
-      sleep 30
+      echo "Installing tigera operator RBAC and CRDs..."
+      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      
+      echo "Waiting 60 seconds for operator to initialize..."
+      sleep 60
       
       echo "Checking if operator is running..."
       if ! kubectl -n tigera-operator get pods | grep -q "Running"; then
@@ -1433,11 +1548,39 @@ spec:
       encapsulation: VXLANCrossSubnet
       natOutgoing: Enabled
       nodeSelector: all()
+  # Add resource recommendations to avoid resource pressure
+  componentResources:
+  - componentName: Node
+    resourceRequirements:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+  - componentName: Typha
+    resourceRequirements:
+      limits:
+        cpu: 300m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
   nodeMetricsPort: 9091
   typhaMetricsPort: 9093
 EOF
       
       echo "Calico installation initiated with minimal config."
+      echo "Waiting for Calico to be ready (this may take a few minutes)..."
+      for i in {1..30}; do
+        if kubectl get pods -n calico-system | grep -q "Running"; then
+          echo "Calico pods are starting to run. Continuing deployment."
+          break
+        fi
+        echo "Waiting for Calico pods to start... Attempt $i/30"
+        sleep 20
+      done
+      
       echo "Note: Full Calico startup can take several minutes. Check with: kubectl get pods -A"
     EOT
   }
@@ -1521,6 +1664,13 @@ spec:
           containers:
           - name: cleanup
             image: ubuntu:20.04
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "100m"
+              limits:
+                memory: "256Mi"
+                cpu: "200m"
             command:
             - /bin/sh
             - -c
@@ -1580,6 +1730,13 @@ spec:
       containers:
       - name: cleanup
         image: ubuntu:20.04
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
         command:
         - /bin/sh
         - -c
@@ -1588,7 +1745,7 @@ spec:
           echo "Emergency cleanup - freeing disk space..."
           docker system prune -af
           find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
-          find /var/log -type f -size +10000000c -delete
+          find /var/log -type f -size +10M -delete
           journalctl --vacuum-time=1d
           rm -rf /tmp/*
           echo "Emergency cleanup completed"
@@ -1623,7 +1780,7 @@ EOF
       
       # Increase timeout for cleanup job
       echo "Waiting for emergency disk cleanup to complete (may take several minutes)..."
-      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=300s || true
+      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=600s || true
       
       echo "Disk cleanup completed, checking node status..."
       kubectl get nodes
@@ -1639,7 +1796,8 @@ resource "null_resource" "deploy_mongodb_directly" {
   
   depends_on = [
     null_resource.install_ebs_csi_driver,
-    null_resource.cleanup_worker_nodes
+    null_resource.cleanup_worker_nodes,
+    null_resource.install_calico
   ]
   
   triggers = {
@@ -1659,6 +1817,24 @@ resource "null_resource" "deploy_mongodb_directly" {
       if kubectl -n mongodb get statefulset mongodb &>/dev/null; then
         echo "MongoDB is already deployed, skipping creation"
       else
+        echo "Ensuring correct storage class exists for MongoDB..."
+        if ! kubectl get storageclass mongodb-sc &>/dev/null; then
+          echo "Creating MongoDB storage class..."
+          kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mongodb-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  csi.storage.k8s.io/fstype: ext4
+  type: gp2
+EOF
+        else
+          echo "MongoDB storage class already exists"
+        fi
+        
         echo "Creating MongoDB StatefulSet directly..."
         kubectl apply -f - <<EOF
 apiVersion: v1
@@ -1714,16 +1890,6 @@ spec:
   - port: 27017
     targetPort: 27017
 ---
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  csi.storage.k8s.io/fstype: ext4
-  type: gp2
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -1771,6 +1937,18 @@ spec:
         command:
         - "mongod"
         - "--config=/config/mongo.conf"
+        # Add readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - mongo
+            - --eval
+            - "db.adminCommand('ping')"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 6
       volumes:
       - name: config
         configMap:
@@ -1786,7 +1964,11 @@ spec:
           storage: 1Gi
 EOF
       fi
-
+      
+      # Wait for MongoDB pod to start
+      echo "Waiting for MongoDB pod to start (this may take a few minutes)..."
+      kubectl -n mongodb wait --for=condition=ready pod/mongodb-0 --timeout=600s || true
+      
       # The initialization job is only necessary if statefulset exists but isn't initialized
       echo "Checking if MongoDB needs initialization..."
       POD_STATUS=$(kubectl -n mongodb get pods -l app=mongodb -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Not Found")
