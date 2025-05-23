@@ -227,7 +227,7 @@ join_cluster() {
     JOIN_COMMAND=""
     
     # Try known secrets
-    for SECRET_NAME in "${SECRET_NAMES[@]}"; do
+    for SECRET_NAME in "$${SECRET_NAMES[@]}"; do
       echo "Checking secret: $SECRET_NAME"
       SECRET_VALUE=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_NAME" 2>/dev/null || echo "")
       if [ -n "$SECRET_VALUE" ]; then
