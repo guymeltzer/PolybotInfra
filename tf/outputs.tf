@@ -123,24 +123,24 @@ EOT
 # ------------------------------------------------------------------------
 
 # Development Environment Outputs
-output "polybot_dev_resources" {
-  description = "Development environment resources"
-  value = {
-    s3_bucket   = module.polybot_dev.s3_bucket_name
-    sqs_queue   = module.polybot_dev.sqs_queue_url
-    domain_name = module.polybot_dev.domain_name
-  }
-}
+# output "polybot_dev_resources" {
+#   description = "Development environment resources"
+#   value = {
+#     s3_bucket   = module.polybot_dev.s3_bucket_name
+#     sqs_queue   = module.polybot_dev.sqs_queue_url
+#     domain_name = module.polybot_dev.domain_name
+#   }
+# }
 
 # Production Environment Outputs
-output "polybot_prod_resources" {
-  description = "Production environment resources"
-  value = {
-    s3_bucket   = module.polybot_prod.s3_bucket_name
-    sqs_queue   = module.polybot_prod.sqs_queue_url
-    domain_name = module.polybot_prod.domain_name
-  }
-}
+# output "polybot_prod_resources" {
+#   description = "Production environment resources"
+#   value = {
+#     s3_bucket   = module.polybot_prod.s3_bucket_name
+#     sqs_queue   = module.polybot_prod.sqs_queue_url
+#     domain_name = module.polybot_prod.domain_name
+#   }
+# }
 
 # ------------------------------------------------------------------------
 # Section 8: SSH Access Details
@@ -225,13 +225,13 @@ output "argocd" {
 output "cluster" {
   description = "Essential cluster information for scripts"
   value = {
-    api_endpoint = "https://${module.k8s-cluster.control_plane_public_ip}:6443"
+    api_endpoint = "https://${try(module.k8s-cluster.control_plane_public_ip, "localhost")}:6443"
     control_plane = {
-      public_ip = module.k8s-cluster.control_plane_public_ip
-      ssh = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
+      public_ip = try(module.k8s-cluster.control_plane_public_ip, "")
+      ssh = "ssh -i ${try(module.k8s-cluster.ssh_key_name, "key")}.pem ubuntu@${try(module.k8s-cluster.control_plane_public_ip, "localhost")}"
     }
-    kubeconfig_cmd = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=./kubeconfig.yaml"
-    alb_dns = module.k8s-cluster.alb_dns_name
+    kubeconfig_cmd = "ssh -i ${try(module.k8s-cluster.ssh_key_name, "key")}.pem ubuntu@${try(module.k8s-cluster.control_plane_public_ip, "localhost")} 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=./kubeconfig.yaml"
+    alb_dns = try(module.k8s-cluster.alb_dns_name, "")
   }
 }
 
@@ -405,4 +405,22 @@ EOF
     null_resource.dynamic_worker_logs,
     null_resource.argocd_direct_access
   ]
+}
+
+# Additional helpful cluster information
+output "kubernetes_info" {
+  description = "Information about the Kubernetes cluster"
+  value = {
+    control_plane_ip = try(module.k8s-cluster.control_plane_public_ip, "")
+    kubeconfig_path  = local.kubeconfig_path
+    worker_nodes     = try(module.k8s-cluster.worker_nodes, [])
+  }
+}
+
+output "cluster_readiness" {
+  description = "Information about cluster readiness"
+  value = {
+    kubeconfig_ready = fileexists(local.kubeconfig_path)
+    ebs_csi_ready    = try(null_resource.install_ebs_csi_driver[0].id, "")
+  }
 }

@@ -1763,4 +1763,31 @@ module "kubernetes_resources" {
   ]
 }
 
+# Add display information at the start of deployment
+resource "terraform_data" "deployment_information" {
+  # Run only on first apply or when Terraform files change
+  triggers_replace = {
+    module_hash = filemd5("${path.module}/main.tf") 
+    variables_hash = filemd5("${path.module}/variables.tf")
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      # Save the start time for later tracking
+      date +%s > /tmp/tf_start_time.txt
+      
+      echo -e "\033[1;34m========================================================\033[0m"
+      echo -e "\033[1;34m     🚀 Polybot Kubernetes Deployment Started 🚀\033[0m"
+      echo -e "\033[1;34m========================================================\033[0m"
+      echo -e "\033[0;33m⏱️  This deployment takes approximately 10 minutes.\033[0m"
+      echo -e "\033[0;33m⏱️  Progress indicators will be displayed throughout.\033[0m"
+      echo -e "\033[0;33m⏱️  Colorful status updates will show deployment stages.\033[0m"
+      echo -e "\033[0;33m⏱️  The first 5 minutes are AWS resources creation.\033[0m"
+      echo -e "\033[0;33m⏱️  The next 5 minutes are Kubernetes initialization.\033[0m"
+      echo -e "\033[0;32m➡️  Beginning infrastructure deployment now...\033[0m"
+    EOT
+  }
+}
+
 
