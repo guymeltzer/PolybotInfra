@@ -929,30 +929,17 @@ module "k8s-cluster" {
   depends_on = [terraform_data.init_environment, terraform_data.deployment_information]
 }
 
-# Create the EBS service-linked role declaratively
-resource "aws_iam_service_linked_role" "ebs" {
-  aws_service_name = "ec2.amazonaws.com"  # Changed from ebs.amazonaws.com to ec2.amazonaws.com
-  description      = "Allows Amazon EC2 to manage AWS resources on your behalf"
-  
-  # This will silently succeed if the role already exists
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    on_failure  = continue
-    command     = "echo \"Created or verified EC2 service-linked role\""
-  }
-}
-
 # Install EBS CSI Driver as a Kubernetes component
 resource "null_resource" "install_ebs_csi_driver" {
   depends_on = [
     null_resource.wait_for_kubernetes,
-    aws_iam_service_linked_role.ebs, # Use the new role resource instead
+    null_resource.check_ebs_role, # Use the new resource instead
     terraform_data.kubectl_provider_config
   ]
   
-  # Trigger reinstall when the EBS role is recreated
+  # Trigger reinstall when the role check is run
   triggers = {
-    ebs_role_id = aws_iam_service_linked_role.ebs.id
+    ebs_role_check = null_resource.check_ebs_role.id
   }
   
   provisioner "local-exec" {
@@ -1877,7 +1864,7 @@ module "kubernetes_resources" {
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
     null_resource.wait_for_kubernetes,
-    aws_iam_service_linked_role.ebs
+    null_resource.check_ebs_role
   ]
 }
 
@@ -1905,6 +1892,42 @@ resource "terraform_data" "deployment_information" {
       echo -e "\033[0;33m⏱️  The next 5 minutes are Kubernetes initialization.\033[0m"
       echo -e "\033[0;32m➡️  Beginning infrastructure deployment now...\033[0m"
     EOT
+  }
+}
+
+# Check for existing EBS service-linked role and continue if it exists
+resource "null_resource" "check_ebs_role" {
+  # Only run this once, not on every apply
+  triggers = {
+    run_once = "check-ebs-role-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<EOF
+#!/bin/bash
+echo "Checking if EBS service-linked role already exists..."
+
+# Try to get the role ARN
+ROLE_ARN=$(aws iam get-role --role-name AWSServiceRoleForEBS --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+if [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ]; then
+  echo "EBS service-linked role already exists: $ROLE_ARN"
+else
+  echo "EBS service-linked role does not exist, attempting to create it..."
+  
+  # Try to create the role - this might fail due to permissions
+  aws iam create-service-linked-role --aws-service-name ebs.amazonaws.com 2>/dev/null || {
+    # Try with ec2 service name as fallback
+    aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com 2>/dev/null || {
+      echo "Warning: Could not create EBS service-linked role - this is normal if you don't have sufficient IAM permissions"
+      echo "The EBS CSI driver might still work if the role already exists at the account level"
+    }
+  }
+fi
+
+echo "Continuing with deployment..."
+EOF
   }
 }
 
