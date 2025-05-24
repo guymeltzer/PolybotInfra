@@ -1,11 +1,27 @@
 region            = "eu-central-1"
-control_plane_ami = "ami-0ec7f9846da6b0f61" # Ubuntu 20.04 LTS (update regularly)
-worker_ami        = "ami-0ec7f9846da6b0f61" # Ubuntu 20.04 LTS (update regularly)
-route53_zone_id   = "Z02842682SGSPDJQMJGFT" # Update with the actual Route53 zone ID
-vpc_id            = ""                      # Will be created by terraform
-subnet_ids        = []                      # Will be created by terraform
-key_name          = "polybot-key"           # Replace with your SSH key name
-git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
+
+# Ubuntu 22.04 LTS AMIs for eu-central-1 
+control_plane_ami = "ami-04e601abe3e1a910f"
+worker_ami        = "ami-04e601abe3e1a910f"
+
+# EC2 instance types
+control_plane_instance_type = "t3.medium"
+instance_type               = "t3.medium"
+
+# Worker node scaling
+min_worker_nodes     = 2
+max_worker_nodes     = 5
+desired_worker_nodes = 2
+
+# Network configuration
+pod_cidr = "10.244.0.0/16"  # Flannel default
+
+# Route53 zone ID (replace with your actual zone ID)
+route53_zone_id = "ZXXXXXXXXXX"
+
+key_name          = "polybot-key"            # SSH key for instance access
+vpc_id            = ""                       # Leave empty to create a new VPC
+
 # Telegram tokens should be set via environment variables
 # export TF_VAR_telegram_token_dev="YOUR_DEV_BOT_TOKEN"
 # export TF_VAR_telegram_token_prod="YOUR_PROD_BOT_TOKEN"

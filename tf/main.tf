@@ -9,6 +9,29 @@ provider "aws" {
 
 provider "tls" {}
 
+# Local variables for configuration
+locals {
+  kubeconfig_path = "${path.module}/kubeconfig.yaml"
+  ssh_private_key_path = var.key_name != "" ? (
+    fileexists("${path.module}/${var.key_name}.pem") ? 
+    "${path.module}/${var.key_name}.pem" : 
+    (fileexists("$HOME/.ssh/${var.key_name}.pem") ? 
+     "$HOME/.ssh/${var.key_name}.pem" : 
+     "${path.module}/polybot-key.pem")
+  ) : "${path.module}/polybot-key.pem"
+  skip_argocd     = false # Enable ArgoCD deployment
+  skip_namespaces = false # Enable namespace creation
+  # Check if kubeconfig exists and doesn't contain placeholder
+  kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml")
+  # Only consider Kubernetes ready if we have a real kubeconfig (not the placeholder)
+  k8s_ready = local.kubeconfig_exists && (
+    !strcontains(
+      try(file("${path.module}/kubeconfig.yaml"), ""),
+      "server: https://placeholder:6443"
+    )
+  )
+}
+
 # Resource to clean problematic resources from Terraform state
 resource "terraform_data" "clean_kubernetes_state" {
   # Use more deterministic triggers that don't cause unnecessary runs
@@ -906,27 +929,41 @@ resource "null_resource" "create_namespaces" {
 }
 
 module "k8s-cluster" {
-  source                      = "./modules/k8s-cluster"
-  region                      = var.region
-  cluster_name                = "polybot-cluster"
-  vpc_id                      = var.vpc_id
-  subnet_ids                  = var.subnet_ids
-  control_plane_instance_type = "t3.medium"  # Reverted back to original type
-  worker_instance_type        = "t3.medium"  # Reverted back to original type
-  worker_count                = 2
-  route53_zone_id             = var.route53_zone_id
-  key_name                    = var.key_name
-  control_plane_ami           = var.control_plane_ami
-  worker_ami                  = var.worker_ami
-  rebuild_control_plane       = false # Set to true only when you need to force a rebuild
+  source = "./modules/k8s-cluster"
+  region = var.region
 
-  addons = [
-    "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/storage-class.yaml",
-    "https://raw.githubusercontent.com/scholzj/terraform-aws-kubernetes/master/addons/autoscaler.yaml"
-  ]
-
-  # Start with the initialization resource that creates a valid kubeconfig
-  depends_on = [terraform_data.init_environment, terraform_data.deployment_information]
+  # Required parameters
+  control_plane_ami = var.control_plane_ami
+  worker_ami        = var.worker_ami
+  route53_zone_id   = var.route53_zone_id
+  
+  # Instance configuration
+  control_plane_instance_type = var.control_plane_instance_type
+  instance_type               = var.instance_type
+  worker_count                = var.desired_worker_nodes
+  
+  # Network configuration
+  vpc_id      = var.vpc_id
+  subnet_ids  = var.subnet_ids
+  
+  # SSH key configuration
+  ssh_public_key = var.ssh_public_key
+  key_name       = var.key_name
+  
+  # Verification settings
+  skip_api_verification     = var.skip_api_verification
+  skip_token_verification   = var.skip_token_verification
+  verification_max_attempts = var.verification_max_attempts
+  verification_wait_seconds = var.verification_wait_seconds
+  
+  # Additional settings (optional)
+  rebuild_workers       = false
+  rebuild_control_plane = false
+  
+  tags = {
+    Environment = "production"
+    ManagedBy   = "terraform"
+  }
 }
 
 # Install EBS CSI Driver as a Kubernetes component

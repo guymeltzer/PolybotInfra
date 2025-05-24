@@ -1,296 +1,247 @@
 #!/bin/bash
-# Minimal bootstrap script for worker nodes
-# This script will download a more complete initialization script from S3
+# Minimalist bootstrap script for worker nodes
+# Establishes basic connectivity and triggers full initialization
 
-# Set up minimal logging
-LOGFILE="/var/log/worker-init.log"
-touch $$LOGFILE
-chmod 644 $$LOGFILE
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting minimal worker node bootstrap"
-exec > >(tee -a $$LOGFILE) 2>&1
+# Set up logging
+LOGFILE="/var/log/k8s-bootstrap.log"
+CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
+mkdir -p /var/log
+touch $${LOGFILE}
+chmod 644 $${LOGFILE}
 
-# Critical step 1: SSH access setup (highest priority)
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting up SSH access (PRIORITY)"
+# Redirect output to log files
+exec > >(tee -a $${LOGFILE} $${CLOUD_INIT_LOG}) 2>&1
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootstrap"
+
+# Error handling with clear error messages
+set -e
+trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?"' ERR
+
+# Initialize progress tracking
+mark_progress() {
+  local stage="$1"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $stage"
+  # Create progress marker
+  echo "$stage" > /var/log/worker-bootstrap-progress
+}
+
+# 1. Configure SSH first for emergency access
+mark_progress "Setting up SSH access"
 mkdir -p /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
 
-# Write SSH public key to authorized_keys
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Writing SSH public key"
-cat > /home/ubuntu/.ssh/authorized_keys << EOF
+# Write SSH key
+cat > /home/ubuntu/.ssh/authorized_keys << 'EOF'
 ${SSH_PUBLIC_KEY}
 EOF
 
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
-# Copy to root user as well for emergencies
+# Also set up for root user
 mkdir -p /root/.ssh
 cp /home/ubuntu/.ssh/authorized_keys /root/.ssh/
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
 
-# Configure SSH daemon for key-based auth
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring SSH daemon"
-cat > /etc/ssh/sshd_config.d/99-custom.conf << EOF
-# Enhanced SSH configuration for security
-Port 22
-AddressFamily inet
-PermitRootLogin prohibit-password
-PubkeyAuthentication yes
-PasswordAuthentication no
-PermitEmptyPasswords no
-ChallengeResponseAuthentication no
-UsePAM yes
-X11Forwarding no
-PrintMotd no
-AcceptEnv LANG LC_*
-Subsystem sftp /usr/lib/openssh/sftp-server
-EOF
-
-# Restart SSH daemon
-systemctl restart ssh || systemctl restart sshd || true
-
-# Critical step 2: Install basic dependencies
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing essential dependencies"
+# 2. Install essential packages
+mark_progress "Installing essential packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -y -q apt-transport-https ca-certificates curl unzip jq
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl unzip jq
 
-# Install AWS CLI for downloading full script from S3
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing AWS CLI"
-curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-unzip -q awscliv2.zip
-./aws/install
-rm -rf awscliv2.zip aws/
-
-# Get instance metadata for identification
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Fetching instance metadata"
-TOKEN=$$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-REGION=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
-INSTANCE_ID=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
-PRIVATE_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
-export AWS_DEFAULT_REGION="$$REGION"
-
-# Write instance metadata to file for later use
-cat > /tmp/instance_metadata.json << EOF
-{
-  "instance_id": "$$INSTANCE_ID",
-  "private_ip": "$$PRIVATE_IP",
-  "region": "$$REGION",
-  "join_command_secret": "${JOIN_COMMAND_SECRET}",
-  "join_command_latest_secret": "${JOIN_COMMAND_LATEST_SECRET}",
-  "worker_logs_bucket": "${WORKER_LOGS_BUCKET}"
-}
-EOF
-
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Downloading full initialization script from S3"
-
-# Generate a file that will contain the full initialization script
-cat > /usr/local/bin/worker_full_init.sh << 'EOF'
-#!/bin/bash
-# Full worker node initialization script downloaded from bootstrap
-
-# Set up extensive logging
-LOGFILE="/var/log/worker-init-full.log"
-DEBUG_LOG="/var/log/worker-debug.log"
-touch $LOGFILE $DEBUG_LOG
-chmod 644 $LOGFILE $DEBUG_LOG
-
-# Log with timestamps
-log() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $1" | tee -a $LOGFILE
-}
-
-# Error handling
-handle_error() {
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] An error occurred at line $1: $2" | tee -a $LOGFILE $DEBUG_LOG
-}
-
-trap 'handle_error $LINENO "$BASH_COMMAND"' ERR
-
-log "Starting full worker initialization script"
-
-# Load instance metadata
-METADATA_FILE="/tmp/instance_metadata.json"
-if [ -f "$METADATA_FILE" ]; then
-  INSTANCE_ID=$(jq -r '.instance_id' $METADATA_FILE)
-  PRIVATE_IP=$(jq -r '.private_ip' $METADATA_FILE)
-  REGION=$(jq -r '.region' $METADATA_FILE)
-  JOIN_COMMAND_SECRET=$(jq -r '.join_command_secret' $METADATA_FILE)
-  JOIN_COMMAND_LATEST_SECRET=$(jq -r '.join_command_latest_secret' $METADATA_FILE)
-  WORKER_LOGS_BUCKET=$(jq -r '.worker_logs_bucket' $METADATA_FILE)
-  log "Loaded metadata: Instance=$INSTANCE_ID, IP=$PRIVATE_IP, Region=$REGION"
-else
-  log "Metadata file not found, falling back to environment"
-  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
-  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
-  PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
+# 3. Install AWS CLI for metadata access and script download
+mark_progress "Installing AWS CLI"
+if ! command -v aws &> /dev/null; then
+  curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  unzip -q awscliv2.zip
+  ./aws/install
+  rm -rf awscliv2.zip aws/
 fi
 
-# Configure Kubernetes components
-log "Installing Kubernetes components"
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update && apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
-apt-mark hold kubelet kubeadm kubectl
+# 4. Get instance metadata with robust retry
+mark_progress "Retrieving instance metadata"
+get_metadata() {
+  local max_attempts=5
+  local attempt=1
+  local wait_time=5
+  local key=$1
+  local value=""
+  
+  # First try IMDSv2
+  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || echo "")
+  
+  while [ $attempt -le $max_attempts ]; do
+    if [ -n "$TOKEN" ]; then
+      value=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$key" || echo "")
+    else
+      value=$(curl -s "http://169.254.169.254/latest/meta-data/$key" || echo "")
+    fi
+    
+    if [ -n "$value" ]; then
+      echo "$value"
+      return 0
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get metadata: $key (attempt $attempt/$max_attempts)"
+    sleep $wait_time
+    attempt=$((attempt + 1))
+    wait_time=$((wait_time * 2))
+  done
+  
+  # Return empty string or default value as fallback
+  echo ""
+}
 
-# Install containerd runtime
-log "Installing containerd runtime"
-apt-get install -y containerd
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-systemctl restart containerd
-systemctl enable containerd
+# Collect metadata
+REGION=$(get_metadata "placement/region")
+INSTANCE_ID=$(get_metadata "instance-id")
+PRIVATE_IP=$(get_metadata "local-ipv4")
+AZ=$(get_metadata "placement/availability-zone")
 
-# Configure kernel modules for Kubernetes
-log "Configuring system for Kubernetes"
-cat > /etc/modules-load.d/k8s.conf << EOFMODULES
+# Use defaults if metadata unavailable
+REGION=${REGION:-"${REGION}"}
+INSTANCE_ID=${INSTANCE_ID:-"unknown-$(hostname)"}
+PRIVATE_IP=${PRIVATE_IP:-$(hostname -I | awk '{print $1}')}
+AZ=${AZ:-"${REGION}a"}
+NODE_NAME="worker-$(echo $INSTANCE_ID | cut -d'-' -f2)"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
+echo "  Instance ID: $INSTANCE_ID"
+echo "  Private IP: $PRIVATE_IP"
+echo "  Region: $REGION"
+echo "  AZ: $AZ"
+echo "  Node name: $NODE_NAME"
+
+# 5. Save metadata for full script
+mark_progress "Saving metadata for full initialization"
+mkdir -p /etc/kubernetes
+cat > /etc/kubernetes/worker-metadata.env << EOF
+INSTANCE_ID=$INSTANCE_ID
+PRIVATE_IP=$PRIVATE_IP
+REGION=$REGION
+AZ=$AZ
+NODE_NAME=$NODE_NAME
+JOIN_COMMAND_SECRET="${JOIN_COMMAND_SECRET}"
+JOIN_COMMAND_LATEST_SECRET="${JOIN_COMMAND_LATEST_SECRET}"
+EOF
+
+# 6. Configure basic Kubernetes prerequisites
+mark_progress "Configuring Kubernetes prerequisites"
+
+# Setup kernel modules
+cat > /etc/modules-load.d/k8s.conf << EOF
 overlay
 br_netfilter
-EOFMODULES
+EOF
+
 modprobe overlay
 modprobe br_netfilter
 
 # Configure sysctl
-cat > /etc/sysctl.d/k8s.conf << EOFSYSCTL
+cat > /etc/sysctl.d/k8s.conf << EOF
+net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
-EOFSYSCTL
+net.ipv4.ip_forward                 = 1
+EOF
+
 sysctl --system
 
 # Disable swap
 swapoff -a
-sed -i '/ swap / s/^/#/' /etc/fstab
+sed -i '/swap/d' /etc/fstab
 
-# Function to retrieve join command with retries
-get_join_command() {
-  local max_attempts=10
-  local attempt=1
-  local delay=10
-  local join_cmd=""
-  
-  log "Retrieving join command from AWS Secrets Manager"
-  
-  while [ $attempt -le $max_attempts ]; do
-    log "Attempt $attempt/$max_attempts to get join command"
-    
-    # Try the latest secret first
-    join_cmd=$(aws secretsmanager get-secret-value \
-      --secret-id "$JOIN_COMMAND_LATEST_SECRET" \
-      --region "$REGION" \
-      --query SecretString \
-      --output text 2>/dev/null)
-    
-    # Validate the join command format
-    if [ -n "$join_cmd" ] && [[ "$join_cmd" == *"kubeadm join"* ]] && [[ "$join_cmd" == *"--token"* ]]; then
-      log "Successfully retrieved valid join command"
-      echo "$join_cmd"
-      return 0
-    fi
-    
-    # If latest secret failed, try the main secret
-    join_cmd=$(aws secretsmanager get-secret-value \
-      --secret-id "$JOIN_COMMAND_SECRET" \
-      --region "$REGION" \
-      --query SecretString \
-      --output text 2>/dev/null)
-    
-    if [ -n "$join_cmd" ] && [[ "$join_cmd" == *"kubeadm join"* ]] && [[ "$join_cmd" == *"--token"* ]]; then
-      log "Successfully retrieved valid join command from main secret"
-      echo "$join_cmd"
-      return 0
-    fi
-    
-    log "Failed to get valid join command on attempt $attempt, will retry in $delay seconds"
-    sleep $delay
-    attempt=$((attempt + 1))
-    delay=$((delay + 5))  # Gradually increase delay
-  done
-  
-  log "Failed to retrieve join command after $max_attempts attempts"
-  return 1
-}
+# 7. Install container runtime
+mark_progress "Installing container runtime"
+apt-get update
+apt-get install -y containerd
 
-# Validate control plane API server is accessible
-validate_api_server() {
-  local api_ip="$1"
-  log "Validating API server at $api_ip:6443"
-  
-  # Try a simple TCP connection first
-  if nc -z -w 5 "$api_ip" 6443; then
-    log "API server port is reachable"
-    return 0
-  else
-    log "API server port 6443 is not reachable, joining may fail"
-    return 1
-  fi
-}
+# Configure containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 
-# Get join command
-JOIN_CMD=$(get_join_command)
+# Start containerd
+systemctl restart containerd
+systemctl enable containerd
 
-if [ -n "$JOIN_CMD" ]; then
-  # Extract control plane IP from join command
-  CP_IP=$(echo "$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
-  
-  if [ -n "$CP_IP" ]; then
-    log "Control plane IP extracted: $CP_IP"
-    validate_api_server "$CP_IP"
-  else
-    log "Could not extract control plane IP from join command"
-  fi
-  
-  # Execute join command with retry logic
-  log "Executing join command"
-  echo "$JOIN_CMD" > /tmp/join_command.sh
-  chmod +x /tmp/join_command.sh
-  
-  for i in {1..3}; do
-    log "Join attempt $i/3"
-    if /tmp/join_command.sh --v=5; then
-      log "Successfully joined the Kubernetes cluster!"
-      break
-    else
-      log "Join attempt $i failed, will retry in 30 seconds"
-      sleep 30
-    fi
-  done
-else
-  log "Failed to get join command, cannot join cluster"
-  exit 1
-fi
+# 8. Install Kubernetes components
+mark_progress "Installing Kubernetes components"
 
-# Configure kubelet with correct parameters
-log "Configuring kubelet"
-cat > /etc/default/kubelet << EOFKUBELET
-KUBELET_EXTRA_ARGS="--node-ip=$PRIVATE_IP --hostname-override=$(hostname) --cloud-provider=external --container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd"
-EOFKUBELET
+# Add Kubernetes repository
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
-# Restart kubelet to apply configuration
-systemctl daemon-reload
-systemctl enable kubelet
-systemctl restart kubelet
+# Install Kubernetes components
+apt-get update
+apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
+apt-mark hold kubelet kubeadm kubectl
 
-log "Worker node initialization completed successfully"
-exit 0
+# Configure kubelet
+mkdir -p /var/lib/kubelet
+cat > /var/lib/kubelet/kubeadm-flags.env << EOF
+KUBELET_EXTRA_ARGS=--node-ip=$PRIVATE_IP --hostname-override=$NODE_NAME --cloud-provider=external --container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd
 EOF
 
-chmod +x /usr/local/bin/worker_full_init.sh
+# Restart kubelet
+systemctl daemon-reload
+systemctl restart kubelet
 
-# Upload the full script to S3 for reference
-if command -v aws &>/dev/null; then
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Uploading full initialization script to S3"
-  aws s3 cp /usr/local/bin/worker_full_init.sh s3://${WORKER_LOGS_BUCKET}/scripts/worker_full_init-$$INSTANCE_ID.sh --region $$REGION || true
-fi
+# 9. Retrieve and execute join command
+mark_progress "Retrieving join command"
 
-# Execute the full initialization script
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Executing full initialization script"
-nohup bash /usr/local/bin/worker_full_init.sh > /var/log/worker-full-init.log 2>&1 &
+MAX_ATTEMPTS=10
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $attempt/$MAX_ATTEMPTS to retrieve join command"
+  
+  # Try the latest secret first, then fall back to the original secret
+  for secret_name in "${JOIN_COMMAND_LATEST_SECRET}" "${JOIN_COMMAND_SECRET}"; do
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying to retrieve secret: $secret_name"
+    
+    JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+      --secret-id "$secret_name" \
+      --region "$REGION" \
+      --query 'SecretString' \
+      --output text 2>/dev/null || echo "")
+    
+    if [ -n "$JOIN_COMMAND" ] && [[ "$JOIN_COMMAND" == *"kubeadm join"* ]]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Successfully retrieved join command"
+      
+      # Attempt to join the cluster
+      mark_progress "Joining cluster"
+      echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Executing join command"
+      
+      # Reset any previous Kubernetes state
+      kubeadm reset -f
+      
+      # Execute the join command
+      if eval "$JOIN_COMMAND"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the cluster!"
+        
+        # Create a success marker
+        touch /var/log/worker-join-success
+        mark_progress "Joined successfully"
+        
+        # Tag the instance with Kubernetes metadata
+        aws ec2 create-tags \
+          --resources "$INSTANCE_ID" \
+          --tags Key=KubernetesNode,Value=Worker Key=Name,Value="$NODE_NAME" \
+          --region "$REGION" || true
+        
+        exit 0
+      else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to join cluster with command from $secret_name"
+      fi
+    fi
+  done
+  
+  # If we get here, either we couldn't get a join command or joining failed
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to join cluster on attempt $attempt/$MAX_ATTEMPTS, waiting before retry"
+  sleep 30
+done
 
-# Bootstrap phase completed successfully
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Bootstrap phase completed, full initialization running in background"
-exit 0 
+echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to join cluster after $MAX_ATTEMPTS attempts"
+mark_progress "Failed to join cluster"
+exit 1 

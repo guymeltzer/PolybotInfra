@@ -96,3 +96,33 @@ variable "ssh_public_key" {
   default     = ""
   sensitive   = true
 }
+
+variable "skip_api_verification" {
+  description = "Skip API server verification (true/false)"
+  type        = bool
+  default     = false
+}
+
+variable "skip_token_verification" {
+  description = "Skip join token verification (true/false)"
+  type        = bool
+  default     = false
+}
+
+variable "verification_max_attempts" {
+  description = "Maximum number of attempts for control plane verification"
+  type        = number
+  default     = 20
+}
+
+variable "verification_wait_seconds" {
+  description = "Seconds to wait between verification attempts"
+  type        = number
+  default     = 30
+}
+
+variable "pod_cidr" {
+  description = "CIDR block for Kubernetes pod network"
+  type        = string
+  default     = "10.244.0.0/16"
+}

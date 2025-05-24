@@ -1,7 +1,24 @@
 region            = "us-east-1"
-control_plane_ami = "ami-084568db4383264d4" # Ubuntu AMI in us-east-1
-worker_ami        = "ami-084568db4383264d4" # Ubuntu AMI in us-east-1
-route53_zone_id   = "Z02842682SGSPDJQMJGFT" # Your actual Route53 zone ID
+
+# Ubuntu 22.04 LTS AMIs for us-east-1
+control_plane_ami = "ami-0574da719dca65348"
+worker_ami        = "ami-0574da719dca65348"
+
+# EC2 instance types
+control_plane_instance_type = "t3.medium"
+instance_type               = "t3.medium"
+
+# Worker node scaling
+min_worker_nodes     = 2
+max_worker_nodes     = 5
+desired_worker_nodes = 2
+
+# Network configuration
+pod_cidr = "10.244.0.0/16"  # Flannel default
+
+# Route53 zone ID (replace with your actual zone ID)
+route53_zone_id = "ZXXXXXXXXXX"
+
 key_name          = "polybot-key"           # SSH key for instance access
 vpc_id            = ""                      # Leave empty to create a new VPC
 subnet_ids        = []                      # Leave empty to create new subnets

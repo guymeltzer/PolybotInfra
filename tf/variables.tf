@@ -4,13 +4,13 @@ variable "region" {
 }
 
 variable "vpc_id" {
-  description = "ID of the VPC where resources will be created"
+  description = "ID of the VPC where resources will be created. If not provided, a new VPC will be created."
   type        = string
   default     = ""
 }
 
 variable "subnet_ids" {
-  description = "List of subnet IDs for the Kubernetes cluster"
+  description = "List of subnet IDs for the Kubernetes cluster. If not provided, new subnets will be created."
   type        = list(string)
   default     = []
 }
@@ -93,4 +93,76 @@ variable "docker_password" {
   type        = string
   sensitive   = true
   default     = ""
+}
+
+variable "control_plane_instance_type" {
+  description = "EC2 instance type for the Kubernetes control plane"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type for the Kubernetes worker nodes"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "min_worker_nodes" {
+  description = "Minimum number of worker nodes in the auto-scaling group"
+  type        = number
+  default     = 2
+}
+
+variable "max_worker_nodes" {
+  description = "Maximum number of worker nodes in the auto-scaling group"
+  type        = number
+  default     = 5
+}
+
+variable "desired_worker_nodes" {
+  description = "Desired number of worker nodes in the auto-scaling group"
+  type        = number
+  default     = 2
+}
+
+variable "ssh_public_key" {
+  description = "SSH public key to use for the instances (will be generated if not provided)"
+  type        = string
+  default     = ""
+}
+
+variable "skip_api_verification" {
+  description = "Skip API server verification (true/false)"
+  type        = bool
+  default     = false
+}
+
+variable "skip_token_verification" {
+  description = "Skip join token verification (true/false)"
+  type        = bool
+  default     = false
+}
+
+variable "verification_max_attempts" {
+  description = "Maximum number of attempts for control plane verification"
+  type        = number
+  default     = 20
+}
+
+variable "verification_wait_seconds" {
+  description = "Seconds to wait between verification attempts"
+  type        = number
+  default     = 30
+}
+
+variable "allow_worker_registration" {
+  description = "Allow workers to register with the cluster"
+  type        = bool
+  default     = true
+}
+
+variable "pod_cidr" {
+  description = "CIDR block for Kubernetes pod network"
+  type        = string
+  default     = "10.244.0.0/16"
 }

@@ -41,6 +41,9 @@ resource "random_string" "token_part2" {
 # Format the token for kubeadm (must be in format AAAAAA.BBBBBBBBBBBBBBBB)
 locals {
   kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
+
+  # Determine pod CIDR for the cluster
+  pod_cidr = var.pod_cidr
 }
 
 # Security Group for Kubernetes Cluster Resources
@@ -627,7 +630,7 @@ resource "aws_instance" "control_plane" {
       API_SERVER_IP     = "",
       # We're adding other AWS related variables
       VPC_CIDR          = module.vpc.vpc_cidr_block,
-      POD_CIDR          = "192.168.0.0/16" # Calico default
+      POD_CIDR          = local.pod_cidr
     }
   ))
 
