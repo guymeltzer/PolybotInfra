@@ -2,7 +2,7 @@
 # Refactored control plane initialization script with modular approach and robust error handling
 
 # Define log file and set up logging
-LOGFILE="/var/log/k8s-control-plane-init.log"
+LOGFILE="/var/log/control-plane-setup.log"
 CLOUD_INIT_LOGFILE="/var/log/cloud-init-output.log"
 INIT_MARKER="/var/lib/k8s-setup/.init_completed"
 mkdir -p $(dirname $${INIT_MARKER})
@@ -10,11 +10,11 @@ mkdir -p $(dirname $${INIT_MARKER})
 # Redirect output to multiple logs
 exec > >(tee -a $${LOGFILE} $${CLOUD_INIT_LOGFILE}) 2>&1
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes control plane initialization"
+echo "$(date +"%Y-%m-%d %H:%M:%S") [INFO] Starting Kubernetes control plane initialization"
 
 # Error handling
 set -e
-trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?"' ERR
+trap 'echo "$(date +"%Y-%m-%d %H:%M:%S") [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?"' ERR
 
 # Function to report progress to CloudWatch
 report_progress() {
@@ -23,7 +23,7 @@ report_progress() {
   local message="$3"
   
   # Log locally
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [$status] $stage: $message"
+  echo "$(date +"%Y-%m-%d %H:%M:%S") [$status] $stage: $message"
   
   # Log to CloudWatch if aws cli is available
   if command -v aws &> /dev/null; then
