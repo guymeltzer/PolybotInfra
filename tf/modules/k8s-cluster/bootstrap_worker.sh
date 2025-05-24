@@ -246,8 +246,12 @@ fi
 
 # Log results to S3 if possible
 log_to_s3() {
-  local log_content="$1"
-  local s3_bucket="${WORKER_LOGS_BUCKET:-guy-polybot-logs}"
+  local log_content="$$1"
+  # Replace the parameter expansion with default value using a different approach
+  local s3_bucket="${WORKER_LOGS_BUCKET}"
+  if [ -z "$$s3_bucket" ]; then
+    s3_bucket="guy-polybot-logs"
+  fi
   local log_file="worker-init-$$INSTANCE_ID-$$(date +%Y%m%d%H%M%S).log"
   
   if command -v aws &>/dev/null; then
