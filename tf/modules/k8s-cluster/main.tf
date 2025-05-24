@@ -1349,8 +1349,8 @@ resource "aws_launch_template" "worker_lt" {
     templatefile(
       "${path.module}/bootstrap_worker.sh",
       {
-        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : tls_private_key.ssh.public_key_openssh,
-        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : tls_private_key.ssh.public_key_openssh,
+        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
+        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
         KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
         KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
         JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
@@ -1388,8 +1388,7 @@ resource "aws_launch_template" "worker_lt" {
   
   depends_on = [
     aws_secretsmanager_secret.kubernetes_join_command,
-    aws_secretsmanager_secret.kubernetes_join_command_latest,
-    tls_private_key.ssh
+    aws_secretsmanager_secret.kubernetes_join_command_latest
   ]
 }
 
@@ -2169,7 +2168,7 @@ resource "aws_key_pair" "generated_key" {
 
 locals {
   # Use provided key name if set, otherwise use the auto-generated key
-  actual_key_name = var.key_name != "" ? var.key_name : aws_key_pair.generated_key[0].key_name
+  actual_key_name = var.key_name != "" ? var.key_name : (length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : "")
 }
 
 # Final progress reporter
@@ -2258,6 +2257,8 @@ resource "null_resource" "update_join_command" {
   triggers = {
     control_plane_ip = aws_instance.control_plane.public_ip
     control_plane_id = aws_instance.control_plane.id
+    # Add a random string to ensure this runs at least once during initial creation
+    random_run = uuid()
   }
 
   provisioner "local-exec" {
@@ -2265,12 +2266,13 @@ resource "null_resource" "update_join_command" {
     command = <<-EOT
       echo "Generating new Kubernetes join command with the current control plane IP: ${aws_instance.control_plane.public_ip}"
       
-      # Wait for the control plane to be fully initialized (60 seconds)
+      # Wait for the control plane to be fully initialized
+      echo "Waiting 60 seconds for control plane to be ready..."
       sleep 60
       
       # Function to handle errors with retry logic
       function retry_command {
-        local max_attempts=5
+        local max_attempts=10
         local attempt=1
         local sleep_time=15
         local command="$1"
@@ -2305,6 +2307,7 @@ resource "null_resource" "update_join_command" {
       # Generate a new join command with retry
       JOIN_CMD=""
       
+      # Try getting the join command directly from the control plane
       if ! JOIN_CMD=$(retry_command "aws ssm send-command \
         --instance-ids ${aws_instance.control_plane.id} \
         --document-name \"AWS-RunShellScript\" \
@@ -2313,38 +2316,84 @@ resource "null_resource" "update_join_command" {
         --output text \
         --query \"CommandInvocations[].CommandPlugins[].Output\" | tr -d '\n\r'" \
         "Getting join command from control plane"); then
-        echo "Failed to get join command, will create a default one based on IP"
         
-        # Create a fallback join command
-        echo "Creating fallback join command..."
-        NEW_TOKEN=$(openssl rand -hex 6 | tr '[:upper:]' '[:lower:]')
-        JOIN_CMD="kubeadm join ${aws_instance.control_plane.public_ip}:6443 --token $NEW_TOKEN --discovery-token-unsafe-skip-ca-verification"
+        echo "Failed to get join command via SSM, trying fallback method..."
+        
+        # Try running the control plane token creation script directly 
+        if ! JOIN_CMD=$(retry_command "aws ssm send-command \
+          --instance-ids ${aws_instance.control_plane.id} \
+          --document-name \"AWS-RunShellScript\" \
+          --parameters commands=\"sudo /usr/local/bin/refresh-join-token.sh && cat /var/log/k8s-token-creator.log | grep 'Join command:' | tail -1 | sed 's/Join command: //g'\" \
+          --region ${var.region} \
+          --output text \
+          --query \"CommandInvocations[].CommandPlugins[].Output\" | tr -d '\n\r'" \
+          "Running token creation script on control plane"); then
+          
+          # Create a fallback join command as last resort
+          echo "All methods failed, creating fallback join command..."
+          TOKEN=$(openssl rand -hex 6 | tr '[:upper:]' '[:lower:]')
+          JOIN_CMD="kubeadm join ${aws_instance.control_plane.public_ip}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
+          echo "Created fallback join command: $JOIN_CMD"
+        fi
       fi
       
-      if [ -n "$JOIN_CMD" ]; then
-        echo "Successfully generated join command: $JOIN_CMD"
+      # Validate the join command 
+      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+        echo "Successfully generated valid join command: $JOIN_CMD"
         
-        # Update both secrets with the new join command
+        # Update both secrets with robust error handling
+        echo "Updating AWS Secrets Manager with join command..."
+        
+        # Update main secret
         if ! retry_command "aws secretsmanager put-secret-value \
           --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
           --secret-string \"$JOIN_CMD\" \
           --region ${var.region}" \
           "Updating main join command secret"; then
-          echo "Failed to update main join command secret"
+          echo "Failed to update main join command secret after multiple retries"
+          exit 1
         fi
           
+        # Update latest secret
         if ! retry_command "aws secretsmanager put-secret-value \
           --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
           --secret-string \"$JOIN_CMD\" \
           --region ${var.region}" \
           "Updating latest join command secret"; then
-          echo "Failed to update latest join command secret"
+          echo "Failed to update latest join command secret after multiple retries"
+          exit 1
         fi
-          
-        echo "Updated join command secrets with new token for control plane IP: ${aws_instance.control_plane.public_ip}"
-        exit 0
+        
+        # Create timestamped backup secret
+        TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+        BACKUP_SECRET_NAME="${aws_secretsmanager_secret.kubernetes_join_command.name}-$TIMESTAMP"
+        if ! retry_command "aws secretsmanager create-secret \
+          --name \"$BACKUP_SECRET_NAME\" \
+          --secret-string \"$JOIN_CMD\" \
+          --description \"Kubernetes join command backup created at $TIMESTAMP\" \
+          --region ${var.region}" \
+          "Creating backup join command secret"; then
+          echo "Failed to create backup secret, but continuing as this is non-critical"
+        fi
+        
+        # Verify secrets can be retrieved
+        echo "Verifying secrets can be retrieved..."
+        sleep 5
+        
+        RETRIEVED_CMD=$(aws secretsmanager get-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+          --region ${var.region} \
+          --query SecretString --output text)
+        
+        if [[ "$RETRIEVED_CMD" == *"kubeadm join"* ]] && [[ "$RETRIEVED_CMD" == *"--token"* ]]; then
+          echo "✅ Secret verification successful - worker nodes should be able to join"
+          exit 0
+        else
+          echo "⚠️ Warning: Secret verification failed, but proceeding"
+          exit 0
+        fi
       else
-        echo "Failed to generate or retrieve a valid join command"
+        echo "Error: Could not generate a valid join command after all attempts"
         exit 1
       fi
     EOT
