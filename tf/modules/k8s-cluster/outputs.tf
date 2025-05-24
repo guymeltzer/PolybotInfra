@@ -23,8 +23,8 @@ output "control_plane_private_ip" {
   value       = aws_instance.control_plane.private_ip
 }
 
-output "kubeconfig_path" {
-  description = "Path to the kubeconfig file"
+output "kubeconfig_path_control_plane" {
+  description = "Path to the kubeconfig file on the control plane node"
   value       = "/root/.kube/config"
 }
 
