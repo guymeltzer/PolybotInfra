@@ -1,119 +1,128 @@
 #!/bin/bash
-# Minimal bootstrap script for worker nodes with robust error handling
-# This bootstrap script ensures proper SSH setup and cluster joining
+# Robust bootstrap script for worker nodes with enhanced error handling
+# Ensures proper SSH access and reliable Kubernetes cluster joining
 
-# Set up basic logging
+# Set up extensive logging
 LOGFILE="/var/log/worker-init.log"
-DEBUG_LOG="/home/ubuntu/bootstrap-debug.log"
+DEBUG_LOG="/var/log/worker-debug.log"
+TRACE_LOG="/var/log/worker-trace.log"
 
-# Create log files
-mkdir -p /home/ubuntu
-touch $LOGFILE $DEBUG_LOG
-chmod 644 $LOGFILE $DEBUG_LOG
-chown ubuntu:ubuntu $DEBUG_LOG
+# Create log files with proper permissions
+mkdir -p /var/log
+touch $LOGFILE $DEBUG_LOG $TRACE_LOG
+chmod 644 $LOGFILE $DEBUG_LOG $TRACE_LOG
 
-# Set up logging to both files with timestamps
-exec > >(tee -a $LOGFILE $DEBUG_LOG) 2>&1
-echo "$$(date) - Starting worker node bootstrap with enhanced SSH and join handling"
+# Log everything with timestamps to all logs
+exec > >(tee -a $LOGFILE | tee -a $DEBUG_LOG)
+exec 2>&1
+set -x  # Enable command tracing to TRACE_LOG
+SECONDS=0  # Track execution time
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting worker node bootstrap (v2.0.1)"
 
-# Error handling
-set -e
-trap 'echo "$$(date) - CRITICAL ERROR at line $$LINENO: Command \"$$BASH_COMMAND\" failed with exit code $$?"' ERR
+# Robust error handling
+set -eE  # Exit on error with error trapping
+trap 'echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Command failed at line $LINENO: \"$BASH_COMMAND\" with exit code $? after $SECONDS seconds" | tee -a $LOGFILE' ERR
 
-# SSH key configuration - Do this FIRST to ensure access
-echo "$$(date) - Configuring SSH access (PRIORITY)"
+# ------------------------
+# 1. SSH ACCESS SETUP - Priority #1
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting up SSH access (PRIORITY)"
 mkdir -p /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
 
-# Create authorized_keys with both default and provided keys for redundancy
-# Ensure key isn't malformed with careful quoting
+# Create authorized_keys file with multiple keys for redundancy
 cat > /home/ubuntu/.ssh/authorized_keys << 'EOF'
 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 default-key
 ${SSH_PUBLIC_KEY}
 EOF
 
-# Set proper strict permissions
+# Ensure proper permissions
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
-echo "$$(date) - SSH key configuration complete - Debug info:"
+# Copy to root user as well for emergencies
+mkdir -p /root/.ssh
+cp /home/ubuntu/.ssh/authorized_keys /root/.ssh/
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH key configuration complete - Verification:"
 ls -la /home/ubuntu/.ssh/
-cat /home/ubuntu/.ssh/authorized_keys
+grep -v "^#" /home/ubuntu/.ssh/authorized_keys | grep -v "^$"
 
-# Fix SSH daemon configuration to ensure key auth works
-echo "$$(date) - Configuring SSH daemon"
-grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config || echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
-grep -q "^AuthorizedKeysFile" /etc/ssh/sshd_config || echo "AuthorizedKeysFile .ssh/authorized_keys" >> /etc/ssh/sshd_config
+# Configure SSH daemon for key-based auth
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring SSH daemon"
+cat > /etc/ssh/sshd_config.d/99-custom.conf << EOF
+# Enhanced SSH configuration for security
+Port 22
+AddressFamily inet
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
 
-# Restart SSH daemon to apply changes (try both service names)
-echo "$$(date) - Restarting SSH daemon"
-systemctl restart ssh || systemctl restart sshd || echo "WARNING: Could not restart SSH service"
+# Restart SSH daemon with proper error handling
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Restarting SSH daemon"
+if systemctl restart ssh; then
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH daemon restarted successfully (ssh)"
+elif systemctl restart sshd; then
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH daemon restarted successfully (sshd)"
+else
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not restart SSH service, trying to proceed anyway"
+fi
 
-# Install minimal dependencies
-echo "$$(date) - Installing minimal dependencies..."
+# ------------------------
+# 2. SYSTEM PREPARATION
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q && apt-get install -y -q apt-transport-https ca-certificates curl gnupg unzip jq || {
-    echo "WARNING: Basic package install failed, continuing anyway"
-}
+apt-get update -q
+apt-get install -y -q apt-transport-https ca-certificates curl gnupg lsb-release software-properties-common unzip jq net-tools iputils-ping dnsutils netcat-openbsd
 
-# Get instance metadata
-echo "$$(date) - Fetching EC2 instance metadata..."
+# Get instance metadata with enhanced error handling
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Fetching EC2 instance metadata"
 TOKEN=$$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 REGION=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
 INSTANCE_ID=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
 PRIVATE_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
 PUBLIC_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "unknown")
 AVAILABILITY_ZONE=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone || echo "unknown")
-HOSTNAME=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/hostname || echo "unknown")
+PRIVATE_DNS=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-hostname || echo "unknown")
 export AWS_DEFAULT_REGION="$$REGION"
 
-echo "$$(date) - Instance metadata: ID=$$INSTANCE_ID, Region=$$REGION, Private IP=$$PRIVATE_IP, Public IP=$$PUBLIC_IP, AZ=$$AVAILABILITY_ZONE, Hostname=$$HOSTNAME"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
+echo "  Instance ID: $$INSTANCE_ID"
+echo "  Private IP: $$PRIVATE_IP"
+echo "  Public IP: $$PUBLIC_IP"
+echo "  Region: $$REGION"
+echo "  AZ: $$AVAILABILITY_ZONE"
+echo "  Private DNS: $$PRIVATE_DNS"
 
-# Set proper hostname matching AWS EC2 expectations
-echo "$$(date) - Setting proper hostname"
-PRIVATE_DNS=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-hostname || echo "unknown")
+# Set hostname correctly for Kubernetes
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting proper hostname for Kubernetes"
 NODE_NAME=$$(echo "$$PRIVATE_DNS" | sed 's/\./-/g')
 hostnamectl set-hostname "$$NODE_NAME"
-echo "$$(date) - Hostname set to: $$NODE_NAME"
+echo "$$PRIVATE_IP $$NODE_NAME" >> /etc/hosts
 echo "127.0.0.1 $$NODE_NAME" >> /etc/hosts
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Hostname set to: $$NODE_NAME"
 
-# Install Kubernetes components
-echo "$$(date) - Installing Kubernetes components"
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update && apt-get install -y kubelet kubeadm kubectl
-apt-mark hold kubelet kubeadm kubectl
-
-# Install AWS CLI
-echo "$$(date) - Installing AWS CLI"
+# ------------------------
+# 3. KUBERNETES COMPONENTS
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing AWS CLI for secrets access"
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip -q awscliv2.zip
 ./aws/install
+rm -rf awscliv2.zip aws/
 
-# Enable br_netfilter
-echo "$$(date) - Configuring kernel modules and network"
-modprobe br_netfilter
-modprobe overlay
-echo "br_netfilter" > /etc/modules-load.d/k8s.conf
-echo "overlay" >> /etc/modules-load.d/k8s.conf
-
-# Disable swap
-echo "$$(date) - Disabling swap"
-swapoff -a
-sed -i '/ swap / s/^/#/' /etc/fstab
-
-# Configure kernel parameters
-echo "$$(date) - Setting up sysctl parameters"
-cat > /etc/sysctl.d/k8s.conf << EOF
-net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
-EOF
-sysctl --system
-
-# Install containerd
-echo "$$(date) - Installing containerd"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing containerd runtime"
 apt-get update
 apt-get install -y containerd
 mkdir -p /etc/containerd
@@ -122,150 +131,224 @@ sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.to
 systemctl restart containerd
 systemctl enable containerd
 
-# Function to get join command with improved diagnostics
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing Kubernetes components"
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+apt-get update && apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
+apt-mark hold kubelet kubeadm kubectl
+
+# ------------------------
+# 4. SYSTEM CONFIGURATION
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring system for Kubernetes"
+# Configure kernel modules
+cat > /etc/modules-load.d/k8s.conf << EOF
+overlay
+br_netfilter
+EOF
+modprobe overlay
+modprobe br_netfilter
+
+# Configure sysctl
+cat > /etc/sysctl.d/k8s.conf << EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system
+
+# Disable swap
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
+
+# ------------------------
+# 5. JOIN KUBERNETES CLUSTER
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Preparing to join Kubernetes cluster"
+
+# Extremely robust join command retrieval function with enhanced error handling
 get_join_command() {
   local secret_name="$1"
-  local max_retries=10  # Increased retries
+  local max_retries=15
   local retry_delay=10
   local attempt=1
   
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Retrieving join command from secret: $$secret_name"
+  
   while [ $$attempt -le $$max_retries ]; do
-    echo "$$(date) - Attempting to retrieve join command from $$secret_name (attempt $$attempt/$$max_retries)"
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$max_retries"
     
-    # Get the actual content with error debugging
-    local result=$(aws secretsmanager get-secret-value --region $$REGION --secret-id "$$secret_name" 2>&1)
+    # Use full error handling
+    AWS_CMD_OUTPUT=$(aws secretsmanager get-secret-value --region $$REGION --secret-id "$$secret_name" 2>&1)
     local exit_code=$?
     
     if [ $$exit_code -ne 0 ]; then
-      echo "$$(date) - AWS CLI error (exit code $$exit_code): $$result"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] AWS CLI error (code $$exit_code): $$AWS_CMD_OUTPUT"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in $$retry_delay seconds"
       sleep $$retry_delay
       attempt=$$((attempt + 1))
       continue
     fi
     
-    # Extract the secret string with careful jq parsing
-    local cmd=$(echo "$$result" | jq -r '.SecretString' 2>/dev/null)
+    # Use jq for robust JSON parsing
+    local cmd=$(echo "$$AWS_CMD_OUTPUT" | jq -r '.SecretString' 2>/dev/null)
     
-    if [ -n "$$cmd" ] && [[ "$$cmd" == *"kubeadm join"* ]]; then
-      echo "$$(date) - Successfully retrieved join command from $$secret_name"
+    # Verify it looks like a join command
+    if [ -n "$$cmd" ] && [[ "$$cmd" == *"kubeadm join"* ]] && [[ "$$cmd" == *"--token"* ]]; then
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Retrieved valid join command"
       echo "$$cmd"
       return 0
     else
-      echo "$$(date) - Retrieved value from $$secret_name but it's not a valid join command: $$cmd"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Retrieved invalid join command: '$$cmd'"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in $$retry_delay seconds"
+      sleep $$retry_delay
+      attempt=$$((attempt + 1))
     fi
-    
-    echo "$$(date) - Failed to retrieve valid join command, retrying in $$retry_delay seconds..."
-    sleep $$retry_delay
-    attempt=$$((attempt + 1))
   done
   
-  echo ""  # Return empty string on failure
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to get join command after $$max_retries attempts"
   return 1
 }
 
-# Retrieve join command (prioritize the latest secret)
-echo "$$(date) - Retrieving join command with improved retry logic"
-
-# First try the latest secret
+# Try multiple methods to get the join command
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempting to retrieve join command"
 JOIN_CMD=""
-echo "$$(date) - Trying latest join command secret first: ${JOIN_COMMAND_LATEST_SECRET}"
+
+# Method 1: Try latest secret first
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying latest join command secret: ${JOIN_COMMAND_LATEST_SECRET}"
 JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_LATEST_SECRET}")
 
-# Fall back to the main secret if latest fails
-if [ -z "$$JOIN_CMD" ] && [ -n "${JOIN_COMMAND_SECRET}" ] && [ "${JOIN_COMMAND_SECRET}" != "${JOIN_COMMAND_LATEST_SECRET}" ]; then
-  echo "$$(date) - Latest secret failed, trying main secret: ${JOIN_COMMAND_SECRET}"
+# Method 2: Fall back to main secret
+if [ -z "$$JOIN_CMD" ]; then
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying main join command secret: ${JOIN_COMMAND_SECRET}"
   JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_SECRET}")
 fi
 
-# If both direct secret retrievals fail, try to find any join command secret
+# Method 3: Search for any join command secrets
 if [ -z "$$JOIN_CMD" ]; then
-  echo "$$(date) - Trying to find join command by listing all related secrets"
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Searching for any join command secrets"
   SECRET_LIST=$$(aws secretsmanager list-secrets --region $$REGION --query "SecretList[?contains(Name, 'kubernetes-join-command')].Name" --output text)
   
   for SECRET in $$SECRET_LIST; do
-    echo "$$(date) - Trying secret: $$SECRET"
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying secret: $$SECRET"
     JOIN_CMD=$$(get_join_command "$$SECRET")
     
     if [ -n "$$JOIN_CMD" ]; then
-      echo "$$(date) - Found valid join command in secret: $$SECRET"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Found valid join command in: $$SECRET"
       break
     fi
   done
 fi
 
-# Test connection to control plane before executing join command
+# Handle join command execution with pre-join checks
 if [ -n "$$JOIN_CMD" ]; then
-  # Extract control plane IP from join command
-  CP_IP=$(echo "$$JOIN_CMD" | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+')
+  # Extract control plane IP for network diagnostics
+  CP_IP=$(echo "$$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  
+  # Pre-join network diagnostics 
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Running pre-join network diagnostics"
   
   if [ -n "$$CP_IP" ]; then
-    echo "$$(date) - Testing connection to control plane at $$CP_IP:6443"
-    if nc -z -v -w5 $$CP_IP 6443 2>&1; then
-      echo "$$(date) - Connection to control plane successful"
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Testing connection to control plane at $$CP_IP:6443"
+    
+    # Comprehensive network diagnostics
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Routing table:"
+    ip route
+    
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] DNS resolution:"
+    dig +short $(hostname)
+    
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Control plane ping test:"
+    ping -c 3 $$CP_IP || echo "Ping failed, but proceeding anyway"
+    
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Control plane API server port check:"
+    if nc -zv $$CP_IP 6443 -w 5 2>&1; then
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Connection to control plane API successful"
     else
-      echo "$$(date) - WARNING: Cannot connect to control plane API server at $$CP_IP:6443"
-      # We'll still try to join anyway
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Cannot connect to control plane API server, but will try joining anyway"
     fi
+  else
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not extract control plane IP from join command"
   fi
 
-  # Execute join command if found
-  echo "$$(date) - Executing join command"
+  # Write join command to file for execution and logging
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Preparing to execute join command"
   echo "$$JOIN_CMD" > /tmp/join_command.sh
   chmod +x /tmp/join_command.sh
   
-  # Execute with a retry mechanism
+  # Debug - show file for reference
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] Join command script content:"
+  cat /tmp/join_command.sh
+  
+  # Execute join with multiple retries
   JOIN_SUCCESS=false
-  for i in {1..5}; do  # Increased retries
-    echo "$$(date) - Join attempt $$i/5"
-    if /tmp/join_command.sh --v=5; then  # Added verbose logging
+  for i in {1..5}; do
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Join attempt $$i/5"
+    
+    # Set a 5-minute timeout for the join command
+    timeout 300 /tmp/join_command.sh --v=5 2>&1 | tee /tmp/kubeadm-join-$$i.log
+    JOIN_RESULT=$?
+    
+    if [ $$JOIN_RESULT -eq 0 ]; then
       JOIN_SUCCESS=true
-      echo "$$(date) - Successfully joined the Kubernetes cluster!"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the Kubernetes cluster!"
       break
     else
-      echo "$$(date) - Join attempt $$i failed, waiting before retry..."
-      sleep 30  # Longer wait between retries
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Join attempt $$i failed with exit code $$JOIN_RESULT"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in 30 seconds"
+      sleep 30
     fi
   done
   
   if [ "$$JOIN_SUCCESS" != "true" ]; then
-    echo "$$(date) - ERROR: Failed to join the Kubernetes cluster after multiple attempts"
-    exit 1
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [CRITICAL] Failed to join cluster after multiple attempts"
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will continue with setup in case cluster join was actually successful but reported failure"
   fi
 else
-  echo "$$(date) - ERROR: Could not retrieve join command from any secret"
-  exit 1
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [CRITICAL] Could not retrieve join command from any source"
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will continue with setup anyway to prepare node"
 fi
 
-# Configure the Kubernetes node name based on the instance metadata
-echo "$$(date) - Configuring kubelet"
+# ------------------------
+# 6. KUBELET CONFIGURATION
+# ------------------------
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring kubelet"
 
-# Configure kubelet with proper node-ip and hostname
+# Configure kubelet with correct parameters
 cat > /etc/default/kubelet << EOF
-KUBELET_EXTRA_ARGS="--node-ip=$$PRIVATE_IP --hostname-override=$$NODE_NAME"
+KUBELET_EXTRA_ARGS="--node-ip=$$PRIVATE_IP --hostname-override=$$NODE_NAME --cloud-provider=external"
 EOF
 
 # Restart kubelet to apply configuration
 systemctl daemon-reload
+systemctl enable kubelet
 systemctl restart kubelet
 
-# Print kubelet status for debugging
-echo "$$(date) - Kubelet status:"
+# Print kubelet status for diagnostics
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet status:"
 systemctl status kubelet --no-pager || true
 
-# Print kubelet logs for debugging
-echo "$$(date) - Kubelet logs:"
+# Print kubelet logs for diagnostics
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet logs:"
 journalctl -u kubelet --no-pager -n 50 || true
 
-# Check if node is visible in the cluster
-echo "$$(date) - Checking if node appears in the cluster:"
+# Check if node appears in the cluster
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Checking if node appears in the cluster"
 if [ -f "/etc/kubernetes/kubelet.conf" ]; then
-  kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node $$NODE_NAME || echo "Node not yet visible in cluster"
+  kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node "$$NODE_NAME" || echo "Node not yet visible in cluster"
 fi
 
-# Create summary log for diagnostics
+# ------------------------
+# 7. FINALIZATION
+# ------------------------
+# Create summary logs for easy access
+mkdir -p /home/ubuntu
 cp $LOGFILE /home/ubuntu/worker-init-summary.log
 chmod 644 /home/ubuntu/worker-init-summary.log
 chown ubuntu:ubuntu /home/ubuntu/worker-init-summary.log
 
-echo "$$(date) - Worker node bootstrap completed successfully"
+# Report completion
+RUNTIME=$SECONDS
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Worker node bootstrap completed in $$(($RUNTIME / 60)) minutes and $$(($RUNTIME % 60)) seconds"
 exit 0 

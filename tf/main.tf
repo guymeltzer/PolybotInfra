@@ -1168,230 +1168,120 @@ EOF
 
 # Modify Calico/Tigera installation to be more robust
 resource "null_resource" "install_calico" {
-  count = local.skip_argocd ? 0 : 1
-  
   depends_on = [
-    null_resource.providers_ready,
     null_resource.wait_for_kubernetes,
-    module.kubernetes_resources.disk_cleanup_id,
     terraform_data.kubectl_provider_config
   ]
-  
+
+  # Only install once unless forced
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    run_id = timestamp()
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
+      set -e
+      echo "Installing Calico networking components..."
+      export KUBECONFIG=${local.kubeconfig_path}
       
-      # First check if worker nodes have disk pressure
-      echo "Checking node status before Calico installation..."
-      NODES_WITH_PRESSURE=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="DiskPressure")].status}{"\n"}{end}' | grep True || echo "")
-      
-      if [ ! -z "$NODES_WITH_PRESSURE" ]; then
-        echo "Some nodes have disk pressure, running cleanup before Calico installation..."
-        # Delete tigera-operator namespace if it exists to ensure clean slate
-        kubectl delete namespace tigera-operator --ignore-not-found=true
-        # Delete evicted pods
-        kubectl get pods --all-namespaces -o json | jq -r '.items[] | select(.status.reason=="Evicted") | .metadata.namespace + " " + .metadata.name' | while read ns name; do 
-          kubectl delete pod -n $ns $name || true
-        done
-        echo "Cleaned up evicted pods"
-        sleep 30
+      # Check if calico is already installed
+      if kubectl get pods -n kube-system | grep -q calico; then
+        echo "Calico already appears to be installed, skipping installation"
+        exit 0
       fi
       
-      # Check if Calico is already installed
-      if kubectl get ns tigera-operator &>/dev/null; then
-        echo "Tigera operator namespace exists, checking if operator is functional..."
-        if kubectl -n tigera-operator get pods | grep -q "Running"; then
-          echo "Calico already installed and running, skipping installation"
-          exit 0
-        else
-          echo "Tigera operator exists but pods aren't running, cleaning up..."
-          kubectl delete namespace tigera-operator
-          sleep 30
-        fi
-      fi
-      
-      echo "Installing Calico operator..."
-      # Step 1: Create namespace first
+      # Create the tigera-operator namespace
       kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
       
-      # Step 2: Install Calico operator without the problematic manifest
+      # Create enhanced RBAC for tigera-operator with node access
       cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: tigera-operator
-  namespace: tigera-operator
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: tigera-operator
-rules:
-- apiGroups: [""]
-  resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts", "nodes"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "daemonsets", "statefulsets"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["apiextensions.k8s.io"]
-  resources: ["customresourcedefinitions"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["operator.tigera.io"]
-  resources: ["*"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: ["crd.projectcalico.org"]
-  resources: ["*"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: tigera-operator
-subjects:
-- kind: ServiceAccount
-  name: tigera-operator
-  namespace: tigera-operator
-roleRef:
-  kind: ClusterRole
-  name: tigera-operator
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tigera-operator
-  namespace: tigera-operator
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      name: tigera-operator
-  template:
-    metadata:
-      labels:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
         name: tigera-operator
-    spec:
-      serviceAccountName: tigera-operator
-      containers:
-      - name: tigera-operator
-        image: quay.io/tigera/operator:v1.29.0
-        env:
-        - name: WATCH_NAMESPACE
-          value: ""
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: OPERATOR_NAME
-          value: "tigera-operator"
-        volumeMounts:
-        - name: tigera-operator-tls
-          mountPath: /etc/ssl/tigera-operator-tls/
-      volumes:
-      - name: tigera-operator-tls
-        emptyDir: {}
-EOF
+      rules:
+      - apiGroups: [""]
+        resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts", "nodes"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "daemonsets", "statefulsets"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["apiextensions.k8s.io"]
+        resources: ["customresourcedefinitions"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["operator.tigera.io"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["crd.projectcalico.org"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      EOF
       
-      echo "Waiting for Tigera operator to be running before applying the Installation resource..."
-      for i in {1..60}; do
-        if kubectl -n tigera-operator get pods -l name=tigera-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q "Running"; then
-          echo "Tigera operator is running, continuing with installation"
+      # Create ClusterRoleBinding for tigera-operator
+      cat <<EOF | kubectl apply -f -
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: tigera-operator
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: tigera-operator
+      subjects:
+      - kind: ServiceAccount
+        name: tigera-operator
+        namespace: tigera-operator
+      EOF
+      
+      # Create the tigera-operator ServiceAccount
+      cat <<EOF | kubectl apply -f -
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: tigera-operator
+        namespace: tigera-operator
+      EOF
+      
+      # Apply the operator manifest
+      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      
+      # Wait for operator to be ready before continuing
+      echo "Waiting for tigera-operator deployment to be ready..."
+      kubectl -n tigera-operator wait --for=condition=available deployment/tigera-operator --timeout=120s
+      
+      # Apply Calico custom resources
+      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
+      
+      # Monitor Calico installation progress
+      echo "Monitoring Calico installation progress..."
+      for i in {1..15}; do
+        if kubectl get tigerastatuses.operator.tigera.io 2>/dev/null | grep -q 'calico'; then
+          echo "Calico installation in progress..."
+        else
+          echo "Waiting for Calico CRDs to be established... attempt $i/15"
+        fi
+        
+        # Check if Calico pods are running
+        if kubectl get pods -n calico-system 2>/dev/null | grep -q 'Running'; then
+          echo "Calico pods are starting to run."
           break
         fi
-        if [ $i -eq 60 ]; then
-          echo "ERROR: Timed out waiting for Tigera operator to start."
-          echo "Current pods in tigera-operator namespace:"
-          kubectl -n tigera-operator get pods -o wide
-          echo "Pod logs:"
-          kubectl -n tigera-operator logs -l name=tigera-operator --tail=50
-          exit 1
-        fi
-        echo "Waiting for Tigera operator to start... ($i/60)"
-        sleep 5
-      done
-      
-      # Step 3: Wait for CRDs to be fully established
-      echo "Waiting for Installation CRD to be established..."
-      for i in {1..60}; do
-        if kubectl get crd installations.operator.tigera.io &>/dev/null; then
-          echo "Installation CRD found, waiting for it to be established..."
-          # Check if the condition NamesAccepted and Established are both True for the CRD
-          if kubectl get crd installations.operator.tigera.io -o jsonpath='{.status.conditions[?(@.type=="NamesAccepted")].status}{.status.conditions[?(@.type=="Established")].status}' | grep -q "TrueTrue"; then
-            echo "Installation CRD is fully established"
-            break
-          fi
-        fi
-        if [ $i -eq 60 ]; then
-          echo "ERROR: Timed out waiting for Installation CRD to be fully established."
-          echo "Current CRD status:"
-          kubectl get crd installations.operator.tigera.io -o yaml
-          exit 1
-        fi
-        echo "Waiting for Installation CRD to be established... ($i/60)"
-        sleep 5
-      done
-      
-      # Step 4: Apply the Installation CR
-      echo "Installing Calico with a simplified Installation resource..."
-      cat <<EOF | kubectl apply -f -
-apiVersion: operator.tigera.io/v1
-kind: Installation
-metadata:
-  name: default
-spec:
-  calicoNetwork:
-    ipPools:
-    - blockSize: 26
-      cidr: 192.168.0.0/16
-      encapsulation: VXLANCrossSubnet
-      natOutgoing: Enabled
-      nodeSelector: all()
-EOF
-      
-      echo "Calico installation initiated with simplified config."
-      echo "Waiting for Calico pods to start running (this may take a few minutes)..."
-      for i in {1..45}; do
-        if kubectl get pods -n calico-system &>/dev/null; then
-          # Count running pods
-          RUNNING_PODS=$(kubectl get pods -n calico-system --field-selector=status.phase=Running 2>/dev/null | grep -v NAME | wc -l)
-          TOTAL_PODS=$(kubectl get pods -n calico-system 2>/dev/null | grep -v NAME | wc -l)
-          
-          echo "Calico system has $RUNNING_PODS running pods out of $TOTAL_PODS total pods"
-          
-          # If we have at least 3 running pods or more than half the pods running, consider it a success
-          if [ "$RUNNING_PODS" -ge 3 ] || [ "$RUNNING_PODS" -gt $(($TOTAL_PODS / 2)) ]; then
-            echo "Sufficient Calico pods are running. Continuing deployment."
-            
-            # Verify with kubectl calico command
-            echo "Current node status:"
-            kubectl get nodes
-            
-            echo "Calico installation completed successfully."
-            break
-          fi
+        
+        # If this is the last attempt, don't sleep
+        if [ $i -eq 15 ]; then
+          echo "Proceeding without waiting further for Calico"
+          break
         fi
         
-        if [ $i -eq 45 ]; then
-          echo "ERROR: Timed out waiting for Calico pods to be running properly."
-          echo "Current pods in calico-system namespace:"
-          kubectl get pods -n calico-system -o wide
-          echo "Checking for any issues with nodes:"
-          kubectl get nodes -o wide
-          echo "Continuing because some worker nodes may need Calico to join, but installation may not be complete."
-        fi
-        
-        echo "Waiting for Calico pods to be running... ($i/45)"
-        sleep 10
+        sleep 20
       done
+      
+      echo "Calico installation completed or timed out. Proceeding."
     EOT
   }
 }

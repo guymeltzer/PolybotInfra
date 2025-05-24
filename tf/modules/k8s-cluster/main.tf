@@ -1349,8 +1349,8 @@ resource "aws_launch_template" "worker_lt" {
     templatefile(
       "${path.module}/bootstrap_worker.sh",
       {
-        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 temp-key",
-        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 temp-key",
+        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : tls_private_key.ssh.public_key_openssh,
+        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : tls_private_key.ssh.public_key_openssh,
         KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
         KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
         JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
@@ -1366,6 +1366,7 @@ resource "aws_launch_template" "worker_lt" {
   network_interfaces {
     security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id, aws_security_group.control_plane_sg.id]
     associate_public_ip_address = true
+    delete_on_termination       = true
   }
   
   tag_specifications {
@@ -1379,9 +1380,16 @@ resource "aws_launch_template" "worker_lt" {
     }
   }
   
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "optional"
+    instance_metadata_tags      = "enabled"
+  }
+  
   depends_on = [
     aws_secretsmanager_secret.kubernetes_join_command,
-    aws_secretsmanager_secret.kubernetes_join_command_latest
+    aws_secretsmanager_secret.kubernetes_join_command_latest,
+    tls_private_key.ssh
   ]
 }
 
@@ -1477,9 +1485,10 @@ resource "aws_autoscaling_group" "worker_asg" {
 
 resource "aws_security_group" "worker_sg" {
   name        = "Guy-WorkerNodes-SG"
-  description = "Allows all traffic to the VPC"
+  description = "Security group for Kubernetes worker nodes"
   vpc_id      = module.vpc.vpc_id
 
+  # Allow SSH from anywhere for debugging
   ingress {
     from_port   = 22
     to_port     = 22
@@ -1488,6 +1497,7 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow SSH access from anywhere"
   }
 
+  # Allow HTTP traffic
   ingress {
     from_port   = 80
     to_port     = 80
@@ -1496,6 +1506,7 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow HTTP traffic"
   }
 
+  # Allow HTTPS traffic
   ingress {
     from_port   = 443
     to_port     = 443
@@ -1504,30 +1515,43 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow HTTPS traffic"
   }
   
+  # Kubelet API for control plane communication
   ingress {
     from_port   = 10250
     to_port     = 10250
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Allow kubelet API"
+    cidr_blocks = ["0.0.0.0/0"]  # Allow from anywhere for debugging
+    description = "Allow kubelet API access"
   }
 
+  # NodePort services
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow NodePort service range"
+  }
+
+  # Specific NodePort for applications
   ingress {
     from_port   = 31024
     to_port     = 31024
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow NodePort services"
+    description = "Allow specific NodePort service"
   }
 
+  # Critical - API server access
   ingress {
     from_port   = 6443
     to_port     = 6443
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+    cidr_blocks = ["0.0.0.0/0"]
     description = "Allow Kubernetes API server access"
   }
 
+  # Allow all internal VPC traffic
   ingress {
     from_port   = 0
     to_port     = 0
@@ -1536,6 +1560,16 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow all internal VPC traffic"
   }
 
+  # Allow Calico overlay networking (VXLAN)
+  ingress {
+    from_port   = 4789
+    to_port     = 4789
+    protocol    = "udp"
+    self        = true
+    description = "Calico VXLAN overlay"
+  }
+
+  # Allow all outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -1544,7 +1578,7 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow all outbound traffic"
   }
 
-  # Explicitly allow outbound traffic to Kubernetes API server
+  # Explicit outbound rule for the Kubernetes API server
   egress {
     from_port   = 6443
     to_port     = 6443

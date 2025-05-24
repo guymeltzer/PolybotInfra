@@ -181,6 +181,62 @@ kubectl taint nodes $(hostname) node-role.kubernetes.io/control-plane:NoSchedule
 echo "$(date) - Installing Calico CNI"
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
 
+# Create proper RBAC for Tigera operator
+echo "$(date) - Creating enhanced RBAC for Tigera operator"
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tigera-operator
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts", "nodes"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["operator.tigera.io"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["crd.projectcalico.org"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+EOF
+
+echo "$(date) - Creating ClusterRoleBinding for Tigera operator"
+cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tigera-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tigera-operator
+subjects:
+- kind: ServiceAccount
+  name: tigera-operator
+  namespace: tigera-operator
+EOF
+
+# Create the tigera-operator namespace if it doesn't exist
+kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
+
+# Create the tigera-operator ServiceAccount if it doesn't exist
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tigera-operator
+  namespace: tigera-operator
+EOF
+
 # Wait for calico pods to be ready
 echo "$(date) - Waiting for Calico pods to become ready"
 kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null || true
