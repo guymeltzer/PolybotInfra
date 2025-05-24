@@ -670,100 +670,87 @@ resource "terraform_data" "kubectl_provider_config" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+    command     = <<EOF
+#!/bin/bash
+set -e
+
+echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+
+# Function to retrieve kubeconfig from control plane with retries
+fetch_kubeconfig() {
+  local MAX_ATTEMPTS=10
+  local RETRY_DELAY=30
+  local attempt=1
+  
+  echo "Retrieving kubeconfig from control plane instance..."
+  
+  while [ $attempt -le $MAX_ATTEMPTS ]; do
+    echo "Attempt $attempt/$MAX_ATTEMPTS to get kubeconfig"
+    
+    # Get the instance ID of the control plane - as a single line command
+    INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text | tr -d '\r\n')
+        
+    if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+      echo "No running control plane instance found, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "Found control plane instance: $INSTANCE_ID"
+    
+    # Use SSM to get the kubeconfig from the instance - as a single line command
+    COMMAND_ID=$(aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" --instance-ids "$INSTANCE_ID" --parameters commands="sudo cat /etc/kubernetes/admin.conf" --output text --query "Command.CommandId" 2>/dev/null | tr -d '\r\n')
+        
+    if [ -z "$COMMAND_ID" ]; then
+      echo "Failed to send SSM command, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "SSM command sent, waiting for completion..."
+    sleep 10
+    
+    # Get the command output - as a single line command
+    KUBECONFIG_CONTENT=$(aws ssm get-command-invocation --region ${var.region} --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text 2>/dev/null)
+        
+    if [ -n "$KUBECONFIG_CONTENT" ] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+      echo "Successfully retrieved kubeconfig"
+      echo "$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
+      chmod 600 ${local.kubeconfig_path}
       
-      # Function to retrieve kubeconfig from control plane with retries
-      fetch_kubeconfig() {
-        local MAX_ATTEMPTS=10
-        local RETRY_DELAY=30
-        local attempt=1
-        
-        echo "Retrieving kubeconfig from control plane instance..."
-        
-        while [ $$attempt -le $$MAX_ATTEMPTS ]; do
-          echo "Attempt $$attempt/$$MAX_ATTEMPTS to get kubeconfig"
+      # Update the server address in the kubeconfig to use public IP - as a single line command
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text | tr -d '\r\n')
           
-          # Get the instance ID of the control plane
-          INSTANCE_ID=$$(aws ec2 describe-instances \
-            --region ${var.region} \
-            --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-            --query "Reservations[0].Instances[0].InstanceId" \
-            --output text)
-            
-          if [ "$$INSTANCE_ID" == "None" ] || [ -z "$$INSTANCE_ID" ]; then
-            echo "No running control plane instance found, retrying in $$RETRY_DELAY seconds..."
-            sleep $$RETRY_DELAY
-            attempt=$$((attempt + 1))
-            continue
-          fi
-          
-          echo "Found control plane instance: $$INSTANCE_ID"
-          
-          # Use SSM to get the kubeconfig from the instance
-          COMMAND_ID=$$(aws ssm send-command \
-            --region ${var.region} \
-            --document-name "AWS-RunShellScript" \
-            --instance-ids "$$INSTANCE_ID" \
-            --parameters commands="sudo cat /etc/kubernetes/admin.conf" \
-            --output text \
-            --query "Command.CommandId" 2>/dev/null)
-            
-          if [ -z "$$COMMAND_ID" ]; then
-            echo "Failed to send SSM command, retrying in $$RETRY_DELAY seconds..."
-            sleep $$RETRY_DELAY
-            attempt=$$((attempt + 1))
-            continue
-          fi
-          
-          echo "SSM command sent, waiting for completion..."
-          sleep 10
-          
-          # Get the command output
-          KUBECONFIG_CONTENT=$$(aws ssm get-command-invocation \
-            --region ${var.region} \
-            --command-id "$$COMMAND_ID" \
-            --instance-id "$$INSTANCE_ID" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null)
-            
-          if [ -n "$$KUBECONFIG_CONTENT" ] && [[ $$KUBECONFIG_CONTENT == *"apiVersion"* ]]; then
-            echo "Successfully retrieved kubeconfig"
-            echo "$$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
-            chmod 600 ${local.kubeconfig_path}
-            
-            # Update the server address in the kubeconfig to use public IP
-            PUBLIC_IP=$$(aws ec2 describe-instances \
-              --region ${var.region} \
-              --instance-ids "$$INSTANCE_ID" \
-              --query "Reservations[0].Instances[0].PublicIpAddress" \
-              --output text)
-              
-            if [ -n "$$PUBLIC_IP" ] && [ "$$PUBLIC_IP" != "None" ]; then
-              echo "Updating kubeconfig to use public IP: $$PUBLIC_IP"
-              sed -i.bak "s/server:.*/server: https:\/\/$$PUBLIC_IP:6443/g" ${local.kubeconfig_path}
-              rm -f ${local.kubeconfig_path}.bak
-            fi
-            
-            echo "Kubeconfig saved to ${local.kubeconfig_path}"
-            return 0
-          else
-            echo "Invalid kubeconfig content received, retrying in $$RETRY_DELAY seconds..."
-            sleep $$RETRY_DELAY
-            attempt=$$((attempt + 1))
-          fi
-        done
-        
-        echo "Failed to retrieve kubeconfig after $$MAX_ATTEMPTS attempts"
-        return 1
-      }
+      if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "None" ]; then
+        echo "Updating kubeconfig to use public IP: $PUBLIC_IP"
+        # Different sed syntax for macOS and Linux
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          sed -i '' "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        else
+          sed -i "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        fi
+      fi
       
-      # Call the function to fetch the kubeconfig
-      fetch_kubeconfig || {
-        echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
-        mkdir -p $(dirname "${local.kubeconfig_path}")
-        cat > ${local.kubeconfig_path} << EOF
+      echo "Kubeconfig saved to ${local.kubeconfig_path}"
+      return 0
+    else
+      echo "Invalid kubeconfig content received, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+    fi
+  done
+  
+  echo "Failed to retrieve kubeconfig after $MAX_ATTEMPTS attempts"
+  return 1
+}
+
+# Call the function to fetch the kubeconfig
+fetch_kubeconfig || {
+  echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
+  mkdir -p $(dirname "${local.kubeconfig_path}")
+  cat > ${local.kubeconfig_path} << EOFINNER
 apiVersion: v1
 kind: Config
 clusters:
@@ -781,12 +768,12 @@ users:
   user:
     client-certificate-data: placeholder
     client-key-data: placeholder
+EOFINNER
+  chmod 600 ${local.kubeconfig_path}
+}
+
+echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
 EOF
-        chmod 600 ${local.kubeconfig_path}
-      }
-      
-      echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
-    EOT
   }
 }
 
@@ -944,14 +931,14 @@ module "k8s-cluster" {
 
 # Create the EBS service-linked role declaratively
 resource "aws_iam_service_linked_role" "ebs" {
-  aws_service_name = "ebs.amazonaws.com"
-  description      = "Allows Amazon EBS to manage AWS resources on your behalf"
+  aws_service_name = "ec2.amazonaws.com"  # Changed from ebs.amazonaws.com to ec2.amazonaws.com
+  description      = "Allows Amazon EC2 to manage AWS resources on your behalf"
   
   # This will silently succeed if the role already exists
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     on_failure  = continue
-    command     = "echo \"Created or verified EBS service-linked role\""
+    command     = "echo \"Created or verified EC2 service-linked role\""
   }
 }
 
