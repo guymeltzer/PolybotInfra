@@ -9,11 +9,11 @@ TRACE_LOG="/var/log/worker-trace.log"
 
 # Create log files with proper permissions
 mkdir -p /var/log
-touch $LOGFILE $DEBUG_LOG $TRACE_LOG
-chmod 644 $LOGFILE $DEBUG_LOG $TRACE_LOG
+touch $$LOGFILE $$DEBUG_LOG $$TRACE_LOG
+chmod 644 $$LOGFILE $$DEBUG_LOG $$TRACE_LOG
 
 # Log everything with timestamps to all logs
-exec > >(tee -a $LOGFILE | tee -a $DEBUG_LOG)
+exec > >(tee -a $$LOGFILE | tee -a $$DEBUG_LOG)
 exec 2>&1
 set -x  # Enable command tracing to TRACE_LOG
 SECONDS=0  # Track execution time
@@ -21,7 +21,7 @@ echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting worker node bootstrap (v2.0.
 
 # Robust error handling
 set -eE  # Exit on error with error trapping
-trap 'echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Command failed at line $LINENO: \"$BASH_COMMAND\" with exit code $? after $SECONDS seconds" | tee -a $LOGFILE' ERR
+trap 'echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Command failed at line $$LINENO: \"$$BASH_COMMAND\" with exit code $$? after $$SECONDS seconds" | tee -a $$LOGFILE' ERR
 
 # ------------------------
 # 1. SSH ACCESS SETUP - Priority #1
@@ -48,7 +48,7 @@ chmod 600 /root/.ssh/authorized_keys
 
 echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH key configuration complete - Verification:"
 ls -la /home/ubuntu/.ssh/
-grep -v "^#" /home/ubuntu/.ssh/authorized_keys | grep -v "^$"
+grep -v "^#" /home/ubuntu/.ssh/authorized_keys | grep -v "^$$"
 
 # Configure SSH daemon for key-based auth
 echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring SSH daemon"
@@ -169,7 +169,7 @@ echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Preparing to join Kubernetes cluster"
 
 # Extremely robust join command retrieval function with enhanced error handling
 get_join_command() {
-  local secret_name="$1"
+  local secret_name="$$1"
   local max_retries=15
   local retry_delay=10
   local attempt=1
@@ -180,12 +180,12 @@ get_join_command() {
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$max_retries"
     
     # Use full error handling with verbose output
-    AWS_CMD_OUTPUT=$(aws secretsmanager get-secret-value \
+    AWS_CMD_OUTPUT=$$(aws secretsmanager get-secret-value \
       --region $$REGION \
       --secret-id "$$secret_name" \
       --query "SecretString" \
       --output text 2>&1)
-    local exit_code=$?
+    local exit_code=$$?
     
     if [ $$exit_code -ne 0 ]; then
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] AWS CLI error (code $$exit_code): $$AWS_CMD_OUTPUT"
@@ -261,7 +261,7 @@ log_to_s3() {
 # Handle join command execution with pre-join checks
 if [ -n "$$JOIN_CMD" ]; then
   # Extract control plane IP for network diagnostics
-  CP_IP=$(echo "$$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  CP_IP=$$(echo "$$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
   
   # Pre-join network diagnostics 
   echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Running pre-join network diagnostics"
@@ -274,7 +274,7 @@ if [ -n "$$JOIN_CMD" ]; then
     ip route
     
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] DNS resolution:"
-    dig +short $(hostname)
+    dig +short $$(hostname)
     
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Control plane ping test:"
     ping -c 3 $$CP_IP || echo "Ping failed, but proceeding anyway"
@@ -305,7 +305,7 @@ if [ -n "$$JOIN_CMD" ]; then
     
     # Set a 5-minute timeout for the join command
     timeout 300 /tmp/join_command.sh --v=5 2>&1 | tee /tmp/kubeadm-join-$$i.log
-    JOIN_RESULT=$?
+    JOIN_RESULT=$$?
     
     if [ $$JOIN_RESULT -eq 0 ]; then
       JOIN_SUCCESS=true
@@ -316,7 +316,7 @@ if [ -n "$$JOIN_CMD" ]; then
       break
     else
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Join attempt $$i failed with exit code $$JOIN_RESULT"
-      cat /tmp/kubeadm-join-$$i.log >> $LOGFILE
+      cat /tmp/kubeadm-join-$$i.log >> $$LOGFILE
       
       if [ $$i -eq 5 ]; then
         # Log failure to S3 on last attempt
@@ -374,11 +374,11 @@ fi
 # ------------------------
 # Create summary logs for easy access
 mkdir -p /home/ubuntu
-cp $LOGFILE /home/ubuntu/worker-init-summary.log
+cp $$LOGFILE /home/ubuntu/worker-init-summary.log
 chmod 644 /home/ubuntu/worker-init-summary.log
 chown ubuntu:ubuntu /home/ubuntu/worker-init-summary.log
 
 # Report completion
-RUNTIME=$SECONDS
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Worker node bootstrap completed in $$(($RUNTIME / 60)) minutes and $$(($RUNTIME % 60)) seconds"
+RUNTIME=$$SECONDS
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Worker node bootstrap completed in $$(($$RUNTIME / 60)) minutes and $$(($$RUNTIME % 60)) seconds"
 exit 0 
