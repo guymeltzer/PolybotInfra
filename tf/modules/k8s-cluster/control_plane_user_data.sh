@@ -173,6 +173,86 @@ cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 chown ubuntu:ubuntu /home/ubuntu/.kube/config
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
+# Wait for API server to be fully ready before proceeding
+validate_api_server() {
+  echo "$(date) - Validating API server readiness..."
+  
+  # Function to check if the API server is responding
+  check_api_health() {
+    # Use kubectl to check the API server health
+    if kubectl get --raw=/healthz >/dev/null 2>&1; then
+      return 0
+    else
+      return 1
+    fi
+  }
+  
+  # Function to check if API server is listening on port 6443
+  check_api_port() {
+    if ss -tlnp | grep -q ":6443"; then
+      return 0
+    else
+      return 1
+    fi
+  }
+  
+  # Function to check if all control plane pods are running
+  check_control_plane_pods() {
+    # Count how many control plane pods are running
+    RUNNING_PODS=$(kubectl get pods -n kube-system -l tier=control-plane --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+    EXPECTED_PODS=3  # api-server, controller-manager, scheduler
+    
+    if [ "$RUNNING_PODS" -ge "$EXPECTED_PODS" ]; then
+      return 0
+    else
+      echo "$(date) - Only $RUNNING_PODS of $EXPECTED_PODS control plane pods are running"
+      return 1
+    fi
+  }
+  
+  # Main validation loop
+  echo "$(date) - Waiting for API server to be fully operational..."
+  MAX_ATTEMPTS=30
+  SLEEP_TIME=10
+  
+  for ((i=1; i<=MAX_ATTEMPTS; i++)); do
+    echo "$(date) - API server validation attempt $i/$MAX_ATTEMPTS"
+    
+    # Check if API server port is open
+    if check_api_port; then
+      echo "$(date) - API server is listening on port 6443"
+      
+      # Check if API server health endpoint is responding
+      if check_api_health; then
+        echo "$(date) - API server health check passed"
+        
+        # Check if all control plane pods are running
+        if check_control_plane_pods; then
+          echo "$(date) - All control plane pods are running"
+          echo "$(date) - ✅ API server validation SUCCESSFUL"
+          return 0
+        else
+          echo "$(date) - Waiting for all control plane pods to be running"
+        fi
+      else
+        echo "$(date) - API server health check failed"
+      fi
+    else
+      echo "$(date) - API server not listening on port 6443 yet"
+    fi
+    
+    echo "$(date) - Waiting $SLEEP_TIME seconds before next attempt..."
+    sleep $SLEEP_TIME
+  done
+  
+  echo "$(date) - ⚠️ API server validation timed out after $MAX_ATTEMPTS attempts"
+  echo "$(date) - Will continue with setup anyway, but worker nodes may have trouble joining"
+  return 1
+}
+
+# Call the validation function
+validate_api_server
+
 # Apply proper control-plane taint instead of removing it
 echo "$(date) - Applying proper control-plane taint"
 kubectl taint nodes $(hostname) node-role.kubernetes.io/control-plane:NoSchedule --overwrite
@@ -287,49 +367,201 @@ cat > /usr/local/bin/refresh-join-token.sh << 'EOFSCRIPT'
 #!/bin/bash
 set -e
 
-# Get latest instance metadata
+LOG_FILE="/var/log/k8s-token-creator.log"
+BACKUP_LOG="/var/log/k8s-token-backup.log"
+
+# Create log files if they don't exist
+touch "$LOG_FILE" "$BACKUP_LOG"
+chmod 644 "$LOG_FILE" "$BACKUP_LOG"
+
+# Log with timestamp
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Log to backup log
+backup_log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$BACKUP_LOG"
+}
+
+# Error handling
+handle_error() {
+  log "ERROR: An error occurred at line $1, command: '$2'"
+  backup_log "ERROR: An error occurred at line $1, command: '$2'"
+}
+
+trap 'handle_error $LINENO "$BASH_COMMAND"' ERR
+
+log "Starting join token refresh process"
+
+# Get latest instance metadata with fallback mechanisms
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || echo "")
 if [ -n "$TOKEN" ]; then
+  log "Successfully obtained IMDSv2 token"
   PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
   PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
   REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "")
 else
+  log "IMDSv2 token request failed, falling back to IMDSv1"
   PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
   PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
   REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region || echo "")
 fi
 
-# Default region if not found
+# Verify we have the required metadata
+if [ -z "$PRIVATE_IP" ]; then
+  log "Failed to retrieve private IP from metadata service"
+  # Try to get IP from hostname or network interface as fallback
+  PRIVATE_IP=$(hostname -I | awk '{print $1}')
+  log "Using fallback private IP: $PRIVATE_IP"
+fi
+
 if [ -z "$REGION" ]; then
-  REGION="us-east-1"
+  log "Failed to retrieve region from metadata service, using default"
+  REGION="${region}"
 fi
 
 # Determine which IP to use (prefer public if available)
-API_SERVER_IP="${PRIVATE_IP}"
-if [ -n "${PUBLIC_IP}" ]; then
-  API_SERVER_IP="${PUBLIC_IP}"
+API_SERVER_IP="$PRIVATE_IP"
+if [ -n "$PUBLIC_IP" ]; then
+  API_SERVER_IP="$PUBLIC_IP"
+  log "Using public IP for join command: $PUBLIC_IP"
+else
+  log "Using private IP for join command: $PRIVATE_IP"
 fi
 
-# Create new token
-TOKEN=$(kubeadm token create --ttl 24h)
-echo "Created token: $TOKEN at $(date)" >> /var/log/k8s-token-creator.log
+# Verify API server is running before creating token
+log "Verifying API server is running before creating token"
+if ! kubectl get --raw=/healthz >/dev/null 2>&1; then
+  log "WARNING: API server health check failed, but will try to create token anyway"
+fi
 
-# Get hash
-DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-echo "Discovery hash: $DISCOVERY_HASH" >> /var/log/k8s-token-creator.log
+# Check if port 6443 is listening
+if ! ss -tlnp | grep -q ":6443"; then
+  log "WARNING: API server port 6443 is not listening"
+fi
+
+# Create new token with retry logic
+log "Creating new kubeadm token"
+MAX_ATTEMPTS=5
+for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+  log "Token creation attempt $attempt/$MAX_ATTEMPTS"
+  if TOKEN=$(kubeadm token create --ttl 24h 2>/dev/null); then
+    log "Successfully created token: $TOKEN"
+    break
+  else
+    log "Token creation failed on attempt $attempt"
+    if [ $attempt -eq $MAX_ATTEMPTS ]; then
+      log "All token creation attempts failed, aborting"
+      exit 1
+    fi
+    sleep 5
+  fi
+done
+
+# Get discovery hash with retry logic
+log "Getting CA cert discovery hash"
+for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+  log "Discovery hash generation attempt $attempt/$MAX_ATTEMPTS"
+  if DISCOVERY_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'); then
+    log "Successfully generated discovery hash: $DISCOVERY_HASH"
+    break
+  else
+    log "Discovery hash generation failed on attempt $attempt"
+    if [ $attempt -eq $MAX_ATTEMPTS ]; then
+      log "All discovery hash attempts failed, aborting"
+      exit 1
+    fi
+    sleep 5
+  fi
+done
 
 # Generate join command
 JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${TOKEN} --discovery-token-ca-cert-hash sha256:${DISCOVERY_HASH}"
-echo "Join command: $JOIN_COMMAND" >> /var/log/k8s-token-creator.log
+log "Join command: $JOIN_COMMAND"
+
+# Also create an unsafe alternative join command for fallback
+UNSAFE_JOIN_COMMAND="kubeadm join ${API_SERVER_IP}:6443 --token ${TOKEN} --discovery-token-unsafe-skip-ca-verification"
+log "Alternative unsafe join command: $UNSAFE_JOIN_COMMAND"
+
+# Update secrets with retry logic
+update_secret() {
+  local secret_id="$1"
+  local secret_string="$2"
+  local description="$3"
+  
+  for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+    log "Updating secret $secret_id (attempt $attempt/$MAX_ATTEMPTS)"
+    
+    if aws secretsmanager update-secret --secret-id "$secret_id" --secret-string "$secret_string" --region "$REGION" >/dev/null 2>&1; then
+      log "Successfully updated secret: $secret_id"
+      return 0
+    else
+      log "Failed to update secret $secret_id on attempt $attempt"
+      if [ $attempt -eq $MAX_ATTEMPTS ]; then
+        log "All update attempts for secret $secret_id failed"
+        return 1
+      fi
+      sleep 5
+    fi
+  done
+}
+
+# Create a new secret with retry logic
+create_secret() {
+  local name="$1"
+  local secret_string="$2"
+  local description="$3"
+  
+  for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+    log "Creating secret $name (attempt $attempt/$MAX_ATTEMPTS)"
+    
+    if aws secretsmanager create-secret --name "$name" --secret-string "$secret_string" --description "$description" --region "$REGION" >/dev/null 2>&1; then
+      log "Successfully created secret: $name"
+      return 0
+    else
+      log "Failed to create secret $name on attempt $attempt"
+      if [ $attempt -eq $MAX_ATTEMPTS ]; then
+        log "All creation attempts for secret $name failed"
+        return 1
+      fi
+      sleep 5
+    fi
+  done
+}
 
 # Update secrets using variable substitution
-aws secretsmanager update-secret --secret-id ${KUBERNETES_JOIN_COMMAND_SECRET} --secret-string "$JOIN_COMMAND" --region ${region} || true
-aws secretsmanager update-secret --secret-id ${KUBERNETES_JOIN_COMMAND_LATEST_SECRET} --secret-string "$JOIN_COMMAND" --region ${region} || true
+update_secret "${KUBERNETES_JOIN_COMMAND_SECRET}" "$JOIN_COMMAND" "Kubernetes join command for worker nodes" || log "Failed to update main secret"
+update_secret "${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}" "$JOIN_COMMAND" "Latest Kubernetes join command" || log "Failed to update latest secret"
 
 # Create a new timestamped secret as backup
 TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-aws secretsmanager create-secret --name "${KUBERNETES_JOIN_COMMAND_SECRET}-$TIMESTAMP" --secret-string "$JOIN_COMMAND" --description "Kubernetes join command for worker nodes" --region ${region} || true
+create_secret "${KUBERNETES_JOIN_COMMAND_SECRET}-$TIMESTAMP" "$JOIN_COMMAND" "Kubernetes join command created at $TIMESTAMP" || log "Failed to create timestamped backup secret"
 
+# Verify the secrets are accessible
+verify_secret() {
+  local secret_id="$1"
+  log "Verifying secret $secret_id is accessible"
+  
+  local result=$(aws secretsmanager get-secret-value --secret-id "$secret_id" --region "$REGION" --query SecretString --output text 2>/dev/null)
+  
+  if [[ -n "$result" && "$result" == *"kubeadm join"* && "$result" == *"--token"* ]]; then
+    log "Secret $secret_id verified successfully"
+    return 0
+  else
+    log "Secret $secret_id verification failed or contains invalid join command"
+    return 1
+  fi
+}
+
+# Wait a moment for AWS to propagate the changes
+sleep 5
+
+# Verify both secrets
+verify_secret "${KUBERNETES_JOIN_COMMAND_SECRET}" || log "Warning: Main secret verification failed"
+verify_secret "${KUBERNETES_JOIN_COMMAND_LATEST_SECRET}" || log "Warning: Latest secret verification failed"
+
+log "Token refresh process completed"
 exit 0
 EOFSCRIPT
 

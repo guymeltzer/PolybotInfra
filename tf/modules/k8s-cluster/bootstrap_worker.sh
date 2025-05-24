@@ -270,6 +270,72 @@ if [ -n "$$JOIN_CMD" ]; then
   # Pre-join network diagnostics 
   echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Running pre-join network diagnostics"
   
+  # Validate control plane API server function
+  validate_api_server() {
+    local api_server_ip="$$1"
+    local max_attempts=15
+    local retry_delay=10
+    local attempt=1
+    
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Validating control plane API server at $$api_server_ip:6443"
+    
+    # Function to check basic connectivity
+    check_connectivity() {
+      local target_ip="$$1"
+      # Try ping first
+      if ping -c 1 -W 2 "$$target_ip" &>/dev/null; then
+        echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Ping to control plane successful"
+        return 0
+      else
+        echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Ping to control plane failed, checking TCP connectivity"
+        # Try TCP connectivity
+        if nc -z -w 5 "$$target_ip" 6443 &>/dev/null; then
+          echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] TCP connection to control plane API server successful"
+          return 0
+        else
+          echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] TCP connection to control plane API server failed"
+          return 1
+        fi
+      fi
+    }
+    
+    # Function to check API server health
+    check_api_health() {
+      local target_ip="$$1"
+      # Try a direct HTTP request to the API server health endpoint
+      # Using curl with proper timeout
+      if curl -k -s -m 5 "https://$$target_ip:6443/healthz" | grep -q "ok"; then
+        echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] API server health check successful"
+        return 0
+      else
+        echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] API server health check failed"
+        return 1
+      fi
+    }
+    
+    # Main validation loop
+    while [ $$attempt -le $$max_attempts ]; do
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] API server validation attempt $$attempt/$$max_attempts"
+      
+      # Step 1: Check basic connectivity
+      if check_connectivity "$$api_server_ip"; then
+        # Step 2: Check API server health if connectivity is good
+        if check_api_health "$$api_server_ip"; then
+          echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Control plane API server is responsive"
+          return 0
+        fi
+      fi
+      
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Control plane API server not fully ready. Will retry in $$retry_delay seconds..."
+      sleep $$retry_delay
+      attempt=$$((attempt + 1))
+    done
+    
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to validate control plane API server after $$max_attempts attempts"
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will attempt to join anyway as a last resort"
+    return 1
+  }
+  
   if [ -n "$$CP_IP" ]; then
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Testing connection to control plane at $$CP_IP:6443"
     
@@ -289,6 +355,9 @@ if [ -n "$$JOIN_CMD" ]; then
     else
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Cannot connect to control plane API server, but will try joining anyway"
     fi
+    
+    # Validate API server
+    validate_api_server "$$CP_IP"
   else
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not extract control plane IP from join command"
   fi

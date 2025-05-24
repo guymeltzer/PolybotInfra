@@ -2253,19 +2253,170 @@ resource "terraform_data" "completion_progress" {
   }
 }
 
+# New resource to verify control plane is fully ready
+resource "null_resource" "verify_control_plane_readiness" {
+  depends_on = [
+    aws_instance.control_plane,
+    null_resource.wait_for_control_plane
+  ]
+
+  # This will cause this resource to be recreated whenever the control plane changes
+  triggers = {
+    control_plane_ip = aws_instance.control_plane.public_ip
+    control_plane_id = aws_instance.control_plane.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      echo "Verifying control plane readiness at $(date)..."
+      
+      # Define max attempts and delay between attempts
+      MAX_ATTEMPTS=20
+      DELAY=30
+      READINESS_LOG="/tmp/k8s_control_plane_readiness.log"
+      echo "Starting control plane verification at $(date)" > $READINESS_LOG
+      
+      # Function to check if SSM agent is ready on the control plane
+      check_ssm_readiness() {
+        echo "Checking SSM agent readiness on ${aws_instance.control_plane.id}..." | tee -a $READINESS_LOG
+        aws ssm describe-instance-information \
+          --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" \
+          --region ${var.region} | grep -q "${aws_instance.control_plane.id}"
+        return $?
+      }
+      
+      # Function to check if Kubernetes API server is ready
+      check_api_server_readiness() {
+        echo "Checking Kubernetes API server readiness..." | tee -a $READINESS_LOG
+        
+        # First check if port 6443 is listening
+        PORT_CHECK=$(aws ssm send-command \
+          --instance-ids ${aws_instance.control_plane.id} \
+          --document-name "AWS-RunShellScript" \
+          --parameters 'commands=["sudo ss -tlnp | grep 6443 || echo not-ready"]' \
+          --region ${var.region} \
+          --output text \
+          --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null)
+          
+        echo "Port check result: $PORT_CHECK" | tee -a $READINESS_LOG
+        
+        if ! echo "$PORT_CHECK" | grep -q "6443"; then
+          echo "API server not listening on port 6443" | tee -a $READINESS_LOG
+          return 1
+        fi
+        
+        # Then try a kubectl command to verify API server is responsive
+        API_CHECK=$(aws ssm send-command \
+          --instance-ids ${aws_instance.control_plane.id} \
+          --document-name "AWS-RunShellScript" \
+          --parameters 'commands=["sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw=/healthz || echo not-ready"]' \
+          --region ${var.region} \
+          --output text \
+          --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null)
+          
+        echo "API health check result: $API_CHECK" | tee -a $READINESS_LOG
+        
+        if [[ "$API_CHECK" == *"ok"* ]]; then
+          echo "API server is healthy" | tee -a $READINESS_LOG
+          return 0
+        else
+          echo "API server is not responding correctly" | tee -a $READINESS_LOG
+          return 1
+        fi
+      }
+      
+      # Function to check if secrets manager contains a valid join token
+      check_secrets_readiness() {
+        echo "Checking if join token exists in Secrets Manager..." | tee -a $READINESS_LOG
+        
+        # Try to get the secret value
+        JOIN_CMD=$(aws secretsmanager get-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+          --region ${var.region} \
+          --query SecretString \
+          --output text 2>/dev/null)
+        
+        if [[ -z "$JOIN_CMD" ]]; then
+          echo "No join command found in Secrets Manager" | tee -a $READINESS_LOG
+          return 1
+        fi
+        
+        if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+          echo "Valid join command found in Secrets Manager" | tee -a $READINESS_LOG
+          return 0
+        else
+          echo "Invalid join command format found in Secrets Manager" | tee -a $READINESS_LOG
+          return 1
+        fi
+      }
+      
+      # Main verification loop
+      for ((i=1; i<=MAX_ATTEMPTS; i++)); do
+        echo "=== Verification attempt $i/$MAX_ATTEMPTS at $(date) ===" | tee -a $READINESS_LOG
+        
+        # Step 1: Check SSM agent readiness
+        if ! check_ssm_readiness; then
+          echo "SSM agent not ready yet. Waiting $DELAY seconds before next attempt..." | tee -a $READINESS_LOG
+          sleep $DELAY
+          continue
+        fi
+        
+        # Step 2: Check API server readiness
+        if ! check_api_server_readiness; then
+          echo "Kubernetes API server not ready yet. Waiting $DELAY seconds before next attempt..." | tee -a $READINESS_LOG
+          sleep $DELAY
+          continue
+        fi
+        
+        # Step 3: Verify token exists in Secrets Manager
+        # If both previous checks passed but no valid token exists,
+        # trigger token creation and wait for it
+        if ! check_secrets_readiness; then
+          echo "No valid join token found. Attempting to trigger token creation..." | tee -a $READINESS_LOG
+          
+          # Trigger token creation via the control plane's built-in service
+          aws ssm send-command \
+            --instance-ids ${aws_instance.control_plane.id} \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["sudo systemctl start k8s-token-creator.service || sudo /usr/local/bin/refresh-join-token.sh"]' \
+            --region ${var.region} \
+            --output text \
+            --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
+            
+          echo "Token creation triggered. Waiting $DELAY seconds before next attempt..." | tee -a $READINESS_LOG
+          sleep $DELAY
+          continue
+        fi
+        
+        # If we get here, all checks have passed
+        echo "✅ Control plane verification SUCCESSFUL at $(date)" | tee -a $READINESS_LOG
+        exit 0
+      }
+      
+      # If we get here, verification failed after all attempts
+      echo "❌ Control plane verification FAILED after $MAX_ATTEMPTS attempts" | tee -a $READINESS_LOG
+      cat $READINESS_LOG
+      exit 1
+    EOT
+  }
+}
+
+# Simplified join command resource that relies on the control plane to generate tokens
 resource "null_resource" "update_join_command" {
   depends_on = [
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
-    aws_secretsmanager_secret.kubernetes_join_command_latest
+    aws_secretsmanager_secret.kubernetes_join_command_latest,
+    null_resource.verify_control_plane_readiness
   ]
 
   # This will cause this resource to be recreated whenever the control plane IP changes
   triggers = {
     control_plane_ip = aws_instance.control_plane.public_ip
     control_plane_id = aws_instance.control_plane.id
-    # Add a random string to ensure this runs at least once during initial creation
-    random_run = uuid()
+    # The verification resource ID ensures we wait for control plane readiness
+    verification_id = null_resource.verify_control_plane_readiness.id
   }
 
   provisioner "local-exec" {
@@ -2276,265 +2427,120 @@ resource "null_resource" "update_join_command" {
       touch $ERROR_LOG
       exec > >(tee -a $ERROR_LOG) 2>&1
       
-      echo "[$(date)] Generating new Kubernetes join command with the current control plane IP: ${aws_instance.control_plane.public_ip}"
-      
-      # Wait longer for the control plane to be fully initialized
-      echo "[$(date)] Waiting 120 seconds for control plane to be fully initialized..."
-      sleep 120
-      
-      # Check if SSM is available on the control plane instance
-      echo "[$(date)] Verifying SSM connectivity to control plane instance ${aws_instance.control_plane.id}..."
-      if ! aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" --region ${var.region} | grep -q "${aws_instance.control_plane.id}"; then
-        echo "[$(date)] ERROR: Control plane instance ${aws_instance.control_plane.id} is not registered with SSM or SSM agent is not running" | tee -a $ERROR_LOG
-        echo "[$(date)] Waiting additional 60 seconds and trying again..." | tee -a $ERROR_LOG
-        sleep 60
-        
-        if ! aws ssm describe-instance-information --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" --region ${var.region} | grep -q "${aws_instance.control_plane.id}"; then
-          echo "[$(date)] ERROR: Control plane instance ${aws_instance.control_plane.id} is still not registered with SSM after additional wait" | tee -a $ERROR_LOG
-          echo "[$(date)] Will attempt to continue with alternative methods" | tee -a $ERROR_LOG
-        else
-          echo "[$(date)] Control plane instance is now registered with SSM" | tee -a $ERROR_LOG
-        fi
-      else
-        echo "[$(date)] Control plane instance is registered with SSM" | tee -a $ERROR_LOG
-      fi
+      echo "[$(date)] Verifying and updating Kubernetes join command for control plane IP: ${aws_instance.control_plane.public_ip}"
       
       # Function to handle errors with retry logic
       function retry_command {
-        local max_attempts=10
+        local max_attempts=5
         local attempt=1
-        local sleep_time=15
+        local sleep_time=10
         local command="$1"
         local error_msg="$2"
         
         while [ $attempt -le $max_attempts ]; do
-          echo "[$(date)] Attempt $attempt/$max_attempts: $error_msg" | tee -a $ERROR_LOG
+          echo "[$(date)] Attempt $attempt/$max_attempts: $error_msg"
           
           # Execute the command and capture result
           local result=$(eval $command 2>&1)
           local status=$?
           
           if [ $status -eq 0 ]; then
-            echo "[$(date)] Command succeeded!" | tee -a $ERROR_LOG
+            echo "[$(date)] Command succeeded!"
             echo "$result"
             return 0
           else
-            echo "[$(date)] Command failed. Error: $result" | tee -a $ERROR_LOG
+            echo "[$(date)] Command failed. Error: $result"
             attempt=$((attempt+1))
             if [ $attempt -le $max_attempts ]; then
-              echo "[$(date)] Retrying in $sleep_time seconds..." | tee -a $ERROR_LOG
+              echo "[$(date)] Retrying in $sleep_time seconds..."
               sleep $sleep_time
-              sleep_time=$((sleep_time*2)) # Exponential backoff
             fi
           fi
         done
         
-        echo "[$(date)] Failed after $max_attempts attempts: $error_msg" | tee -a $ERROR_LOG
+        echo "[$(date)] Failed after $max_attempts attempts: $error_msg"
         return 1
       }
       
-      # Create refresh token script on control plane if it doesn't exist
-      echo "[$(date)] Ensuring refresh-join-token.sh script exists on control plane..." | tee -a $ERROR_LOG
-      aws ssm send-command \
-        --instance-ids ${aws_instance.control_plane.id} \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands='[ 
-          "if [ ! -f /usr/local/bin/refresh-join-token.sh ]; then
-            echo \"#!/bin/bash\" > /usr/local/bin/refresh-join-token.sh
-            echo \"TOKEN=\\\$(sudo kubeadm token create --print-join-command)\" >> /usr/local/bin/refresh-join-token.sh
-            echo \"echo \\\"Join command: \\\$TOKEN\\\" >> /var/log/k8s-token-creator.log\" >> /usr/local/bin/refresh-join-token.sh
-            chmod +x /usr/local/bin/refresh-join-token.sh
-            echo \"Created refresh-join-token.sh\"
-          else
-            echo \"refresh-join-token.sh already exists\"
-          fi",
-          "chmod +x /usr/local/bin/refresh-join-token.sh",
-          "touch /var/log/k8s-token-creator.log",
-          "chmod 644 /var/log/k8s-token-creator.log"
-        ]' \
-        --timeout-seconds 300 \
+      # Primary method: Read the join command from Secrets Manager (it should already exist)
+      echo "[$(date)] Reading join command from Secrets Manager..."
+      JOIN_CMD=$(aws secretsmanager get-secret-value \
+        --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
         --region ${var.region} \
-        --output text \
-        --query "CommandInvocations[].CommandPlugins[].Output" || echo "[$(date)] Failed to create or verify refresh-join-token.sh script" | tee -a $ERROR_LOG
-      
-      # Check if Kubernetes API is accessible on the control plane
-      echo "[$(date)] Checking if Kubernetes API is accessible on port 6443..." | tee -a $ERROR_LOG
-      API_CHECK=$(aws ssm send-command \
-        --instance-ids ${aws_instance.control_plane.id} \
-        --document-name "AWS-RunShellScript" \
-        --parameters commands='["sudo ss -tlnp | grep 6443 || echo \"API server not listening on 6443\""]' \
-        --timeout-seconds 300 \
-        --region ${var.region} \
-        --output text \
-        --query "CommandInvocations[].CommandPlugins[].Output")
-      
-      if echo "$API_CHECK" | grep -q "6443"; then
-        echo "[$(date)] Kubernetes API server is listening on port 6443" | tee -a $ERROR_LOG
+        --query SecretString \
+        --output text)
+        
+      # Validate the join command format
+      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+        echo "[$(date)] Successfully retrieved valid join command from Secrets Manager: $JOIN_CMD"
       else
-        echo "[$(date)] WARNING: Kubernetes API server may not be running on port 6443" | tee -a $ERROR_LOG
-        echo "[$(date)] API check output: $API_CHECK" | tee -a $ERROR_LOG
-        echo "[$(date)] Waiting additional 60 seconds for API server to start..." | tee -a $ERROR_LOG
-        sleep 60
-      fi
-      
-      # Generate a new join command with retry
-      JOIN_CMD=""
-      
-      # Method 1: Try getting the join command directly from the control plane via SSM
-      echo "[$(date)] Trying to get join command via SSM..." | tee -a $ERROR_LOG
-      if ! JOIN_CMD=$(retry_command "aws ssm send-command \
-        --instance-ids ${aws_instance.control_plane.id} \
-        --document-name \"AWS-RunShellScript\" \
-        --parameters commands=\"sudo kubeadm token create --print-join-command\" \
-        --timeout-seconds 300 \
-        --region ${var.region} \
-        --output text \
-        --query \"CommandInvocations[].CommandPlugins[].Output\" | tr -d '\n\r'" \
-        "Getting join command from control plane"); then
+        echo "[$(date)] Retrieved command is not valid. Attempting to refresh token..."
         
-        echo "[$(date)] Failed to get join command via SSM, trying fallback method..." | tee -a $ERROR_LOG
-        
-        # Method 2: Try running the control plane token creation script directly 
-        if ! JOIN_CMD=$(retry_command "aws ssm send-command \
+        # Trigger token refresh via SSM
+        echo "[$(date)] Triggering token refresh via control plane's service..."
+        if ! retry_command "aws ssm send-command \
           --instance-ids ${aws_instance.control_plane.id} \
           --document-name \"AWS-RunShellScript\" \
-          --parameters commands=\"sudo /usr/local/bin/refresh-join-token.sh && cat /var/log/k8s-token-creator.log | grep 'Join command:' | tail -1 | sed 's/Join command: //g'\" \
+          --parameters commands=\"sudo systemctl start k8s-token-creator.service || sudo /usr/local/bin/refresh-join-token.sh\" \
           --timeout-seconds 300 \
           --region ${var.region} \
           --output text \
-          --query \"CommandInvocations[].CommandPlugins[].Output\" | tr -d '\n\r'" \
-          "Running token creation script on control plane"); then
+          --query \"CommandInvocations[].CommandPlugins[].Output\"" \
+          "Triggering token refresh"; then
+          echo "[$(date)] Failed to trigger token refresh, but will check Secrets Manager again anyway"
+        fi
+        
+        # Wait for token to be updated
+        echo "[$(date)] Waiting for token to be updated in Secrets Manager..."
+        sleep 15
+        
+        # Try reading the secret again
+        JOIN_CMD=$(aws secretsmanager get-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+          --region ${var.region} \
+          --query SecretString \
+          --output text)
           
-          # Method 3: Use SSH to connect to the control plane directly
-          echo "[$(date)] All SSM methods failed, attempting SSH connection to control plane..." | tee -a $ERROR_LOG
-          
-          # Create a temporary SSH key file if needed
-          SSH_KEY_PATH="${path.root}/polybot-key.pem"
-          if [ ! -f "$SSH_KEY_PATH" ]; then
-            echo "[$(date)] SSH key not found at $SSH_KEY_PATH, checking alternative locations..." | tee -a $ERROR_LOG
-            # Try alternative locations
-            if [ -f "${path.module}/polybot-key.pem" ]; then
-              SSH_KEY_PATH="${path.module}/polybot-key.pem"
-            elif [ -f "$HOME/.ssh/polybot-key.pem" ]; then
-              SSH_KEY_PATH="$HOME/.ssh/polybot-key.pem"
-            else
-              echo "[$(date)] Could not find SSH key file in any expected location" | tee -a $ERROR_LOG
-            fi
-          fi
-          
-          if [ -f "$SSH_KEY_PATH" ]; then
-            echo "[$(date)] Using SSH key at $SSH_KEY_PATH to connect to control plane at ${aws_instance.control_plane.public_ip}" | tee -a $ERROR_LOG
-            # Ensure key has correct permissions
-            chmod 600 "$SSH_KEY_PATH"
-            
-            # Try SSH connection with strict host key checking disabled
-            JOIN_CMD=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "$SSH_KEY_PATH" ubuntu@${aws_instance.control_plane.public_ip} "sudo kubeadm token create --print-join-command" 2>> $ERROR_LOG)
-            
-            if [ -n "$JOIN_CMD" ] && [[ "$JOIN_CMD" == *"kubeadm join"* ]]; then
-              echo "[$(date)] Successfully retrieved join command via SSH" | tee -a $ERROR_LOG
-            else
-              echo "[$(date)] Failed to get join command via SSH: $JOIN_CMD" | tee -a $ERROR_LOG
-              # Create a fallback join command as absolute last resort
-              echo "[$(date)] All methods failed, creating fallback join command..." | tee -a $ERROR_LOG
-              TOKEN=$(openssl rand -hex 6 | tr '[:upper:]' '[:lower:]')
-              DISCOVERY_TOKEN_CA_CERT_HASH=$(retry_command "aws ssm send-command \
-                --instance-ids ${aws_instance.control_plane.id} \
-                --document-name \"AWS-RunShellScript\" \
-                --parameters commands=\"openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'\" \
-                --timeout-seconds 300 \
-                --region ${var.region} \
-                --output text \
-                --query \"CommandInvocations[].CommandPlugins[].Output\" | tr -d '\n\r'" \
-                "Getting CA cert hash")
-              
-              if [ -n "$DISCOVERY_TOKEN_CA_CERT_HASH" ]; then
-                JOIN_CMD="kubeadm join ${aws_instance.control_plane.public_ip}:6443 --token $TOKEN --discovery-token-ca-cert-hash sha256:$DISCOVERY_TOKEN_CA_CERT_HASH"
-              else
-                # Absolute last resort - unsafe but better than nothing
-                JOIN_CMD="kubeadm join ${aws_instance.control_plane.public_ip}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
-              fi
-              echo "[$(date)] Created fallback join command: $JOIN_CMD" | tee -a $ERROR_LOG
-            fi
-          else
-            echo "[$(date)] SSH key not found, creating a basic fallback join command..." | tee -a $ERROR_LOG
-            TOKEN=$(openssl rand -hex 6 | tr '[:upper:]' '[:lower:]')
-            JOIN_CMD="kubeadm join ${aws_instance.control_plane.public_ip}:6443 --token $TOKEN --discovery-token-unsafe-skip-ca-verification"
-            echo "[$(date)] Created basic fallback join command: $JOIN_CMD" | tee -a $ERROR_LOG
-          fi
+        if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+          echo "[$(date)] Successfully retrieved valid join command after refresh: $JOIN_CMD"
+        else
+          echo "[$(date)] Still failed to get valid join command after refresh. This is unexpected since control plane readiness was verified."
+          echo "[$(date)] Will log this failure but continue deployment as control plane's built-in token creator service should eventually succeed."
+          aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/join-command-unexpected-failure-$(date +"%Y%m%d%H%M%S").log || echo "[$(date)] Failed to upload logs to S3"
+          exit 0
         fi
       fi
       
-      # Validate the join command 
-      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
-        echo "[$(date)] Successfully generated valid join command: $JOIN_CMD" | tee -a $ERROR_LOG
+      # Verify both secrets are accessible and identical
+      echo "[$(date)] Verifying both secrets are up to date..."
+      MAIN_SECRET=$(aws secretsmanager get-secret-value \
+        --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
+        --region ${var.region} \
+        --query SecretString \
+        --output text)
         
-        # Update both secrets with robust error handling
-        echo "[$(date)] Updating AWS Secrets Manager with join command..." | tee -a $ERROR_LOG
-        
-        # Define the specific secret ARNs
-        MAIN_SECRET_ARN="arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command-${random_id.suffix.hex}"
-        LATEST_SECRET_ARN="arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command-latest-${random_id.suffix.hex}"
-        
-        echo "[$(date)] Using main secret ARN: $MAIN_SECRET_ARN" | tee -a $ERROR_LOG
-        echo "[$(date)] Using latest secret ARN: $LATEST_SECRET_ARN" | tee -a $ERROR_LOG
-        
-        # Update main secret
-        if ! retry_command "aws secretsmanager put-secret-value \
+      # If secrets don't match, update main secret to match latest
+      if [[ "$MAIN_SECRET" != "$JOIN_CMD" ]]; then
+        echo "[$(date)] Secrets don't match. Updating main secret to match latest..."
+        aws secretsmanager put-secret-value \
           --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
-          --secret-string \"$JOIN_CMD\" \
-          --region ${var.region}" \
-          "Updating main join command secret"; then
-          echo "[$(date)] Failed to update main join command secret after multiple retries" | tee -a $ERROR_LOG
-          exit 1
-        fi
-          
-        # Update latest secret
-        if ! retry_command "aws secretsmanager put-secret-value \
-          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-          --secret-string \"$JOIN_CMD\" \
-          --region ${var.region}" \
-          "Updating latest join command secret"; then
-          echo "[$(date)] Failed to update latest join command secret after multiple retries" | tee -a $ERROR_LOG
-          exit 1
-        fi
-        
-        # Create timestamped backup secret
-        TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-        BACKUP_SECRET_NAME="${aws_secretsmanager_secret.kubernetes_join_command.name}-$TIMESTAMP"
-        if ! retry_command "aws secretsmanager create-secret \
-          --name \"$BACKUP_SECRET_NAME\" \
-          --secret-string \"$JOIN_CMD\" \
-          --description \"Kubernetes join command backup created at $TIMESTAMP\" \
-          --region ${var.region}" \
-          "Creating backup join command secret"; then
-          echo "[$(date)] Failed to create backup secret, but continuing as this is non-critical" | tee -a $ERROR_LOG
-        fi
-        
-        # Verify secrets can be retrieved
-        echo "[$(date)] Verifying secrets can be retrieved..." | tee -a $ERROR_LOG
-        sleep 5
-        
-        RETRIEVED_CMD=$(aws secretsmanager get-secret-value \
-          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-          --region ${var.region} \
-          --query SecretString --output text)
-        
-        if [[ "$RETRIEVED_CMD" == *"kubeadm join"* ]] && [[ "$RETRIEVED_CMD" == *"--token"* ]]; then
-          echo "[$(date)] ✅ Secret verification successful - worker nodes should be able to join" | tee -a $ERROR_LOG
-          
-          # Final verification - upload logs to S3 
-          aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/join-command-$(date +"%Y%m%d%H%M%S").log || echo "[$(date)] Failed to upload logs to S3"
-          exit 0
-        else
-          echo "[$(date)] ⚠️ Warning: Secret verification failed, but proceeding" | tee -a $ERROR_LOG
-          aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/join-command-failed-$(date +"%Y%m%d%H%M%S").log || echo "[$(date)] Failed to upload logs to S3"
-          exit 0
-        fi
+          --secret-string "$JOIN_CMD" \
+          --region ${var.region}
       else
-        echo "[$(date)] Error: Could not generate a valid join command after all attempts" | tee -a $ERROR_LOG
-        aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/join-command-critical-failure-$(date +"%Y%m%d%H%M%S").log || echo "[$(date)] Failed to upload logs to S3"
-        exit 1
+        echo "[$(date)] Both secrets contain matching valid join commands."
       fi
+      
+      # Create timestamped backup for audit trail
+      TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+      BACKUP_SECRET_NAME="${aws_secretsmanager_secret.kubernetes_join_command.name}-$TIMESTAMP"
+      aws secretsmanager create-secret \
+        --name "$BACKUP_SECRET_NAME" \
+        --secret-string "$JOIN_CMD" \
+        --description "Kubernetes join command backup created at $TIMESTAMP" \
+        --region ${var.region} || echo "[$(date)] Failed to create backup secret, but continuing"
+      
+      echo "[$(date)] ✅ Join command verification and update complete"
+      aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/join-command-success-$(date +"%Y%m%d%H%M%S").log || echo "[$(date)] Failed to upload logs to S3"
     EOT
   }
 }
