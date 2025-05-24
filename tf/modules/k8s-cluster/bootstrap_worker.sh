@@ -1,16 +1,16 @@
 #!/bin/bash
-# Minimalist bootstrap script for worker nodes
-# Establishes basic connectivity and triggers full initialization
+# Simple bootstrap script for worker nodes
+# Establishes basic connectivity and joins the cluster
 
 # Set up logging
 LOGFILE="/var/log/k8s-bootstrap.log"
 CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
 mkdir -p /var/log
-touch $${LOGFILE}
-chmod 644 $${LOGFILE}
+touch $LOGFILE
+chmod 644 $LOGFILE
 
 # Redirect output to log files
-exec > >(tee -a $${LOGFILE} $${CLOUD_INIT_LOG}) 2>&1
+exec > >(tee -a $LOGFILE $CLOUD_INIT_LOG) 2>&1
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootstrap"
 
@@ -22,7 +22,6 @@ trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command 
 mark_progress() {
   local stage="$1"
   echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $stage"
-  # Create progress marker
   echo "$stage" > /var/log/worker-bootstrap-progress
 }
 
@@ -51,7 +50,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y apt-transport-https ca-certificates curl unzip jq
 
-# 3. Install AWS CLI for metadata access and script download
+# 3. Install AWS CLI for metadata access
 mark_progress "Installing AWS CLI"
 if ! command -v aws &> /dev/null; then
   curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -90,7 +89,6 @@ get_metadata() {
     wait_time=$((wait_time * 2))
   done
   
-  # Return empty string or default value as fallback
   echo ""
 }
 
@@ -101,10 +99,10 @@ PRIVATE_IP=$(get_metadata "local-ipv4")
 AZ=$(get_metadata "placement/availability-zone")
 
 # Use defaults if metadata unavailable
-REGION=${REGION:-"${REGION}"}
-INSTANCE_ID=${INSTANCE_ID:-"unknown-$(hostname)"}
-PRIVATE_IP=${PRIVATE_IP:-$(hostname -I | awk '{print $1}')}
-AZ=${AZ:-"${REGION}a"}
+REGION=$${REGION:-"${REGION}"}
+INSTANCE_ID=$${INSTANCE_ID:-"unknown-$(hostname)"}
+PRIVATE_IP=$${PRIVATE_IP:-$(hostname -I | awk '{print $1}')}
+AZ=$${AZ:-"${REGION}a"}
 NODE_NAME="worker-$(echo $INSTANCE_ID | cut -d'-' -f2)"
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
