@@ -148,8 +148,6 @@ bootstrapTokens:
   ttl: "0s"
 nodeRegistration:
   name: $${HOSTNAME}
-  kubeletExtraArgs:
-    cloud-provider: external
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
@@ -168,11 +166,8 @@ cat <<EOF >> /tmp/kubeadm-config.yaml
   - $${HOSTNAME}
   - localhost
   - 127.0.0.1
-  extraArgs:
-    cloud-provider: external
 controllerManager:
   extraArgs:
-    cloud-provider: external
 networking:
   podSubnet: 192.168.0.0/16
   serviceSubnet: 10.96.0.0/12

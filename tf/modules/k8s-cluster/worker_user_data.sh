@@ -289,9 +289,8 @@ EOF
   apt-get update && apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
   apt-mark hold kubelet kubeadm kubectl
   
-  # Configure kubelet
-  mkdir -p /var/lib/kubelet /etc/kubernetes
-  echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --cloud-provider=external --provider-id=$${PROVIDER_ID}" > /var/lib/kubelet/kubeadm-flags.env
+  # Configure kubelet flags - removed cloud-provider as it's not needed with EBS CSI driver
+  echo "KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --provider-id=$${PROVIDER_ID}" > /var/lib/kubelet/kubeadm-flags.env
   
   # Disable swap
   swapoff -a && sed -i '/swap/d' /etc/fstab

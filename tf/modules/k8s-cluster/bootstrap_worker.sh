@@ -61,9 +61,10 @@ REGION=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/
 INSTANCE_ID=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
 PRIVATE_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
 PUBLIC_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "unknown")
+AVAILABILITY_ZONE=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone || echo "unknown")
 export AWS_DEFAULT_REGION="$$REGION"
 
-echo "$$(date) - Instance metadata: ID=$$INSTANCE_ID, Region=$$REGION, Private IP=$$PRIVATE_IP, Public IP=$$PUBLIC_IP"
+echo "$$(date) - Instance metadata: ID=$$INSTANCE_ID, Region=$$REGION, Private IP=$$PRIVATE_IP, Public IP=$$PUBLIC_IP, AZ=$$AVAILABILITY_ZONE"
 
 # Install Kubernetes components
 echo "$$(date) - Installing Kubernetes components"
@@ -97,90 +98,105 @@ net.ipv4.ip_forward = 1
 EOF
 sysctl --system
 
-# Try multiple methods to get join command
-echo "$$(date) - Retrieving join command (multiple methods)"
+# Function to get join command with retries
+get_join_command() {
+  local secret_name="$1"
+  local max_retries=5
+  local retry_delay=5
+  local attempt=1
+  
+  while [ $$attempt -le $$max_retries ]; do
+    echo "$$(date) - Attempting to retrieve join command from $$secret_name (attempt $$attempt/$$max_retries)"
+    local cmd=$$(aws secretsmanager get-secret-value --region $$REGION --secret-id "$$secret_name" \
+      --query "SecretString" --output text 2>/dev/null)
+    
+    if [ -n "$$cmd" ]; then
+      echo "$$(date) - Successfully retrieved join command from $$secret_name"
+      echo "$$cmd"
+      return 0
+    fi
+    
+    echo "$$(date) - Failed to retrieve join command, retrying in $$retry_delay seconds..."
+    sleep $$retry_delay
+    attempt=$$((attempt + 1))
+  done
+  
+  echo ""  # Return empty string on failure
+  return 1
+}
 
-# Method 1: Try the main secret
+# Retrieve join command (prioritize the latest secret)
+echo "$$(date) - Retrieving join command with improved retry logic"
+
+# First try the latest secret
 JOIN_CMD=""
-if [ -n "${JOIN_COMMAND_SECRET}" ]; then
-  echo "$$(date) - Trying to get join command from main secret: ${JOIN_COMMAND_SECRET}"
-  JOIN_CMD=$$(aws secretsmanager get-secret-value --region $$REGION --secret-id "${JOIN_COMMAND_SECRET}" \
-    --query "SecretString" --output text)
-  # Use $$ to escape $ for Terraform
-  echo "$$(date) - Join command from main secret (first 20 chars): $${JOIN_CMD:0:20}..."
+echo "$$(date) - Trying latest join command secret first: ${JOIN_COMMAND_LATEST_SECRET}"
+JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_LATEST_SECRET}")
+
+# Fall back to the main secret if latest fails
+if [ -z "$$JOIN_CMD" ] && [ -n "${JOIN_COMMAND_SECRET}" ] && [ "${JOIN_COMMAND_SECRET}" != "${JOIN_COMMAND_LATEST_SECRET}" ]; then
+  echo "$$(date) - Latest secret failed, trying main secret: ${JOIN_COMMAND_SECRET}"
+  JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_SECRET}")
 fi
 
-# Method 2: Try the latest secret if first method failed
-if [ -z "$$JOIN_CMD" ] && [ -n "${JOIN_COMMAND_LATEST_SECRET}" ]; then
-  echo "$$(date) - Trying to get join command from latest secret: ${JOIN_COMMAND_LATEST_SECRET}"
-  JOIN_CMD=$$(aws secretsmanager get-secret-value --region $$REGION --secret-id "${JOIN_COMMAND_LATEST_SECRET}" \
-    --query "SecretString" --output text)
-  echo "$$(date) - Join command from latest secret (first 20 chars): $${JOIN_CMD:0:20}..."
-fi
-
-# Method 3: Try to list secrets with kubernetes-join-command in the name
+# If both direct secret retrievals fail, try to find any join command secret
 if [ -z "$$JOIN_CMD" ]; then
-  echo "$$(date) - Trying to find join command secrets by listing them"
+  echo "$$(date) - Trying to find join command by listing all related secrets"
   SECRET_LIST=$$(aws secretsmanager list-secrets --region $$REGION --query "SecretList[?contains(Name, 'kubernetes-join-command')].Name" --output text)
   
   for SECRET in $$SECRET_LIST; do
     echo "$$(date) - Trying secret: $$SECRET"
-    JOIN_CMD=$$(aws secretsmanager get-secret-value --region $$REGION --secret-id "$$SECRET" \
-      --query "SecretString" --output text)
+    JOIN_CMD=$$(get_join_command "$$SECRET")
     
     if [ -n "$$JOIN_CMD" ]; then
-      echo "$$(date) - Found join command in secret: $$SECRET (first 20 chars): $${JOIN_CMD:0:20}..."
+      echo "$$(date) - Found valid join command in secret: $$SECRET"
       break
     fi
   done
 fi
 
-# Method 4: Generate a fallback join command using control plane's IP
-if [ -z "$$JOIN_CMD" ]; then
-  echo "$$(date) - No join command found in secrets, creating fallback"
-  
-  # Find the control plane instance
-  CONTROL_PLANE_IP=$$(aws ec2 describe-instances --region $$REGION \
-    --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-    --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-  
-  if [ -n "$$CONTROL_PLANE_IP" ] && [ "$$CONTROL_PLANE_IP" != "None" ]; then
-    echo "$$(date) - Found control plane IP: $$CONTROL_PLANE_IP"
-    TOKEN=$$(kubeadm token create --ttl 2h --print-join-command | sed "s/.*join/kubeadm join/")
-    JOIN_CMD="kubeadm join $${CONTROL_PLANE_IP}:6443 --token $${TOKEN} --discovery-token-unsafe-skip-ca-verification"
-    echo "$$(date) - Created fallback join command: $$JOIN_CMD"
-  else
-    echo "$$(date) - ERROR: Could not find control plane IP"
-  fi
-fi
-
 # Execute join command if found
 if [ -n "$$JOIN_CMD" ]; then
-  echo "$$(date) - Executing join command (output below)"
+  echo "$$(date) - Executing join command"
   echo "$$JOIN_CMD" > /tmp/join_command.sh
   chmod +x /tmp/join_command.sh
-  /tmp/join_command.sh
-  JOIN_STATUS=$$?
-  echo "$$(date) - Join command executed with status: $$JOIN_STATUS"
   
-  if [ $$JOIN_STATUS -eq 0 ]; then
-    echo "$$(date) - Successfully joined the Kubernetes cluster!"
-  else
-    echo "$$(date) - ERROR: Failed to join the Kubernetes cluster"
+  # Execute with a retry mechanism
+  JOIN_SUCCESS=false
+  for i in {1..3}; do
+    echo "$$(date) - Join attempt $$i/3"
+    if /tmp/join_command.sh; then
+      JOIN_SUCCESS=true
+      echo "$$(date) - Successfully joined the Kubernetes cluster!"
+      break
+    else
+      echo "$$(date) - Join attempt $$i failed, waiting before retry..."
+      sleep 15
+    fi
+  done
+  
+  if [ "$$JOIN_SUCCESS" != "true" ]; then
+    echo "$$(date) - ERROR: Failed to join the Kubernetes cluster after multiple attempts"
+    exit 1
   fi
 else
-  echo "$$(date) - ERROR: Could not retrieve or generate join command"
+  echo "$$(date) - ERROR: Could not retrieve join command from any secret"
   exit 1
 fi
 
-# Configure the Kubernetes node name based on the hostname pattern
-echo "$$(date) - Configuring node name"
+# Configure the Kubernetes node name based on the instance metadata
+echo "$$(date) - Configuring kubelet"
 PRIVATE_DNS=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-hostname || echo "unknown")
 NODE_NAME=$$(echo $$PRIVATE_DNS | sed 's/\./-/g')
-echo "NODE_NAME=$$NODE_NAME" >> /etc/default/kubelet
-echo "KUBELET_EXTRA_ARGS=--node-ip=$$PRIVATE_IP" >> /etc/default/kubelet
+
+# Configure kubelet WITHOUT cloud-provider flag
+cat > /etc/default/kubelet << EOF
+NODE_NAME=$$NODE_NAME
+KUBELET_EXTRA_ARGS=--node-ip=$$PRIVATE_IP
+EOF
 
 # Restart kubelet to apply configuration
+systemctl daemon-reload
 systemctl restart kubelet
 
 # Print kubelet status for debugging

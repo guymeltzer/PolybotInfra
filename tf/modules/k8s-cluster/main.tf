@@ -521,9 +521,20 @@ resource "aws_iam_role_policy" "control_plane_secrets_manager_policy" {
       {
         Effect = "Allow"
         Action = [
-          "secretsmanager:UpdateSecret"
+          "secretsmanager:UpdateSecret",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
         ]
         Resource = "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:ListSecrets"
+        ]
+        Resource = "*"
       },
       {
         Effect = "Allow"

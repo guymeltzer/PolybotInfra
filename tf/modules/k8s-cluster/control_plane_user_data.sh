@@ -147,7 +147,6 @@ bootstrapTokens:
   ttl: "24h"
 nodeRegistration:
   kubeletExtraArgs:
-    cloud-provider: "external"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
@@ -158,7 +157,6 @@ apiServer:
 $(echo -e "$${CERT_SANS}")
 controllerManager:
   extraArgs:
-    cloud-provider: "external"
 EOF
 
 # Print the kubeadm config for debugging

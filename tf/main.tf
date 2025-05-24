@@ -659,72 +659,133 @@ EOF
   }
 }
 
-# Configure kubectl provider with credentials after waiting for the API to be ready
+# Configure Kubernetes provider with the kubeconfig file
 resource "terraform_data" "kubectl_provider_config" {
-  # Use a static count value
   count = 1
 
-  # Ensure this runs after the control plane is available and we've waited for the API
-  depends_on = [
-    null_resource.wait_for_kubernetes,
-    module.k8s-cluster
-  ]
+  triggers_replace = {
+    control_plane_id = module.k8s-cluster.control_plane_id
+    kubeconfig_path  = local.kubeconfig_path
+  }
 
-  # Trigger updates when control plane details change
-  triggers_replace = [
-    module.k8s-cluster.control_plane_id
-  ]
-
-  # Retrieve and store kubeconfig directly from the control plane
   provisioner "local-exec" {
-    command = <<-EOT
-      # Wait for instance to appear
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
       
-      if [ "$INSTANCE_ID" == "None" ] || [ -z "$INSTANCE_ID" ]; then
-        echo "No running control plane instance found, exiting early"
-        exit 0
-      fi
+      # Function to retrieve kubeconfig from control plane with retries
+      fetch_kubeconfig() {
+        local MAX_ATTEMPTS=10
+        local RETRY_DELAY=30
+        local attempt=1
+        
+        echo "Retrieving kubeconfig from control plane instance..."
+        
+        while [ $$attempt -le $$MAX_ATTEMPTS ]; do
+          echo "Attempt $$attempt/$$MAX_ATTEMPTS to get kubeconfig"
+          
+          # Get the instance ID of the control plane
+          INSTANCE_ID=$$(aws ec2 describe-instances \
+            --region ${var.region} \
+            --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+            
+          if [ "$$INSTANCE_ID" == "None" ] || [ -z "$$INSTANCE_ID" ]; then
+            echo "No running control plane instance found, retrying in $$RETRY_DELAY seconds..."
+            sleep $$RETRY_DELAY
+            attempt=$$((attempt + 1))
+            continue
+          fi
+          
+          echo "Found control plane instance: $$INSTANCE_ID"
+          
+          # Use SSM to get the kubeconfig from the instance
+          COMMAND_ID=$$(aws ssm send-command \
+            --region ${var.region} \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$$INSTANCE_ID" \
+            --parameters commands="sudo cat /etc/kubernetes/admin.conf" \
+            --output text \
+            --query "Command.CommandId" 2>/dev/null)
+            
+          if [ -z "$$COMMAND_ID" ]; then
+            echo "Failed to send SSM command, retrying in $$RETRY_DELAY seconds..."
+            sleep $$RETRY_DELAY
+            attempt=$$((attempt + 1))
+            continue
+          fi
+          
+          echo "SSM command sent, waiting for completion..."
+          sleep 10
+          
+          # Get the command output
+          KUBECONFIG_CONTENT=$$(aws ssm get-command-invocation \
+            --region ${var.region} \
+            --command-id "$$COMMAND_ID" \
+            --instance-id "$$INSTANCE_ID" \
+            --query "StandardOutputContent" \
+            --output text 2>/dev/null)
+            
+          if [ -n "$$KUBECONFIG_CONTENT" ] && [[ $$KUBECONFIG_CONTENT == *"apiVersion"* ]]; then
+            echo "Successfully retrieved kubeconfig"
+            echo "$$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
+            chmod 600 ${local.kubeconfig_path}
+            
+            # Update the server address in the kubeconfig to use public IP
+            PUBLIC_IP=$$(aws ec2 describe-instances \
+              --region ${var.region} \
+              --instance-ids "$$INSTANCE_ID" \
+              --query "Reservations[0].Instances[0].PublicIpAddress" \
+              --output text)
+              
+            if [ -n "$$PUBLIC_IP" ] && [ "$$PUBLIC_IP" != "None" ]; then
+              echo "Updating kubeconfig to use public IP: $$PUBLIC_IP"
+              sed -i.bak "s/server:.*/server: https:\/\/$$PUBLIC_IP:6443/g" ${local.kubeconfig_path}
+              rm -f ${local.kubeconfig_path}.bak
+            fi
+            
+            echo "Kubeconfig saved to ${local.kubeconfig_path}"
+            return 0
+          else
+            echo "Invalid kubeconfig content received, retrying in $$RETRY_DELAY seconds..."
+            sleep $$RETRY_DELAY
+            attempt=$$((attempt + 1))
+          fi
+        done
+        
+        echo "Failed to retrieve kubeconfig after $$MAX_ATTEMPTS attempts"
+        return 1
+      }
       
-      # Get the public IP of the control plane
-      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+      # Call the function to fetch the kubeconfig
+      fetch_kubeconfig || {
+        echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
+        mkdir -p $(dirname "${local.kubeconfig_path}")
+        cat > ${local.kubeconfig_path} << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: placeholder
+    client-key-data: placeholder
+EOF
+        chmod 600 ${local.kubeconfig_path}
+      }
       
-      if [ "$PUBLIC_IP" == "None" ] || [ -z "$PUBLIC_IP" ]; then
-        echo "Control plane instance doesn't have a public IP yet, exiting early"
-        exit 0
-      fi
-      
-      echo "Using control plane with IP: $PUBLIC_IP and instance ID: $INSTANCE_ID"
-      
-      # Wait for SSM to be ready
-      echo "Checking if SSM is available on the control plane..."
-      if ! aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-           --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-        echo "SSM not available yet, exiting early"
-        exit 0
-      fi
-      
-      # Retrieve the kubeconfig from the control plane
-      echo "Getting kubeconfig from control plane..."
-      aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" \
-        --instance-ids "$INSTANCE_ID" --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
-        --output text --query "Command.CommandId" > /tmp/command_id.txt
-      
-      sleep 5
-      
-      # Get the kubeconfig content
-      aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
-        --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text > /tmp/kubeconfig_content.yaml
-      
-      # Only update kubeconfig if we got valid content
-      if grep -q "apiVersion: v1" /tmp/kubeconfig_content.yaml; then
-        # Update server endpoint in the kubeconfig
-        cat /tmp/kubeconfig_content.yaml | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
-        chmod 600 ./kubeconfig.yaml
-        echo "Created kubeconfig.yaml with server endpoint: https://$PUBLIC_IP:6443"
-      else
-        echo "Failed to retrieve valid kubeconfig, not updating existing file"
-      fi
+      echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
     EOT
   }
 }
@@ -804,17 +865,12 @@ resource "null_resource" "providers_ready" {
 
 # Create Kubernetes namespaces directly with kubectl to avoid provider auth issues
 resource "null_resource" "create_namespaces" {
-  # Use a static count value based on the skip_namespaces flag
-  count = local.skip_namespaces ? 0 : 1
-
-  # Ensure all prerequisites are met
   depends_on = [
+    null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
-    null_resource.providers_ready,
-    null_resource.wait_for_kubernetes
+    null_resource.providers_ready
   ]
 
-  # Only trigger after the control plane is actually ready
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     instance_id = module.k8s-cluster.control_plane_id
@@ -825,87 +881,39 @@ resource "null_resource" "create_namespaces" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
+      set -e
       
-      echo -e "\033[1;34m==== 🔍 Attempting to Create Kubernetes Namespaces ====\033[0m"
+      echo "Creating namespaces directly with kubectl..."
       
-      export KUBECONFIG="${path.module}/kubeconfig.yaml"
+      export KUBECONFIG="${local.kubeconfig_path}"
       
-      # Function to test API server connection with better error messages
-      test_api_server() {
-        echo -e "\033[0;33m⏱️  Testing Kubernetes API server connection...\033[0m"
-        if kubectl get nodes --request-timeout=5s >/dev/null 2>&1; then
-          echo -e "\033[0;32m✅ Connected to Kubernetes API server successfully\033[0m"
-          return 0
-        else
-          echo -e "\033[0;33m⚠️  Cannot connect to Kubernetes API server\033[0m"
-          return 1
-        fi
-      }
-      
-      # Function to display a spinner during wait periods
-      spinner() {
-        local pid=$1
-        local delay=0.5
-        local spinstr='|/-\'
-        echo -n "   "
-        while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-          local temp=$${spinstr#?}
-          printf "\r\033[0;33m⏱️  Waiting for API server... %c\033[0m" "$spinstr"
-          local spinstr=$temp$${spinstr%"$temp"}
-          sleep $$delay
-        done
-        printf "\r   \033[0;33m⏱️  Continuing...\033[0m                      \n"
-      }
-      
-      # Verify the kubeconfig is valid
-      echo -e "\033[0;33m🔍 Validating kubeconfig at $KUBECONFIG\033[0m"
-      if grep -q "placeholder" "$KUBECONFIG"; then
-        echo -e "\033[0;31m❌ ERROR: Kubeconfig contains placeholder values\033[0m"
-        exit 1
+      # Check if kubectl can connect to the cluster
+      if ! kubectl get nodes &>/dev/null; then
+        echo "Cannot connect to Kubernetes cluster, skipping namespace creation"
+        exit 0
       fi
       
-      # Try to connect to the API server with retries
-      MAX_RETRIES=30
-      RETRY_INTERVAL=20
-      
-      echo -e "\033[0;33m⏱️  Waiting up to 10 minutes for API server to be ready...\033[0m"
-      
-      for ((i=1; i<=MAX_RETRIES; i++)); do
-        if test_api_server; then
-          break
-        fi
-        
-        if [ $i -eq $MAX_RETRIES ]; then
-          echo -e "\033[0;31m❌ ERROR: Could not connect to API server after 30 attempts. Manual intervention required.\033[0m"
-          echo -e "\033[0;33m📋 Troubleshooting tips:\033[0m"
-          echo -e "   1. SSH to control plane: ssh ubuntu@${module.k8s-cluster.control_plane_public_ip}"
-          echo -e "   2. Check logs: sudo journalctl -u kubelet"
-          echo -e "   3. Check status: sudo systemctl status kubelet"
-          echo -e "   4. Check pods: sudo kubectl get pods -A"
-          exit 1
+      # Function to create a namespace if it doesn't exist
+      create_namespace() {
+        if ! kubectl get namespace "$$1" &>/dev/null; then
+          echo "Creating namespace $$1"
+          kubectl create namespace "$$1"
         else
-          echo -e "\033[0;33m⏱️  Retry $i/$MAX_RETRIES - Waiting $RETRY_INTERVAL seconds before next attempt...\033[0m"
-          sleep $RETRY_INTERVAL &
-          spinner $!
+          echo "Namespace $$1 already exists"
         fi
-      done
+      }
       
-      echo -e "\033[1;34m==== 🚀 Creating Kubernetes Namespaces ====\033[0m"
+      # Create standard namespaces
+      create_namespace "kube-system"
+      create_namespace "default"
+      create_namespace "monitoring"
+      create_namespace "logging"
+      create_namespace "dev"
+      create_namespace "prod"
+      create_namespace "mongodb"
+      create_namespace "argocd"
       
-      # Create dev namespace
-      echo -e "\033[0;33m🔨 Creating dev namespace...\033[0m"
-      kubectl create namespace dev --dry-run=client -o yaml | kubectl apply --validate=false -f -
-      
-      # Create prod namespace
-      echo -e "\033[0;33m🔨 Creating prod namespace...\033[0m"
-      kubectl create namespace prod --dry-run=client -o yaml | kubectl apply --validate=false -f -
-      
-      # Create argocd namespace
-      echo -e "\033[0;33m🔨 Creating argocd namespace...\033[0m"
-      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply --validate=false -f -
-      
-      echo -e "\033[0;32m✅ Namespaces created successfully!\033[0m"
-      echo -e "\033[1;34m===============================================\033[0m"
+      echo "Namespace creation complete"
     EOT
   }
 }
@@ -934,141 +942,120 @@ module "k8s-cluster" {
   depends_on = [terraform_data.init_environment, terraform_data.deployment_information]
 }
 
-# Install EBS CSI Driver using local-exec only
-resource "null_resource" "install_ebs_csi_driver" {
-  # Use a static count value
-  count = 1
+# Create the EBS service-linked role declaratively
+resource "aws_iam_service_linked_role" "ebs" {
+  aws_service_name = "ebs.amazonaws.com"
+  description      = "Allows Amazon EBS to manage AWS resources on your behalf"
   
-  # Only run after we have a valid kubeconfig and the service-linked role is created
+  # This will silently succeed if the role already exists
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    on_failure  = continue
+    command     = "echo \"Created or verified EBS service-linked role\""
+  }
+}
+
+# Install EBS CSI Driver as a Kubernetes component
+resource "null_resource" "install_ebs_csi_driver" {
   depends_on = [
-    module.k8s-cluster, 
-    null_resource.wait_for_kubernetes, 
-    terraform_data.kubectl_provider_config,
-    null_resource.providers_ready,
-    terraform_data.ebs_service_role_setup,
-    null_resource.verify_ebs_role
+    null_resource.wait_for_kubernetes,
+    aws_iam_service_linked_role.ebs, # Use the new role resource instead
+    terraform_data.kubectl_provider_config
   ]
   
-  # Only run when needed, based on resource changes
+  # Trigger reinstall when the EBS role is recreated
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    instance_id = module.k8s-cluster.control_plane_id
+    ebs_role_id = aws_iam_service_linked_role.ebs.id
   }
   
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      echo "Checking if kubeconfig is valid before installing EBS CSI Driver..."
-      KUBECONFIG="${local.kubeconfig_path}"
+      echo "Installing AWS EBS CSI Driver..."
       
-      if [ ! -f "$KUBECONFIG" ]; then
-        echo "Kubeconfig file not found, skipping installation"
-        exit 0
-      fi
+      # Use kubectl directly since it's already set up
+      export KUBECONFIG=${local.kubeconfig_path}
       
-      # Check if kubeconfig contains placeholder values
-      if grep -q "placeholder" "$KUBECONFIG"; then
-        echo "Kubeconfig contains placeholder values, skipping installation"
-        exit 0
-      fi
+      # Create required namespace
+      kubectl create namespace kube-system --dry-run=client -o yaml | kubectl apply -f -
       
-      # Check if we can connect to the Kubernetes API
-      if ! kubectl --kubeconfig="$KUBECONFIG" get nodes >/dev/null 2>&1; then
-        echo "Cannot connect to Kubernetes cluster, skipping installation"
-        exit 0
-      fi
+      # Install the EBS CSI driver using the official YAML
+      kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19"
       
-      # Clean up old EBS CSI driver files if they exist
-      echo "Cleaning up any old EBS CSI Driver installations..."
-      kubectl --kubeconfig="$KUBECONFIG" delete -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master" --ignore-not-found=true || true
-      sleep 5
+      echo "Waiting for EBS CSI driver pods to start..."
+      kubectl -n kube-system wait --for=condition=ready pod -l app=ebs-csi-controller --timeout=120s || true
       
-      # Install EBS CSI Driver using kubectl
-      echo "Creating kube-system namespace if it doesn't exist..."
-      kubectl --kubeconfig="$KUBECONFIG" create namespace kube-system --dry-run=client -o yaml | kubectl --kubeconfig="$KUBECONFIG" apply -f -
-      
-      # Check for required AWS role before proceeding
-      echo "Verifying AWS role for EBS CSI Driver..."
-      aws sts get-caller-identity >/dev/null || {
-        echo "⚠️ AWS CLI not configured properly. Make sure your AWS credentials are valid."
-        echo "Continuing anyway as the EBS CSI driver may still work if the role exists in AWS."
-      }
-      
-      # Check if the EBS service role exists without requiring creation permissions
-      if ! aws iam get-role --role-name AWSServiceRoleForEBS >/dev/null 2>&1; then
-        echo "⚠️ Warning: EBS service role not found. Volume provisioning may fail."
-        echo "Consider creating it manually with: aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com"
-      else
-        echo "✅ EBS service role exists. Proceeding with installation."
-      fi
-      
-      echo "Creating EBS CSI Driver service account..."
-      cat <<EOF | kubectl --kubeconfig="$KUBECONFIG" apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ebs-csi-controller-sa
-  namespace: kube-system
-EOF
-      
-      echo "Installing EBS CSI Driver..."
-      kubectl --kubeconfig="$KUBECONFIG" apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=master" || {
-        echo "⚠️ Error installing EBS CSI Driver. This may be a permissions issue."
-        echo "You may need to manually create the service role or grant the required permissions."
-        echo "Continuing deployment, but dynamic volume provisioning may not work."
-      }
-      
-      echo "EBS CSI Driver installation completed. Now creating storage classes..."
+      echo "EBS CSI Driver installation complete"
     EOT
   }
 }
 
-# Add the storage class resource after the EBS CSI driver resource
-# Look for the end of the install_ebs_csi_driver resource and add after it
-
+# Create storage classes for dynamic volume provisioning
 resource "null_resource" "create_storage_classes" {
-  count = 1
-  
   depends_on = [
+    null_resource.wait_for_kubernetes,
     null_resource.install_ebs_csi_driver
   ]
-  
+
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    ebs_driver_id = null_resource.install_ebs_csi_driver.id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
+      echo "Creating Kubernetes storage classes..."
+      
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "Cleaning up any existing storage classes to avoid conflicts..."
-      # Check if NGINX Ingress is already installed
-      if kubectl get ns ingress-nginx &>/dev/null && kubectl get deployment -n ingress-nginx ingress-nginx-controller &>/dev/null; then
-        echo "NGINX Ingress Controller already installed, skipping installation"
+      # Check if kubectl can connect to the cluster
+      if ! kubectl get nodes &>/dev/null; then
+        echo "Cannot connect to Kubernetes cluster, skipping storage class creation"
         exit 0
       fi
       
-      echo "Creating ingress-nginx namespace..."
-      kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+      # Wait for the EBS CSI driver to be ready
+      echo "Waiting for EBS CSI driver pods to be ready..."
+      kubectl -n kube-system wait --for=condition=ready pod -l app=ebs-csi-controller --timeout=120s || {
+        echo "Warning: EBS CSI driver pods not ready within timeout, but continuing anyway"
+      }
       
-      echo "Installing NGINX Ingress Controller..."
-      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/aws/deploy.yaml
+      # Create general purpose SSD storage class
+      echo "Creating gp2 storage class..."
+      kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp2
+  encrypted: "true"
+allowVolumeExpansion: true
+EOF
       
-      # Wait for the Ingress Controller to be ready - increase timeout
-      echo "Waiting for NGINX Ingress Controller to be ready (may take up to 10 minutes)..."
-      for i in {1..20}; do
-        if kubectl -n ingress-nginx get deployment ingress-nginx-controller | grep -q "1/1"; then
-          echo "NGINX Ingress Controller is ready!"
-          break
-        fi
-        echo "Waiting for NGINX Ingress Controller to be ready, attempt $i/20..."
-        sleep 30
-      done
+      # Create MongoDB storage class
+      echo "Creating MongoDB storage class..."
+      kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mongodb-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp2
+  encrypted: "true"
+allowVolumeExpansion: true
+EOF
       
-      echo "NGINX Ingress Controller installation complete"
+      echo "Storage classes created successfully"
     EOT
   }
 }
@@ -1610,7 +1597,7 @@ spec:
           mountPath: /var/lib/docker
         - name: run
           mountPath: /run
-        - name: tmp 
+        - name: tmp
           mountPath: /tmp
       volumes:
       - name: var-log
@@ -1878,65 +1865,6 @@ EOF
   }
 }
 
-# Instead of creating a service-linked role directly (which may fail due to permissions),
-# use a terraform_data resource to check for or create the role using the AWS CLI
-resource "terraform_data" "ebs_service_role_setup" {
-  # This doesn't depend on other resources to avoid circular dependencies
-  # It's meant to run early in the process
-
-  triggers_replace = {
-    # Only run once per deployment
-    run_id = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    # Use on_failure = continue to ensure this doesn't stop the deployment
-    on_failure = continue
-    command = <<-EOT
-      #!/bin/bash
-      echo "Checking for AWS EBS service role..."
-      
-      # Check if the role already exists
-      if aws iam get-role --role-name AWSServiceRoleForEBS 2>/dev/null; then
-        echo "✅ EBS service role already exists, no action needed."
-        exit 0
-      fi
-      
-      echo "⚠️ EBS service role not found, attempting to create it..."
-      
-      # Try to create the role, but continue even if it fails
-      if aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com 2>/dev/null; then
-        echo "✅ Successfully created EBS service role."
-      else
-        echo "⚠️ Could not create service role for EBS. This might be due to insufficient permissions."
-        echo "⚠️ EBS volume provisioning might fail later. Manual role creation may be required."
-        echo "⚠️ Run: aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com"
-      fi
-    EOT
-  }
-}
-
-# Alternative EBS role check that doesn't require role creation permissions
-resource "null_resource" "verify_ebs_role" {
-  depends_on = [
-    terraform_data.ebs_service_role_setup
-  ]
-  
-  provisioner "local-exec" {
-    command = <<-EOT
-      echo "Checking if EBS service-linked role exists..."
-      if aws iam get-role --role-name AWSServiceRoleForEBS 2>/dev/null; then
-        echo "EBS service-linked role already exists."
-      else
-        echo "Warning: EBS service-linked role may not exist. This is often created automatically by AWS."
-        echo "If you encounter volume provisioning issues, create it manually with:"
-        echo "aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com"
-      fi
-    EOT
-  }
-}
-
 # Use the kubernetes-resources module for all Kubernetes-specific resources
 module "kubernetes_resources" {
   source = "./modules/kubernetes-resources"
@@ -1962,8 +1890,7 @@ module "kubernetes_resources" {
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
     null_resource.wait_for_kubernetes,
-    terraform_data.ebs_service_role_setup,
-    null_resource.verify_ebs_role
+    aws_iam_service_linked_role.ebs
   ]
 }
 
