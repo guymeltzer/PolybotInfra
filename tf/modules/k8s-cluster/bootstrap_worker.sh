@@ -99,10 +99,10 @@ PRIVATE_IP=$(get_metadata "local-ipv4")
 AZ=$(get_metadata "placement/availability-zone")
 
 # Use defaults if metadata unavailable
-REGION=$${REGION:-"${REGION}"}
-INSTANCE_ID=$${INSTANCE_ID:-"unknown-$(hostname)"}
-PRIVATE_IP=$${PRIVATE_IP:-$(hostname -I | awk '{print $1}')}
-AZ=$${AZ:-"${REGION}a"}
+REGION="$${REGION:-${REGION}}"
+INSTANCE_ID="$${INSTANCE_ID:-unknown-$(hostname)}"
+PRIVATE_IP="$${PRIVATE_IP:-$(hostname -I | awk '{print $1}')}"
+AZ="$${AZ:-${REGION}a}"
 NODE_NAME="worker-$(echo $INSTANCE_ID | cut -d'-' -f2)"
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
