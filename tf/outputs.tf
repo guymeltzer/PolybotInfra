@@ -16,7 +16,7 @@
 resource "null_resource" "worker_node_details" {
   triggers = {
     # Use meaningful triggers instead of timestamp
-    worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
+    worker_count = fileexists("/tmp/worker_nodes.json") ? (length(file("/tmp/worker_nodes.json")) > 2 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0) : 0
     # Don't use filemd5 on kubeconfig as it changes during apply
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
@@ -39,7 +39,7 @@ resource "null_resource" "worker_node_details" {
 
 output "worker_nodes" {
   description = "Worker node details (running instances only)"
-  value = fileexists("/tmp/worker_nodes.json") ? jsondecode(file("/tmp/worker_nodes.json")) : []
+  value = fileexists("/tmp/worker_nodes.json") ? (length(file("/tmp/worker_nodes.json")) > 2 ? jsondecode(file("/tmp/worker_nodes.json")) : []) : []
 }
 
 output "worker_nodes_formatted" {
@@ -154,7 +154,7 @@ EOT
 resource "null_resource" "dynamic_worker_logs" {
   triggers = {
     # Use meaningful triggers instead of timestamp
-    worker_count = length(jsondecode(file(fileexists("/tmp/worker_nodes.json") ? "/tmp/worker_nodes.json" : "/dev/null"))) > 0 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0
+    worker_count = fileexists("/tmp/worker_nodes.json") ? (length(file("/tmp/worker_nodes.json")) > 2 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0) : 0
     # Don't use filemd5 on kubeconfig as it changes during apply
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
@@ -427,7 +427,7 @@ output "cluster_readiness" {
   description = "Information about cluster readiness"
   value = {
     kubeconfig_ready = fileexists(local.kubeconfig_path)
-    ebs_csi_ready    = try(null_resource.install_ebs_csi_driver[0].id, "")
+    ebs_csi_ready    = try(null_resource.install_ebs_csi_driver.id, "")
   }
 }
 
