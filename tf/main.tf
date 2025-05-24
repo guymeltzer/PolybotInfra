@@ -30,6 +30,11 @@ locals {
       "server: https://placeholder:6443"
     )
   )
+  # Add the control_plane_ip from the second locals block
+  control_plane_ip = try(
+    module.k8s-cluster.control_plane_public_ip,
+    "kubernetes.default.svc"
+  )
 }
 
 # Resource to clean problematic resources from Terraform state
@@ -798,27 +803,6 @@ EOFINNER
 echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
 EOF
   }
-}
-
-# Add a data source to ensure kubeconfig is ready - use a different pattern to avoid errors
-# We'll use the file() function directly in a local value instead of a data source
-locals {
-  control_plane_ip = try(
-    module.k8s-cluster.control_plane_public_ip,
-    "kubernetes.default.svc"
-  )
-  skip_argocd     = false # Enable ArgoCD deployment
-  skip_namespaces = false # Enable namespace creation
-  # Check if kubeconfig exists and doesn't contain placeholder
-  kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml")
-  # Only consider Kubernetes ready if we have a real kubeconfig (not the placeholder)
-  k8s_ready = local.kubeconfig_exists && (
-    !strcontains(
-      try(file("${path.module}/kubeconfig.yaml"), ""),
-      "server: https://placeholder:6443"
-    )
-  )
-  kubeconfig_path = "${path.module}/kubeconfig.yaml"
 }
 
 # This ensures the Kubernetes providers are properly initialized before any resources use them
