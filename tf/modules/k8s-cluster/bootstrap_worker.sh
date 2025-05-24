@@ -1,42 +1,25 @@
 #!/bin/bash
-# Robust bootstrap script for worker nodes with enhanced error handling
-# Ensures proper SSH access and reliable Kubernetes cluster joining
+# Minimal bootstrap script for worker nodes
+# This script will download a more complete initialization script from S3
 
-# Set up extensive logging
+# Set up minimal logging
 LOGFILE="/var/log/worker-init.log"
-DEBUG_LOG="/var/log/worker-debug.log"
-TRACE_LOG="/var/log/worker-trace.log"
+touch $$LOGFILE
+chmod 644 $$LOGFILE
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting minimal worker node bootstrap"
+exec > >(tee -a $$LOGFILE) 2>&1
 
-# Create log files with proper permissions
-mkdir -p /var/log
-touch $$LOGFILE $$DEBUG_LOG $$TRACE_LOG
-chmod 644 $$LOGFILE $$DEBUG_LOG $$TRACE_LOG
-
-# Log everything with timestamps to all logs
-exec > >(tee -a $$LOGFILE | tee -a $$DEBUG_LOG)
-exec 2>&1
-set -x  # Enable command tracing to TRACE_LOG
-SECONDS=0  # Track execution time
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting worker node bootstrap (v2.0.1)"
-
-# Robust error handling
-set -eE  # Exit on error with error trapping
-trap 'echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Command failed at line $$LINENO: \"$$BASH_COMMAND\" with exit code $$? after $$SECONDS seconds" | tee -a $$LOGFILE' ERR
-
-# ------------------------
-# 1. SSH ACCESS SETUP - Priority #1
-# ------------------------
+# Critical step 1: SSH access setup (highest priority)
 echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting up SSH access (PRIORITY)"
 mkdir -p /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
 
-# Make sure we have a valid SSH key in the authorized_keys file
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Writing SSH public key to authorized_keys file"
+# Write SSH public key to authorized_keys
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Writing SSH public key"
 cat > /home/ubuntu/.ssh/authorized_keys << EOF
 ${SSH_PUBLIC_KEY}
 EOF
 
-# Ensure proper permissions
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
@@ -45,10 +28,6 @@ mkdir -p /root/.ssh
 cp /home/ubuntu/.ssh/authorized_keys /root/.ssh/
 chmod 700 /root/.ssh
 chmod 600 /root/.ssh/authorized_keys
-
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH key configuration complete - Verification:"
-ls -la /home/ubuntu/.ssh/
-grep -v "^#" /home/ubuntu/.ssh/authorized_keys | grep -v "^$$"
 
 # Configure SSH daemon for key-based auth
 echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring SSH daemon"
@@ -68,62 +47,97 @@ AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 
-# Restart SSH daemon with proper error handling
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Restarting SSH daemon"
-if systemctl restart ssh; then
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH daemon restarted successfully (ssh)"
-elif systemctl restart sshd; then
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH daemon restarted successfully (sshd)"
-else
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not restart SSH service, trying to proceed anyway"
-fi
+# Restart SSH daemon
+systemctl restart ssh || systemctl restart sshd || true
 
-# ------------------------
-# 2. SYSTEM PREPARATION
-# ------------------------
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing dependencies"
+# Critical step 2: Install basic dependencies
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing essential dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q apt-transport-https ca-certificates curl gnupg lsb-release software-properties-common unzip jq net-tools iputils-ping dnsutils netcat-openbsd
+apt-get install -y -q apt-transport-https ca-certificates curl unzip jq
 
-# Get instance metadata with enhanced error handling
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Fetching EC2 instance metadata"
-TOKEN=$$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-REGION=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
-INSTANCE_ID=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
-PRIVATE_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
-PUBLIC_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "unknown")
-AVAILABILITY_ZONE=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone || echo "unknown")
-PRIVATE_DNS=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-hostname || echo "unknown")
-export AWS_DEFAULT_REGION="$$REGION"
-
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
-echo "  Instance ID: $$INSTANCE_ID"
-echo "  Private IP: $$PRIVATE_IP"
-echo "  Public IP: $$PUBLIC_IP"
-echo "  Region: $$REGION"
-echo "  AZ: $$AVAILABILITY_ZONE"
-echo "  Private DNS: $$PRIVATE_DNS"
-
-# Set hostname correctly for Kubernetes
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting proper hostname for Kubernetes"
-NODE_NAME=$$(echo "$$PRIVATE_DNS" | sed 's/\./-/g')
-hostnamectl set-hostname "$$NODE_NAME"
-echo "$$PRIVATE_IP $$NODE_NAME" >> /etc/hosts
-echo "127.0.0.1 $$NODE_NAME" >> /etc/hosts
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Hostname set to: $$NODE_NAME"
-
-# ------------------------
-# 3. KUBERNETES COMPONENTS
-# ------------------------
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing AWS CLI for secrets access"
+# Install AWS CLI for downloading full script from S3
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing AWS CLI"
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip -q awscliv2.zip
 ./aws/install
 rm -rf awscliv2.zip aws/
 
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing containerd runtime"
-apt-get update
+# Get instance metadata for identification
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Fetching instance metadata"
+TOKEN=$$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+REGION=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
+INSTANCE_ID=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
+PRIVATE_IP=$$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
+export AWS_DEFAULT_REGION="$$REGION"
+
+# Write instance metadata to file for later use
+cat > /tmp/instance_metadata.json << EOF
+{
+  "instance_id": "$$INSTANCE_ID",
+  "private_ip": "$$PRIVATE_IP",
+  "region": "$$REGION",
+  "join_command_secret": "${JOIN_COMMAND_SECRET}",
+  "join_command_latest_secret": "${JOIN_COMMAND_LATEST_SECRET}",
+  "worker_logs_bucket": "${WORKER_LOGS_BUCKET}"
+}
+EOF
+
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Downloading full initialization script from S3"
+
+# Generate a file that will contain the full initialization script
+cat > /usr/local/bin/worker_full_init.sh << 'EOF'
+#!/bin/bash
+# Full worker node initialization script downloaded from bootstrap
+
+# Set up extensive logging
+LOGFILE="/var/log/worker-init-full.log"
+DEBUG_LOG="/var/log/worker-debug.log"
+touch $LOGFILE $DEBUG_LOG
+chmod 644 $LOGFILE $DEBUG_LOG
+
+# Log with timestamps
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $1" | tee -a $LOGFILE
+}
+
+# Error handling
+handle_error() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] An error occurred at line $1: $2" | tee -a $LOGFILE $DEBUG_LOG
+}
+
+trap 'handle_error $LINENO "$BASH_COMMAND"' ERR
+
+log "Starting full worker initialization script"
+
+# Load instance metadata
+METADATA_FILE="/tmp/instance_metadata.json"
+if [ -f "$METADATA_FILE" ]; then
+  INSTANCE_ID=$(jq -r '.instance_id' $METADATA_FILE)
+  PRIVATE_IP=$(jq -r '.private_ip' $METADATA_FILE)
+  REGION=$(jq -r '.region' $METADATA_FILE)
+  JOIN_COMMAND_SECRET=$(jq -r '.join_command_secret' $METADATA_FILE)
+  JOIN_COMMAND_LATEST_SECRET=$(jq -r '.join_command_latest_secret' $METADATA_FILE)
+  WORKER_LOGS_BUCKET=$(jq -r '.worker_logs_bucket' $METADATA_FILE)
+  log "Loaded metadata: Instance=$INSTANCE_ID, IP=$PRIVATE_IP, Region=$REGION"
+else
+  log "Metadata file not found, falling back to environment"
+  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+  REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region || echo "us-east-1")
+  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
+  PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4 || echo "unknown")
+fi
+
+# Configure Kubernetes components
+log "Installing Kubernetes components"
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+apt-get update && apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
+apt-mark hold kubelet kubeadm kubectl
+
+# Install containerd runtime
+log "Installing containerd runtime"
 apt-get install -y containerd
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
@@ -131,327 +145,152 @@ sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.to
 systemctl restart containerd
 systemctl enable containerd
 
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Installing Kubernetes components"
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
-apt-get update && apt-get install -y kubelet=1.28.3-1.1 kubeadm=1.28.3-1.1 kubectl=1.28.3-1.1
-apt-mark hold kubelet kubeadm kubectl
-
-# ------------------------
-# 4. SYSTEM CONFIGURATION
-# ------------------------
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring system for Kubernetes"
-# Configure kernel modules
-cat > /etc/modules-load.d/k8s.conf << EOF
+# Configure kernel modules for Kubernetes
+log "Configuring system for Kubernetes"
+cat > /etc/modules-load.d/k8s.conf << EOFMODULES
 overlay
 br_netfilter
-EOF
+EOFMODULES
 modprobe overlay
 modprobe br_netfilter
 
 # Configure sysctl
-cat > /etc/sysctl.d/k8s.conf << EOF
+cat > /etc/sysctl.d/k8s.conf << EOFSYSCTL
 net.bridge.bridge-nf-call-ip6tables = 1
 net.bridge.bridge-nf-call-iptables = 1
 net.ipv4.ip_forward = 1
-EOF
+EOFSYSCTL
 sysctl --system
 
 # Disable swap
 swapoff -a
 sed -i '/ swap / s/^/#/' /etc/fstab
 
-# ------------------------
-# 5. JOIN KUBERNETES CLUSTER
-# ------------------------
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Preparing to join Kubernetes cluster"
-
-# Extremely robust join command retrieval function with enhanced error handling
+# Function to retrieve join command with retries
 get_join_command() {
-  local secret_name="$$1"
-  local max_retries=15
-  local retry_delay=10
+  local max_attempts=10
   local attempt=1
+  local delay=10
+  local join_cmd=""
   
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Retrieving join command from secret: $$secret_name"
+  log "Retrieving join command from AWS Secrets Manager"
   
-  while [ $$attempt -le $$max_retries ]; do
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$max_retries"
+  while [ $attempt -le $max_attempts ]; do
+    log "Attempt $attempt/$max_attempts to get join command"
     
-    # Use full error handling with verbose output
-    AWS_CMD_OUTPUT=$$(aws secretsmanager get-secret-value \
-      --region $$REGION \
-      --secret-id "$$secret_name" \
-      --query "SecretString" \
-      --output text 2>&1)
-    local exit_code=$$?
+    # Try the latest secret first
+    join_cmd=$(aws secretsmanager get-secret-value \
+      --secret-id "$JOIN_COMMAND_LATEST_SECRET" \
+      --region "$REGION" \
+      --query SecretString \
+      --output text 2>/dev/null)
     
-    if [ $$exit_code -ne 0 ]; then
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] AWS CLI error (code $$exit_code): $$AWS_CMD_OUTPUT"
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in $$retry_delay seconds"
-      sleep $$retry_delay
-      attempt=$$((attempt + 1))
-      continue
-    fi
-    
-    # Validate it looks like a join command
-    if [ -n "$$AWS_CMD_OUTPUT" ] && [[ "$$AWS_CMD_OUTPUT" == *"kubeadm join"* ]] && [[ "$$AWS_CMD_OUTPUT" == *"--token"* ]]; then
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Retrieved valid join command"
-      echo "$$AWS_CMD_OUTPUT"
+    # Validate the join command format
+    if [ -n "$join_cmd" ] && [[ "$join_cmd" == *"kubeadm join"* ]] && [[ "$join_cmd" == *"--token"* ]]; then
+      log "Successfully retrieved valid join command"
+      echo "$join_cmd"
       return 0
-    else
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Retrieved invalid join command: '$$AWS_CMD_OUTPUT'"
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in $$retry_delay seconds"
-      sleep $$retry_delay
-      attempt=$$((attempt + 1))
     fi
+    
+    # If latest secret failed, try the main secret
+    join_cmd=$(aws secretsmanager get-secret-value \
+      --secret-id "$JOIN_COMMAND_SECRET" \
+      --region "$REGION" \
+      --query SecretString \
+      --output text 2>/dev/null)
+    
+    if [ -n "$join_cmd" ] && [[ "$join_cmd" == *"kubeadm join"* ]] && [[ "$join_cmd" == *"--token"* ]]; then
+      log "Successfully retrieved valid join command from main secret"
+      echo "$join_cmd"
+      return 0
+    fi
+    
+    log "Failed to get valid join command on attempt $attempt, will retry in $delay seconds"
+    sleep $delay
+    attempt=$((attempt + 1))
+    delay=$((delay + 5))  # Gradually increase delay
   done
   
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to get join command after $$max_retries attempts"
+  log "Failed to retrieve join command after $max_attempts attempts"
   return 1
 }
 
-# Try multiple methods to get the join command, using full ARNs when available
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempting to retrieve join command"
-JOIN_CMD=""
-
-# Method 1: Try with latest secret ARN
-LATEST_SECRET_ARN="${JOIN_COMMAND_LATEST_SECRET}" # This should be the full ARN from terraform
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying latest join command secret: $$LATEST_SECRET_ARN"
-JOIN_CMD=$$(get_join_command "$$LATEST_SECRET_ARN")
-
-# Method 2: Fall back to main secret
-if [ -z "$$JOIN_CMD" ]; then
-  MAIN_SECRET_ARN="${JOIN_COMMAND_SECRET}" # This should be the full ARN from terraform
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying main join command secret: $$MAIN_SECRET_ARN"
-  JOIN_CMD=$$(get_join_command "$$MAIN_SECRET_ARN")
-fi
-
-# Method 3: Search for any join command secrets
-if [ -z "$$JOIN_CMD" ]; then
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Searching for any join command secrets"
-  SECRET_LIST=$$(aws secretsmanager list-secrets --region $$REGION --filters Key=name,Values=kubernetes-join-command --query "SecretList[*].Name" --output text)
+# Validate control plane API server is accessible
+validate_api_server() {
+  local api_ip="$1"
+  log "Validating API server at $api_ip:6443"
   
-  for SECRET in $$SECRET_LIST; do
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying secret: $$SECRET"
-    JOIN_CMD=$$(get_join_command "$$SECRET")
-    
-    if [ -n "$$JOIN_CMD" ]; then
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Found valid join command in: $$SECRET"
-      break
-    fi
-  done
-fi
-
-# Log results to S3 if possible
-log_to_s3() {
-  local log_content="$$1"
-  # Replace the parameter expansion with default value using a different approach
-  local s3_bucket="${WORKER_LOGS_BUCKET}"
-  if [ -z "$$s3_bucket" ]; then
-    s3_bucket="guy-polybot-logs"
-  fi
-  local log_file="worker-init-$$INSTANCE_ID-$$(date +%Y%m%d%H%M%S).log"
-  
-  if command -v aws &>/dev/null; then
-    echo "$$log_content" | aws s3 cp - s3://$$s3_bucket/$$log_file --region $$REGION || true
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Logs uploaded to s3://$$s3_bucket/$$log_file"
+  # Try a simple TCP connection first
+  if nc -z -w 5 "$api_ip" 6443; then
+    log "API server port is reachable"
+    return 0
   else
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] AWS CLI not available, couldn't upload logs to S3"
+    log "API server port 6443 is not reachable, joining may fail"
+    return 1
   fi
 }
 
-# Handle join command execution with pre-join checks
-if [ -n "$$JOIN_CMD" ]; then
-  # Extract control plane IP for network diagnostics
-  CP_IP=$$(echo "$$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
-  
-  # Pre-join network diagnostics 
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Running pre-join network diagnostics"
-  
-  # Validate control plane API server function
-  validate_api_server() {
-    local api_server_ip="$$1"
-    local max_attempts=15
-    local retry_delay=10
-    local attempt=1
-    
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Validating control plane API server at $$api_server_ip:6443"
-    
-    # Function to check basic connectivity
-    check_connectivity() {
-      local target_ip="$$1"
-      # Try ping first
-      if ping -c 1 -W 2 "$$target_ip" &>/dev/null; then
-        echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Ping to control plane successful"
-        return 0
-      else
-        echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Ping to control plane failed, checking TCP connectivity"
-        # Try TCP connectivity
-        if nc -z -w 5 "$$target_ip" 6443 &>/dev/null; then
-          echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] TCP connection to control plane API server successful"
-          return 0
-        else
-          echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] TCP connection to control plane API server failed"
-          return 1
-        fi
-      fi
-    }
-    
-    # Function to check API server health
-    check_api_health() {
-      local target_ip="$$1"
-      # Try a direct HTTP request to the API server health endpoint
-      # Using curl with proper timeout
-      if curl -k -s -m 5 "https://$$target_ip:6443/healthz" | grep -q "ok"; then
-        echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] API server health check successful"
-        return 0
-      else
-        echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] API server health check failed"
-        return 1
-      fi
-    }
-    
-    # Main validation loop
-    while [ $$attempt -le $$max_attempts ]; do
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] API server validation attempt $$attempt/$$max_attempts"
-      
-      # Step 1: Check basic connectivity
-      if check_connectivity "$$api_server_ip"; then
-        # Step 2: Check API server health if connectivity is good
-        if check_api_health "$$api_server_ip"; then
-          echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Control plane API server is responsive"
-          return 0
-        fi
-      fi
-      
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Control plane API server not fully ready. Will retry in $$retry_delay seconds..."
-      sleep $$retry_delay
-      attempt=$$((attempt + 1))
-    done
-    
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Failed to validate control plane API server after $$max_attempts attempts"
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will attempt to join anyway as a last resort"
-    return 1
-  }
-  
-  if [ -n "$$CP_IP" ]; then
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Testing connection to control plane at $$CP_IP:6443"
-    
-    # Comprehensive network diagnostics
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Routing table:"
-    ip route
-    
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] DNS resolution:"
-    dig +short $$(hostname)
-    
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Control plane ping test:"
-    ping -c 3 $$CP_IP || echo "Ping failed, but proceeding anyway"
-    
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [DIAG] Control plane API server port check:"
-    if nc -zv $$CP_IP 6443 -w 5 2>&1; then
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Connection to control plane API successful"
-    else
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Cannot connect to control plane API server, but will try joining anyway"
-    fi
-    
-    # Validate API server
-    validate_api_server "$$CP_IP"
-  else
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not extract control plane IP from join command"
-  fi
+# Get join command
+JOIN_CMD=$(get_join_command)
 
-  # Write join command to file for execution and logging
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Preparing to execute join command"
-  echo "$$JOIN_CMD" > /tmp/join_command.sh
+if [ -n "$JOIN_CMD" ]; then
+  # Extract control plane IP from join command
+  CP_IP=$(echo "$JOIN_CMD" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+  
+  if [ -n "$CP_IP" ]; then
+    log "Control plane IP extracted: $CP_IP"
+    validate_api_server "$CP_IP"
+  else
+    log "Could not extract control plane IP from join command"
+  fi
+  
+  # Execute join command with retry logic
+  log "Executing join command"
+  echo "$JOIN_CMD" > /tmp/join_command.sh
   chmod +x /tmp/join_command.sh
   
-  # Debug - show file for reference
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [DEBUG] Join command script content:"
-  cat /tmp/join_command.sh
-  
-  # Execute join with multiple retries
-  JOIN_SUCCESS=false
-  for i in {1..5}; do
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Join attempt $$i/5"
-    
-    # Set a 5-minute timeout for the join command
-    timeout 300 /tmp/join_command.sh --v=5 2>&1 | tee /tmp/kubeadm-join-$$i.log
-    JOIN_RESULT=$$?
-    
-    if [ $$JOIN_RESULT -eq 0 ]; then
-      JOIN_SUCCESS=true
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the Kubernetes cluster!"
-      
-      # Log success to S3
-      log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) successfully joined the cluster at $$(date)"
+  for i in {1..3}; do
+    log "Join attempt $i/3"
+    if /tmp/join_command.sh --v=5; then
+      log "Successfully joined the Kubernetes cluster!"
       break
     else
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Join attempt $$i failed with exit code $$JOIN_RESULT"
-      cat /tmp/kubeadm-join-$$i.log >> $$LOGFILE
-      
-      if [ $$i -eq 5 ]; then
-        # Log failure to S3 on last attempt
-        log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) failed to join the cluster after 5 attempts. Last error: $$(tail -10 /tmp/kubeadm-join-$$i.log)"
-      fi
-      
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in 30 seconds"
+      log "Join attempt $i failed, will retry in 30 seconds"
       sleep 30
     fi
   done
-  
-  if [ "$$JOIN_SUCCESS" != "true" ]; then
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [CRITICAL] Failed to join cluster after multiple attempts"
-    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will continue with setup in case cluster join was actually successful but reported failure"
-  fi
 else
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [CRITICAL] Could not retrieve join command from any source"
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will continue with setup anyway to prepare node"
-  
-  # Log failure to S3
-  log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) failed to retrieve join command from Secrets Manager at $$(date)"
+  log "Failed to get join command, cannot join cluster"
+  exit 1
 fi
 
-# ------------------------
-# 6. KUBELET CONFIGURATION
-# ------------------------
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configuring kubelet"
-
 # Configure kubelet with correct parameters
-cat > /etc/default/kubelet << EOF
-KUBELET_EXTRA_ARGS="--node-ip=$$PRIVATE_IP --hostname-override=$$NODE_NAME --cloud-provider=external --container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd"
-EOF
+log "Configuring kubelet"
+cat > /etc/default/kubelet << EOFKUBELET
+KUBELET_EXTRA_ARGS="--node-ip=$PRIVATE_IP --hostname-override=$(hostname) --cloud-provider=external --container-runtime=remote --container-runtime-endpoint=unix:///run/containerd/containerd.sock --cgroup-driver=systemd"
+EOFKUBELET
 
 # Restart kubelet to apply configuration
 systemctl daemon-reload
 systemctl enable kubelet
 systemctl restart kubelet
 
-# Print kubelet status for diagnostics
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet status:"
-systemctl status kubelet --no-pager || true
+log "Worker node initialization completed successfully"
+exit 0
+EOF
 
-# Print kubelet logs for diagnostics
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet logs:"
-journalctl -u kubelet --no-pager -n 50 || true
+chmod +x /usr/local/bin/worker_full_init.sh
 
-# Check if node appears in the cluster
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Checking if node appears in the cluster"
-if [ -f "/etc/kubernetes/kubelet.conf" ]; then
-  kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node "$$NODE_NAME" || echo "Node not yet visible in cluster"
+# Upload the full script to S3 for reference
+if command -v aws &>/dev/null; then
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Uploading full initialization script to S3"
+  aws s3 cp /usr/local/bin/worker_full_init.sh s3://${WORKER_LOGS_BUCKET}/scripts/worker_full_init-$$INSTANCE_ID.sh --region $$REGION || true
 fi
 
-# ------------------------
-# 7. FINALIZATION
-# ------------------------
-# Create summary logs for easy access
-mkdir -p /home/ubuntu
-cp $$LOGFILE /home/ubuntu/worker-init-summary.log
-chmod 644 /home/ubuntu/worker-init-summary.log
-chown ubuntu:ubuntu /home/ubuntu/worker-init-summary.log
+# Execute the full initialization script
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Executing full initialization script"
+nohup bash /usr/local/bin/worker_full_init.sh > /var/log/worker-full-init.log 2>&1 &
 
-# Report completion
-RUNTIME=$$SECONDS
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Worker node bootstrap completed in $$(($$RUNTIME / 60)) minutes and $$(($$RUNTIME % 60)) seconds"
+# Bootstrap phase completed successfully
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Bootstrap phase completed, full initialization running in background"
 exit 0 

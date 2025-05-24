@@ -2392,7 +2392,7 @@ resource "null_resource" "verify_control_plane_readiness" {
         # If we get here, all checks have passed
         echo "✅ Control plane verification SUCCESSFUL at $(date)" | tee -a $READINESS_LOG
         exit 0
-      }
+      done
       
       # If we get here, verification failed after all attempts
       echo "❌ Control plane verification FAILED after $MAX_ATTEMPTS attempts" | tee -a $READINESS_LOG
