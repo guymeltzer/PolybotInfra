@@ -518,3 +518,43 @@ cat $${LOGFILE} > /home/ubuntu/init_summary.log
 chown ubuntu:ubuntu /home/ubuntu/init_summary.log
 chmod 644 /home/ubuntu/init_summary.log
 echo "$(date) - Log summary created at /home/ubuntu/init_summary.log"
+
+# Wait for API server to be up before running components
+wait_for_api_server() {
+  echo "$(date) - Waiting for Kubernetes API server to be accessible on port 6443"
+  
+  local max_attempts=30
+  local attempt=1
+  local wait_time=10
+  
+  while [ $attempt -le $max_attempts ]; do
+    echo "$(date) - Checking API server (attempt $attempt/$max_attempts)..."
+    
+    # Check if port 6443 is open
+    if ss -tlnp | grep -q 6443; then
+      echo "$(date) - API server is listening on port 6443"
+      
+      # Verify we can actually connect to the API
+      if kubectl cluster-info &>/dev/null; then
+        echo "$(date) - Successfully connected to Kubernetes API server"
+        return 0
+      else
+        echo "$(date) - API server is listening but not responding to requests yet"
+      fi
+    else
+      echo "$(date) - API server not yet listening on port 6443"
+    fi
+    
+    if [ $attempt -eq $max_attempts ]; then
+      echo "$(date) - WARNING: Timed out waiting for API server, but continuing anyway"
+      return 1
+    fi
+    
+    echo "$(date) - Waiting $wait_time seconds before next attempt..."
+    sleep $wait_time
+    attempt=$((attempt + 1))
+  done
+}
+
+# Call the function before continuing with other components
+wait_for_api_server

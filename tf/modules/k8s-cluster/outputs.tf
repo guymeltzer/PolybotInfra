@@ -98,7 +98,8 @@ output "ssh_private_key_path" {
 }
 
 output "worker_asg_name" {
-  value = aws_autoscaling_group.worker_asg.name
+  description = "Name of the Auto Scaling Group for worker nodes"
+  value       = aws_autoscaling_group.worker_asg.name
 }
 
 output "worker_launch_template_id" {
@@ -130,7 +131,7 @@ output "rotate_join_token" {
 }
 
 output "control_plane_id" {
-  description = "The ID of the control plane instance"
+  description = "Instance ID of the Kubernetes control plane"
   value       = aws_instance.control_plane.id
 }
 
@@ -250,4 +251,32 @@ output "init_logs_commands" {
     # Then for each worker:
     # ssh -i ${local.actual_key_name}.pem ubuntu@WORKER_PUBLIC_IP 'cat /home/ubuntu/init_summary.log'
   EOT
+}
+
+output "control_plane_ip" {
+  description = "Public IP address of the Kubernetes control plane"
+  value       = aws_instance.control_plane.public_ip
+}
+
+output "worker_logs_bucket" {
+  description = "S3 bucket for worker logs"
+  value       = aws_s3_bucket.worker_logs.bucket
+}
+
+output "load_balancer_dns" {
+  description = "DNS name of the load balancer"
+  value       = aws_lb.polybot_alb.dns_name
+}
+
+output "kubernetes_join_command_secrets" {
+  description = "Secret names containing the Kubernetes join command"
+  value = [
+    aws_secretsmanager_secret.kubernetes_join_command.name,
+    aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  ]
+}
+
+output "kubeconfig_path" {
+  description = "Path to the kubeconfig file"
+  value       = "${path.module}/kubeconfig"
 }

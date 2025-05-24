@@ -415,3 +415,177 @@ fi
 
 # Upload final logs
 upload_logs_to_s3 "COMPLETE"
+
+# Create the token refresh script
+echo "Creating token refresh script..."
+cat > /usr/local/bin/refresh-join-token.sh << 'EOF'
+#!/bin/bash
+# Script to generate and store the Kubernetes join command
+# Created by Terraform deployment
+
+# Log file
+LOG_FILE="/var/log/k8s-token-creator.log"
+
+# Ensure the log file exists
+touch $LOG_FILE
+chmod 644 $LOG_FILE
+
+# Log function with timestamps
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+# Wait for the API server to be up before trying to create a token
+wait_for_api_server() {
+  log "Checking Kubernetes API server status"
+  local max_attempts=30
+  local attempt=1
+  
+  while [ $attempt -le $max_attempts ]; do
+    if ss -tlnp | grep -q 6443; then
+      log "API server is listening on port 6443"
+      if kubectl get nodes &>/dev/null; then
+        log "Successfully connected to Kubernetes API server"
+        return 0
+      else
+        log "API server is listening but kubectl command failed"
+      fi
+    else
+      log "API server not yet listening on port 6443 (attempt $attempt/$max_attempts)"
+    fi
+    
+    if [ $attempt -eq $max_attempts ]; then
+      log "ERROR: API server not ready after $max_attempts attempts"
+      return 1
+    fi
+    
+    log "Waiting 10 seconds before next attempt..."
+    sleep 10
+    attempt=$((attempt + 1))
+  done
+}
+
+# Function to generate a join command
+generate_join_command() {
+  log "Generating new join command"
+  
+  # Verify kubeadm is installed
+  if ! command -v kubeadm &>/dev/null; then
+    log "ERROR: kubeadm not found"
+    return 1
+  fi
+  
+  # Check that the control plane is initialized
+  if [ ! -f /etc/kubernetes/admin.conf ]; then
+    log "ERROR: Kubernetes admin.conf not found - control plane may not be initialized"
+    return 1
+  fi
+  
+  # Set KUBECONFIG for the command
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+  
+  # Generate the join command
+  TOKEN_CMD=$(kubeadm token create --print-join-command 2>&1)
+  if [[ "$TOKEN_CMD" == *"kubeadm join"* ]]; then
+    log "Join command: $TOKEN_CMD"
+    
+    # Store the token in AWS Secrets Manager if aws CLI is available
+    if command -v aws &>/dev/null; then
+      local region=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo "us-east-1")
+      local secret_list=$(aws secretsmanager list-secrets --region $region --query "SecretList[?contains(Name, 'kubernetes-join-command')].Name" --output text 2>/dev/null)
+      
+      if [ -n "$secret_list" ]; then
+        log "Updating AWS Secrets Manager with join command"
+        for secret in $secret_list; do
+          aws secretsmanager put-secret-value --secret-id $secret --secret-string "$TOKEN_CMD" --region $region &>/dev/null
+          log "Updated secret: $secret"
+        done
+      else
+        log "No kubernetes-join-command secrets found in Secrets Manager"
+      fi
+    else
+      log "AWS CLI not available - skipping Secrets Manager update"
+    fi
+    
+    return 0
+  else
+    log "ERROR generating join command: $TOKEN_CMD"
+    return 1
+  fi
+}
+
+# Main execution
+log "Starting refresh-join-token.sh script"
+
+# Wait for API server to be ready
+wait_for_api_server
+
+# Generate the join command
+generate_join_command
+
+log "refresh-join-token.sh completed"
+EOF
+
+# Make the script executable
+chmod +x /usr/local/bin/refresh-join-token.sh
+
+# Set up a systemd service to periodically refresh the token
+echo "Setting up token refresh service..."
+cat > /etc/systemd/system/k8s-token-creator.service << EOF
+[Unit]
+Description=Kubernetes Join Token Creator
+After=kubelet.service
+Wants=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh-join-token.sh
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Set up a timer to run the service periodically
+cat > /etc/systemd/system/k8s-token-creator.timer << EOF
+[Unit]
+Description=Run Kubernetes Join Token Creator periodically
+Requires=k8s-token-creator.service
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=1800
+Unit=k8s-token-creator.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Enable and start the timer
+systemctl daemon-reload
+systemctl enable k8s-token-creator.timer
+systemctl start k8s-token-creator.timer
+
+# Run the script once to generate the initial token
+echo "Generating initial join command..."
+/usr/local/bin/refresh-join-token.sh
+
+# Add a manual check for API server accessibility
+echo "Checking API server accessibility on port 6443..."
+if ss -tlnp | grep -q 6443; then
+  echo "API server is listening on port 6443"
+else
+  echo "WARNING: API server is not yet listening on port 6443, might need to wait longer for full initialization"
+fi
+
+# Verify that kubeadm is available
+if command -v kubeadm &>/dev/null; then
+  echo "kubeadm is available"
+else
+  echo "ERROR: kubeadm is not available - this will prevent token creation"
+fi
+
+# Create a log file if it doesn't exist
+touch /var/log/k8s-token-creator.log
+chmod 644 /var/log/k8s-token-creator.log

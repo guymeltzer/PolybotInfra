@@ -437,3 +437,58 @@ output "cluster_kubeconfig" {
   value       = fileexists("${path.module}/kubeconfig.yaml") ? file("${path.module}/kubeconfig.yaml") : "Kubeconfig not available yet"
   sensitive   = true
 }
+
+output "control_plane_ip" {
+  description = "Public IP address of the Kubernetes control plane"
+  value       = module.k8s-cluster.control_plane_ip
+}
+
+output "control_plane_id" {
+  description = "Instance ID of the Kubernetes control plane"
+  value       = module.k8s-cluster.control_plane_id
+}
+
+output "worker_asg_name" {
+  description = "Name of the Auto Scaling Group for worker nodes"
+  value       = module.k8s-cluster.worker_asg_name
+}
+
+output "worker_logs_bucket" {
+  description = "S3 bucket containing worker node logs"
+  value       = module.k8s-cluster.worker_logs_bucket
+}
+
+output "load_balancer_dns" {
+  description = "DNS name of the load balancer in front of the Kubernetes cluster"
+  value       = module.k8s-cluster.load_balancer_dns
+}
+
+output "kubernetes_join_command_secrets" {
+  description = "Secret names containing the Kubernetes join command"
+  value       = module.k8s-cluster.kubernetes_join_command_secrets
+}
+
+output "ssh_key_path" {
+  description = "Path to the SSH key for connecting to cluster nodes"
+  value       = "Use 'polybot-key.pem' to SSH as 'ubuntu@${module.k8s-cluster.control_plane_ip}'"
+}
+
+output "connection_commands" {
+  description = "Commands to connect to the Kubernetes cluster"
+  value = <<-EOT
+    # SSH to control plane:
+    ssh -i polybot-key.pem ubuntu@${module.k8s-cluster.control_plane_ip}
+    
+    # Check cluster status:
+    ssh -i polybot-key.pem ubuntu@${module.k8s-cluster.control_plane_ip} "kubectl get nodes"
+    
+    # View control plane logs:
+    ssh -i polybot-key.pem ubuntu@${module.k8s-cluster.control_plane_ip} "sudo cat /var/log/k8s-control-plane-init.log"
+    
+    # View join command logs:
+    ssh -i polybot-key.pem ubuntu@${module.k8s-cluster.control_plane_ip} "sudo cat /var/log/k8s-token-creator.log"
+    
+    # Access worker logs in S3:
+    aws s3 ls s3://${module.k8s-cluster.worker_logs_bucket}/
+  EOT
+}

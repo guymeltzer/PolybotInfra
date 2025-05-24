@@ -30,9 +30,9 @@ echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Setting up SSH access (PRIORITY)"
 mkdir -p /home/ubuntu/.ssh
 chmod 700 /home/ubuntu/.ssh
 
-# Create authorized_keys file with multiple keys for redundancy
+# Make sure we have a valid SSH key in the authorized_keys file
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Writing SSH public key to authorized_keys file"
 cat > /home/ubuntu/.ssh/authorized_keys << EOF
-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 default-key
 ${SSH_PUBLIC_KEY}
 EOF
 
@@ -179,8 +179,12 @@ get_join_command() {
   while [ $$attempt -le $$max_retries ]; do
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$max_retries"
     
-    # Use full error handling
-    AWS_CMD_OUTPUT=$(aws secretsmanager get-secret-value --region $$REGION --secret-id "$$secret_name" 2>&1)
+    # Use full error handling with verbose output
+    AWS_CMD_OUTPUT=$(aws secretsmanager get-secret-value \
+      --region $$REGION \
+      --secret-id "$$secret_name" \
+      --query "SecretString" \
+      --output text 2>&1)
     local exit_code=$?
     
     if [ $$exit_code -ne 0 ]; then
@@ -191,16 +195,13 @@ get_join_command() {
       continue
     fi
     
-    # Use jq for robust JSON parsing
-    local cmd=$(echo "$$AWS_CMD_OUTPUT" | jq -r '.SecretString' 2>/dev/null)
-    
-    # Verify it looks like a join command
-    if [ -n "$$cmd" ] && [[ "$$cmd" == *"kubeadm join"* ]] && [[ "$$cmd" == *"--token"* ]]; then
+    # Validate it looks like a join command
+    if [ -n "$$AWS_CMD_OUTPUT" ] && [[ "$$AWS_CMD_OUTPUT" == *"kubeadm join"* ]] && [[ "$$AWS_CMD_OUTPUT" == *"--token"* ]]; then
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Retrieved valid join command"
-      echo "$$cmd"
+      echo "$$AWS_CMD_OUTPUT"
       return 0
     else
-      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Retrieved invalid join command: '$$cmd'"
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Retrieved invalid join command: '$$AWS_CMD_OUTPUT'"
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in $$retry_delay seconds"
       sleep $$retry_delay
       attempt=$$((attempt + 1))
@@ -211,24 +212,26 @@ get_join_command() {
   return 1
 }
 
-# Try multiple methods to get the join command
+# Try multiple methods to get the join command, using full ARNs when available
 echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempting to retrieve join command"
 JOIN_CMD=""
 
-# Method 1: Try latest secret first
-echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying latest join command secret: ${JOIN_COMMAND_LATEST_SECRET}"
-JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_LATEST_SECRET}")
+# Method 1: Try with latest secret ARN
+LATEST_SECRET_ARN="${JOIN_COMMAND_LATEST_SECRET}" # This should be the full ARN from terraform
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying latest join command secret: $$LATEST_SECRET_ARN"
+JOIN_CMD=$$(get_join_command "$$LATEST_SECRET_ARN")
 
 # Method 2: Fall back to main secret
 if [ -z "$$JOIN_CMD" ]; then
-  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying main join command secret: ${JOIN_COMMAND_SECRET}"
-  JOIN_CMD=$$(get_join_command "${JOIN_COMMAND_SECRET}")
+  MAIN_SECRET_ARN="${JOIN_COMMAND_SECRET}" # This should be the full ARN from terraform
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying main join command secret: $$MAIN_SECRET_ARN"
+  JOIN_CMD=$$(get_join_command "$$MAIN_SECRET_ARN")
 fi
 
 # Method 3: Search for any join command secrets
 if [ -z "$$JOIN_CMD" ]; then
   echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Searching for any join command secrets"
-  SECRET_LIST=$$(aws secretsmanager list-secrets --region $$REGION --query "SecretList[?contains(Name, 'kubernetes-join-command')].Name" --output text)
+  SECRET_LIST=$$(aws secretsmanager list-secrets --region $$REGION --filters Key=name,Values=kubernetes-join-command --query "SecretList[*].Name" --output text)
   
   for SECRET in $$SECRET_LIST; do
     echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying secret: $$SECRET"
@@ -240,6 +243,20 @@ if [ -z "$$JOIN_CMD" ]; then
     fi
   done
 fi
+
+# Log results to S3 if possible
+log_to_s3() {
+  local log_content="$1"
+  local s3_bucket="${WORKER_LOGS_BUCKET:-guy-polybot-logs}"
+  local log_file="worker-init-$$INSTANCE_ID-$$(date +%Y%m%d%H%M%S).log"
+  
+  if command -v aws &>/dev/null; then
+    echo "$$log_content" | aws s3 cp - s3://$$s3_bucket/$$log_file --region $$REGION || true
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Logs uploaded to s3://$$s3_bucket/$$log_file"
+  else
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] AWS CLI not available, couldn't upload logs to S3"
+  fi
+}
 
 # Handle join command execution with pre-join checks
 if [ -n "$$JOIN_CMD" ]; then
@@ -293,9 +310,19 @@ if [ -n "$$JOIN_CMD" ]; then
     if [ $$JOIN_RESULT -eq 0 ]; then
       JOIN_SUCCESS=true
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the Kubernetes cluster!"
+      
+      # Log success to S3
+      log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) successfully joined the cluster at $$(date)"
       break
     else
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Join attempt $$i failed with exit code $$JOIN_RESULT"
+      cat /tmp/kubeadm-join-$$i.log >> $LOGFILE
+      
+      if [ $$i -eq 5 ]; then
+        # Log failure to S3 on last attempt
+        log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) failed to join the cluster after 5 attempts. Last error: $$(tail -10 /tmp/kubeadm-join-$$i.log)"
+      fi
+      
       echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will retry in 30 seconds"
       sleep 30
     fi
@@ -308,6 +335,9 @@ if [ -n "$$JOIN_CMD" ]; then
 else
   echo "$$(date '+%Y-%m-%d %H:%M:%S') [CRITICAL] Could not retrieve join command from any source"
   echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Will continue with setup anyway to prepare node"
+  
+  # Log failure to S3
+  log_to_s3 "Worker node $$HOSTNAME ($$INSTANCE_ID) failed to retrieve join command from Secrets Manager at $$(date)"
 fi
 
 # ------------------------
