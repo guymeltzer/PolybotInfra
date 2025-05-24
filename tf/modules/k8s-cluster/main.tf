@@ -620,6 +620,8 @@ resource "aws_instance" "control_plane" {
       cluster_name      = var.cluster_name,
       # Add these required variables to fix templating issues
       token_formatted   = local.kubeadm_token,
+      JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
+      JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
       KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
       KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
       # Add explicit empty variables for heredoc escape
@@ -1352,14 +1354,12 @@ resource "aws_launch_template" "worker_lt" {
   # This bootstrap script has the full initialization content embedded
   user_data = base64encode(
     templatefile(
-      "${path.module}/worker_user_data.sh",
+      "${path.module}/bootstrap_worker.sh",
       {
-        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
+        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
         JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
         JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-        region = var.region,
-        KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
-        KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+        REGION = var.region
       }
     )
   )
