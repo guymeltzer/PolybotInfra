@@ -1234,7 +1234,7 @@ metadata:
   name: tigera-operator
 rules:
 - apiGroups: [""]
-  resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts"]
+  resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts", "nodes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments", "daemonsets", "statefulsets"]

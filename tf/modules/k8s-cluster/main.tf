@@ -1521,6 +1521,14 @@ resource "aws_security_group" "worker_sg" {
   }
 
   ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow Kubernetes API server access"
+  }
+
+  ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"

@@ -173,8 +173,9 @@ cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
 chown ubuntu:ubuntu /home/ubuntu/.kube/config
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
-# Untaint the control plane if we have a single-node cluster
-kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+# Apply proper control-plane taint instead of removing it
+echo "$(date) - Applying proper control-plane taint"
+kubectl taint nodes $(hostname) node-role.kubernetes.io/control-plane:NoSchedule --overwrite
 
 # Install Calico networking
 echo "$(date) - Installing Calico CNI"
