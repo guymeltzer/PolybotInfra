@@ -628,6 +628,8 @@ resource "aws_instance" "control_plane" {
       TOKEN             = "",
       DISCOVERY_HASH    = "",
       API_SERVER_IP     = "",
+      # Add the missing 'step' variable referenced in the template
+      step              = "",
       # We're adding other AWS related variables
       VPC_CIDR          = module.vpc.vpc_cidr_block,
       POD_CIDR          = local.pod_cidr
@@ -1350,12 +1352,14 @@ resource "aws_launch_template" "worker_lt" {
   # This bootstrap script has the full initialization content embedded
   user_data = base64encode(
     templatefile(
-      "${path.module}/bootstrap_worker.sh",
+      "${path.module}/worker_user_data.sh",
       {
-        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
+        ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
         JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
         JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-        WORKER_LOGS_BUCKET = aws_s3_bucket.worker_logs.bucket
+        region = var.region,
+        KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
+        KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
       }
     )
   )
