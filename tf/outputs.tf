@@ -15,26 +15,20 @@
 # Dynamically get worker node details (attempts to get them if available)
 resource "null_resource" "worker_node_details" {
   triggers = {
-    # Use meaningful triggers instead of timestamp
-    worker_count = fileexists("/tmp/worker_nodes.json") ? (length(file("/tmp/worker_nodes.json")) > 2 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0) : 0
-    # Don't use filemd5 on kubeconfig as it changes during apply
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    worker_asg_name = module.k8s-cluster.worker_asg_name
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      # Get running worker nodes with full details
       aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
         --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,InstanceId:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
         --output json > /tmp/worker_nodes.json || echo '[]' > /tmp/worker_nodes.json
-      
-      # Create a formatted text version for output display
       echo "" > /tmp/worker_nodes_formatted.txt
       jq -r '.[][] | "Name: \(.Name)\nInstanceId: \(.InstanceId)\nPrivateIP: \(.PrivateIP)\nPublicIP: \(.PublicIP)\nState: \(.State)\n---"' /tmp/worker_nodes.json > /tmp/worker_nodes_formatted.txt
     EOT
   }
+  depends_on = [module.k8s-cluster]
 }
 
 output "worker_nodes" {
@@ -58,20 +52,12 @@ output "worker_nodes_formatted" {
 # Resource to retrieve ArgoCD password for output display
 resource "null_resource" "argocd_password_retriever" {
   triggers = {
-    # Only trigger when ArgoCD is installed or kubeconfig changes
     argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
-    # Don't use filemd5 on kubeconfig as it changes during apply
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      # Retrieve ArgoCD password if available
-      if [ -f "/tmp/argocd-admin-password.txt" ]; then
-        cat /tmp/argocd-admin-password.txt > /tmp/argocd-password-output.txt
-      elif [ -f "${local.kubeconfig_path}" ]; then
-        # Try to get it directly if file not found
+      if [ -f "${local.kubeconfig_path}" ]; then
         PASSWORD=$(KUBECONFIG="${local.kubeconfig_path}" kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
         if [ -n "$PASSWORD" ]; then
           echo "$PASSWORD" > /tmp/argocd-password-output.txt
@@ -81,24 +67,17 @@ resource "null_resource" "argocd_password_retriever" {
       else
         echo "Password not available yet. Kubeconfig not found." > /tmp/argocd-password-output.txt
       fi
-      
-      # Create colorful ArgoCD info
       cat > /tmp/argocd-info.txt << 'INFOEOF'
-🔐 ArgoCD Access Information
----------------------------
+      🔐 ArgoCD Access Information
+      ---------------------------
+      🌐 URL: https://localhost:8081
+      👤 Username: admin
+      🔑 Password: $(cat /tmp/argocd-password-output.txt)
+      Note: Port forwarding is managed by ~/argocd-ssh-tunnel.sh
 INFOEOF
-      
-      echo -e "🌐 URL: \033[1;36mhttps://localhost:8081\033[0m (Port forwarding running automatically)" >> /tmp/argocd-info.txt
-      echo -e "👤 Username: \033[1;32madmin\033[0m" >> /tmp/argocd-info.txt
-      echo -e "🔑 Password: \033[1;32m$(cat /tmp/argocd-password-output.txt)\033[0m" >> /tmp/argocd-info.txt
-      echo "" >> /tmp/argocd-info.txt
-      echo -e "Note: Port forwarding is managed automatically by Terraform" >> /tmp/argocd-info.txt
     EOT
   }
-
-  depends_on = [
-    null_resource.argocd_direct_access
-  ]
+  depends_on = [null_resource.argocd_direct_access, module.k8s-cluster]
 }
 
 output "argocd_info" {
@@ -153,34 +132,24 @@ EOT
 # New dynamic worker logs command that uses actual worker public IPs
 resource "null_resource" "dynamic_worker_logs" {
   triggers = {
-    # Use meaningful triggers instead of timestamp
-    worker_count = fileexists("/tmp/worker_nodes.json") ? (length(file("/tmp/worker_nodes.json")) > 2 ? length(jsondecode(file("/tmp/worker_nodes.json"))) : 0) : 0
-    # Don't use filemd5 on kubeconfig as it changes during apply
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    worker_asg_name = module.k8s-cluster.worker_asg_name
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      # Get running worker nodes
       WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
         --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,PublicIP:PublicIpAddress}" \
         --output json)
-      
       echo "# Dynamic Worker Node Log Commands" > /tmp/worker_log_commands.txt
       echo "# Generated $(date)" >> /tmp/worker_log_commands.txt
       echo "" >> /tmp/worker_log_commands.txt
-      
-      # Generate dynamic log commands with actual IPs
       for row in $(echo "$WORKER_DATA" | jq -r '.[][] | @base64'); do
         _jq() {
           echo $row | base64 --decode | jq -r $1
         }
-        
         NAME=$(_jq '.Name')
         IP=$(_jq '.PublicIP')
-        
         if [ -n "$IP" ]; then
           echo "# Worker: $NAME" >> /tmp/worker_log_commands.txt
           echo "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@$IP 'cat /home/ubuntu/init_summary.log'" >> /tmp/worker_log_commands.txt
@@ -189,6 +158,7 @@ resource "null_resource" "dynamic_worker_logs" {
       done
     EOT
   }
+  depends_on = [module.k8s-cluster]
 }
 
 output "dynamic_worker_logs" {
@@ -277,139 +247,90 @@ output "aws_resources" {
 # Resource to format all outputs into a single file
 resource "null_resource" "format_outputs" {
   triggers = {
-    # Create meaningful triggers that depend on actual resources
-    worker_nodes = null_resource.worker_node_details.id
-    argocd_password = null_resource.argocd_password_retriever.id
-    worker_logs = null_resource.dynamic_worker_logs.id
-    # Don't use filemd5 on kubeconfig as it changes during apply
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    worker_asg_name = module.k8s-cluster.worker_asg_name
+    argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      #!/bin/bash
-      
-      # Create visually appealing output without ANSI color codes
       cat > /tmp/final_output.txt << 'EOF'
-=================================================================
-                POLYBOT KUBERNETES CLUSTER DEPLOYMENT
-=================================================================
-
-EOF
-      
-      # ----- ARGOCD INFO -----
+      =================================================================
+                    POLYBOT KUBERNETES CLUSTER DEPLOYMENT
+      =================================================================
+      EOF
       echo -e "🔐 ARGOCD ACCESS" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
-      
-      # Get password if available
       ARGOCD_PASSWORD=""
       if [ -f "/tmp/argocd-admin-password.txt" ]; then
         ARGOCD_PASSWORD=$(cat /tmp/argocd-admin-password.txt)
       fi
-      
       echo -e "URL: https://localhost:8081" >> /tmp/final_output.txt
       echo -e "Username: admin" >> /tmp/final_output.txt
       echo -e "Password: $ARGOCD_PASSWORD" >> /tmp/final_output.txt
       echo -e "Connection: Run ~/argocd-ssh-tunnel.sh" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
-      
-      # ----- CONTROL PLANE INFO -----
       echo -e "🔧 CONTROL PLANE" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
-      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} \
-        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-        --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} \
-        --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
-        --query "Reservations[0].Instances[0].InstanceId" --output text)
+      PUBLIC_IP=${module.k8s-cluster.control_plane_public_ip}
+      INSTANCE_ID=${module.k8s-cluster.control_plane_instance_id}
       PRIVATE_IP=$(aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" \
         --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
-        
       echo -e "Instance ID: $INSTANCE_ID" >> /tmp/final_output.txt
       echo -e "Public IP:   $PUBLIC_IP" >> /tmp/final_output.txt
       echo -e "Private IP:  $PRIVATE_IP" >> /tmp/final_output.txt
       echo -e "SSH Command: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
-      
-      # ----- WORKER NODES INFO -----
       echo -e "🖥️ WORKER NODES" >> /tmp/final_output.txt
       echo -e "-------------------" >> /tmp/final_output.txt
-      
-      # Directly get worker node information from AWS to be more reliable
       WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
         --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,State:State.Name}" \
         --output json)
-          
-      # Count the number of worker nodes
       NODE_COUNT=$(echo "$WORKER_DATA" | jq -r '.[][][]' | grep "ID" | wc -l)
       echo -e "Worker Count: $NODE_COUNT" >> /tmp/final_output.txt
-      
-      # Format worker details
       if [ "$NODE_COUNT" -gt 0 ]; then
         echo -e "\nWorker Node Details:" >> /tmp/final_output.txt
-        
-        # Get running worker nodes with their public IPs
         WORKER_LINES=$(echo "$WORKER_DATA" | jq -r '.[][] | "- " + .Name + ": ID: " + .ID + ", Private IP: " + .PrivateIP + ", Public IP: " + .PublicIP + ", State: " + .State')
         echo "$WORKER_LINES" >> /tmp/final_output.txt
-        
-        # Extract worker node log commands for later use
         echo -e "\nWorker Node SSH Commands:" >> /tmp/final_output.txt
         echo "$WORKER_DATA" | jq -r '.[][] | "ssh -i polybot-key.pem ubuntu@" + .PublicIP + " # " + .Name' >> /tmp/final_output.txt
       else
         echo -e "No worker nodes found. They may still be starting up." >> /tmp/final_output.txt
       fi
       echo "" >> /tmp/final_output.txt
-      
-      # ----- LOGS AND TROUBLESHOOTING -----
       echo -e "📜 LOGS AND TROUBLESHOOTING" >> /tmp/final_output.txt
       echo -e "----------------------------" >> /tmp/final_output.txt
-      
       echo -e "Control Plane Init Log:" >> /tmp/final_output.txt
       echo -e "ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/init_summary.log'" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
-      
-      # Add worker node log commands
       if [ "$NODE_COUNT" -gt 0 ]; then
         echo -e "Worker Node Init Logs:" >> /tmp/final_output.txt
         echo "$WORKER_DATA" | jq -r '.[][] | "ssh -i polybot-key.pem ubuntu@" + .PublicIP + " \"cat /home/ubuntu/init_summary.log\" # " + .Name' >> /tmp/final_output.txt
         echo "" >> /tmp/final_output.txt
       fi
-      
-      # ----- KUBERNETES ACCESS -----
       echo -e "☸️ KUBERNETES ACCESS" >> /tmp/final_output.txt
       echo -e "---------------------" >> /tmp/final_output.txt
       echo -e "API Endpoint: https://$PUBLIC_IP:6443" >> /tmp/final_output.txt
       echo -e "Kubeconfig:   ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'cat /home/ubuntu/.kube/config' > kubeconfig.yaml && export KUBECONFIG=./kubeconfig.yaml" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
-      
-      # ----- APPLICATION ENDPOINTS -----
       echo -e "🌐 APPLICATION ENDPOINTS" >> /tmp/final_output.txt
       echo -e "------------------------" >> /tmp/final_output.txt
       echo -e "Dev URL:  Not available (polybot_dev module not loaded)" >> /tmp/final_output.txt
       echo -e "Prod URL: Not available (polybot_prod module not loaded)" >> /tmp/final_output.txt
-      
-      # Get ALB DNS from AWS
-      ALB_DNS=$(aws elbv2 describe-load-balancers --region ${var.region} \
-        --query "LoadBalancers[?contains(LoadBalancerName, 'guy-polybot-lb')].DNSName" \
-        --output text)
-      
+      ALB_DNS=${module.k8s-cluster.alb_dns_name}
       echo -e "Load Balancer DNS: $ALB_DNS" >> /tmp/final_output.txt
       echo "" >> /tmp/final_output.txt
-      
-      # ----- CLOSING -----
       echo -e "✅ TERRAFORM DEPLOYMENT COMPLETE" >> /tmp/final_output.txt
       echo -e "==========================================" >> /tmp/final_output.txt
     EOT
   }
-
   depends_on = [
     null_resource.argocd_password_retriever,
     null_resource.worker_node_details,
     null_resource.dynamic_worker_logs,
-    null_resource.argocd_direct_access
+    module.k8s-cluster
   ]
 }
 
