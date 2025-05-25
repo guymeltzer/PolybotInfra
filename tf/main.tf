@@ -1782,4 +1782,310 @@ resource "null_resource" "comprehensive_cluster_validation" {
   }
 }
 
+#DEBUGGABLE: Pre-cluster debug validation hook
+resource "null_resource" "pre_cluster_debug" {
+  depends_on = [null_resource.debug_initialization]
+  
+  triggers = {
+    cluster_config = jsonencode({
+      region     = var.region
+      key_name   = var.key_name
+      timestamp  = timestamp()
+    })
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"pre_cluster_validation", "status":"start", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      
+      # Validate AWS credentials and permissions
+      aws sts get-caller-identity > logs/aws_identity_${timestamp()}.json 2>&1 || {
+        echo '{"stage":"aws_validation", "status":"error", "message":"AWS credentials failed", "time":"${timestamp()}"}' >> logs/tf_debug.log
+        exit 1
+      }
+      
+      # Validate SSH key existence
+      if [ -n "${var.key_name}" ]; then
+        aws ec2 describe-key-pairs --key-names "${var.key_name}" > logs/ssh_key_validation_${timestamp()}.json 2>&1 || {
+          echo '{"stage":"ssh_key_validation", "status":"warning", "message":"SSH key ${var.key_name} not found in AWS", "time":"${timestamp()}"}' >> logs/tf_debug.log
+        }
+      fi
+      
+      echo '{"stage":"pre_cluster_validation", "status":"complete", "time":"${timestamp()}"}' >> logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+module "k8s-cluster" {
+  # Remove dependency that creates circular reference
+  # depends_on = [null_resource.pre_cluster_debug]
+  
+  source = "./modules/k8s-cluster"
+  region = var.region
+
+  # Required parameters
+  control_plane_ami = var.control_plane_ami
+  worker_ami        = var.worker_ami
+  route53_zone_id   = var.route53_zone_id
+  
+  # Instance configuration
+  control_plane_instance_type = var.control_plane_instance_type
+  instance_type               = var.instance_type
+  worker_count                = var.desired_worker_nodes
+  
+  # Network configuration
+  vpc_id      = var.vpc_id
+  subnet_ids  = var.subnet_ids
+  
+  # SSH key configuration
+  ssh_public_key = var.ssh_public_key
+  key_name       = var.key_name
+  
+  # Verification settings
+  skip_api_verification     = var.skip_api_verification
+  skip_token_verification   = var.skip_token_verification
+  verification_max_attempts = var.verification_max_attempts
+  verification_wait_seconds = var.verification_wait_seconds
+  
+  # Additional settings (optional)
+  rebuild_workers       = false
+  rebuild_control_plane = false
+  
+  tags = {
+    Environment = "production"
+    ManagedBy   = "terraform"
+    DebugEnabled = "true"  #DEBUGGABLE: Mark for debug tracking
+  }
+}
+
+#DEBUGGABLE: Post-cluster state validation and error detection
+resource "null_resource" "post_cluster_debug" {
+  # Remove dependency that creates circular reference
+  # depends_on = [module.k8s-cluster]
+  
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"post_cluster_validation", "status":"start", "control_plane_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      
+      # Capture cluster state
+      mkdir -p logs/cluster_state
+      
+      # Get control plane instance details
+      aws ec2 describe-instances --instance-ids "${module.k8s-cluster.control_plane_instance_id}" --region "${var.region}" > logs/cluster_state/control_plane_${timestamp()}.json 2>&1 || {
+        echo '{"stage":"control_plane_describe", "status":"error", "instance_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      }
+      
+      # Test SSH connectivity to control plane
+      timeout 30 bash -c "until nc -z ${module.k8s-cluster.control_plane_public_ip} 22; do sleep 2; done" && {
+        echo '{"stage":"ssh_connectivity", "status":"success", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      } || {
+        echo '{"stage":"ssh_connectivity", "status":"error", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      }
+      
+      # Test Kubernetes API connectivity
+      timeout 30 bash -c "until nc -z ${module.k8s-cluster.control_plane_public_ip} 6443; do sleep 2; done" && {
+        echo '{"stage":"k8s_api_connectivity", "status":"success", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      } || {
+        echo '{"stage":"k8s_api_connectivity", "status":"error", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      }
+      
+      echo '{"stage":"post_cluster_validation", "status":"complete", "time":"${timestamp()}"}' >> logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+# Configure Kubernetes provider with the kubeconfig file
+resource "terraform_data" "kubectl_provider_config" {
+  count = 1
+
+  triggers_replace = {
+    control_plane_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_path  = local.kubeconfig_path
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<EOF
+#!/bin/bash
+set -e
+
+echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+
+# Function to retrieve kubeconfig from control plane with retries
+fetch_kubeconfig() {
+  local MAX_ATTEMPTS=10
+  local RETRY_DELAY=30
+  local attempt=1
+  
+  echo "Retrieving kubeconfig from control plane instance..."
+  
+  while [ $attempt -le $MAX_ATTEMPTS ]; do
+    echo "Attempt $attempt/$MAX_ATTEMPTS to get kubeconfig"
+    
+    # Get the instance ID of the control plane - as a single line command
+    INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text | tr -d '\r\n')
+        
+    if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+      echo "No running control plane instance found, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "Found control plane instance: $INSTANCE_ID"
+    
+    # Use SSM to get the kubeconfig from the instance - as a single line command
+    COMMAND_ID=$(aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" --instance-ids "$INSTANCE_ID" --parameters commands="sudo cat /etc/kubernetes/admin.conf" --output text --query "Command.CommandId" 2>/dev/null | tr -d '\r\n')
+        
+    if [ -z "$COMMAND_ID" ]; then
+      echo "Failed to send SSM command, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "SSM command sent, waiting for completion..."
+    sleep 10
+    
+    # Get the command output - as a single line command
+    KUBECONFIG_CONTENT=$(aws ssm get-command-invocation --region ${var.region} --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text 2>/dev/null)
+        
+    if [ -n "$KUBECONFIG_CONTENT" ] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+      echo "Successfully retrieved kubeconfig"
+      echo "$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
+      chmod 600 ${local.kubeconfig_path}
+      
+      # Update the server address in the kubeconfig to use public IP - as a single line command
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text | tr -d '\r\n')
+          
+      if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "None" ]; then
+        echo "Updating kubeconfig to use public IP: $PUBLIC_IP"
+        # Different sed syntax for macOS and Linux
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          sed -i '' "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        else
+          sed -i "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        fi
+      fi
+      
+      echo "Kubeconfig saved to ${local.kubeconfig_path}"
+      return 0
+    else
+      echo "Invalid kubeconfig content received, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+    fi
+  done
+  
+  echo "Failed to retrieve kubeconfig after $MAX_ATTEMPTS attempts"
+  return 1
+}
+
+# Call the function to fetch the kubeconfig
+fetch_kubeconfig || {
+  echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
+  mkdir -p $(dirname "${local.kubeconfig_path}")
+  cat > ${local.kubeconfig_path} << EOFINNER
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: placeholder
+    client-key-data: placeholder
+EOFINNER
+  chmod 600 ${local.kubeconfig_path}
+}
+
+echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
+EOF
+  }
+}
+
+# Install EBS CSI Driver as a Kubernetes component
+resource "null_resource" "install_ebs_csi_driver" {
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    null_resource.check_ebs_role,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  # Trigger reinstall when the role check is run
+  triggers = {
+    ebs_role_check = null_resource.check_ebs_role.id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      echo "Installing AWS EBS CSI Driver..."
+      
+      # Use kubectl directly since it's already set up
+      export KUBECONFIG=${local.kubeconfig_path}
+      
+      # Create required namespace
+      kubectl create namespace kube-system --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Install the EBS CSI driver using the official YAML
+      kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19"
+      
+      echo "Waiting for EBS CSI driver pods to start..."
+      kubectl -n kube-system wait --for=condition=ready pod -l app=ebs-csi-controller --timeout=120s || true
+      
+      echo "EBS CSI Driver installation complete"
+    EOT
+  }
+}
+
+# Direct ArgoCD access setup
+resource "null_resource" "argocd_direct_access" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "Setting up ArgoCD direct access..."
+      
+      # Wait for ArgoCD deployment to be ready
+      echo "Waiting for ArgoCD deployment to be ready..."
+      kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || true
+      
+      echo "ArgoCD direct access setup complete"
+    EOT
+  }
+}
 
