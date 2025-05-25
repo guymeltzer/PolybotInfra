@@ -2200,24 +2200,24 @@ resource "null_resource" "integrated_debug_analysis" {
       NC='\033[0m'
       
       echo ""
-      echo -e "${BLUE}=====================================================================${NC}"
-      echo -e "${BLUE}           🐛 TERRAFORM DEBUG ANALYSIS RESULTS 🐛${NC}"
-      echo -e "${BLUE}=====================================================================${NC}"
+      echo -e "$${BLUE}=====================================================================$${NC}"
+      echo -e "$${BLUE}           🐛 TERRAFORM DEBUG ANALYSIS RESULTS 🐛$${NC}"
+      echo -e "$${BLUE}=====================================================================$${NC}"
       echo ""
       
       # Check if logs directory exists
       if [ ! -d "logs" ]; then
-        echo -e "${RED}❌ Error: logs/ directory not found!${NC}"
+        echo -e "$${RED}❌ Error: logs/ directory not found!$${NC}"
         exit 1
       fi
       
-      echo -e "${GREEN}📁 Debug logs directory found${NC}"
+      echo -e "$${GREEN}📁 Debug logs directory found$${NC}"
       
       # Analyze main debug log
       echo ""
-      echo -e "${CYAN}═══ Main Debug Log Analysis ═══${NC}"
+      echo -e "$${CYAN}═══ Main Debug Log Analysis ═══$${NC}"
       if [ -f "logs/tf_debug.log" ]; then
-        echo -e "${GREEN}📋 Main debug log found${NC}"
+        echo -e "$${GREEN}📋 Main debug log found$${NC}"
         
         # Count events by status - using simple grep since jq might not be available
         TOTAL_EVENTS=$(wc -l < logs/tf_debug.log 2>/dev/null || echo "0")
@@ -2226,98 +2226,98 @@ resource "null_resource" "integrated_debug_analysis" {
         WARNING_EVENTS=$(grep -c '"status":"warning"' logs/tf_debug.log 2>/dev/null || echo "0")
         
         echo ""
-        echo -e "${BLUE}Event Status Summary:${NC}"
-        echo -e "${YELLOW}  Total events:${NC} $TOTAL_EVENTS"
-        echo -e "${YELLOW}  Successful events:${NC} $SUCCESS_EVENTS"
-        echo -e "${YELLOW}  Error events:${NC} $ERROR_EVENTS"
-        echo -e "${YELLOW}  Warning events:${NC} $WARNING_EVENTS"
+        echo -e "$${BLUE}Event Status Summary:$${NC}"
+        echo -e "$${YELLOW}  Total events:$${NC} $TOTAL_EVENTS"
+        echo -e "$${YELLOW}  Successful events:$${NC} $SUCCESS_EVENTS"
+        echo -e "$${YELLOW}  Error events:$${NC} $ERROR_EVENTS"
+        echo -e "$${YELLOW}  Warning events:$${NC} $WARNING_EVENTS"
         
         echo ""
-        echo -e "${BLUE}Recent Events (last 5):${NC}"
+        echo -e "$${BLUE}Recent Events (last 5):$${NC}"
         tail -5 logs/tf_debug.log | while read -r line; do
           if echo "$line" | grep -q '"status":"error"'; then
-            echo -e "  ${RED}❌ ERROR:${NC} $line"
+            echo -e "  $${RED}❌ ERROR:$${NC} $line"
           elif echo "$line" | grep -q '"status":"success"'; then
-            echo -e "  ${GREEN}✅ SUCCESS:${NC} $line"
+            echo -e "  $${GREEN}✅ SUCCESS:$${NC} $line"
           elif echo "$line" | grep -q '"status":"warning"'; then
-            echo -e "  ${YELLOW}⚠️  WARNING:${NC} $line"
+            echo -e "  $${YELLOW}⚠️  WARNING:$${NC} $line"
           else
-            echo -e "  ${BLUE}📝 INFO:${NC} $line"
+            echo -e "  $${BLUE}📝 INFO:$${NC} $line"
           fi
         done
       else
-        echo -e "${RED}❌ Main debug log not found${NC}"
+        echo -e "$${RED}❌ Main debug log not found$${NC}"
       fi
       
       # Error Analysis
       echo ""
-      echo -e "${CYAN}═══ Error Analysis ═══${NC}"
+      echo -e "$${CYAN}═══ Error Analysis ═══$${NC}"
       if [ -f "logs/tf_debug.log" ]; then
         ERROR_COUNT=$(grep -c '"status":"error"' logs/tf_debug.log 2>/dev/null || echo "0")
         if [ "$ERROR_COUNT" -gt 0 ]; then
-          echo -e "${RED}🚨 Found $ERROR_COUNT error(s):${NC}"
+          echo -e "$${RED}🚨 Found $ERROR_COUNT error(s):$${NC}"
           grep '"status":"error"' logs/tf_debug.log | while read -r error_line; do
-            echo -e "  ${RED}❌${NC} $error_line"
+            echo -e "  $${RED}❌$${NC} $error_line"
           done
         else
-          echo -e "${GREEN}✅ No errors found in debug log${NC}"
+          echo -e "$${GREEN}✅ No errors found in debug log$${NC}"
         fi
       else
-        echo -e "${YELLOW}⚠️  No debug log available for error analysis${NC}"
+        echo -e "$${YELLOW}⚠️  No debug log available for error analysis$${NC}"
       fi
       
       # Cluster State Analysis
       echo ""
-      echo -e "${CYAN}═══ Cluster State Analysis ═══${NC}"
+      echo -e "$${CYAN}═══ Cluster State Analysis ═══$${NC}"
       STATE_DIRS=("cluster_state" "kubernetes_state" "final_state")
       for dir in "cluster_state" "kubernetes_state" "final_state"; do
         if [ -d "logs/$dir" ]; then
           file_count=$(find "logs/$dir" -type f 2>/dev/null | wc -l || echo "0")
-          echo -e "${GREEN}📂 logs/$dir: $file_count files${NC}"
+          echo -e "$${GREEN}📂 logs/$dir: $file_count files$${NC}"
           
           if [ "$file_count" -gt 0 ]; then
-            echo -e "${BLUE}  Recent files:${NC}"
+            echo -e "$${BLUE}  Recent files:$${NC}"
             find "logs/$dir" -type f -name "*.json" 2>/dev/null | tail -3 | sed 's/^/    /' || echo "    No JSON files found"
           fi
         else
-          echo -e "${YELLOW}📂 logs/$dir: directory not found${NC}"
+          echo -e "$${YELLOW}📂 logs/$dir: directory not found$${NC}"
         fi
       done
       
       # AWS Connectivity Check
       echo ""
-      echo -e "${CYAN}═══ AWS Connectivity Check ═══${NC}"
+      echo -e "$${CYAN}═══ AWS Connectivity Check ═══$${NC}"
       if ls logs/aws_identity_*.json >/dev/null 2>&1; then
         LATEST_IDENTITY=$(ls -t logs/aws_identity_*.json 2>/dev/null | head -1)
-        echo -e "${GREEN}🔐 AWS Identity Check:${NC}"
-        echo -e "  ${BLUE}Latest identity file:${NC} $(basename "$LATEST_IDENTITY")"
+        echo -e "$${GREEN}🔐 AWS Identity Check:$${NC}"
+        echo -e "  $${BLUE}Latest identity file:$${NC} $(basename "$LATEST_IDENTITY")"
         
         # Try to extract basic info without requiring jq
         if grep -q '"Account"' "$LATEST_IDENTITY" 2>/dev/null; then
           ACCOUNT=$(grep '"Account"' "$LATEST_IDENTITY" | cut -d'"' -f4 2>/dev/null || echo "unknown")
-          echo -e "  ${BLUE}Account:${NC} $ACCOUNT"
+          echo -e "  $${BLUE}Account:$${NC} $ACCOUNT"
         fi
       else
-        echo -e "${YELLOW}⚠️  No AWS identity files found${NC}"
+        echo -e "$${YELLOW}⚠️  No AWS identity files found$${NC}"
       fi
       
       # Deployment Information
       echo ""
-      echo -e "${CYAN}═══ Deployment Information ═══${NC}"
-      echo -e "${BLUE}📝 Configuration:${NC}"
-      echo -e "  ${YELLOW}Region:${NC} ${var.region}"
-      echo -e "  ${YELLOW}Cluster Name:${NC} ${try(module.k8s-cluster.cluster_name, "unknown")}"
-      echo -e "  ${YELLOW}Control Plane IP:${NC} ${try(module.k8s-cluster.control_plane_public_ip, "not available")}"
-      echo -e "  ${YELLOW}VPC ID:${NC} ${try(module.k8s-cluster.vpc_id, "not available")}"
+      echo -e "$${CYAN}═══ Deployment Information ═══$${NC}"
+      echo -e "$${BLUE}📝 Configuration:$${NC}"
+      echo -e "  $${YELLOW}Region:$${NC} ${var.region}"
+      echo -e "  $${YELLOW}Cluster Name:$${NC} ${try(module.k8s-cluster.cluster_name, "unknown")}"
+      echo -e "  $${YELLOW}Control Plane IP:$${NC} ${try(module.k8s-cluster.control_plane_public_ip, "not available")}"
+      echo -e "  $${YELLOW}VPC ID:$${NC} ${try(module.k8s-cluster.vpc_id, "not available")}"
       
       # Generate Recommendations
       echo ""
-      echo -e "${CYAN}═══ Recommendations ═══${NC}"
-      echo -e "${BLUE}📝 Next Steps:${NC}"
+      echo -e "$${CYAN}═══ Recommendations ═══$${NC}"
+      echo -e "$${BLUE}📝 Next Steps:$${NC}"
       
       # Check for common issues and provide specific guidance
       if grep -q '"status":"error"' logs/tf_debug.log 2>/dev/null; then
-        echo -e "${YELLOW}🔧 Error Resolution:${NC}"
+        echo -e "$${YELLOW}🔧 Error Resolution:$${NC}"
         echo -e "  1. Review error details above"
         echo -e "  2. Check AWS credentials: aws sts get-caller-identity"
         echo -e "  3. Verify region access: aws ec2 describe-regions --region ${var.region}"
@@ -2325,36 +2325,36 @@ resource "null_resource" "integrated_debug_analysis" {
         echo ""
       fi
       
-      echo -e "${GREEN}🚀 Debug Resources Created:${NC}"
-      echo -e "  • Main structured log: ${CYAN}logs/tf_debug.log${NC}"
-      echo -e "  • AWS state files: ${CYAN}logs/cluster_state/${NC}"
-      echo -e "  • Kubernetes state: ${CYAN}logs/kubernetes_state/${NC}"
-      echo -e "  • Deployment summaries: ${CYAN}logs/deployment_summary_*.json${NC}"
+      echo -e "$${GREEN}🚀 Debug Resources Created:$${NC}"
+      echo -e "  • Main structured log: $${CYAN}logs/tf_debug.log$${NC}"
+      echo -e "  • AWS state files: $${CYAN}logs/cluster_state/$${NC}"
+      echo -e "  • Kubernetes state: $${CYAN}logs/kubernetes_state/$${NC}"
+      echo -e "  • Deployment summaries: $${CYAN}logs/deployment_summary_*.json$${NC}"
       echo ""
       
-      echo -e "${BLUE}💡 Useful Commands for Further Analysis:${NC}"
-      echo -e "  • View all errors: ${CYAN}grep '\"status\":\"error\"' logs/tf_debug.log${NC}"
-      echo -e "  • Check timing: ${CYAN}grep -E '(start|complete)' logs/tf_debug.log${NC}"
-      echo -e "  • List all debug files: ${CYAN}find logs/ -type f | sort${NC}"
-      echo -e "  • Check control plane: ${CYAN}ssh ubuntu@${try(module.k8s-cluster.control_plane_public_ip, "CONTROL_PLANE_IP")} 'kubectl get nodes'${NC}"
+      echo -e "$${BLUE}💡 Useful Commands for Further Analysis:$${NC}"
+      echo -e "  • View all errors: $${CYAN}grep '\"status\":\"error\"' logs/tf_debug.log$${NC}"
+      echo -e "  • Check timing: $${CYAN}grep -E '(start|complete)' logs/tf_debug.log$${NC}"
+      echo -e "  • List all debug files: $${CYAN}find logs/ -type f | sort$${NC}"
+      echo -e "  • Check control plane: $${CYAN}ssh ubuntu@${try(module.k8s-cluster.control_plane_public_ip, "CONTROL_PLANE_IP")} 'kubectl get nodes'$${NC}"
       
       # Final Bundle Information
       if ls logs/debug-bundle-*.tgz >/dev/null 2>&1; then
         LATEST_BUNDLE=$(ls -t logs/debug-bundle-*.tgz 2>/dev/null | head -1)
         echo ""
-        echo -e "${GREEN}📦 Debug Bundle Created:${NC}"
-        echo -e "  ${CYAN}$(basename "$LATEST_BUNDLE")${NC}"
-        echo -e "  ${BLUE}Contains all logs and state files for troubleshooting${NC}"
+        echo -e "$${GREEN}📦 Debug Bundle Created:$${NC}"
+        echo -e "  $${CYAN}$(basename "$LATEST_BUNDLE")$${NC}"
+        echo -e "  $${BLUE}Contains all logs and state files for troubleshooting$${NC}"
       fi
       
       echo ""
-      echo -e "${BLUE}=====================================================================${NC}"
+      echo -e "$${BLUE}=====================================================================$${NC}"
       if [ "$ERROR_COUNT" -gt 0 ]; then
-        echo -e "${YELLOW}⚠️  Deployment completed with $ERROR_COUNT errors - review above for details${NC}"
+        echo -e "$${YELLOW}⚠️  Deployment completed with $ERROR_COUNT errors - review above for details$${NC}"
       else
-        echo -e "${GREEN}🎉 Deployment analysis complete - no errors detected!${NC}"
+        echo -e "$${GREEN}🎉 Deployment analysis complete - no errors detected!$${NC}"
       fi
-      echo -e "${BLUE}=====================================================================${NC}"
+      echo -e "$${BLUE}=====================================================================$${NC}"
       
       echo '{"stage":"integrated_debug_analysis", "status":"complete", "errors":"'$ERROR_COUNT'", "time":"${timestamp()}"}' >> logs/tf_debug.log
     EOT
