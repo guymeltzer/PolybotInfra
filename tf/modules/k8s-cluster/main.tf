@@ -16,12 +16,12 @@ module "vpc" {
 
   tags = {
     Name                               = "guy-vpc"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 
   public_subnet_tags = {
-    "kubernetes.io/role/elb"          = "1"
-    "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes-io-role-elb"          = "1"
+    "kubernetes-io-role-internal-elb" = "1"
   }
 }
 
@@ -92,7 +92,7 @@ resource "aws_security_group" "k8s_sg" {
 
   tags = {
     Name = "guy-k8s-sg"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 }
 
@@ -1253,7 +1253,7 @@ resource "aws_security_group" "control_plane_sg" {
   }
 
   tags = {
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 }
 
@@ -1294,7 +1294,7 @@ resource "aws_s3_bucket" "worker_logs" {
   
   tags = {
     Name = "Worker Node Logs Bucket"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 }
 
@@ -1378,7 +1378,7 @@ resource "aws_launch_template" "worker_lt" {
     resource_type = "instance"
     tags = {
       Name = "guy-worker-node-${random_id.suffix.hex}"
-      "kubernetes.io/cluster/kubernetes" = "owned"
+      "kubernetes-io-cluster-kubernetes" = "owned"
       "k8s.io/cluster-autoscaler/enabled" = "true"
       "k8s.io/role/node" = "true"
       "ClusterIdentifier" = "${var.cluster_name}-${random_id.suffix.hex}"
@@ -1442,7 +1442,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
   
   tag {
-    key                 = "kubernetes.io/cluster/kubernetes"
+    key                 = "kubernetes-io-cluster-kubernetes"
     value               = "owned"
     propagate_at_launch = true
   }
@@ -1602,7 +1602,7 @@ resource "aws_security_group" "worker_sg" {
 
   tags = {
     Name = "guy-worker-sg"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 }
 
@@ -2066,7 +2066,7 @@ resource "aws_security_group" "alb_sg" {
   }
 
   tags = {
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   }
 }
 
