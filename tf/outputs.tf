@@ -440,7 +440,7 @@ output "cluster_kubeconfig" {
 
 output "control_plane_ip" {
   description = "Public IP address of the Kubernetes control plane"
-  value       = module.k8s-cluster.control_plane_ip
+  value       = module.k8s-cluster.control_plane_public_ip
 }
 
 output "control_plane_id" {
