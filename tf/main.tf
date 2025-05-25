@@ -475,7 +475,7 @@ resource "null_resource" "configure_argocd_apps" {
   }
   depends_on = [
     null_resource.configure_argocd_repositories,
-    module.kubernetes_resources.null_resource.deploy_mongodb,
+    module.kubernetes_resources,
     module.k8s-cluster
   ]
 }
