@@ -2551,6 +2551,62 @@ resource "aws_launch_template" "worker_lt" {
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
   key_name      = local.actual_key_name
+  
+  # CRITICAL: Add missing properties for worker nodes
+  vpc_security_group_ids = [aws_security_group.worker_sg.id]
+  
+  iam_instance_profile {
+    name = aws_iam_instance_profile.worker_profile.name
+  }
+  
+  # CRITICAL: Add user data for worker node bootstrap
+  user_data = base64encode(templatefile("${path.module}/bootstrap_worker.sh", {
+    cluster_name = var.cluster_name
+    region       = var.region
+    secret_name  = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  }))
+  
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = 20
+      volume_type = "gp3"
+      encrypted   = true
+      delete_on_termination = true
+    }
+  }
+  
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+    instance_metadata_tags      = "enabled"
+  }
+  
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name                                        = "guy-worker-node"
+      "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+      "k8s.io/role/node"                         = "true"
+      #DEBUGGABLE: Mark for debug tracking
+      "DebugEnabled"                              = "true"
+    }
+  }
+  
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name                                        = "guy-worker-node-volume"
+      "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+      #DEBUGGABLE: Mark for debug tracking
+      "DebugEnabled"                              = "true"
+    }
+  }
+  
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 #DEBUGGABLE: Final cluster state validation and debug artifact creation
@@ -2810,13 +2866,36 @@ resource "aws_iam_instance_profile" "worker_profile" {
   }
 }
 
-# Security Group for Kubernetes Cluster Resources - LEGACY (TO BE REMOVED)
-resource "aws_security_group" "k8s_sg_legacy" {
-  name        = "Guy-K8S-SG-Legacy"
-  description = "LEGACY: Security group for Kubernetes control plane and workers - being replaced"
+# Security Group for Kubernetes Cluster Resources
+resource "aws_security_group" "k8s_sg_duplicate_remove" {
+  #VALIDATION: This is a duplicate resource - DO NOT USE
+  # Enhanced version is at line 2384 with all required Kubernetes ports
+  # This resource exists only to prevent Terraform errors during transition
+  
+  name        = "Guy-K8S-SG-Duplicate-Remove"
+  description = "DUPLICATE - DO NOT USE - See enhanced version at line 2384"
   vpc_id      = module.vpc.vpc_id
 
-  #VALIDATION: This is the old version - enhanced version with all ports is later in file
-  # This resource should be removed in next iteration to eliminate duplicate
+  # Minimal configuration to prevent errors
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["127.0.0.1/32"]  # Localhost only - effectively disabled
+    description = "Disabled - use enhanced security group"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name = "guy-k8s-sg-duplicate-remove"
+    "REMOVE" = "true"
+  }
 }
 
