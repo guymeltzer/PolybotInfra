@@ -6,7 +6,7 @@
 resource "null_resource" "create_storage_classes" {
   count = var.enable_resources ? 1 : 0
   triggers = {
-    kubeconfig_trigger = terraform_data.kubectl_provider_config[0].id
+    kubeconfig_trigger = var.kubeconfig_trigger_id
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -14,11 +14,6 @@ resource "null_resource" "create_storage_classes" {
       KUBECONFIG="${var.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/storage-classes.yaml
     EOT
   }
-  depends_on = [
-    terraform_data.kubectl_provider_config,
-    module.k8s-cluster.aws_instance.control_plane,
-    null_resource.install_ebs_csi_driver
-  ]
   lifecycle {
     create_before_destroy = true
   }
@@ -28,7 +23,7 @@ resource "null_resource" "create_storage_classes" {
 resource "null_resource" "improved_disk_cleanup" {
   count = var.enable_resources ? 1 : 0
   triggers = {
-    worker_asg_name = module.k8s-cluster.worker_asg_name
+    control_plane_id = var.control_plane_id
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -38,7 +33,6 @@ resource "null_resource" "improved_disk_cleanup" {
         --query "Reservations[*].Instances[*].InstanceId" --output text | xargs -I {} aws ec2 terminate-instances --region ${var.region} --instance-ids {}
     EOT
   }
-  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
   lifecycle {
     create_before_destroy = true
   }
@@ -137,7 +131,7 @@ resource "null_resource" "cleanup_worker_nodes" {
 resource "null_resource" "deploy_mongodb" {
   count = var.enable_resources && !var.skip_mongodb ? 1 : 0
   triggers = {
-    kubeconfig_trigger = terraform_data.kubectl_provider_config[0].id
+    kubeconfig_trigger = var.kubeconfig_trigger_id
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -145,11 +139,6 @@ resource "null_resource" "deploy_mongodb" {
       KUBECONFIG="${var.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/mongodb-deployment.yaml
     EOT
   }
-  depends_on = [
-    terraform_data.kubectl_provider_config,
-    module.k8s-cluster.aws_instance.control_plane,
-    null_resource.install_ebs_csi_driver
-  ]
   lifecycle {
     create_before_destroy = true
   }
@@ -221,7 +210,6 @@ resource "terraform_data" "kubectl_provider_config" {
   triggers_replace = {
     cluster_id = var.control_plane_id
   }
-  depends_on = [module.k8s-cluster.aws_instance.control_plane]
   lifecycle {
     create_before_destroy = true
   }
@@ -232,12 +220,11 @@ resource "null_resource" "providers_ready" {
   count = var.enable_resources ? 1 : 0
   
   depends_on = [
-    var.kubernetes_dependency,
-    terraform_data.kubectl_provider_config
+    var.kubernetes_dependency
   ]
   
   triggers = {
-    kubeconfig_id = try(terraform_data.kubectl_provider_config[0].id, "")
+    kubeconfig_id = var.kubeconfig_trigger_id
   }
   
   provisioner "local-exec" {

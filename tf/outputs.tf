@@ -28,7 +28,7 @@ resource "null_resource" "worker_node_details" {
       jq -r '.[][] | "Name: \(.Name)\nInstanceId: \(.InstanceId)\nPrivateIP: \(.PrivateIP)\nPublicIP: \(.PublicIP)\nState: \(.State)\n---"' /tmp/worker_nodes.json > /tmp/worker_nodes_formatted.txt
     EOT
   }
-  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
+  depends_on = [module.k8s-cluster]
 }
 
 output "worker_nodes" {
@@ -77,7 +77,7 @@ resource "null_resource" "argocd_password_retriever" {
 INFOEOF
     EOT
   }
-  depends_on = [null_resource.install_argocd, module.k8s-cluster.aws_instance.control_plane]
+  depends_on = [null_resource.install_argocd, module.k8s-cluster]
 }
 
 output "argocd_info" {
@@ -158,7 +158,7 @@ resource "null_resource" "dynamic_worker_logs" {
       done
     EOT
   }
-  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
+  depends_on = [module.k8s-cluster]
 }
 
 output "dynamic_worker_logs" {
@@ -330,8 +330,7 @@ resource "null_resource" "format_outputs" {
     null_resource.argocd_password_retriever,
     null_resource.worker_node_details,
     null_resource.dynamic_worker_logs,
-    module.k8s-cluster.aws_instance.control_plane,
-    module.k8s-cluster.aws_autoscaling_group.worker_asg
+    module.k8s-cluster
   ]
 }
 

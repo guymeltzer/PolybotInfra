@@ -53,6 +53,38 @@ locals {
   )
 }
 
+# K8S-CLUSTER MODULE - Main Kubernetes cluster infrastructure
+module "k8s-cluster" {
+  source = "./modules/k8s-cluster"
+  
+  # Required parameters
+  region                        = var.region
+  cluster_name                 = "guy-cluster"  # Fixed cluster name
+  vpc_id                       = var.vpc_id
+  subnet_ids                   = var.subnet_ids
+  route53_zone_id              = var.route53_zone_id
+  key_name                     = var.key_name
+  control_plane_ami            = var.control_plane_ami
+  worker_ami                   = var.worker_ami
+  control_plane_instance_type  = var.control_plane_instance_type
+  worker_instance_type         = var.instance_type
+  worker_count                 = var.desired_worker_nodes
+  instance_type                = var.instance_type
+  ssh_public_key              = var.ssh_public_key
+  skip_api_verification       = var.skip_api_verification
+  skip_token_verification     = var.skip_token_verification
+  verification_max_attempts   = var.verification_max_attempts
+  verification_wait_seconds   = var.verification_wait_seconds
+  pod_cidr                    = var.pod_cidr
+  
+  # Optional parameters
+  tags = {
+    Environment = "production"
+    Project     = "polybot"
+    ManagedBy   = "terraform"
+  }
+}
+
 #DEBUGGABLE: Debug initialization and pre-execution logging
 resource "null_resource" "debug_initialization" {
   triggers = {
@@ -313,7 +345,7 @@ resource "null_resource" "wait_for_kubernetes" {
       done
     EOT
   }
-  depends_on = [module.k8s-cluster.aws_instance.control_plane]
+  depends_on = [module.k8s-cluster]
 }
 
 # Resource that checks if ArgoCD is already deployed before spending time installing it
@@ -444,7 +476,7 @@ resource "null_resource" "configure_argocd_apps" {
   depends_on = [
     null_resource.configure_argocd_repositories,
     module.kubernetes_resources.null_resource.deploy_mongodb,
-    module.k8s-cluster.aws_instance.control_plane
+    module.k8s-cluster
   ]
 }
 
@@ -461,7 +493,7 @@ resource "null_resource" "install_calico" {
   }
   depends_on = [
     null_resource.wait_for_kubernetes,
-    module.k8s-cluster.aws_instance.control_plane
+    module.k8s-cluster
   ]
 }
 
@@ -480,7 +512,7 @@ resource "null_resource" "configure_argocd_repositories" {
   depends_on = [
     null_resource.install_argocd,
     null_resource.argocd_password_retriever,
-    module.k8s-cluster.aws_instance.control_plane
+    module.k8s-cluster
   ]
 }
 
@@ -666,7 +698,7 @@ resource "null_resource" "deploy_mongodb_directly" {
   depends_on = [
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
-    module.k8s-cluster.aws_instance.control_plane
+    module.k8s-cluster
   ]
 }
 
@@ -690,13 +722,12 @@ module "kubernetes_resources" {
   ebs_csi_dependency    = null_resource.install_ebs_csi_driver
   control_plane_id      = module.k8s-cluster.control_plane_instance_id
   
-  # Remove most depends_on to avoid circular dependencies
-  # depends_on = [
-  #   terraform_data.kubectl_provider_config,
-  #   null_resource.install_ebs_csi_driver,
-  #   null_resource.wait_for_kubernetes,
-  #   null_resource.check_ebs_role
-  # ]
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    null_resource.install_ebs_csi_driver,
+    null_resource.wait_for_kubernetes,
+    module.k8s-cluster
+  ]
 }
 
 # Add display information at the start of deployment
@@ -959,7 +990,7 @@ resource "null_resource" "integrated_debug_analysis" {
       echo "Cluster debug: Control plane ID: ${module.k8s-cluster.control_plane_instance_id}" > /tmp/post_cluster_debug.txt
     EOT
   }
-  depends_on = [module.k8s-cluster.aws_instance.control_plane]
+  depends_on = [module.k8s-cluster]
 }
 
 # Configure Kubernetes provider with the kubeconfig file
@@ -1078,6 +1109,8 @@ EOFINNER
 echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
 EOF
   }
+  
+  depends_on = [module.k8s-cluster]
 }
 
 # Install EBS CSI Driver as a Kubernetes component

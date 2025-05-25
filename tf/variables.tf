@@ -166,3 +166,64 @@ variable "pod_cidr" {
   type        = string
   default     = "10.244.0.0/16"
 }
+
+# Additional variables for cluster configuration
+variable "cluster_name" {
+  description = "Name of the Kubernetes cluster"
+  type        = string
+  default     = "guy-cluster"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "subnet_cidrs" {
+  description = "List of subnet CIDR blocks"
+  type        = list(string)
+  default     = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "ami_id" {
+  description = "AMI ID for EC2 instances (for backwards compatibility)"
+  type        = string
+  default     = ""
+}
+
+variable "worker_instance_type" {
+  description = "Instance type for worker nodes"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "worker_node_count" {
+  description = "Number of worker nodes (for backwards compatibility)"
+  type        = number
+  default     = 2
+}
+
+variable "rebuild_workers" {
+  description = "Flag to trigger rebuild of worker nodes"
+  type        = bool
+  default     = false
+}
+
+variable "rebuild_control_plane" {
+  description = "Flag to trigger rebuild of the control plane instance"
+  type        = bool
+  default     = false
+}
+
+variable "addons" {
+  description = "List of URLs to Kubernetes add-on manifests to apply"
+  type        = list(string)
+  default     = []
+}
+
+variable "tags" {
+  description = "A map of tags to add to all resources"
+  type        = map(string)
+  default     = {}
+}
