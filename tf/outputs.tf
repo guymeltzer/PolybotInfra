@@ -445,7 +445,7 @@ output "control_plane_ip" {
 
 output "control_plane_id" {
   description = "Instance ID of the Kubernetes control plane"
-  value       = module.k8s-cluster.control_plane_id
+  value       = module.k8s-cluster.control_plane_instance_id
 }
 
 output "worker_asg_name" {
@@ -460,7 +460,7 @@ output "worker_logs_bucket" {
 
 output "load_balancer_dns" {
   description = "DNS name of the load balancer in front of the Kubernetes cluster"
-  value       = module.k8s-cluster.load_balancer_dns
+  value       = module.k8s-cluster.alb_dns_name
 }
 
 output "kubernetes_join_command_secrets" {
@@ -511,7 +511,7 @@ output "deployment_status" {
     region               = var.region
     cluster_name         = try(module.k8s-cluster.cluster_name, "unknown")
     control_plane_ip     = try(module.k8s-cluster.control_plane_public_ip, "not available")
-    control_plane_id     = try(module.k8s-cluster.control_plane_id, "not available")
+    control_plane_id     = try(module.k8s-cluster.control_plane_instance_id, "not available")
     vpc_id              = try(module.k8s-cluster.vpc_id, "not available")
     kubeconfig_path     = local.kubeconfig_path
     kubeconfig_ready    = local.k8s_ready
@@ -613,12 +613,12 @@ output "copy_paste_debug_info" {
 output "deployment_readiness_check" {
   description = "Final check of deployment readiness"
   value = {
-    infrastructure_ready = try(module.k8s-cluster.control_plane_id != "", false)
+    infrastructure_ready = try(module.k8s-cluster.control_plane_instance_id != "", false)
     kubeconfig_available = local.kubeconfig_exists
     kubernetes_ready     = local.k8s_ready
     debug_logs_created   = fileexists("logs/tf_debug.log")
     overall_status = (
-      try(module.k8s-cluster.control_plane_id != "", false) &&
+      try(module.k8s-cluster.control_plane_instance_id != "", false) &&
       local.kubeconfig_exists &&
       fileexists("logs/tf_debug.log")
     ) ? "🎉 READY" : "⚠️ NEEDS ATTENTION"

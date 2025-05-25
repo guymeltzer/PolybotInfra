@@ -308,7 +308,7 @@ resource "null_resource" "wait_for_kubernetes" {
   ]
   
   triggers = {
-    control_plane_id = try(module.k8s-cluster.control_plane_id, "none")
+    control_plane_id = try(module.k8s-cluster.control_plane_instance_id, "none")
   }
   
   provisioner "local-exec" {
@@ -762,7 +762,7 @@ resource "terraform_data" "kubectl_provider_config" {
   count = 1
 
   triggers_replace = {
-    control_plane_id = module.k8s-cluster.control_plane_id
+    control_plane_id = module.k8s-cluster.control_plane_instance_id
     kubeconfig_path  = local.kubeconfig_path
   }
 
@@ -937,7 +937,7 @@ resource "null_resource" "create_namespaces" {
 
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    instance_id = module.k8s-cluster.control_plane_id
+    instance_id = module.k8s-cluster.control_plane_instance_id
   }
 
   # Use local-exec to create namespaces directly with kubectl
@@ -1065,21 +1065,21 @@ resource "null_resource" "post_cluster_debug" {
   depends_on = [module.k8s-cluster]
   
   triggers = {
-    cluster_id = module.k8s-cluster.control_plane_id
+    cluster_id = module.k8s-cluster.control_plane_instance_id
     timestamp = timestamp()
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<EOT
-      echo '{"stage":"post_cluster_validation", "status":"start", "control_plane_id":"${module.k8s-cluster.control_plane_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      echo '{"stage":"post_cluster_validation", "status":"start", "control_plane_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
       
       # Capture cluster state
       mkdir -p logs/cluster_state
       
       # Get control plane instance details
-      aws ec2 describe-instances --instance-ids "${module.k8s-cluster.control_plane_id}" --region "${var.region}" > logs/cluster_state/control_plane_${timestamp()}.json 2>&1 || {
-        echo '{"stage":"control_plane_describe", "status":"error", "instance_id":"${module.k8s-cluster.control_plane_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
+      aws ec2 describe-instances --instance-ids "${module.k8s-cluster.control_plane_instance_id}" --region "${var.region}" > logs/cluster_state/control_plane_${timestamp()}.json 2>&1 || {
+        echo '{"stage":"control_plane_describe", "status":"error", "instance_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
       }
       
       # Test SSH connectivity to control plane
@@ -1921,7 +1921,7 @@ module "kubernetes_resources" {
   kubeconfig_trigger_id = terraform_data.kubectl_provider_config[0].id
   kubernetes_dependency = null_resource.wait_for_kubernetes
   ebs_csi_dependency    = null_resource.install_ebs_csi_driver
-  control_plane_id      = module.k8s-cluster.control_plane_id
+  control_plane_id      = module.k8s-cluster.control_plane_instance_id
   
   # Ensure this module runs after the necessary resources
   depends_on = [
