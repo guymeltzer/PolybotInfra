@@ -2039,8 +2039,9 @@ resource "null_resource" "kubernetes_readiness_debug" {
 #DEBUGGABLE: Debug artifact packaging and final validation
 resource "null_resource" "debug_bundle_creation" {
   depends_on = [
-    null_resource.kubernetes_readiness_debug,
-    module.kubernetes_resources
+    null_resource.kubernetes_readiness_debug
+    # Remove potential circular dependency with kubernetes_resources module
+    # module.kubernetes_resources
   ]
   
   triggers = {
@@ -2117,7 +2118,8 @@ SUMMARY
 
 #DEBUGGABLE: Final deployment summary and troubleshooting guide
 resource "null_resource" "deployment_summary" {
-  depends_on = [null_resource.integrated_debug_analysis]
+  # Remove circular dependency - this should run independently
+  # depends_on = [null_resource.integrated_debug_analysis]
   
   triggers = {
     completion_time = timestamp()
@@ -2179,7 +2181,8 @@ GUIDE
 
 #DEBUGGABLE: Comprehensive debug analysis and summary integrated into Terraform apply
 resource "null_resource" "integrated_debug_analysis" {
-  depends_on = [null_resource.debug_bundle_creation]
+  # Remove circular dependency - this should run independently
+  # depends_on = [null_resource.debug_bundle_creation]
   
   triggers = {
     analysis_time = timestamp()
@@ -2411,7 +2414,8 @@ resource "null_resource" "integrated_debug_analysis" {
 
 #VALIDATION: Comprehensive post-deployment cluster validation
 resource "null_resource" "comprehensive_cluster_validation" {
-  depends_on = [null_resource.integrated_debug_analysis]
+  # Remove circular dependency - this should run independently
+  # depends_on = [null_resource.integrated_debug_analysis]
   
   triggers = {
     validation_time = timestamp()
