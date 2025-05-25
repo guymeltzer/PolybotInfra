@@ -492,3 +492,135 @@ output "connection_commands" {
     aws s3 ls s3://${module.k8s-cluster.worker_logs_bucket}/
   EOT
 }
+
+#DEBUGGABLE: Comprehensive debug outputs for Terraform apply
+output "debug_logs_location" {
+  description = "Location of all debug logs and artifacts"
+  value = {
+    main_log           = "logs/tf_debug.log"
+    cluster_state      = "logs/cluster_state/"
+    kubernetes_state   = "logs/kubernetes_state/"
+    deployment_summary = "logs/deployment_summary_*.json"
+    debug_bundle       = "logs/debug-bundle-*.tgz"
+  }
+}
+
+output "deployment_status" {
+  description = "Overall deployment status and key information"
+  value = {
+    region               = var.region
+    cluster_name         = try(module.k8s-cluster.cluster_name, "unknown")
+    control_plane_ip     = try(module.k8s-cluster.control_plane_public_ip, "not available")
+    control_plane_id     = try(module.k8s-cluster.control_plane_id, "not available")
+    vpc_id              = try(module.k8s-cluster.vpc_id, "not available")
+    kubeconfig_path     = local.kubeconfig_path
+    kubeconfig_ready    = local.k8s_ready
+  }
+}
+
+output "debug_analysis_summary" {
+  description = "Summary of debug analysis for quick troubleshooting"
+  value = {
+    logs_directory_exists = fileexists("logs/tf_debug.log") ? "✅ Found" : "❌ Missing"
+    cluster_state_files   = try(length(fileset("logs/cluster_state", "*.json")) > 0, false) ? "✅ Available" : "⚠️ None found"
+    kubernetes_state      = try(length(fileset("logs/kubernetes_state", "*.json")) > 0, false) ? "✅ Available" : "⚠️ None found"
+    debug_bundle_created  = try(length(fileset("logs", "debug-bundle-*.tgz")) > 0, false) ? "✅ Created" : "⚠️ Not found"
+  }
+}
+
+output "error_analysis" {
+  description = "Error analysis from debug logs"
+  value = fileexists("logs/tf_debug.log") ? {
+    total_lines    = try(length(split("\n", file("logs/tf_debug.log"))), 0)
+    error_count    = try(length(regexall("\"status\":\"error\"", file("logs/tf_debug.log"))), 0)
+    warning_count  = try(length(regexall("\"status\":\"warning\"", file("logs/tf_debug.log"))), 0)
+    success_count  = try(length(regexall("\"status\":\"success\"", file("logs/tf_debug.log"))), 0)
+  } : {
+    status = "❌ Debug log not available"
+    total_lines = 0
+    error_count = 0
+    warning_count = 0
+    success_count = 0
+  }
+}
+
+output "troubleshooting_commands" {
+  description = "Key commands for troubleshooting deployment issues"
+  value = {
+    view_errors           = "grep '\"status\":\"error\"' logs/tf_debug.log"
+    check_timing          = "grep -E '(start|complete)' logs/tf_debug.log"
+    list_debug_files      = "find logs/ -type f | sort"
+    check_control_plane   = try("ssh ubuntu@${module.k8s-cluster.control_plane_public_ip} 'kubectl get nodes'", "Control plane IP not available")
+    check_aws_identity    = "aws sts get-caller-identity"
+    verify_region_access  = "aws ec2 describe-regions --region ${var.region}"
+  }
+}
+
+output "next_steps" {
+  description = "Recommended next steps based on deployment status"
+  value = local.k8s_ready ? {
+    status = "🎉 Deployment appears successful!"
+    actions = [
+      "✅ Verify cluster: kubectl --kubeconfig=${local.kubeconfig_path} get nodes",
+      "✅ Check pods: kubectl --kubeconfig=${local.kubeconfig_path} get pods --all-namespaces",
+      "✅ Access ArgoCD: Run the ArgoCD tunnel script if available",
+      "✅ Review logs: Check logs/tf_debug.log for any warnings"
+    ]
+  } : {
+    status = "⚠️ Deployment may need attention"
+    actions = [
+      "🔍 Check errors: grep '\"status\":\"error\"' logs/tf_debug.log",
+      "🔍 Verify AWS access: aws sts get-caller-identity",
+      "🔍 Check control plane: SSH to instance if available",
+      "🔍 Review debug bundle: Latest debug-bundle-*.tgz in logs/"
+    ]
+  }
+}
+
+output "debug_environment_info" {
+  description = "Debug environment configuration for troubleshooting"
+  value = {
+    terraform_workspace = terraform.workspace
+    debug_config = local.debug_config
+    debug_environment = local.debug_environment
+    skip_resources = {
+      argocd     = local.skip_argocd
+      namespaces = local.skip_namespaces
+    }
+  }
+}
+
+# Special output for copy-paste debugging
+output "copy_paste_debug_info" {
+  description = "Debug information formatted for easy copy-paste to Cursor AI"
+  value = fileexists("logs/tf_debug.log") ? join("\n", [
+    "=== TERRAFORM DEBUG SUMMARY ===",
+    "Region: ${var.region}",
+    "Cluster: ${try(module.k8s-cluster.cluster_name, "unknown")}",
+    "Control Plane: ${try(module.k8s-cluster.control_plane_public_ip, "not available")}",
+    "Kubeconfig Ready: ${local.k8s_ready}",
+    "Error Count: ${try(length(regexall("\"status\":\"error\"", file("logs/tf_debug.log"))), 0)}",
+    "Warning Count: ${try(length(regexall("\"status\":\"warning\"", file("logs/tf_debug.log"))), 0)}",
+    "Last 3 Log Entries:",
+    try(join("\n", slice(split("\n", file("logs/tf_debug.log")), 
+                         max(0, length(split("\n", file("logs/tf_debug.log"))) - 3),
+                         length(split("\n", file("logs/tf_debug.log"))))), "No log entries available"),
+    "=== END DEBUG SUMMARY ==="
+  ]) : "Debug log not available - check if terraform apply completed successfully"
+}
+
+# Final deployment readiness check
+output "deployment_readiness_check" {
+  description = "Final check of deployment readiness"
+  value = {
+    infrastructure_ready = try(module.k8s-cluster.control_plane_id != "", false)
+    kubeconfig_available = local.kubeconfig_exists
+    kubernetes_ready     = local.k8s_ready
+    debug_logs_created   = fileexists("logs/tf_debug.log")
+    overall_status = (
+      try(module.k8s-cluster.control_plane_id != "", false) &&
+      local.kubeconfig_exists &&
+      fileexists("logs/tf_debug.log")
+    ) ? "🎉 READY" : "⚠️ NEEDS ATTENTION"
+  }
+}

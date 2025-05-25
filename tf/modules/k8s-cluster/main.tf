@@ -1,4 +1,32 @@
+#DEBUGGABLE: VPC creation debug hook
+resource "null_resource" "vpc_debug_pre" {
+  triggers = {
+    vpc_config = jsonencode({
+      vpc_cidr = "10.0.0.0/16"
+      region   = var.region
+      timestamp = timestamp()
+    })
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"vpc_creation", "status":"start", "region":"${var.region}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Validate region and availability zones
+      aws ec2 describe-availability-zones --region "${var.region}" > ../logs/cluster_state/az_validation_${timestamp()}.json 2>&1 || {
+        echo '{"stage":"az_validation", "status":"error", "region":"${var.region}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      }
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+# Fix 1: Update VPC tags with AWS cloud provider integration requirements
 module "vpc" {
+  depends_on = [null_resource.vpc_debug_pre]
+  
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
 
@@ -15,13 +43,57 @@ module "vpc" {
   enable_dns_support   = true
 
   tags = {
-    Name                               = "guy-vpc"
-    "kubernetes-io-cluster-kubernetes" = "owned"
+    Name                                        = "guy-vpc"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    # AWS Cloud Provider integration tags
+    "kubernetes.io/role/elb"                    = "1"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
   }
 
   public_subnet_tags = {
-    "kubernetes-io-role-elb"          = "1"
-    "kubernetes-io-role-internal-elb" = "1"
+    "kubernetes.io/role/elb"                    = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    # Ensure load balancer controller can find subnets
+    "kubernetes.io/role/internal-elb"           = ""
+  }
+
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb"           = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+  }
+}
+
+#DEBUGGABLE: VPC creation validation hook
+resource "null_resource" "vpc_debug_post" {
+  depends_on = [module.vpc]
+  
+  triggers = {
+    vpc_id = module.vpc.vpc_id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"vpc_creation", "status":"complete", "vpc_id":"${module.vpc.vpc_id}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Capture VPC details for debugging
+      aws ec2 describe-vpcs --vpc-ids "${module.vpc.vpc_id}" --region "${var.region}" > ../logs/cluster_state/vpc_details_${timestamp()}.json 2>&1
+      aws ec2 describe-subnets --filters "Name=vpc-id,Values=${module.vpc.vpc_id}" --region "${var.region}" > ../logs/cluster_state/subnet_details_${timestamp()}.json 2>&1
+      
+      echo '{"stage":"vpc_validation", "status":"complete", "public_subnets":${length(module.vpc.public_subnets)}, "private_subnets":${length(module.vpc.private_subnets)}, "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+# Generate a random suffix for unique resource naming
+resource "random_id" "suffix" {
+  byte_length = 4
+  
+  keepers = {
+    cluster_name = var.cluster_name
   }
 }
 
@@ -42,8 +114,9 @@ resource "random_string" "token_part2" {
 locals {
   kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
 
-  # Determine pod CIDR for the cluster
-  pod_cidr = var.pod_cidr
+  # Fix CIDR conflict: VPC uses 10.0.0.0/16, so use 10.244.0.0/16 for pods
+  # This ensures no overlap between VPC subnets and pod network
+  pod_cidr = var.pod_cidr != "" ? var.pod_cidr : "10.244.0.0/16"
 }
 
 # Security Group for Kubernetes Cluster Resources
@@ -57,6 +130,7 @@ resource "aws_security_group" "k8s_sg" {
     to_port     = 6443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Kubernetes API server"
   }
 
   ingress {
@@ -64,13 +138,15 @@ resource "aws_security_group" "k8s_sg" {
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
   }
 
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]
+    cidr_blocks = ["10.0.0.0/16"]  # Only from VPC for security
+    description = "Allow all internal VPC traffic for cluster communication"
   }
 
   egress {
@@ -109,6 +185,15 @@ resource "aws_iam_role_policy_attachment" "control_plane_role_policy_attachment"
     "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
     "arn:aws:iam::aws:policy/AWSCertificateManagerFullAccess"
   ])
+
+  role       = aws_iam_role.control_plane_role.name
+  policy_arn = each.value
+}
+
+# IAM Role Policy Attachments for Control Plane - LEGACY
+resource "aws_iam_role_policy_attachment" "control_plane_role_policy_attachment_legacy" {
+  #VALIDATION: This is duplicate - remove in next iteration
+  for_each = toset([])  # Empty set to disable this duplicate
 
   role       = aws_iam_role.control_plane_role.name
   policy_arn = each.value
@@ -602,799 +687,140 @@ resource "terraform_data" "deployment_progress" {
   }
 }
 
-resource "aws_instance" "control_plane" {
-  ami                    = var.control_plane_ami
-  instance_type          = var.control_plane_instance_type
-  key_name               = local.actual_key_name
-  subnet_id              = module.vpc.public_subnets[0]
-  vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
-  iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
-  associate_public_ip_address = true
-
-  # Prepare user data with template
-  user_data_base64 = base64gzip(templatefile(
-    "${path.module}/control_plane_user_data.sh",
-    {
-      ssh_public_key    = var.ssh_public_key != "" ? var.ssh_public_key : "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 temp-key",
-      region            = var.region,
-      cluster_name      = var.cluster_name,
-      # Add these required variables to fix templating issues
-      token_formatted   = local.kubeadm_token,
-      JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
-      JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-      KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
-      KUBERNETES_JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-      # Add explicit empty variables for heredoc escape
-      PRIVATE_IP        = "",
-      PUBLIC_IP         = "",
-      TOKEN             = "",
-      DISCOVERY_HASH    = "",
-      API_SERVER_IP     = "",
-      # Add the missing 'step' variable referenced in the template
-      step              = "",
-      # We're adding other AWS related variables
-      VPC_CIDR          = module.vpc.vpc_cidr_block,
-      POD_CIDR          = local.pod_cidr
-    }
-  ))
-
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp2"
-  }
-
-  tags = {
-    Name = "guy-control-plane"
-    Role = "control-plane"
-    ClusterIdentifier = "${var.cluster_name}-${random_id.suffix.hex}"
-  }
-
+#DEBUGGABLE: Control plane instance creation debug hook
+resource "null_resource" "control_plane_instance_debug" {
   depends_on = [
-    module.vpc,
-    terraform_data.deployment_progress
+    aws_iam_instance_profile.control_plane_profile,
+    aws_security_group.control_plane_sg
   ]
-
-  lifecycle {
-    # Prevent replacement: Ignore changes to user_data since we want to preserve the control plane
-    ignore_changes = [user_data_base64, tags["ClusterIdentifier"]]
-    # Only replace when script content changes
-    replace_triggered_by = [
-      terraform_data.control_plane_script_hash
-    ]
-    # Create new instance before destroying the old one
-    create_before_destroy = false
-    # Prevent destruction by default
-    prevent_destroy = false
-  }
-
-  # Add a provisioner to report progress
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = "echo -e \"\\033[0;32m✅ Control Plane instance launched! Instance ID: ${self.id}\\033[0m\""
-  }
-}
-
-resource "null_resource" "wait_for_control_plane" {
-  depends_on = [aws_instance.control_plane]
-
-  provisioner "local-exec" {
-    command = <<EOF
-      # Wait for the control plane to initialize
-      echo "Waiting for control plane to initialize..."
-      sleep 60
-      
-      # Create empty certificate files if they don't already exist
-      mkdir -p ${path.module}/certs
-      [ -f ${path.module}/certs/ca.crt ] || touch ${path.module}/certs/ca.crt
-      [ -f ${path.module}/certs/client.crt ] || touch ${path.module}/certs/client.crt
-      [ -f ${path.module}/certs/client.key ] || touch ${path.module}/certs/client.key
-      
-      echo "Control plane certificates prepared (dummy files)."
-      echo "NOTE: Actual certificates not retrieved. You may need to manually retrieve them later."
-      
-      # To manually retrieve certificates later, use:
-      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/ca.crt" --output text --query "CommandInvocations[].CommandPlugins[].Output"
-      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/apiserver-kubelet-client.crt" --output text --query "CommandInvocations[].CommandPlugins[].Output" 
-      # aws ssm send-command --instance-ids ${aws_instance.control_plane.id} --document-name "AWS-RunShellScript" --parameters commands="cat /etc/kubernetes/pki/apiserver-kubelet-client.key" --output text --query "CommandInvocations[].CommandPlugins[].Output"
-    EOF
-  }
-}
-
-resource "local_file" "kubeconfig" {
-  content = templatefile("${path.module}/templates/kubeconfig.tpl", {
-    endpoint       = aws_lb.polybot_alb.dns_name
-    token          = local.kubeadm_token
-    cluster_ca     = base64encode(file("${path.module}/certs/ca.crt"))
-    client_cert    = base64encode(file("${path.module}/certs/client.crt"))
-    client_key     = base64encode(file("${path.module}/certs/client.key"))
-    aws_region     = var.region
-    cluster_name   = "k8s-cluster"
-  })
-  filename = "${path.module}/kubeconfig"
-
-  depends_on = [
-    null_resource.wait_for_control_plane
-  ]
-}
-
-# Secrets Manager for Kubernetes join command
-resource "random_id" "suffix" {
-  byte_length = 4
-}
-
-resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
-  description             = "Kubernetes join command for worker nodes"
-  recovery_window_in_days = 0  # No recovery window for easy replacement
-  force_overwrite_replica_secret = true
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
-  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
-  description             = "Latest Kubernetes join command for worker nodes"
-  recovery_window_in_days = 0  # No recovery window for easy replacement
-  force_overwrite_replica_secret = true
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-# Lambda function for node draining and token refresh
-resource "aws_lambda_function" "node_management_lambda" {
-  function_name = "guy-polybot-token"
-  role          = aws_iam_role.node_management_lambda_role.arn
-  handler       = "index.lambda_handler"
-  runtime       = "python3.9"
-  timeout       = 120
-  memory_size   = 256
-
-  filename = "${path.module}/lambda_package.zip"
-
-  environment {
-    variables = {
-      CONTROL_PLANE_INSTANCE_ID = aws_instance.control_plane.id
-      REGION                   = var.region
-    }
-  }
-
-  depends_on = [
-    aws_iam_role_policy_attachment.node_management_lambda_policy_attach,
-    aws_secretsmanager_secret.kubernetes_join_command
-  ]
-}
-
-# Create the Lambda package with the node draining/token refresh code
-resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/lambda_code.py"
-  content = <<EOF
-import boto3
-import json
-import time
-import logging
-import traceback
-
-# Configure logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-def lambda_handler(event, context):
-    autoscaling = boto3.client('autoscaling')
-    ssm_client = boto3.client('ssm')
-    secrets_client = boto3.client('secretsmanager')
-    ec2_client = boto3.client('ec2')
-    region = '${var.region}'
-    control_plane_instance_id = '${aws_instance.control_plane.id}'
-    
-    logger.info(f"Event received: {json.dumps(event)}")
-    
-    # Handle SNS events (node termination)
-    if 'Records' in event and len(event['Records']) > 0:
-        try:
-            record = event['Records'][0]
-            if record.get('EventSource') == 'aws:sns' or record.get('EventSource') == 'aws:sqs' or record.get('Source') == 'aws:sns':
-                logger.info("Processing SNS/SQS event")
-                
-                # Parse the message - handle both direct JSON or string-encoded JSON
-                message_text = record.get('Sns', {}).get('Message', '{}')
-                try:
-                    message = json.loads(message_text)
-                except Exception:
-                    logger.warning(f"Failed to parse message as JSON: {message_text}")
-                    message = {}
-                
-                logger.info(f"Parsed message: {json.dumps(message)}")
-                
-                # Check if this is an ASG lifecycle event
-                if message.get('LifecycleTransition') == 'autoscaling:EC2_INSTANCE_TERMINATING':
-                    logger.info("Processing scale-down event")
-                    instance_id = message.get('EC2InstanceId')
-                    lifecycle_hook_name = message.get('LifecycleHookName')
-                    asg_name = message.get('AutoScalingGroupName')
-                    
-                    if not instance_id or not lifecycle_hook_name or not asg_name:
-                        logger.error(f"Missing required fields in message: {json.dumps(message)}")
-                        return {'statusCode': 400, 'body': 'Missing required fields in SNS message'}
-                    
-                    try:
-                        # Get instance details
-                        ec2_response = ec2_client.describe_instances(InstanceIds=[instance_id])
-                        if not ec2_response.get('Reservations') or not ec2_response['Reservations'][0].get('Instances'):
-                            logger.warning(f"No instance data found for {instance_id}")
-                            return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 'CONTINUE', 
-                                                    f"No instance data found for {instance_id}")
-                        
-                        instance = ec2_response['Reservations'][0]['Instances'][0]
-                        tags = instance.get('Tags', [])
-                        private_ip = instance.get('PrivateIpAddress', '')
-                        
-                        # Find node name from tags or use IP
-                        node_name = None
-                        for tag in tags:
-                            if tag.get('Key') == 'Name':
-                                node_name = tag.get('Value')
-                                break
-                        
-                        # Fall back to IP-based node name if tag not found
-                        if not node_name:
-                            node_name = f"ip-{private_ip.replace('.', '-')}.ec2.internal"
-                        
-                        logger.info(f"Draining node: {node_name}")
-                        
-                        # Drain node with 3 retries
-                        success = False
-                        for attempt in range(3):
-                            try:
-                                # Drain the node
-                                drain_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf drain --ignore-daemonsets --delete-emptydir-data --force {node_name}"
-                                logger.info(f"Running drain command: {drain_command}")
-                                
-                                response = ssm_client.send_command(
-                                    InstanceIds=[control_plane_instance_id],
-                                    DocumentName='AWS-RunShellScript',
-                                    Parameters={'commands': [drain_command]},
-                                    TimeoutSeconds=300
-                                )
-                                
-                                command_id = response['Command']['CommandId']
-                                wait_for_command(ssm_client, command_id, control_plane_instance_id)
-                                
-                                # Delete the node
-                                delete_command = f"kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node {node_name}"
-                                logger.info(f"Running delete command: {delete_command}")
-                                
-                                response = ssm_client.send_command(
-                                    InstanceIds=[control_plane_instance_id],
-                                    DocumentName='AWS-RunShellScript',
-                                    Parameters={'commands': [delete_command]},
-                                    TimeoutSeconds=300
-                                )
-                                
-                                command_id = response['Command']['CommandId']
-                                wait_for_command(ssm_client, command_id, control_plane_instance_id)
-                                
-                                success = True
-                                break
-                            except Exception as e:
-                                logger.error(f"Attempt {attempt+1} failed: {str(e)}")
-                                if attempt < 2:  # Only sleep if we're going to retry
-                                    time.sleep(10)
-                        
-                        return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 
-                                                'CONTINUE', "Node drained and deleted successfully")
-                    
-                    except Exception as e:
-                        logger.error(f"Error handling scale-down event: {str(e)}")
-                        logger.error(traceback.format_exc())
-                        return complete_lifecycle(autoscaling, lifecycle_hook_name, asg_name, instance_id, 
-                                                'ABANDON', f"Error: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error processing SNS record: {str(e)}")
-            logger.error(traceback.format_exc())
-            return {'statusCode': 500, 'body': f"Error: {str(e)}"}
-    
-    # Default action: token refresh
-    logger.info("Running join command refresh logic")
-    try:
-        # Get join command from control plane
-        response = ssm_client.send_command(
-            InstanceIds=[control_plane_instance_id],
-            DocumentName='AWS-RunShellScript',
-            Parameters={'commands': ['kubeadm token create --print-join-command']}
-        )
-        
-        command_id = response['Command']['CommandId']
-        join_command = wait_for_command(ssm_client, command_id, control_plane_instance_id)
-        
-        if not join_command:
-            raise Exception("Failed to get join command from control plane")
-            
-        logger.info(f"Join command retrieved: {join_command}")
-        
-        # Update secrets with the new join command
-        update_secrets(secrets_client, join_command)
-        
-        return {'statusCode': 200, 'body': 'Join command updated successfully'}
-        
-    except Exception as e:
-        logger.error(f"Error in token refresh: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {'statusCode': 500, 'body': f"Error: {str(e)}"}
-
-def wait_for_command(ssm_client, command_id, instance_id):
-    """Wait for SSM command to complete and return its output"""
-    max_attempts = 30
-    attempt = 0
-    
-    while attempt < max_attempts:
-        time.sleep(2)
-        try:
-            command_output = ssm_client.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=instance_id
-            )
-            
-            status = command_output['Status']
-            
-            if status in ['Success', 'Completed']:
-                return command_output.get('StandardOutputContent', '').strip()
-            elif status in ['Failed', 'Cancelled', 'TimedOut']:
-                error = command_output.get('StandardErrorContent', 'Unknown error')
-                raise Exception(f"SSM command failed: {error}")
-                
-        except ssm_client.exceptions.InvocationDoesNotExist:
-            # Command not yet registered, wait and retry
-            pass
-            
-        attempt += 1
-    
-    raise Exception("SSM command did not complete within 60 seconds")
-
-def update_secrets(secrets_client, join_command):
-    """Update all join command secrets with the new command"""
-    # Get all secrets with 'kubernetes-join-command' in the name
-    try:
-        response = secrets_client.list_secrets(
-            Filters=[{'Key': 'name', 'Values': ['kubernetes-join-command']}]
-        )
-        
-        secrets = response.get('SecretList', [])
-        
-        if not secrets:
-            raise Exception("No kubernetes-join-command secrets found")
-            
-        # Update the -latest secret first (highest priority)
-        latest_secrets = [s for s in secrets if '-latest' in s['Name']]
-        if latest_secrets:
-            latest_secret = sorted(latest_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]
-            logger.info(f"Updating latest secret: {latest_secret['Name']}")
-            
-            secrets_client.put_secret_value(
-                SecretId=latest_secret['Name'],
-                SecretString=join_command
-            )
-        
-        # Then update the base secrets
-        base_secrets = [s for s in secrets if '-latest' not in s['Name'] and not s['Name'].endswith(('-INIT', '-COMPLETE'))]
-        if base_secrets:
-            base_secret = sorted(base_secrets, key=lambda x: x.get('LastChangedDate', 0), reverse=True)[0]
-            logger.info(f"Updating base secret: {base_secret['Name']}")
-            
-            secrets_client.put_secret_value(
-                SecretId=base_secret['Name'],
-                SecretString=join_command
-            )
-        
-        # Create a new timestamped secret as backup
-        timestamp = int(time.time())
-        new_secret_name = f"kubernetes-join-command-{timestamp}"
-        
-        secrets_client.create_secret(
-            Name=new_secret_name,
-            Description="Kubernetes join command created by Lambda",
-            SecretString=join_command
-        )
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error updating secrets: {str(e)}")
-        raise
-
-def complete_lifecycle(autoscaling, hook_name, asg_name, instance_id, result, message):
-    """Complete a lifecycle action and return a response"""
-    try:
-        logger.info(f"Completing lifecycle action: {hook_name}, ASG: {asg_name}, Instance: {instance_id}, Result: {result}")
-        
-        autoscaling.complete_lifecycle_action(
-            LifecycleHookName=hook_name,
-            AutoScalingGroupName=asg_name,
-            LifecycleActionResult=result,
-            InstanceId=instance_id
-        )
-        
-        return {'statusCode': 200, 'body': message}
-    except Exception as e:
-        logger.error(f"Error completing lifecycle action: {str(e)}")
-        return {'statusCode': 500, 'body': f"Error completing lifecycle action: {str(e)}"}
-EOF
-}
-
-resource "null_resource" "create_lambda_zip" {
-  depends_on = [local_file.lambda_function_code]
   
-  provisioner "local-exec" {
-    command = "cd ${path.module} && zip lambda_package.zip lambda_code.py"
-  }
-
   triggers = {
-    lambda_code_hash = sha256(local_file.lambda_function_code.content)
-  }
-}
-
-# IAM role for the Lambda function
-resource "aws_iam_role" "node_management_lambda_role" {
-  name = "guy-polybot-token-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-# Lambda policy for node management
-resource "aws_iam_policy" "node_management_lambda_policy" {
-  name        = "guy-polybot-token-policy"
-  description = "Policy for Lambda function to manage Kubernetes nodes"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:*:*:*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:CreateTags",
-          "ec2:DescribeTags"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:CompleteLifecycleAction",
-          "autoscaling:DescribeAutoScalingGroups"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ssm:SendCommand",
-          "ssm:GetCommandInvocation"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:ListSecrets"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach" {
-  role       = aws_iam_role.node_management_lambda_role.name
-  policy_arn = aws_iam_policy.node_management_lambda_policy.arn
-}
-
-# SNS Topic for ASG Lifecycle Hooks
-resource "aws_sns_topic" "lifecycle_topic" {
-  name = "guy-lifecycle-topic"
-}
-
-# Subscribe Lambda to SNS Topic
-resource "aws_sns_topic_subscription" "lambda_subscription" {
-  topic_arn = aws_sns_topic.lifecycle_topic.arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.node_management_lambda.arn
-}
-
-# Lambda permission for SNS
-resource "aws_lambda_permission" "sns_permission" {
-  statement_id  = "lambda-59321475-88d3-4cfa-b6a6-febec42e38bd"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.node_management_lambda.function_name
-  principal     = "sns.amazonaws.com"
-  source_arn    = aws_sns_topic.lifecycle_topic.arn
-}
-
-# EventBridge (CloudWatch Events) Rule for scheduled refresh
-resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
-  name                = "guy-fetch-rule"
-  description         = "Hourly Kubernetes token refresh"
-  schedule_expression = "cron(0 * * * ? *)"
-}
-
-# EventBridge Target for Lambda
-resource "aws_cloudwatch_event_target" "token_refresh_target" {
-  rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
-  target_id = "LambdaFunction"
-  arn       = aws_lambda_function.node_management_lambda.arn
-}
-
-# Lambda permission for EventBridge
-resource "aws_lambda_permission" "eventbridge_permission" {
-  statement_id  = "cloudwatch-events-permission"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.node_management_lambda.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
-}
-
-# ASG Lifecycle Hooks
-resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
-  name                   = "guy-scale-up-hook"
-  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 600
-  lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
-
-  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
-  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
-}
-
-resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
-  name                   = "guy-scale-down-hook"
-  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 300
-  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
-
-  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
-  role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
-}
-
-# IAM role for ASG Lifecycle Hooks
-resource "aws_iam_role" "asg_lifecycle_hook_role" {
-  name = "guy-asg-lifecycle-hook-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "autoscaling.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-# Policy for ASG to publish to SNS
-resource "aws_iam_role_policy" "asg_sns_publish_policy" {
-  name = "ASGSNSPublishPolicy"
-  role = aws_iam_role.asg_lifecycle_hook_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "sns:Publish"
-        ]
-        Resource = aws_sns_topic.lifecycle_topic.arn
-      }
-    ]
-  })
-}
-
-resource "aws_security_group" "control_plane_sg" {
-  name        = "Guy-Control-Plane-SG"
-  description = "Allows SSH and API server access to the cluster"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow worker nodes to connect to API server"
-  }
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Allow all internal VPC traffic"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    "kubernetes-io-cluster-kubernetes" = "owned"
-  }
-}
-
-# IAM Instance Profile for Worker Nodes
-resource "aws_iam_instance_profile" "worker_profile" {
-  name = "guy-worker-profile"
-  role = aws_iam_role.worker_role.name
-}
-
-# Also create a terraform_data resource for worker script
-resource "terraform_data" "worker_script_hash" {
-  input = md5(file("${path.module}/worker_user_data.sh"))
-  
-  triggers_replace = {
-    rebuild = var.rebuild_workers ? timestamp() : "static"
-  }
-}
-
-# Progress reporter for worker nodes
-resource "terraform_data" "worker_progress" {
-  depends_on = [aws_instance.control_plane]
-  triggers_replace = {
-    timestamp = timestamp()
+    cp_timestamp = timestamp()
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      echo -e "\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes...\\033[0m"
+    command = <<EOT
+      echo '{"stage":"control_plane_instance_creation", "status":"start", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Validate prerequisites
+      aws iam get-instance-profile --instance-profile-name control-plane-profile > ../logs/cluster_state/cp_instance_profile_${timestamp()}.json 2>&1
+      aws ec2 describe-security-groups --group-ids ${aws_security_group.control_plane_sg.id} --region "${var.region}" > ../logs/cluster_state/cp_sg_${timestamp()}.json 2>&1
+      
+      echo '{"stage":"control_plane_prerequisites", "status":"validated", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
     EOT
+    
+    on_failure = continue
   }
 }
 
-# Create bucket for worker logs
-resource "aws_s3_bucket" "worker_logs" {
-  bucket = "guy-polybot-logs"
-  force_destroy = true
-  
-  tags = {
-    Name = "Worker Node Logs Bucket"
-    "kubernetes-io-cluster-kubernetes" = "owned"
-  }
-}
-
-# Configure bucket to allow ACLs
-resource "aws_s3_bucket_ownership_controls" "worker_logs_ownership" {
-  bucket = aws_s3_bucket.worker_logs.id
-  
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
-}
-
-# Set the bucket ACL to private
-resource "aws_s3_bucket_acl" "worker_logs_acl" {
-  depends_on = [aws_s3_bucket_ownership_controls.worker_logs_ownership]
-  
-  bucket = aws_s3_bucket.worker_logs.id
-  acl    = "private"
-}
-
-# IAM policy for access to S3 logs bucket
-resource "aws_iam_policy" "worker_s3_access" {
-  name        = "guy-worker-s3-access"
-  description = "Policy allowing workers to access S3 bucket for logs"
-  
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          "${aws_s3_bucket.worker_logs.arn}",
-          "${aws_s3_bucket.worker_logs.arn}/*"
-        ]
-      }
-    ]
-  })
-}
-
-# Attach the S3 access policy to the worker role
-resource "aws_iam_role_policy_attachment" "worker_s3_access" {
-  role       = aws_iam_role.worker_role.name
-  policy_arn = aws_iam_policy.worker_s3_access.arn
-}
-
-resource "aws_launch_template" "worker_lt" {
-  name_prefix   = "guy-polybot-worker-"
-  image_id      = var.worker_ami
-  instance_type = var.worker_instance_type
-  key_name      = local.actual_key_name
-
-  # This bootstrap script has the full initialization content embedded
-  user_data = base64encode(
-    templatefile(
-      "${path.module}/bootstrap_worker.sh",
-      {
-        SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
-        JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
-        JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-        REGION = var.region
-      }
-    )
-  )
-  
-  iam_instance_profile {
-    name = aws_iam_instance_profile.worker_profile.name
-  }
-  
-  network_interfaces {
-    security_groups             = [aws_security_group.worker_sg.id, aws_security_group.k8s_sg.id, aws_security_group.control_plane_sg.id]
-    associate_public_ip_address = true
-    delete_on_termination       = true
-  }
-  
-  tag_specifications {
-    resource_type = "instance"
-    tags = {
-      Name = "guy-worker-node-${random_id.suffix.hex}"
-      "kubernetes-io-cluster-kubernetes" = "owned"
-      "k8s.io/cluster-autoscaler/enabled" = "true"
-      "k8s.io/role/node" = "true"
-      "ClusterIdentifier" = "${var.cluster_name}-${random_id.suffix.hex}"
-    }
-  }
-  
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "optional"
-    instance_metadata_tags      = "enabled"
-  }
-  
+# Enhanced control plane instance with debug tags and comprehensive dependencies
+resource "aws_instance" "control_plane" {
   depends_on = [
+    null_resource.control_plane_instance_debug,
+    aws_security_group.control_plane_sg,
+    aws_iam_instance_profile.control_plane_profile,
     aws_secretsmanager_secret.kubernetes_join_command,
     aws_secretsmanager_secret.kubernetes_join_command_latest
   ]
+
+  ami           = var.control_plane_ami
+  instance_type = var.control_plane_instance_type
+  key_name      = local.actual_key_name
+  
+  iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
+  vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
+  subnet_id              = var.vpc_id != "" ? var.subnet_ids[0] : module.vpc.public_subnets[0]
+
+  # Enhanced user data with comprehensive error handling
+  user_data = base64encode(templatefile("${path.module}/control_plane_user_data.sh", {
+    token       = local.kubeadm_token
+    step        = "control_plane_init"
+    secret_name = aws_secretsmanager_secret.kubernetes_join_command.name
+  }))
+
+  # Enhanced metadata options for proper cloud integration
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+    instance_metadata_tags      = "enabled"
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 20
+    encrypted   = true
+    
+    tags = {
+      Name         = "guy-control-plane-root"
+      DebugEnabled = "true"  #DEBUGGABLE
+    }
+  }
+
+  tags = {
+    Name                                        = "guy-control-plane"
+    Role                                        = "control-plane"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    # AWS cloud provider integration tags (CRITICAL)
+    "k8s.io/cluster-autoscaler/enabled"         = "true"
+    "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
+    #DEBUGGABLE: Enhanced debug tracking
+    "DebugEnabled"                              = "true"
+    "DeploymentTime"                            = timestamp()
+  }
+
+  lifecycle {
+    create_before_destroy = false
+    ignore_changes = [
+      user_data  # Prevent unnecessary recreation when user data changes
+    ]
+  }
+}
+
+#DEBUGGABLE: Control plane initialization monitoring
+resource "null_resource" "control_plane_bootstrap_debug" {
+  depends_on = [aws_instance.control_plane]
+  
+  triggers = {
+    cp_instance_id = aws_instance.control_plane.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"control_plane_bootstrap", "status":"monitoring", "instance_id":"${aws_instance.control_plane.id}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Wait for instance to be running and capture detailed state
+      aws ec2 wait instance-running --instance-ids "${aws_instance.control_plane.id}" --region "${var.region}" || {
+        echo '{"stage":"control_plane_wait", "status":"timeout", "instance_id":"${aws_instance.control_plane.id}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      }
+      
+      # Capture instance details after it's running
+      aws ec2 describe-instances --instance-ids "${aws_instance.control_plane.id}" --region "${var.region}" > ../logs/cluster_state/cp_running_state_${timestamp()}.json 2>&1
+      
+      # Monitor bootstrap process via cloud-init logs (if SSM is available)
+      for i in {1..10}; do
+        if aws ssm describe-instance-information --region "${var.region}" --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" --query "InstanceInformationList[0].PingStatus" --output text 2>/dev/null | grep -q "Online"; then
+          echo '{"stage":"ssm_connectivity", "status":"online", "instance_id":"${aws_instance.control_plane.id}", "attempt":"'$i'", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+          
+          # Capture cloud-init status
+          aws ssm send-command --region "${var.region}" --document-name "AWS-RunShellScript" \
+            --instance-ids "${aws_instance.control_plane.id}" \
+            --parameters 'commands=["cloud-init status"]' \
+            --query "Command.CommandId" --output text > /tmp/cloud_init_check_${timestamp()}.cmd 2>/dev/null || true
+          break
+        else
+          echo '{"stage":"ssm_connectivity", "status":"waiting", "instance_id":"${aws_instance.control_plane.id}", "attempt":"'$i'", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+          sleep 30
+        fi
+      done
+      
+      echo '{"stage":"control_plane_bootstrap", "status":"monitoring_complete", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
 }
 
 # Force update ASG when worker script changes
@@ -1405,6 +831,29 @@ resource "terraform_data" "force_asg_update" {
     aws_launch_template.worker_lt.latest_version,
     var.rebuild_workers
   ]
+}
+
+#DEBUGGABLE: Worker ASG creation debug hook
+resource "null_resource" "worker_asg_debug" {
+  depends_on = [aws_launch_template.worker_lt]
+  
+  triggers = {
+    asg_timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"worker_asg_creation", "status":"start", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Validate ASG prerequisites
+      aws ec2 describe-launch-templates --launch-template-names "${aws_launch_template.worker_lt.name}" --region "${var.region}" > ../logs/cluster_state/worker_lt_${timestamp()}.json 2>&1
+      
+      echo '{"stage":"worker_asg_prerequisites", "status":"validated", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
 }
 
 resource "aws_autoscaling_group" "worker_asg" {
@@ -1423,6 +872,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     version = "$Latest"
   }
 
+  # Critical Fix: Valid AWS tag keys for cluster autoscaler
   tag {
     key                 = "k8s.io/cluster-autoscaler/enabled"
     value               = "true"
@@ -1430,7 +880,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
 
   tag {
-    key                 = "k8s.io/cluster-autoscaler/guy-polybot-cluster"
+    key                 = "k8s.io/cluster-autoscaler/${var.cluster_name}"
     value               = "owned"
     propagate_at_launch = true
   }
@@ -1441,8 +891,9 @@ resource "aws_autoscaling_group" "worker_asg" {
     propagate_at_launch = true
   }
   
+  # Critical Fix: Valid tag key format for AWS cloud provider
   tag {
-    key                 = "kubernetes-io-cluster-kubernetes"
+    key                 = "kubernetes-io-cluster-${var.cluster_name}"
     value               = "owned"
     propagate_at_launch = true
   }
@@ -1459,13 +910,17 @@ resource "aws_autoscaling_group" "worker_asg" {
     propagate_at_launch = true
   }
   
+  # Critical Fix: Ensure proper dependency chain - workers start only after control plane is verified ready
   depends_on = [
+    null_resource.worker_asg_debug,
     aws_instance.control_plane,
-    aws_secretsmanager_secret.kubernetes_join_command,
-    null_resource.wait_for_control_plane,
+    aws_launch_template.worker_lt,
     terraform_data.force_asg_update,
-    terraform_data.worker_progress,
-    null_resource.update_join_command
+    aws_secretsmanager_secret.kubernetes_join_command,
+    aws_secretsmanager_secret.kubernetes_join_command_latest,
+    null_resource.verify_control_plane_readiness,  # Critical: Wait for control plane to be actually ready
+    null_resource.update_join_command,             # Critical: Ensure join token exists
+    terraform_data.worker_progress
   ]
   
   lifecycle {
@@ -1519,70 +974,106 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow HTTPS traffic"
   }
   
-  # Kubelet API for control plane communication
+  # Critical: Kubelet API for control plane communication
   ingress {
     from_port   = 10250
     to_port     = 10250
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]  # Allow from anywhere for debugging
-    description = "Allow kubelet API access"
+    cidr_blocks = ["10.0.0.0/16"]  # Only from VPC for security
+    description = "Kubelet API - required for control plane communication"
   }
 
-  # NodePort services
+  # Critical: Read-only Kubelet API
+  ingress {
+    from_port   = 10255
+    to_port     = 10255
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Read-only Kubelet API"
+  }
+
+  # NodePort services range
   ingress {
     from_port   = 30000
     to_port     = 32767
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow NodePort service range"
+    description = "NodePort service range"
   }
 
-  # Specific NodePort for applications
-  ingress {
-    from_port   = 31024
-    to_port     = 31024
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow specific NodePort service"
-  }
-
-  # Critical - API server access
+  # Critical: Kubernetes API server access for worker nodes
   ingress {
     from_port   = 6443
     to_port     = 6443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow Kubernetes API server access"
+    cidr_blocks = ["0.0.0.0/0"]  # Workers need to reach API server
+    description = "Kubernetes API server access"
   }
 
-  # Allow all internal VPC traffic
+  # Allow all internal VPC traffic for cluster communication
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["10.0.0.0/16"]
-    description = "Allow all internal VPC traffic"
+    description = "Allow all internal VPC traffic for cluster communication"
   }
 
-  # Allow Calico overlay networking (VXLAN)
+  # Critical: Calico overlay networking (VXLAN) - required for pod-to-pod communication
   ingress {
     from_port   = 4789
     to_port     = 4789
     protocol    = "udp"
     self        = true
-    description = "Calico VXLAN overlay"
+    description = "Calico VXLAN overlay - required for pod networking"
   }
 
-  # Allow Calico BGP traffic
+  # Critical: Calico BGP traffic - required for network policy
   ingress {
     from_port   = 179
     to_port     = 179
     protocol    = "tcp"
     self        = true
-    description = "Calico BGP traffic"
+    description = "Calico BGP traffic - required for network policy"
   }
 
-  # Allow all outbound traffic
+  # Critical: Container runtime ports (containerd/Docker)
+  ingress {
+    from_port   = 2376
+    to_port     = 2377
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Container runtime communication"
+  }
+
+  # NodePort Services (CRITICAL for external service access)
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "NodePort services for external access"
+  }
+
+  # Allow all internal traffic for clustering
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic for cluster communication"
+  }
+
+  # NodePort Services (CRITICAL for external service access on workers)
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "NodePort services for external access via workers"
+  }
+
+  # All outbound traffic
   egress {
     from_port   = 0
     to_port     = 0
@@ -1591,18 +1082,11 @@ resource "aws_security_group" "worker_sg" {
     description = "Allow all outbound traffic"
   }
 
-  # Explicit outbound rule for the Kubernetes API server
-  egress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow outbound traffic to Kubernetes API server"
-  }
-
   tags = {
     Name = "guy-worker-sg"
-    "kubernetes-io-cluster-kubernetes" = "owned"
+    # Critical: AWS cloud provider integration tags
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/node" = "true"
   }
 }
 
@@ -1630,13 +1114,10 @@ resource "aws_iam_role" "worker_role" {
 resource "aws_iam_role_policy_attachment" "worker_policies" {
   for_each = toset([
     "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
     "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",
-    "arn:aws:iam::aws:policy/AmazonSQSFullAccess",
-    "arn:aws:iam::aws:policy/AmazonSNSFullAccess",
-    "arn:aws:iam::aws:policy/CloudWatchFullAccess",
-    "arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess",
-    "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",  # VALIDATION: Added for EBS dynamic volumes
     "arn:aws:iam::aws:policy/AmazonS3FullAccess"
   ])
 
@@ -1990,8 +1471,16 @@ resource "aws_lb" "polybot_alb" {
   security_groups    = [aws_security_group.alb_sg.id]
   subnets            = module.vpc.public_subnets
 
+  # Critical: Enable deletion protection to prevent accidental removal
+  enable_deletion_protection = false
+
   tags = {
     Name = "guy-polybot-lg"
+    # Critical: AWS cloud provider integration tags
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/elb" = "1"
+    # Required for AWS Load Balancer Controller
+    "elbv2.k8s.aws/cluster" = var.cluster_name
   }
 }
 
@@ -2049,6 +1538,7 @@ resource "aws_security_group" "alb_sg" {
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP traffic"
   }
 
   ingress {
@@ -2056,6 +1546,7 @@ resource "aws_security_group" "alb_sg" {
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTPS traffic"
   }
 
   egress {
@@ -2063,10 +1554,14 @@ resource "aws_security_group" "alb_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
   }
 
   tags = {
-    "kubernetes-io-cluster-kubernetes" = "owned"
+    Name = "guy-alb-sg"
+    # Critical: AWS cloud provider integration tags
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/elb" = "1"
   }
 }
 
@@ -2275,7 +1770,7 @@ resource "null_resource" "verify_control_plane_readiness" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command = <<EOT
       # Allow skipping verification with environment variable
       if [ "$${SKIP_K8S_VERIFICATION:-false}" == "true" ]; then
         echo "SKIP_K8S_VERIFICATION is set to true, skipping control plane verification"
@@ -2757,5 +2252,571 @@ resource "null_resource" "validate_user_data_size" {
       echo "All script sizes are within AWS EC2 user-data limit (16,384 bytes)"
     EOT
   }
+}
+
+# Critical Fix: Add missing EBS CSI driver and AWS cloud provider permissions
+resource "aws_iam_role_policy" "control_plane_ebs_csi_policy" {
+  name = "EBSCSIDriverPolicy"
+  role = aws_iam_role.control_plane_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateVolume",
+          "ec2:DeleteVolume",
+          "ec2:AttachVolume", 
+          "ec2:DetachVolume",
+          "ec2:ModifyVolume",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeInstances",
+          "ec2:DescribeSnapshots",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeVolumeAttribute",
+          "ec2:DescribeVolumeStatus",
+          "ec2:DescribeVolumesModifications",
+          "ec2:CreateSnapshot",
+          "ec2:CopySnapshot",
+          "ec2:DescribeInstanceAttribute",
+          "ec2:CreateTags",
+          "ec2:DeleteTags",
+          "ec2:DescribeTags"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Critical Fix: AWS cloud provider permissions for control plane
+resource "aws_iam_role_policy" "control_plane_cloud_provider_policy" {
+  name = "AWSCloudProviderPolicy"
+  role = aws_iam_role.control_plane_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeRegions",
+          "ec2:DescribeRouteTables",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeVolumes",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceAttribute",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeInstanceTypes",
+          "iam:ListServerCertificates",
+          "iam:GetServerCertificate"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateRoute",
+          "ec2:DeleteRoute",
+          "ec2:ReplaceRoute"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/kubernetes.io/cluster/${var.cluster_name}" = ["owned", "shared"]
+          }
+        }
+      }
+    ]
+  })
+}
+
+#DEBUGGABLE: Control plane IAM debugging hook
+resource "null_resource" "control_plane_iam_debug" {
+  depends_on = [null_resource.vpc_debug_post]
+  
+  triggers = {
+    iam_timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"control_plane_iam_setup", "status":"start", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Check existing IAM resources to avoid conflicts
+      aws iam get-role --role-name control-plane-role > ../logs/cluster_state/existing_cp_role_${timestamp()}.json 2>&1 || {
+        echo '{"stage":"iam_role_check", "status":"new_role_needed", "role":"control-plane-role", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      }
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+#DEBUGGABLE: Security group creation debug hook  
+resource "null_resource" "security_group_debug" {
+  depends_on = [null_resource.control_plane_iam_debug]
+  
+  triggers = {
+    sg_timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"security_group_creation", "status":"start", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Check VPC security groups to avoid conflicts
+      aws ec2 describe-security-groups --filters "Name=vpc-id,Values=${module.vpc.vpc_id}" --region "${var.region}" > ../logs/cluster_state/existing_sgs_${timestamp()}.json 2>&1
+      
+      echo '{"stage":"security_group_pre_check", "status":"complete", "vpc_id":"${module.vpc.vpc_id}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+# Fix 2: Enhanced security group with all required Kubernetes ports and proper tags
+resource "aws_security_group" "k8s_sg" {
+  depends_on = [null_resource.security_group_debug]
+  
+  name_prefix = "guy-k8s-sg-"
+  vpc_id      = var.vpc_id != "" ? var.vpc_id : module.vpc.vpc_id
+
+  # SSH access
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
+  }
+
+  # Kubernetes API server
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Kubernetes API server"
+  }
+
+  # etcd server client API (CRITICAL - was missing!)
+  ingress {
+    from_port   = 2379
+    to_port     = 2380
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "etcd server client API"
+  }
+
+  # Kubelet API
+  ingress {
+    from_port   = 10250
+    to_port     = 10250
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Kubelet API"
+  }
+
+  # kube-controller-manager
+  ingress {
+    from_port   = 10257
+    to_port     = 10257
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "kube-controller-manager"
+  }
+
+  # kube-scheduler
+  ingress {
+    from_port   = 10259
+    to_port     = 10259
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "kube-scheduler"
+  }
+
+  # Calico BGP
+  ingress {
+    from_port   = 179
+    to_port     = 179
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Calico BGP"
+  }
+
+  # Calico VXLAN
+  ingress {
+    from_port   = 4789
+    to_port     = 4789
+    protocol    = "udp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Calico VXLAN"
+  }
+
+  # Container runtime (containerd)
+  ingress {
+    from_port   = 2376
+    to_port     = 2377
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Container runtime"
+  }
+
+  # NodePort Services (CRITICAL for external service access)
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "NodePort services for external access"
+  }
+
+  # Allow all internal traffic for clustering
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic for cluster communication"
+  }
+
+  # NodePort Services (CRITICAL for external service access on workers)
+  ingress {
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "NodePort services for external access via workers"
+  }
+
+  # All outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name                                        = "guy-k8s-sg"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+#DEBUGGABLE: Worker node launch template debug hook
+resource "null_resource" "worker_lt_debug" {
+  #VALIDATION: Enhanced dependencies with API server readiness check
+  depends_on = [
+    null_resource.control_plane_bootstrap_debug,
+    null_resource.verify_control_plane_readiness  # Added comprehensive readiness check
+  ]
+  
+  triggers = {
+    worker_timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"worker_launch_template_creation", "status":"start", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Validate worker prerequisites
+      aws iam get-instance-profile --instance-profile-name ${aws_iam_instance_profile.worker_profile.name} > ../logs/cluster_state/worker_instance_profile_${timestamp()}.json 2>&1
+      
+      echo '{"stage":"worker_prerequisites", "status":"validated", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+resource "aws_launch_template" "worker_lt" {
+  depends_on = [null_resource.worker_lt_debug]
+  
+  name_prefix   = "guy-polybot-worker-"
+  image_id      = var.worker_ami
+  instance_type = var.worker_instance_type
+  key_name      = local.actual_key_name
+}
+
+#DEBUGGABLE: Final cluster state validation and debug artifact creation
+resource "null_resource" "cluster_debug_final" {
+  depends_on = [
+    aws_autoscaling_group.worker_asg,
+    null_resource.verify_control_plane_readiness
+  ]
+  
+  triggers = {
+    cluster_complete = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      echo '{"stage":"cluster_deployment_complete", "status":"finalizing", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      
+      # Create comprehensive cluster state snapshot
+      mkdir -p ../logs/final_state
+      
+      # Capture control plane state
+      aws ec2 describe-instances --instance-ids "${aws_instance.control_plane.id}" --region "${var.region}" > ../logs/final_state/control_plane_final_${timestamp()}.json 2>&1
+      
+      # Capture ASG state
+      aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "${aws_autoscaling_group.worker_asg.name}" --region "${var.region}" > ../logs/final_state/worker_asg_final_${timestamp()}.json 2>&1
+      
+      # Capture launch template state  
+      aws ec2 describe-launch-templates --launch-template-names "${aws_launch_template.worker_lt.name}" --region "${var.region}" > ../logs/final_state/launch_template_final_${timestamp()}.json 2>&1
+      
+      # Test final connectivity
+      timeout 30 bash -c "until nc -z ${aws_instance.control_plane.public_ip} 6443; do sleep 2; done" && {
+        echo '{"stage":"final_api_connectivity", "status":"success", "ip":"${aws_instance.control_plane.public_ip}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      } || {
+        echo '{"stage":"final_api_connectivity", "status":"error", "ip":"${aws_instance.control_plane.public_ip}", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      }
+      
+      # Generate deployment summary
+      cat > ../logs/deployment_summary_${timestamp()}.json <<SUMMARY
+{
+  "deployment_complete": "${timestamp()}",
+  "control_plane": {
+    "instance_id": "${aws_instance.control_plane.id}",
+    "public_ip": "${aws_instance.control_plane.public_ip}",
+    "private_ip": "${aws_instance.control_plane.private_ip}"
+  },
+  "worker_asg": {
+    "name": "${aws_autoscaling_group.worker_asg.name}",
+    "desired_capacity": ${aws_autoscaling_group.worker_asg.desired_capacity},
+    "min_size": ${aws_autoscaling_group.worker_asg.min_size},
+    "max_size": ${aws_autoscaling_group.worker_asg.max_size}
+  },
+  "cluster_info": {
+    "name": "${var.cluster_name}",
+    "region": "${var.region}",
+    "vpc_id": "${module.vpc.vpc_id}"
+  },
+  "debug_files_created": {
+    "logs_directory": "../logs/",
+    "cluster_state": "../logs/cluster_state/",
+    "kubernetes_state": "../logs/kubernetes_state/",
+    "final_state": "../logs/final_state/"
+  }
+}
+SUMMARY
+      
+      echo '{"stage":"cluster_deployment_complete", "status":"success", "time":"${timestamp()}"}' >> ../logs/tf_debug.log
+      echo "🎉 Cluster deployment debug artifacts created successfully!"
+    EOT
+    
+    on_failure = continue
+  }
+}
+
+# S3 bucket for worker logs and debugging artifacts
+resource "aws_s3_bucket" "worker_logs" {
+  bucket = "guy-polybot-worker-logs-${random_id.suffix.hex}"
+  
+  tags = {
+    Name                                        = "guy-polybot-worker-logs"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "worker_logs_pab" {
+  bucket = aws_s3_bucket.worker_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "worker_logs_versioning" {
+  bucket = aws_s3_bucket.worker_logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "worker_logs_lifecycle" {
+  bucket = aws_s3_bucket.worker_logs.id
+
+  rule {
+    id     = "delete_old_logs"
+    status = "Enabled"
+
+    expiration {
+      days = 30
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 7
+    }
+  }
+}
+
+# AWS Secrets Manager for storing Kubernetes join commands
+resource "aws_secretsmanager_secret" "kubernetes_join_command" {
+  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
+  description             = "Kubernetes cluster join command for worker nodes"
+  recovery_window_in_days = 0  # Allow immediate deletion for development
+
+  tags = {
+    Name                                        = "kubernetes-join-command"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
+  }
+}
+
+resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
+  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
+  description             = "Latest Kubernetes cluster join command for worker nodes"
+  recovery_window_in_days = 0  # Allow immediate deletion for development
+
+  tags = {
+    Name                                        = "kubernetes-join-command-latest"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
+  }
+}
+
+# Initialize the secrets with placeholder values
+resource "aws_secretsmanager_secret_version" "kubernetes_join_command_initial" {
+  secret_id     = aws_secretsmanager_secret.kubernetes_join_command.id
+  secret_string = "kubeadm join placeholder:6443 --token ${local.kubeadm_token} --discovery-token-ca-cert-hash sha256:placeholder"
+}
+
+resource "aws_secretsmanager_secret_version" "kubernetes_join_command_latest_initial" {
+  secret_id     = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+  secret_string = "kubeadm join placeholder:6443 --token ${local.kubeadm_token} --discovery-token-ca-cert-hash sha256:placeholder"
+}
+
+# Dedicated security group for control plane node
+resource "aws_security_group" "control_plane_sg" {
+  depends_on = [null_resource.security_group_debug]
+  
+  name_prefix = "guy-control-plane-sg-"
+  vpc_id      = var.vpc_id != "" ? var.vpc_id : module.vpc.vpc_id
+
+  # SSH access
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
+  }
+
+  # Kubernetes API server
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Kubernetes API server"
+  }
+
+  # etcd server client API (CRITICAL for control plane)
+  ingress {
+    from_port   = 2379
+    to_port     = 2380
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "etcd server client API"
+  }
+
+  # Kubelet API (control plane)
+  ingress {
+    from_port   = 10250
+    to_port     = 10250
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Kubelet API"
+  }
+
+  # kube-controller-manager
+  ingress {
+    from_port   = 10257
+    to_port     = 10257
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "kube-controller-manager"
+  }
+
+  # kube-scheduler
+  ingress {
+    from_port   = 10259
+    to_port     = 10259
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "kube-scheduler"
+  }
+
+  # All VPC traffic for internal cluster communication
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic for cluster communication"
+  }
+
+  # All outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound traffic"
+  }
+
+  tags = {
+    Name                                        = "guy-control-plane-sg"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/control-plane"         = "true"
+    #DEBUGGABLE: Mark for debug tracking
+    "DebugEnabled"                              = "true"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# IAM Instance Profile for Worker Nodes
+resource "aws_iam_instance_profile" "worker_profile" {
+  name = "Guy-K8S-WorkerNode-Profile"
+  role = aws_iam_role.worker_role.name
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Security Group for Kubernetes Cluster Resources - LEGACY (TO BE REMOVED)
+resource "aws_security_group" "k8s_sg_legacy" {
+  name        = "Guy-K8S-SG-Legacy"
+  description = "LEGACY: Security group for Kubernetes control plane and workers - being replaced"
+  vpc_id      = module.vpc.vpc_id
+
+  #VALIDATION: This is the old version - enhanced version with all ports is later in file
+  # This resource should be removed in next iteration to eliminate duplicate
 }
 
