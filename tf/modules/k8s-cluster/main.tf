@@ -119,58 +119,6 @@ locals {
   pod_cidr = var.pod_cidr != "" ? var.pod_cidr : "10.244.0.0/16"
 }
 
-# Security Group for Kubernetes Cluster Resources
-resource "aws_security_group" "k8s_sg" {
-  name        = "Guy-K8S-SG"
-  description = "Security group for Kubernetes control plane and workers"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Kubernetes API server"
-  }
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "SSH access"
-  }
-
-  ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]  # Only from VPC for security
-    description = "Allow all internal VPC traffic for cluster communication"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  # Explicitly allow outbound traffic to Kubernetes API server
-  egress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow outbound traffic to Kubernetes API server"
-  }
-
-  tags = {
-    Name = "guy-k8s-sg"
-    "kubernetes-io-cluster-kubernetes" = "owned"
-  }
-}
 
 # IAM Role Policy Attachments for Control Plane
 resource "aws_iam_role_policy_attachment" "control_plane_role_policy_attachment" {
@@ -2866,36 +2814,5 @@ resource "aws_iam_instance_profile" "worker_profile" {
   }
 }
 
-# Security Group for Kubernetes Cluster Resources
-resource "aws_security_group" "k8s_sg_duplicate_remove" {
-  #VALIDATION: This is a duplicate resource - DO NOT USE
-  # Enhanced version is at line 2384 with all required Kubernetes ports
-  # This resource exists only to prevent Terraform errors during transition
-  
-  name        = "Guy-K8S-SG-Duplicate-Remove"
-  description = "DUPLICATE - DO NOT USE - See enhanced version at line 2384"
-  vpc_id      = module.vpc.vpc_id
 
-  # Minimal configuration to prevent errors
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["127.0.0.1/32"]  # Localhost only - effectively disabled
-    description = "Disabled - use enhanced security group"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  tags = {
-    Name = "guy-k8s-sg-duplicate-remove"
-    "REMOVE" = "true"
-  }
-}
 
