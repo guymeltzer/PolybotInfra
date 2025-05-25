@@ -28,7 +28,7 @@ resource "null_resource" "worker_node_details" {
       jq -r '.[][] | "Name: \(.Name)\nInstanceId: \(.InstanceId)\nPrivateIP: \(.PrivateIP)\nPublicIP: \(.PublicIP)\nState: \(.State)\n---"' /tmp/worker_nodes.json > /tmp/worker_nodes_formatted.txt
     EOT
   }
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
 }
 
 output "worker_nodes" {
@@ -52,7 +52,7 @@ output "worker_nodes_formatted" {
 # Resource to retrieve ArgoCD password for output display
 resource "null_resource" "argocd_password_retriever" {
   triggers = {
-    argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
+    argocd_install_id = null_resource.install_argocd[0].id
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -60,24 +60,24 @@ resource "null_resource" "argocd_password_retriever" {
       if [ -f "${local.kubeconfig_path}" ]; then
         PASSWORD=$(KUBECONFIG="${local.kubeconfig_path}" kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
         if [ -n "$PASSWORD" ]; then
-          echo "$PASSWORD" > /tmp/argocd-password-output.txt
+          echo "$PASSWORD" > /tmp/argocd-admin-password.txt
         else
-          echo "Password not available yet. ArgoCD may still be initializing." > /tmp/argocd-password-output.txt
+          echo "Password not available yet. ArgoCD may still be initializing." > /tmp/argocd-admin-password.txt
         fi
       else
-        echo "Password not available yet. Kubeconfig not found." > /tmp/argocd-password-output.txt
+        echo "Kubeconfig not found." > /tmp/argocd-admin-password.txt
       fi
       cat > /tmp/argocd-info.txt << 'INFOEOF'
       🔐 ArgoCD Access Information
       ---------------------------
       🌐 URL: https://localhost:8081
       👤 Username: admin
-      🔑 Password: $(cat /tmp/argocd-password-output.txt)
+      🔑 Password: $(cat /tmp/argocd-admin-password.txt)
       Note: Port forwarding is managed by ~/argocd-ssh-tunnel.sh
 INFOEOF
     EOT
   }
-  depends_on = [null_resource.argocd_direct_access, module.k8s-cluster]
+  depends_on = [null_resource.install_argocd, module.k8s-cluster.aws_instance.control_plane]
 }
 
 output "argocd_info" {
@@ -158,7 +158,7 @@ resource "null_resource" "dynamic_worker_logs" {
       done
     EOT
   }
-  depends_on = [module.k8s-cluster]
+  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
 }
 
 output "dynamic_worker_logs" {
@@ -249,7 +249,7 @@ resource "null_resource" "format_outputs" {
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
     worker_asg_name = module.k8s-cluster.worker_asg_name
-    argocd_status = fileexists("/tmp/argocd_already_installed") ? file("/tmp/argocd_already_installed") : "unknown"
+    argocd_install_id = null_resource.install_argocd[0].id
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
@@ -330,7 +330,8 @@ resource "null_resource" "format_outputs" {
     null_resource.argocd_password_retriever,
     null_resource.worker_node_details,
     null_resource.dynamic_worker_logs,
-    module.k8s-cluster
+    module.k8s-cluster.aws_instance.control_plane,
+    module.k8s-cluster.aws_autoscaling_group.worker_asg
   ]
 }
 

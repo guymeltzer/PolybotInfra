@@ -5,194 +5,42 @@
 # Call the storage class resource
 resource "null_resource" "create_storage_classes" {
   count = var.enable_resources ? 1 : 0
-  
-  depends_on = [
-    var.ebs_csi_dependency
-  ]
-  
   triggers = {
-    kubeconfig_id = var.kubeconfig_trigger_id
+    kubeconfig_trigger = terraform_data.kubectl_provider_config[0].id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${var.kubeconfig_path}"
-      
-      echo "Cleaning up any existing storage classes to avoid conflicts..."
-      kubectl delete storageclass ebs-sc --ignore-not-found=true
-      kubectl delete storageclass mongodb-sc --ignore-not-found=true
-      kubectl delete storageclass mongodb-storage --ignore-not-found=true
-      sleep 5
-      
-      echo "Creating EBS storage class..."
-      cat <<EOFSC | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp2
-  encrypted: "true"
-EOFSC
-      
-      echo "Creating MongoDB storage class..."
-      cat <<EOFSC | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp2
-EOFSC
-      
-      echo "Storage classes created successfully"
+    command = <<-EOT
+      KUBECONFIG="${var.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/storage-classes.yaml
     EOT
+  }
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    module.k8s-cluster.aws_instance.control_plane,
+    null_resource.install_ebs_csi_driver
+  ]
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
 # Improved disk cleanup resource
 resource "null_resource" "improved_disk_cleanup" {
   count = var.enable_resources ? 1 : 0
-  
-  depends_on = [
-    var.kubernetes_dependency,
-    null_resource.create_storage_classes
-  ]
-  
   triggers = {
-    kubeconfig_id = var.kubeconfig_trigger_id
+    worker_asg_name = module.k8s-cluster.worker_asg_name
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${var.kubeconfig_path}"
-      
-      echo "Cleaning up evicted pods with improved syntax..."
-      # Use jq for reliable pod detection and deletion
-      kubectl get pods --all-namespaces -o json | jq -r '.items[] | select(.status.reason=="Evicted") | .metadata.namespace + " " + .metadata.name' | while read ns name; do 
-        echo "Deleting evicted pod $name in namespace $ns"
-        kubectl delete pod -n $ns $name || true
-      done
-      
-      echo "Creating emergency disk cleanup job..."
-      cat <<EOFJOB | kubectl apply -f -
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: disk-cleanup-now
-  namespace: kube-system
-spec:
-  ttlSecondsAfterFinished: 100
-  activeDeadlineSeconds: 300  # Add 5-minute timeout to prevent job from hanging
-  template:
-    spec:
-      tolerations:
-      - operator: Exists
-      containers:
-      - name: cleanup
-        image: ubuntu:20.04
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "200m"
-        command: ["/bin/sh", "-c"]
-        args:
-        - |
-          apt-get update && apt-get install -y docker.io
-          echo "Emergency cleanup - freeing disk space..."
-          docker system prune -af
-          find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
-          find /var/log -type f -size +10M -delete
-          journalctl --vacuum-time=1d
-          rm -rf /tmp/*
-          echo "Emergency cleanup completed"
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - name: host-fs
-          mountPath: /
-          readOnly: false
-      volumes:
-      - name: host-fs
-        hostPath:
-          path: /
-      restartPolicy: Never
-      hostNetwork: true
-      hostPID: true
-EOFJOB
-      
-      echo "Setting up recurring disk cleanup job..."
-      cat <<EOFJOB | kubectl apply -f -
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: node-cleanup
-  namespace: kube-system
-spec:
-  schedule: "0 */6 * * *"
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          tolerations:
-          - operator: Exists
-          containers:
-          - name: cleanup
-            image: ubuntu:20.04
-            resources:
-              requests:
-                memory: "128Mi"
-                cpu: "100m"
-              limits:
-                memory: "256Mi"
-                cpu: "200m"
-            command: ["/bin/sh", "-c"]
-            args:
-            - |
-              apt-get update && apt-get install -y docker.io
-              echo "Scheduled cleanup - maintaining disk space..."
-              docker system prune -af
-              find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
-              find /var/log -type f -size +10M -delete
-              journalctl --vacuum-time=1d
-              rm -rf /tmp/*
-              echo "Scheduled cleanup completed"
-            securityContext:
-              privileged: true
-            volumeMounts:
-            - name: host-fs
-              mountPath: /
-              readOnly: false
-          volumes:
-          - name: host-fs
-            hostPath:
-              path: /
-          restartPolicy: OnFailure
-          hostNetwork: true
-          hostPID: true
-EOFJOB
-      
-      # Wait with reduced timeout
-      echo "Waiting for emergency cleanup job to complete (timeout: 3 minutes)..."
-      kubectl -n kube-system wait --for=condition=complete job/disk-cleanup-now --timeout=180s || true
-      
-      # Continue even if job hasn't completed
-      echo "Continuing deployment regardless of cleanup job status..."
-      echo "Disk cleanup jobs created. Regular maintenance will happen every 6 hours."
+    command = <<-EOT
+      aws ec2 describe-instances --region ${var.region} \
+        --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].InstanceId" --output text | xargs -I {} aws ec2 terminate-instances --region ${var.region} --instance-ids {}
     EOT
+  }
+  depends_on = [module.k8s-cluster.aws_autoscaling_group.worker_asg]
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
@@ -288,202 +136,22 @@ resource "null_resource" "cleanup_worker_nodes" {
 # MongoDB deployment
 resource "null_resource" "deploy_mongodb" {
   count = var.enable_resources && !var.skip_mongodb ? 1 : 0
-  
-  depends_on = [
-    null_resource.create_storage_classes,
-    null_resource.improved_disk_cleanup,
-    null_resource.cleanup_worker_nodes
-  ]
-  
   triggers = {
-    kubeconfig_id = var.kubeconfig_trigger_id
+    kubeconfig_trigger = terraform_data.kubectl_provider_config[0].id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${var.kubeconfig_path}"
-      
-      echo "Creating MongoDB namespace if it doesn't exist..."
-      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
-      
-      echo "Checking if MongoDB is already deployed..."
-      if kubectl -n mongodb get statefulset mongodb &>/dev/null; then
-        echo "MongoDB is already deployed, checking its status..."
-        if kubectl -n mongodb get pod mongodb-0 -o jsonpath='{.status.phase}' | grep -q "Running"; then
-          echo "MongoDB pod is already running, skipping creation"
-          exit 0
-        else
-          echo "MongoDB exists but pod is not running. Cleaning up and redeploying..."
-          kubectl delete statefulset mongodb -n mongodb --cascade=foreground --timeout=120s || true
-          kubectl delete pvc -n mongodb --all || true
-          sleep 30
-        fi
-      fi
-      
-      # Make sure we have the MongoDB storage class
-      if ! kubectl get storageclass mongodb-sc &>/dev/null; then
-        echo "MongoDB storage class doesn't exist, creating it..."
-        cat <<EOFSC | kubectl apply -f -
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp2
-EOFSC
-      fi
-      
-      echo "Creating MongoDB resources with proper resource limits..."
-      cat <<EOFMONGO | kubectl apply -f -
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mongodb-config
-  namespace: mongodb
-data:
-  mongo.conf: |
-    storage:
-      dbPath: /data/db
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: mongodb-secret
-  namespace: mongodb
-type: Opaque
-stringData:
-  root-username: admin
-  root-password: password
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb
-  namespace: mongodb
-spec:
-  selector:
-    app: mongodb
-  ports:
-  - port: 27017
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: mongodb
-  namespace: mongodb
-spec:
-  serviceName: mongodb
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mongodb
-  template:
-    metadata:
-      labels:
-        app: mongodb
-    spec:
-      containers:
-      - name: mongodb
-        image: mongo:4.4
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        readinessProbe:
-          exec:
-            command:
-            - mongo
-            - --eval
-            - "db.adminCommand('ping')"
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          successThreshold: 1
-          failureThreshold: 6
-        livenessProbe:
-          exec:
-            command:
-            - mongo
-            - --eval
-            - "db.adminCommand('ping')"
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          successThreshold: 1
-          failureThreshold: 10
-        ports:
-        - containerPort: 27017
-        volumeMounts:
-        - name: data
-          mountPath: /data/db
-        env:
-        - name: MONGO_INITDB_ROOT_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: root-username
-        - name: MONGO_INITDB_ROOT_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: root-password
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      storageClassName: mongodb-sc
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 1Gi
-EOFMONGO
-      
-      echo "Waiting for MongoDB pod to start (10 minute timeout)..."
-      for i in {1..40}; do
-        if kubectl -n mongodb get pod mongodb-0 -o jsonpath='{.status.phase}' | grep -q "Running"; then
-          echo "MongoDB pod is running!"
-          sleep 10  # Give it a little more time to fully initialize
-          echo "Creating a test database..."
-          kubectl -n mongodb exec -i mongodb-0 -- mongo -u admin -p password --authenticationDatabase admin <<EOF
-use polybot
-db.createUser({user: 'polybot', pwd: 'polybot', roles: [{role: 'readWrite', db: 'polybot'}]})
-db.test.insert({name: 'test'})
-EOF
-          echo "MongoDB setup complete and verified working!"
-          break
-        fi
-        
-        # Check for PVC errors
-        if [[ $((i % 5)) -eq 0 ]]; then  # Every 5 iterations
-          echo "Checking PVC status..."
-          kubectl -n mongodb get pvc
-          kubectl -n mongodb describe pvc
-          echo "Checking MongoDB pod status..."
-          kubectl -n mongodb describe pod mongodb-0
-          echo "Checking storage classes..."
-          kubectl get sc
-        fi
-        
-        echo "Waiting for MongoDB to start... ($i/40)"
-        sleep 15
-      done
-      
-      # Final check
-      if ! kubectl -n mongodb get pod mongodb-0 -o jsonpath='{.status.phase}' | grep -q "Running"; then
-        echo "WARNING: MongoDB pod did not reach Running state within timeout"
-        echo "Current pod status:"
-        kubectl -n mongodb get pods
-        echo "Latest pod events:"
-        kubectl -n mongodb get events --sort-by='.lastTimestamp'
-      fi
+    command = <<-EOT
+      KUBECONFIG="${var.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/mongodb-deployment.yaml
     EOT
+  }
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    module.k8s-cluster.aws_instance.control_plane,
+    null_resource.install_ebs_csi_driver
+  ]
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
@@ -550,46 +218,12 @@ resource "terraform_data" "init_environment" {
 # Better kubectl provider configuration with more robust error handling
 resource "terraform_data" "kubectl_provider_config" {
   count = var.enable_resources ? 1 : 0
-  
-  depends_on = [
-    var.kubernetes_dependency
-  ]
-  
   triggers_replace = {
-    # Use a stable identifier that changes when the cluster changes
     cluster_id = var.control_plane_id
   }
-  
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      set -e
-      
-      # Define paths consistently
-      KUBECONFIG_PATH="${var.kubeconfig_path}"
-      
-      # Ensure the kubeconfig file exists and has valid content
-      if [ ! -f "$KUBECONFIG_PATH" ]; then
-        echo "Error: Kubeconfig file not found at $KUBECONFIG_PATH"
-        exit 0 # Don't fail terraform, just exit the script
-      fi
-      
-      # Check if kubeconfig is valid and cluster is accessible
-      echo "Testing kubectl connectivity..."
-      if kubectl --kubeconfig="$KUBECONFIG_PATH" cluster-info &>/dev/null; then
-        echo "Kubectl connectivity verified successfully!"
-      else
-        echo "Warning: Could not connect to Kubernetes cluster with the kubeconfig."
-        echo "This may indicate network connectivity issues or an invalid kubeconfig."
-        echo "Will continue but subsequent Kubernetes-related steps may fail."
-      fi
-      
-      # Make sure kubectl provider will be able to use the kubeconfig
-      chmod 600 "$KUBECONFIG_PATH"
-      
-      echo "Kubectl provider configuration completed."
-    EOT
+  depends_on = [module.k8s-cluster.aws_instance.control_plane]
+  lifecycle {
+    create_before_destroy = true
   }
 }
 

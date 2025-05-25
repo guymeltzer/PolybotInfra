@@ -301,111 +301,19 @@ EOF
 # Resource to wait for Kubernetes API to be fully available - with improved triggers
 resource "null_resource" "wait_for_kubernetes" {
   count = 1
-  
-  depends_on = [
-    module.k8s-cluster,
-    terraform_data.init_environment
-  ]
-  
   triggers = {
-    control_plane_id = try(module.k8s-cluster.control_plane_instance_id, "none")
+    cluster_id = module.k8s-cluster.control_plane_instance_id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      #!/bin/bash
-      
-      # Define key path with better fallback logic and early validation
-      KEY_PATH=""
-      if [ -n "${var.key_name}" ]; then
-        # Try home directory first
-        if [ -f "$HOME/.ssh/${var.key_name}.pem" ]; then
-          KEY_PATH="$HOME/.ssh/${var.key_name}.pem"
-        # Then try current directory
-        elif [ -f "${path.module}/${var.key_name}.pem" ]; then
-          KEY_PATH="${path.module}/${var.key_name}.pem"
-        else
-          echo "WARNING: Specified key ${var.key_name}.pem not found in $HOME/.ssh or ${path.module}"
-        fi
-      fi
-      
-      # If key_name wasn't specified or wasn't found, use the generated key
-      if [ -z "$KEY_PATH" ] || [ ! -f "$KEY_PATH" ]; then
-        # Try polybot-key.pem in module path first
-        if [ -f "${path.module}/polybot-key.pem" ]; then
-          KEY_PATH="${path.module}/polybot-key.pem"
-        # Then try generated key if it exists
-        elif [ -f "${path.module}/generated-ssh-key.pem" ]; then
-          KEY_PATH="${path.module}/generated-ssh-key.pem"
-        else
-          echo "ERROR: No valid SSH key found! Cannot continue."
-          echo "Looking for key in: "
-          echo "  - $HOME/.ssh/${var.key_name}.pem"
-          echo "  - ${path.module}/${var.key_name}.pem"
-          echo "  - ${path.module}/polybot-key.pem"
-          echo "  - ${path.module}/generated-ssh-key.pem"
-          exit 0  # Don't fail Terraform, just log the error
-        fi
-      fi
-      
-      echo "Using SSH key: $KEY_PATH"
-      chmod 600 "$KEY_PATH" || echo "Warning: Could not set permissions on key"
-      
-      # Define variables
-      CONTROL_PLANE_IP="${try(module.k8s-cluster.control_plane_public_ip, "")}"
-      MAX_RETRIES=60  # Increased from 30
-      RETRY_INTERVAL=20
-      
-      # Verify control plane IP is available
-      if [ -z "$CONTROL_PLANE_IP" ]; then
-        echo "Error: No running control plane instance found"
-        exit 0  # Don't fail, let Terraform handle retries
-      fi
-      
-      echo "Control plane IP: $CONTROL_PLANE_IP"
-      echo "Waiting for Kubernetes API to become available..."
-      
-      # Try to connect to the Kubernetes API with retries
-      for ((i=1; i<=MAX_RETRIES; i++)); do
-        echo "Attempt $i/$MAX_RETRIES: Testing SSH connectivity..."
-        
-        # Test SSH connectivity first with better timeout and debugging
-        if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -v ubuntu@$CONTROL_PLANE_IP "echo SSH connection successful"; then
-          echo "SSH connection successful!"
-          
-          # Now check if Kubernetes API is responding
-          if ssh -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP "sudo kubectl get nodes --request-timeout=5s"; then
-            echo "Kubernetes API is responding!"
-            
-            # Copy kubeconfig and fix permissions
-            echo "Copying kubeconfig from control plane..."
-            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/home/ubuntu/.kube/config "${path.module}/kubeconfig.yaml" || \
-            scp -i "$KEY_PATH" -o StrictHostKeyChecking=no ubuntu@$CONTROL_PLANE_IP:/etc/kubernetes/admin.conf "${path.module}/kubeconfig.yaml"
-            
-            chmod 600 "${path.module}/kubeconfig.yaml"
-            
-            # Update kubeconfig with correct IP
-            echo "Updating kubeconfig with control plane public IP..."
-            sed -i.bak "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml" || \
-            sed -i "s/https:\/\/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/https:\/\/$CONTROL_PLANE_IP/g" "${path.module}/kubeconfig.yaml"
-            
-            echo "Kubernetes is ready and kubeconfig is updated"
-            exit 0
-          else
-            echo "Kubernetes API not ready yet, will retry..."
-          fi
-        else
-          echo "SSH connection failed, will retry..."
-        fi
-        
-        sleep $RETRY_INTERVAL
+      until KUBECONFIG="${local.kubeconfig_path}" kubectl get nodes --request-timeout=10s; do
+        echo "Waiting for Kubernetes API..."
+        sleep 10
       done
-      
-      echo "Warning: Maximum retries reached. Kubernetes API might not be ready yet."
-      exit 0  # Don't fail, let Terraform continue
     EOT
   }
+  depends_on = [module.k8s-cluster.aws_instance.control_plane]
 }
 
 # Resource that checks if ArgoCD is already deployed before spending time installing it
@@ -519,294 +427,61 @@ EOF
 # Now let's set up ArgoCD applications for polybot and its dependencies
 resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd,
-    # null_resource.install_nginx_ingress,  # Commented out since this resource no longer exists
-    null_resource.configure_argocd_repositories
-  ]
-  
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    argocd_install = null_resource.install_argocd[0].id
+    argocd_repo_id = null_resource.configure_argocd_repositories[0].id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      # Create MongoDB namespace
-      echo "Creating MongoDB namespace..."
-      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
-      
-      # Create ArgoCD application manifests directory
-      mkdir -p /tmp/argocd-apps
-      
-      # Create persistent volume provisioning
-      echo "Creating storage class for EBS..."
-      
-      # Check if the storage class already exists
-      if kubectl get storageclass ebs-sc &>/dev/null; then
-        echo "Storage class ebs-sc already exists, removing it first to avoid parameter update errors..."
-        kubectl delete storageclass ebs-sc --wait=false
-        sleep 5  # Give Kubernetes some time to process the deletion
-      fi
-      
-      # Create the storage class with replace if it exists
-      kubectl apply -f - --force --grace-period=0 <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  csi.storage.k8s.io/fstype: ext4
-  type: gp2
-EOF
-      
-      # Create MongoDB ArgoCD application
-      cat > /tmp/argocd-apps/mongodb-app.yaml << 'EOF'
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: mongodb
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://charts.bitnami.com/bitnami
-    chart: mongodb
-    targetRevision: 13.6.0
-    helm:
-      values: |
-        architecture: replicaset
-        replicaCount: 3
-        auth:
-          enabled: true
-          rootPassword: mongopassword
-          username: polybot
-          password: polybot
-          database: polybot
-        persistence:
-          enabled: true
-          storageClass: "ebs-sc"
-          size: 8Gi
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: mongodb
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-EOF
-      
-      # Create NGINX deployment instead of using private repo
-      cat > /tmp/argocd-apps/nginx-app.yaml << 'EOF'
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: nginx-app
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://charts.bitnami.com/bitnami
-    chart: nginx
-    targetRevision: 15.0.2
-    helm:
-      values: |
-        service:
-          type: ClusterIP
-        replicaCount: 1
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: default
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-EOF
-      
-      # Apply ArgoCD applications
-      echo "Applying ArgoCD applications..."
-      kubectl apply -f /tmp/argocd-apps/mongodb-app.yaml
-      kubectl apply -f /tmp/argocd-apps/nginx-app.yaml
-      
-      echo "Deleting old applications that had repository errors..."
-      kubectl delete application -n argocd polybot yolo5 --ignore-not-found
-      
-      echo "ArgoCD applications configured. They will start syncing automatically."
-      echo "Note: For Polybot and Yolo5, you'll need to provide your own GitHub credentials."
+    command = <<-EOT
+      KUBECONFIG="${local.kubeconfig_path}" argocd app create polybot \
+        --repo https://github.com/your-org/polybot-repo.git \
+        --path manifests \
+        --dest-server https://kubernetes.default.svc \
+        --dest-namespace polybot
+      KUBECONFIG="${local.kubeconfig_path}" argocd app sync polybot
     EOT
   }
+  depends_on = [
+    null_resource.configure_argocd_repositories,
+    module.kubernetes_resources.null_resource.deploy_mongodb,
+    module.k8s-cluster.aws_instance.control_plane
+  ]
 }
 
 # Modify Calico/Tigera installation to be more robust
 resource "null_resource" "install_calico" {
-  depends_on = [
-    null_resource.wait_for_kubernetes,
-    terraform_data.kubectl_provider_config
-  ]
-
-  # Only install once unless forced
   triggers = {
-    run_id = timestamp()
+    cluster_id = module.k8s-cluster.control_plane_instance_id
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      set -e
-      echo "Installing Calico networking components..."
-      export KUBECONFIG=${local.kubeconfig_path}
-      
-      # Check if calico is already installed
-      if kubectl get pods -n kube-system | grep -q calico; then
-        echo "Calico already appears to be installed, skipping installation"
-        exit 0
-      fi
-      
-      # Create the tigera-operator namespace
-      kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
-      
-      # Create enhanced RBAC for tigera-operator with node access
-      cat <<EOF | kubectl apply -f -
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
-      metadata:
-        name: tigera-operator
-      rules:
-      - apiGroups: [""]
-        resources: ["namespaces", "pods", "services", "endpoints", "configmaps", "serviceaccounts", "nodes"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      - apiGroups: ["apps"]
-        resources: ["deployments", "daemonsets", "statefulsets"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      - apiGroups: ["apiextensions.k8s.io"]
-        resources: ["customresourcedefinitions"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      - apiGroups: ["rbac.authorization.k8s.io"]
-        resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      - apiGroups: ["operator.tigera.io"]
-        resources: ["*"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      - apiGroups: ["crd.projectcalico.org"]
-        resources: ["*"]
-        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-      EOF
-      
-      # Create ClusterRoleBinding for tigera-operator
-      cat <<EOF | kubectl apply -f -
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: tigera-operator
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: tigera-operator
-      subjects:
-      - kind: ServiceAccount
-        name: tigera-operator
-        namespace: tigera-operator
-      EOF
-      
-      # Create the tigera-operator ServiceAccount
-      cat <<EOF | kubectl apply -f -
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: tigera-operator
-        namespace: tigera-operator
-      EOF
-      
-      # Apply the operator manifest
-      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
-      
-      # Wait for operator to be ready before continuing
-      echo "Waiting for tigera-operator deployment to be ready..."
-      kubectl -n tigera-operator wait --for=condition=available deployment/tigera-operator --timeout=120s
-      
-      # Apply Calico custom resources
-      kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
-      
-      # Monitor Calico installation progress
-      echo "Monitoring Calico installation progress..."
-      for i in {1..15}; do
-        if kubectl get tigerastatuses.operator.tigera.io 2>/dev/null | grep -q 'calico'; then
-          echo "Calico installation in progress..."
-        else
-          echo "Waiting for Calico CRDs to be established... attempt $i/15"
-        fi
-        
-        # Check if Calico pods are running
-        if kubectl get pods -n calico-system 2>/dev/null | grep -q 'Running'; then
-          echo "Calico pods are starting to run."
-          break
-        fi
-        
-        # If this is the last attempt, don't sleep
-        if [ $i -eq 15 ]; then
-          echo "Proceeding without waiting further for Calico"
-          break
-        fi
-        
-        sleep 20
-      done
-      
-      echo "Calico installation completed or timed out. Proceeding."
+    command = <<-EOT
+      KUBECONFIG="${local.kubeconfig_path}" kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
     EOT
   }
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    module.k8s-cluster.aws_instance.control_plane
+  ]
 }
 
 # Configure ArgoCD with repository credentials
 resource "null_resource" "configure_argocd_repositories" {
   count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_argocd,
-    null_resource.argocd_direct_access
-  ]
-  
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    argocd_install_id = null_resource.install_argocd[0].id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      # Create the repository configuration secret
-      echo "Configuring public Helm repository access..."
-      
-      kubectl -n argocd apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: helm-repos
-  namespace: argocd
-  labels:
-    argocd.argoproj.io/secret-type: repository
-stringData:
-  type: helm
-  name: bitnami
-  url: https://charts.bitnami.com/bitnami
-EOF
-      
-      echo "ArgoCD repositories configured."
+    command = <<-EOT
+      KUBECONFIG="${local.kubeconfig_path}" argocd repo add https://github.com/your-org/polybot-repo.git --name polybot-repo
     EOT
   }
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.argocd_password_retriever,
+    module.k8s-cluster.aws_instance.control_plane
+  ]
 }
 
 # Add this resource after the null_resource.fix_argocd_connectivity resource
@@ -979,236 +654,20 @@ EOF
 # Create MongoDB directly without ArgoCD, but with simpler implementation
 resource "null_resource" "deploy_mongodb_directly" {
   count = local.skip_argocd ? 0 : 1
-  
-  depends_on = [
-    null_resource.install_ebs_csi_driver,
-    module.kubernetes_resources.disk_cleanup_id,
-    null_resource.install_calico
-  ]
-  
   triggers = {
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    kubeconfig_trigger = terraform_data.kubectl_provider_config[0].id
   }
-  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      export KUBECONFIG="${local.kubeconfig_path}"
-      
-      echo "Creating MongoDB namespace if it doesn't exist..."
-      kubectl create namespace mongodb --dry-run=client -o yaml | kubectl apply -f -
-      
-      echo "Checking if MongoDB is already deployed..."
-      if kubectl -n mongodb get statefulset mongodb &>/dev/null; then
-        echo "MongoDB is already deployed, skipping creation"
-      else
-        echo "Ensuring correct storage class exists for MongoDB..."
-        if ! kubectl get storageclass mongodb-sc &>/dev/null; then
-          echo "Creating MongoDB storage class..."
-          kubectl apply -f - <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  csi.storage.k8s.io/fstype: ext4
-  type: gp2
-EOF
-        else
-          echo "MongoDB storage class already exists, checking if it needs to be updated..."
-          # Check if the existing storage class has the correct parameters
-          if ! kubectl get storageclass mongodb-sc -o yaml | grep -q "csi.storage.k8s.io/fstype: ext4"; then
-            echo "Storage class needs updating, deleting and recreating..."
-            kubectl delete storageclass mongodb-sc --wait=false
-            sleep 5  # Give Kubernetes some time to process the deletion
-            kubectl apply -f - --force --grace-period=0 <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  csi.storage.k8s.io/fstype: ext4
-  type: gp2
-EOF
-          else
-            echo "MongoDB storage class has correct parameters, skipping update"
-          fi
-        fi
-        
-        echo "Creating MongoDB StatefulSet directly..."
-        kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mongodb-config
-  namespace: mongodb
-data:
-  mongo.conf: |
-    storage:
-      dbPath: /data/db
-    net:
-      bindIp: 0.0.0.0
-    replication:
-      replSetName: rs0
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: mongodb-secret
-  namespace: mongodb
-type: Opaque
-data:
-  MONGO_INITDB_ROOT_USERNAME: YWRtaW4=
-  MONGO_INITDB_ROOT_PASSWORD: cGFzc3dvcmQ=
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb-headless
-  namespace: mongodb
-  labels:
-    app: mongodb
-spec:
-  clusterIP: None
-  selector:
-    app: mongodb
-  ports:
-  - port: 27017
-    targetPort: 27017
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mongodb
-  namespace: mongodb
-  labels:
-    app: mongodb
-spec:
-  selector:
-    app: mongodb
-  ports:
-  - port: 27017
-    targetPort: 27017
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: mongodb
-  namespace: mongodb
-spec:
-  serviceName: mongodb-headless
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mongodb
-  template:
-    metadata:
-      labels:
-        app: mongodb
-    spec:
-      containers:
-      - name: mongodb
-        image: mongo:4.4
-        resources:
-          limits:
-            cpu: "0.5"
-            memory: "512Mi"
-          requests:
-            cpu: "0.2"
-            memory: "256Mi"
-        env:
-        - name: MONGO_INITDB_ROOT_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: MONGO_INITDB_ROOT_USERNAME
-        - name: MONGO_INITDB_ROOT_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: mongodb-secret
-              key: MONGO_INITDB_ROOT_PASSWORD
-        ports:
-        - containerPort: 27017
-        volumeMounts:
-        - name: data
-          mountPath: /data/db
-        - name: config
-          mountPath: /config
-        command:
-        - "mongod"
-        - "--config=/config/mongo.conf"
-        # Add readiness probe
-        readinessProbe:
-          exec:
-            command:
-            - mongo
-            - --eval
-            - "db.adminCommand('ping')"
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          successThreshold: 1
-          failureThreshold: 6
-      volumes:
-      - name: config
-        configMap:
-          name: mongodb-config
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      storageClassName: "mongodb-sc"
-      resources:
-        requests:
-          storage: 1Gi
-EOF
-      fi
-      
-      # Wait for MongoDB pod to start
-      echo "Waiting for MongoDB pod to start (this may take a few minutes)..."
-      kubectl -n mongodb wait --for=condition=ready pod/mongodb-0 --timeout=600s || true
-      
-      # The initialization job is only necessary if statefulset exists but isn't initialized
-      echo "Checking if MongoDB needs initialization..."
-      POD_STATUS=$(kubectl -n mongodb get pods -l app=mongodb -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Not Found")
-      
-      if [ "$POD_STATUS" == "Running" ]; then
-        echo "Creating MongoDB initialization job..."
-        kubectl apply -f - <<EOF
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mongodb-init
-  namespace: mongodb
-spec:
-  ttlSecondsAfterFinished: 100
-  template:
-    spec:
-      containers:
-      - name: mongo-init
-        image: mongo:4.4
-        command:
-        - /bin/bash
-        - -c
-        - |
-          echo "Waiting for MongoDB to be ready..."
-          sleep 10
-          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017'}]})" || true
-          mongo --host mongodb-0.mongodb-headless.mongodb.svc.cluster.local:27017 -u admin -p password --authenticationDatabase admin --eval "db.getSiblingDB('polybot').createUser({user: 'polybot', pwd: 'polybot', roles: [{role: 'readWrite', db: 'polybot'}]})" || true
-          echo "MongoDB initialized successfully"
-      restartPolicy: OnFailure
-EOF
-      fi
-      
-      echo "MongoDB deployment completed. Monitor status with: kubectl -n mongodb get pods"
+    command = <<-EOT
+      KUBECONFIG="${local.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/mongodb-deployment.yaml
     EOT
   }
+  depends_on = [
+    terraform_data.kubectl_provider_config,
+    null_resource.install_ebs_csi_driver,
+    module.k8s-cluster.aws_instance.control_plane
+  ]
 }
 
 # Use the kubernetes-resources module for all Kubernetes-specific resources
@@ -1490,419 +949,17 @@ GUIDE
 
 #DEBUGGABLE: Comprehensive debug analysis and summary integrated into Terraform apply
 resource "null_resource" "integrated_debug_analysis" {
-  # Remove circular dependency - this should run independently
-  # depends_on = [null_resource.debug_bundle_creation]
-  
-  triggers = {
-    analysis_time = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      echo '{"stage":"integrated_debug_analysis", "status":"start", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      
-      # ANSI color codes for Terraform output
-      RED='\033[0;31m'
-      GREEN='\033[0;32m'
-      YELLOW='\033[1;33m'
-      BLUE='\033[0;34m'
-      PURPLE='\033[0;35m'
-      CYAN='\033[0;36m'
-      NC='\033[0m'
-      
-      echo ""
-      echo -e "$${BLUE}=====================================================================$${NC}"
-      echo -e "$${BLUE}           🐛 TERRAFORM DEBUG ANALYSIS RESULTS 🐛$${NC}"
-      echo -e "$${BLUE}=====================================================================$${NC}"
-      echo ""
-      
-      # Check if logs directory exists
-      if [ ! -d "logs" ]; then
-        echo -e "$${RED}❌ Error: logs/ directory not found!$${NC}"
-        exit 1
-      fi
-      
-      echo -e "$${GREEN}📁 Debug logs directory found$${NC}"
-      
-      # Analyze main debug log
-      echo ""
-      echo -e "$${CYAN}═══ Main Debug Log Analysis ═══$${NC}"
-      if [ -f "logs/tf_debug.log" ]; then
-        echo -e "$${GREEN}📋 Main debug log found$${NC}"
-        
-        # Count events by status - using simple grep since jq might not be available
-        TOTAL_EVENTS=$(wc -l < logs/tf_debug.log 2>/dev/null || echo "0")
-        SUCCESS_EVENTS=$(grep -c '"status":"success"' logs/tf_debug.log 2>/dev/null || echo "0")
-        ERROR_EVENTS=$(grep -c '"status":"error"' logs/tf_debug.log 2>/dev/null || echo "0")
-        WARNING_EVENTS=$(grep -c '"status":"warning"' logs/tf_debug.log 2>/dev/null || echo "0")
-        
-        echo ""
-        echo -e "$${BLUE}Event Status Summary:$${NC}"
-        echo -e "$${YELLOW}  Total events:$${NC} $TOTAL_EVENTS"
-        echo -e "$${YELLOW}  Successful events:$${NC} $SUCCESS_EVENTS"
-        echo -e "$${YELLOW}  Error events:$${NC} $ERROR_EVENTS"
-        echo -e "$${YELLOW}  Warning events:$${NC} $WARNING_EVENTS"
-        
-        echo ""
-        echo -e "$${BLUE}Recent Events (last 5):$${NC}"
-        tail -5 logs/tf_debug.log | while read -r line; do
-          if echo "$line" | grep -q '"status":"error"'; then
-            echo -e "  $${RED}❌ ERROR:$${NC} $line"
-          elif echo "$line" | grep -q '"status":"success"'; then
-            echo -e "  $${GREEN}✅ SUCCESS:$${NC} $line"
-          elif echo "$line" | grep -q '"status":"warning"'; then
-            echo -e "  $${YELLOW}⚠️  WARNING:$${NC} $line"
-          else
-            echo -e "  $${BLUE}📝 INFO:$${NC} $line"
-          fi
-        done
-      else
-        echo -e "$${RED}❌ Main debug log not found$${NC}"
-      fi
-      
-      # Error Analysis
-      echo ""
-      echo -e "$${CYAN}═══ Error Analysis ═══$${NC}"
-      if [ -f "logs/tf_debug.log" ]; then
-        ERROR_COUNT=$(grep -c '"status":"error"' logs/tf_debug.log 2>/dev/null || echo "0")
-        if [ "$ERROR_COUNT" -gt 0 ]; then
-          echo -e "$${RED}🚨 Found $ERROR_COUNT error(s):$${NC}"
-          grep '"status":"error"' logs/tf_debug.log | while read -r error_line; do
-            echo -e "  $${RED}❌$${NC} $error_line"
-          done
-        else
-          echo -e "$${GREEN}✅ No errors found in debug log$${NC}"
-        fi
-      else
-        echo -e "$${YELLOW}⚠️  No debug log available for error analysis$${NC}"
-      fi
-      
-      # Cluster State Analysis
-      echo ""
-      echo -e "$${CYAN}═══ Cluster State Analysis ═══$${NC}"
-      STATE_DIRS=("cluster_state" "kubernetes_state" "final_state")
-      for dir in "cluster_state" "kubernetes_state" "final_state"; do
-        if [ -d "logs/$dir" ]; then
-          file_count=$(find "logs/$dir" -type f 2>/dev/null | wc -l || echo "0")
-          echo -e "$${GREEN}📂 logs/$dir: $file_count files$${NC}"
-          
-          if [ "$file_count" -gt 0 ]; then
-            echo -e "$${BLUE}  Recent files:$${NC}"
-            find "logs/$dir" -type f -name "*.json" 2>/dev/null | tail -3 | sed 's/^/    /' || echo "    No JSON files found"
-          fi
-        else
-          echo -e "$${YELLOW}📂 logs/$dir: directory not found$${NC}"
-        fi
-      done
-      
-      # AWS Connectivity Check
-      echo ""
-      echo -e "$${CYAN}═══ AWS Connectivity Check ═══$${NC}"
-      if ls logs/aws_identity_*.json >/dev/null 2>&1; then
-        LATEST_IDENTITY=$(ls -t logs/aws_identity_*.json 2>/dev/null | head -1)
-        echo -e "$${GREEN}🔐 AWS Identity Check:$${NC}"
-        echo -e "  $${BLUE}Latest identity file:$${NC} $(basename "$LATEST_IDENTITY")"
-        
-        # Try to extract basic info without requiring jq
-        if grep -q '"Account"' "$LATEST_IDENTITY" 2>/dev/null; then
-          ACCOUNT=$(grep '"Account"' "$LATEST_IDENTITY" | cut -d'"' -f4 2>/dev/null || echo "unknown")
-          echo -e "  $${BLUE}Account:$${NC} $ACCOUNT"
-        fi
-      else
-        echo -e "$${YELLOW}⚠️  No AWS identity files found$${NC}"
-      fi
-      
-      # Deployment Information
-      echo ""
-      echo -e "$${CYAN}═══ Deployment Information ═══$${NC}"
-      echo -e "$${BLUE}📝 Configuration:$${NC}"
-      echo -e "  $${YELLOW}Region:$${NC} ${var.region}"
-      echo -e "  $${YELLOW}Cluster Name:$${NC} ${try(module.k8s-cluster.cluster_name, "unknown")}"
-      echo -e "  $${YELLOW}Control Plane IP:$${NC} ${try(module.k8s-cluster.control_plane_public_ip, "not available")}"
-      echo -e "  $${YELLOW}VPC ID:$${NC} ${try(module.k8s-cluster.vpc_id, "not available")}"
-      
-      # Generate Recommendations
-      echo ""
-      echo -e "$${CYAN}═══ Recommendations ═══$${NC}"
-      echo -e "$${BLUE}📝 Next Steps:$${NC}"
-      
-      # Check for common issues and provide specific guidance
-      if grep -q '"status":"error"' logs/tf_debug.log 2>/dev/null; then
-        echo -e "$${YELLOW}🔧 Error Resolution:$${NC}"
-        echo -e "  1. Review error details above"
-        echo -e "  2. Check AWS credentials: aws sts get-caller-identity"
-        echo -e "  3. Verify region access: aws ec2 describe-regions --region ${var.region}"
-        echo -e "  4. Check SSH key permissions if specified"
-        echo ""
-      fi
-      
-      echo -e "$${GREEN}🚀 Debug Resources Created:$${NC}"
-      echo -e "  • Main structured log: $${CYAN}logs/tf_debug.log$${NC}"
-      echo -e "  • AWS state files: $${CYAN}logs/cluster_state/$${NC}"
-      echo -e "  • Kubernetes state: $${CYAN}logs/kubernetes_state/$${NC}"
-      echo -e "  • Deployment summaries: $${CYAN}logs/deployment_summary_*.json$${NC}"
-      echo ""
-      
-      echo -e "$${BLUE}💡 Useful Commands for Further Analysis:$${NC}"
-      echo -e "  • View all errors: $${CYAN}grep '\"status\":\"error\"' logs/tf_debug.log$${NC}"
-      echo -e "  • Check timing: $${CYAN}grep -E '(start|complete)' logs/tf_debug.log$${NC}"
-      echo -e "  • List all debug files: $${CYAN}find logs/ -type f | sort$${NC}"
-      echo -e "  • Check control plane: $${CYAN}ssh ubuntu@${try(module.k8s-cluster.control_plane_public_ip, "CONTROL_PLANE_IP")} 'kubectl get nodes'$${NC}"
-      
-      # Final Bundle Information
-      if ls logs/debug-bundle-*.tgz >/dev/null 2>&1; then
-        LATEST_BUNDLE=$(ls -t logs/debug-bundle-*.tgz 2>/dev/null | head -1)
-        echo ""
-        echo -e "$${GREEN}📦 Debug Bundle Created:$${NC}"
-        echo -e "  $${CYAN}$(basename "$LATEST_BUNDLE")$${NC}"
-        echo -e "  $${BLUE}Contains all logs and state files for troubleshooting$${NC}"
-      fi
-      
-      echo ""
-      echo -e "$${BLUE}=====================================================================$${NC}"
-      if [ "$ERROR_COUNT" -gt 0 ]; then
-        echo -e "$${YELLOW}⚠️  Deployment completed with $ERROR_COUNT errors - review above for details$${NC}"
-      else
-        echo -e "$${GREEN}🎉 Deployment analysis complete - no errors detected!$${NC}"
-      fi
-      echo -e "$${BLUE}=====================================================================$${NC}"
-      
-      echo '{"stage":"integrated_debug_analysis", "status":"complete", "errors":"'$ERROR_COUNT'", "time":"${timestamp()}"}' >> logs/tf_debug.log
-    EOT
-  }
-}
-
-#DEBUGGABLE: ========================================================================
-# COMPREHENSIVE TERRAFORM DEBUG ENHANCEMENTS SUMMARY
-# ========================================================================
-#
-# This Terraform configuration has been enhanced with extensive debugging capabilities:
-#
-# 🔧 DEBUG INFRASTRUCTURE:
-# - Structured JSON logging to logs/tf_debug.log
-# - Comprehensive state capture in logs/cluster_state/, logs/kubernetes_state/
-# - Automated debug bundle creation with timestamps
-# - Environment variable injection for TF_LOG=DEBUG, TF_LOG_CORE=DEBUG
-#
-# 🔍 ERROR DETECTION & ANALYSIS:
-# - Pre/post execution hooks for each major component
-# - Error pattern detection with on_failure=continue
-# - State validation checkpoints after control plane, workers, networking
-# - AWS connectivity and permission validation
-#
-# 📊 TERRAFORM APPLY OUTPUT INTEGRATION:
-# - Real-time debug analysis displayed during terraform apply
-# - Color-coded status indicators and error reporting
-# - Comprehensive troubleshooting commands and recommendations
-# - Copy-paste ready debug information for Cursor AI
-#
-# 📁 DEBUG ARTIFACTS:
-# - logs/tf_debug.log: Main structured debug log
-# - logs/cluster_state/: AWS resource state captures
-# - logs/kubernetes_state/: Kubernetes cluster state
-# - logs/debug-bundle-*.tgz: Timestamped debug bundles
-# - logs/TROUBLESHOOTING_GUIDE.md: Step-by-step troubleshooting
-#
-# 🚀 TERRAFORM OUTPUTS:
-# - deployment_status: Overall deployment status and key information
-# - error_analysis: Error counts and analysis from debug logs
-# - troubleshooting_commands: Key commands for issue resolution
-# - copy_paste_debug_info: Formatted debug info for AI assistance
-# - next_steps: Recommended actions based on deployment status
-#
-# 🎯 USAGE:
-# 1. Run: terraform apply
-# 2. Watch for color-coded debug analysis during apply
-# 3. Use: terraform output <output_name> for specific debug info
-# 4. Check: logs/ directory for detailed debug artifacts
-# 5. Share: debug-bundle-*.tgz for comprehensive troubleshooting
-#
-# All debug resources are marked with #DEBUGGABLE comments for easy identification.
-# ========================================================================
-
-#VALIDATION: Comprehensive post-deployment cluster validation
-resource "null_resource" "comprehensive_cluster_validation" {
-  # Remove circular dependency - this should run independently
-  # depends_on = [null_resource.integrated_debug_analysis]
-  
-  triggers = {
-    validation_time = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      echo '{"stage":"comprehensive_validation", "status":"start", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      
-      echo ""
-      echo "🔍 COMPREHENSIVE CLUSTER VALIDATION REPORT"
-      echo "==========================================="
-      echo ""
-      
-      # Simple validation checks
-      echo "📋 DUPLICATE AND ERROR DETECTION:"
-      echo "   ✅ Terraform configuration validated"
-      echo ""
-      
-      echo "🔄 CLUSTER CREATION WORKFLOW VALIDATION:"
-      echo "   ✅ Control plane deployment sequence verified"
-      echo "   ✅ Worker node dependencies configured"
-      echo ""
-      
-      echo "🌐 NETWORKING AND IAM VALIDATION:"
-      echo "   ✅ Security groups configured with Kubernetes ports"
-      echo "   ✅ NodePort range (30000-32767) added"
-      echo "   ✅ EBS CSI driver permissions included"
-      echo ""
-      
-      echo "⚙️  PROVISIONER AND ERROR HANDLING:"
-      echo "   ✅ Error handling configured with on_failure=continue"
-      echo "   ✅ Debug logging enabled for all critical steps"
-      echo ""
-      
-      echo "✅ POST-APPLY VALIDATION SUMMARY:"
-      echo "   📍 All critical fixes implemented in Terraform"
-      echo "   📊 Debug analysis integrated into apply output"
-      echo ""
-      
-      echo "📋 VALIDATION SUMMARY:"
-      echo "==================="
-      echo "✅ Terraform Configuration Analyzed"
-      echo "✅ Security Groups Validated"  
-      echo "✅ IAM Policies Checked"
-      echo "✅ Networking Rules Verified"
-      echo "✅ Error Handling Assessed"
-      echo ""
-      
-      echo '{"stage":"comprehensive_validation", "status":"complete", "time":"${timestamp()}"}' >> logs/tf_debug.log
-    EOT
-    
-    on_failure = continue
-  }
-}
-
-#DEBUGGABLE: Pre-cluster debug validation hook
-resource "null_resource" "pre_cluster_debug" {
-  depends_on = [null_resource.debug_initialization]
-  
-  triggers = {
-    cluster_config = jsonencode({
-      region     = var.region
-      key_name   = var.key_name
-      timestamp  = timestamp()
-    })
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      echo '{"stage":"pre_cluster_validation", "status":"start", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      
-      # Validate AWS credentials and permissions
-      aws sts get-caller-identity > logs/aws_identity_${timestamp()}.json 2>&1 || {
-        echo '{"stage":"aws_validation", "status":"error", "message":"AWS credentials failed", "time":"${timestamp()}"}' >> logs/tf_debug.log
-        exit 1
-      }
-      
-      # Validate SSH key existence
-      if [ -n "${var.key_name}" ]; then
-        aws ec2 describe-key-pairs --key-names "${var.key_name}" > logs/ssh_key_validation_${timestamp()}.json 2>&1 || {
-          echo '{"stage":"ssh_key_validation", "status":"warning", "message":"SSH key ${var.key_name} not found in AWS", "time":"${timestamp()}"}' >> logs/tf_debug.log
-        }
-      fi
-      
-      echo '{"stage":"pre_cluster_validation", "status":"complete", "time":"${timestamp()}"}' >> logs/tf_debug.log
-    EOT
-    
-    on_failure = continue
-  }
-}
-
-module "k8s-cluster" {
-  # Remove dependency that creates circular reference
-  # depends_on = [null_resource.pre_cluster_debug]
-  
-  source = "./modules/k8s-cluster"
-  region = var.region
-
-  # Required parameters
-  control_plane_ami = var.control_plane_ami
-  worker_ami        = var.worker_ami
-  route53_zone_id   = var.route53_zone_id
-  
-  # Instance configuration
-  control_plane_instance_type = var.control_plane_instance_type
-  instance_type               = var.instance_type
-  worker_count                = var.desired_worker_nodes
-  
-  # Network configuration
-  vpc_id      = var.vpc_id
-  subnet_ids  = var.subnet_ids
-  
-  # SSH key configuration
-  ssh_public_key = var.ssh_public_key
-  key_name       = var.key_name
-  
-  # Verification settings
-  skip_api_verification     = var.skip_api_verification
-  skip_token_verification   = var.skip_token_verification
-  verification_max_attempts = var.verification_max_attempts
-  verification_wait_seconds = var.verification_wait_seconds
-  
-  # Additional settings (optional)
-  rebuild_workers       = false
-  rebuild_control_plane = false
-  
-  tags = {
-    Environment = "production"
-    ManagedBy   = "terraform"
-    DebugEnabled = "true"  #DEBUGGABLE: Mark for debug tracking
-  }
-}
-
-#DEBUGGABLE: Post-cluster state validation and error detection
-resource "null_resource" "post_cluster_debug" {
-  # Remove dependency that creates circular reference
-  # depends_on = [module.k8s-cluster]
-  
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
-    timestamp = timestamp()
   }
-
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      echo '{"stage":"post_cluster_validation", "status":"start", "control_plane_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      
-      # Capture cluster state
-      mkdir -p logs/cluster_state
-      
-      # Get control plane instance details
-      aws ec2 describe-instances --instance-ids "${module.k8s-cluster.control_plane_instance_id}" --region "${var.region}" > logs/cluster_state/control_plane_${timestamp()}.json 2>&1 || {
-        echo '{"stage":"control_plane_describe", "status":"error", "instance_id":"${module.k8s-cluster.control_plane_instance_id}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      }
-      
-      # Test SSH connectivity to control plane
-      timeout 30 bash -c "until nc -z ${module.k8s-cluster.control_plane_public_ip} 22; do sleep 2; done" && {
-        echo '{"stage":"ssh_connectivity", "status":"success", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      } || {
-        echo '{"stage":"ssh_connectivity", "status":"error", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      }
-      
-      # Test Kubernetes API connectivity
-      timeout 30 bash -c "until nc -z ${module.k8s-cluster.control_plane_public_ip} 6443; do sleep 2; done" && {
-        echo '{"stage":"k8s_api_connectivity", "status":"success", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      } || {
-        echo '{"stage":"k8s_api_connectivity", "status":"error", "ip":"${module.k8s-cluster.control_plane_public_ip}", "time":"${timestamp()}"}' >> logs/tf_debug.log
-      }
-      
-      echo '{"stage":"post_cluster_validation", "status":"complete", "time":"${timestamp()}"}' >> logs/tf_debug.log
+    command = <<-EOT
+      echo "Integrated debug: Worker ASG: ${module.k8s-cluster.worker_asg_name}" > /tmp/integrated_debug.txt
+      echo "Cluster debug: Control plane ID: ${module.k8s-cluster.control_plane_instance_id}" > /tmp/post_cluster_debug.txt
     EOT
-    
-    on_failure = continue
   }
+  depends_on = [module.k8s-cluster.aws_instance.control_plane]
 }
 
 # Configure Kubernetes provider with the kubeconfig file
