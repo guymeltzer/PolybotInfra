@@ -874,7 +874,6 @@ resource "aws_autoscaling_group" "worker_asg" {
     aws_secretsmanager_secret.kubernetes_join_command_latest,
     null_resource.verify_control_plane_readiness,  # Critical: Wait for control plane to be actually ready
     null_resource.update_join_command,             # Critical: Ensure join token exists
-    terraform_data.worker_progress
   ]
   
   lifecycle {
