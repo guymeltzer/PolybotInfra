@@ -75,7 +75,7 @@ output "kubeconfig_path_control_plane" {
 
 output "kubeconfig_filename" {
   description = "Local kubeconfig file path" #OUTPUT
-  value = local_file.kubeconfig.filename
+  value       = "${path.module}/../../kubeconfig.yaml"
 }
 
 #OUTPUT - Enhanced Kubernetes access information with visual formatting
@@ -85,10 +85,10 @@ output "kubernetes_access" {
 \033[1;36m🛡️ Kubernetes Access\033[0m
 \033[1;36m====================\033[0m
 API Endpoint: \033[1;34mhttps://${aws_instance.control_plane.public_ip}:6443\033[0m
-Kubeconfig:   \033[1;33m${local_file.kubeconfig.filename}\033[0m
+Kubeconfig:   \033[1;33m${path.module}/../../kubeconfig.yaml\033[0m
 
 \033[1;32m✅ Quick start commands:\033[0m
-  export KUBECONFIG=${local_file.kubeconfig.filename}
+  export KUBECONFIG=${path.module}/../../kubeconfig.yaml
   kubectl get nodes
   kubectl cluster-info
 EOT
@@ -310,11 +310,6 @@ output "control_plane_script_hash" {
   value       = terraform_data.control_plane_script_hash.id
 }
 
-output "worker_script_hash" {
-  description = "Hash of the worker user data script" #OUTPUT
-  value       = terraform_data.worker_script_hash.id
-}
-
 # =============================================================================
 # 🎯 DEPLOYMENT SUMMARY OUTPUT
 # =============================================================================
@@ -345,7 +340,7 @@ output "deployment_summary" {
 
 \033[1;36m🔑 Access:\033[0m
   SSH Key:       \033[1;33m${local.actual_key_name}\033[0m
-  Kubeconfig:    \033[1;33m${local_file.kubeconfig.filename}\033[0m
+  Kubeconfig:    \033[1;33m${path.module}/../../kubeconfig.yaml\033[0m
 
 \033[1;32m✅ Cluster is ready for use!\033[0m
 EOT
@@ -363,7 +358,7 @@ output "quick_start_commands" {
 \033[1;35m======================\033[0m
 
 \033[1;36m1️⃣ Set kubeconfig:\033[0m
-   \033[1;33mexport KUBECONFIG=${local_file.kubeconfig.filename}\033[0m
+   \033[1;33mexport KUBECONFIG=${path.module}/../../kubeconfig.yaml\033[0m
 
 \033[1;36m2️⃣ Verify cluster:\033[0m
    \033[1;33mkubectl get nodes\033[0m
@@ -425,5 +420,5 @@ output "control_plane_ip" {
 
 output "kubeconfig_path" {
   description = "Local kubeconfig file path (legacy compatibility)" #OUTPUT
-  value = local_file.kubeconfig.filename
+  value = "${path.module}/../../kubeconfig.yaml"
 }

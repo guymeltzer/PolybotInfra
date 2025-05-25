@@ -682,9 +682,15 @@ resource "aws_instance" "control_plane" {
 
   # Enhanced user data with comprehensive error handling
   user_data = base64encode(templatefile("${path.module}/control_plane_user_data.sh", {
-    token       = local.kubeadm_token
-    step        = "control_plane_init"
-    secret_name = aws_secretsmanager_secret.kubernetes_join_command.name
+    token                        = local.kubeadm_token
+    token_formatted             = local.kubeadm_token
+    step                        = "control_plane_init"
+    secret_name                 = aws_secretsmanager_secret.kubernetes_join_command.name
+    ssh_public_key              = var.key_name != "" ? "" : tls_private_key.ssh[0].public_key_openssh
+    POD_CIDR                    = "10.244.0.0/16"
+    JOIN_COMMAND_SECRET         = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET  = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    region                      = var.region
   }))
 
   # Enhanced metadata options for proper cloud integration
@@ -773,7 +779,7 @@ resource "null_resource" "control_plane_bootstrap_debug" {
 
 # Force update ASG when worker script changes
 resource "terraform_data" "force_asg_update" {
-  input = terraform_data.worker_script_hash.id
+  input = terraform_data.control_plane_script_hash.id
   
   triggers_replace = [
     aws_launch_template.worker_lt.latest_version,
@@ -2663,6 +2669,10 @@ resource "aws_s3_bucket_lifecycle_configuration" "worker_logs_lifecycle" {
   rule {
     id     = "delete_old_logs"
     status = "Enabled"
+
+    filter {
+      prefix = ""
+    }
 
     expiration {
       days = 30
