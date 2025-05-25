@@ -1713,7 +1713,7 @@ resource "terraform_data" "completion_progress" {
 resource "null_resource" "verify_control_plane_readiness" {
   depends_on = [
     aws_instance.control_plane,
-    null_resource.wait_for_control_plane
+    null_resource.control_plane_bootstrap_debug
   ]
 
   # This will cause this resource to be recreated whenever the control plane changes
