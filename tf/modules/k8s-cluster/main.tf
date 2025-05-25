@@ -2515,9 +2515,13 @@ resource "aws_launch_template" "worker_lt" {
   
   # CRITICAL: Add user data for worker node bootstrap
   user_data = base64encode(templatefile("${path.module}/bootstrap_worker.sh", {
-    cluster_name = var.cluster_name
-    region       = var.region
-    secret_name  = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    cluster_name                = var.cluster_name
+    region                     = var.region
+    secret_name                = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    SSH_PUBLIC_KEY            = var.key_name != "" ? "" : tls_private_key.ssh[0].public_key_openssh
+    REGION                    = var.region
+    JOIN_COMMAND_SECRET       = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
   }))
   
   block_device_mappings {
