@@ -17,7 +17,7 @@ exec > >(tee -a "$LOGFILE" "$CLOUD_INIT_LOG") 2>&1
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootstrap (CRI-O)"
 
 # Error handling with clear error messages
-trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" >&2' ERR
+# trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" >&2' ERR
 
 # These variables are NOW expected to be substituted by Terraform's templatefile function:
 # ${SSH_PUBLIC_KEY}, ${region}, ${JOIN_COMMAND_SECRET}, ${JOIN_COMMAND_LATEST_SECRET},
@@ -176,20 +176,20 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubernetes components installed and he
 
 # 9. Configure Kubelet to use CRI-O
 mark_progress "Configuring Kubelet for CRI-O"
-KUBELET_DROPIN_DIR="/etc/systemd/system/kubelet.service.d"
-mkdir -p "$KUBELET_DROPIN_DIR" # Use $KUBELET_DROPIN_DIR (bash variable)
-cat > "$${KUBELET_DROPIN_DIR}/10-kubeadm.conf" << EOF # Escape $ for KUBELET_DROPIN_DIR
-# This file is created by kubeadm init/join.
-# To override kubelet args, create a file like /etc/systemd/system/kubelet.service.d/20-extra-args.conf
-EOF
-cat > "$${KUBELET_DROPIN_DIR}/00-crio.conf" << EOF # Escape $ for KUBELET_DROPIN_DIR
+KUBELET_DROPIN_DIR="/etc/systemd/system/kubelet.service.d" # CORRECT PATH
+mkdir -p "$KUBELET_DROPIN_DIR"
+
+# Use a filename like 20-crio-override.conf to ensure it's applied appropriately
+cat > "${KUBELET_DROPIN_DIR}/20-crio-override.conf" << EOF
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/crio/crio.sock --node-ip=$${PRIVATE_IP_FROM_META} --hostname-override=$${NODE_NAME} --cloud-provider=external"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=$${PRIVATE_IP_FROM_META} --hostname-override=$${NODE_NAME} --cloud-provider=external"
 EOF
+# Note the $$ to escape for templatefile, so bash sees ${PRIVATE_IP_FROM_META} and ${NODE_NAME}
 
 systemctl daemon-reload
-systemctl enable --now kubelet
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet configured for CRI-O, started and enabled."
+systemctl restart kubelet # Restart to ensure it picks up the drop-in *before* kubeadm join
+systemctl enable --now kubelet 
+echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet configured for CRI-O, (re)started and enabled."
 
 # 10. Retrieve and execute join command
 mark_progress "Retrieving join command"
@@ -228,7 +228,7 @@ if [ -z "$RAW_JOIN_COMMAND" ]; then
   exit 1
 fi
 
-CRIO_SOCKET_PATH="unix:///var/run/crio/crio.sock"
+CRIO_SOCKET_PATH="unix:///run/crio/crio.sock"
 MODIFIED_JOIN_COMMAND="$RAW_JOIN_COMMAND --cri-socket $CRIO_SOCKET_PATH --node-name $NODE_NAME"
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Using join command: $MODIFIED_JOIN_COMMAND"
