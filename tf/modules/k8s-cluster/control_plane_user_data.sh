@@ -1,32 +1,68 @@
 #!/bin/bash
-# Simple, proven control plane initialization
+# Control plane initialization script with CRI-O
 
 # Basic setup
-set -e
+set -euo pipefail # Exit on error, unset variable, or pipe failure
 export DEBIAN_FRONTEND=noninteractive
 
-# Log everything
+# Log everything to a file and also to stdout/stderr (for cloud-init output)
 exec > >(tee -a /var/log/k8s-init.log) 2>&1
 
-echo "Starting control plane initialization at $(date)"
+echo "--- Starting control plane initialization at $(date) ---"
+
+# These variables are expected to be substituted by Terraform's templatefile function:
+# ${token_formatted}, ${TOKEN_SUFFIX}, ${ssh_public_key}, ${POD_CIDR},
+# ${JOIN_COMMAND_SECRET}, ${JOIN_COMMAND_LATEST_SECRET}, ${region},
+# ${K8S_VERSION_FULL}, ${K8S_PACKAGE_VERSION}, ${K8S_MAJOR_MINOR}
+
+# 0. Set Hostname (Good Practice)
+echo "Setting hostname..."
+if [ -z "${token_formatted}" ]; then # This is substituted by templatefile
+  echo "FATAL: token_formatted variable not set in template. Exiting."
+  exit 1
+fi
+# TOKEN_SUFFIX is substituted by templatefile
+NEW_HOSTNAME="k8s-control-plane-${TOKEN_SUFFIX}"
+hostnamectl set-hostname "$NEW_HOSTNAME"
+if grep -q "127.0.0.1 $NEW_HOSTNAME" /etc/hosts; then
+    echo "Hostname $NEW_HOSTNAME already in /etc/hosts for 127.0.0.1."
+else
+    if grep -q "127.0.0.1 localhost" /etc/hosts; then
+        sed -i "/^127.0.0.1 localhost/ s/$/ $NEW_HOSTNAME/" /etc/hosts
+    else
+        echo "127.0.0.1 localhost $NEW_HOSTNAME" >> /etc/hosts
+    fi
+fi
+echo "Hostname set to $NEW_HOSTNAME"
 
 # 1. Install essential packages
-apt-get update
-apt-get install -y apt-transport-https ca-certificates curl unzip jq awscli
+echo "Installing essential packages..."
+apt-get update -y
+apt-get install -y apt-transport-https ca-certificates curl unzip jq awscli software-properties-common gpg
 
 # 2. SSH setup
-mkdir -p /home/ubuntu/.ssh /root/.ssh
-echo "${ssh_public_key}" > /home/ubuntu/.ssh/authorized_keys
-echo "${ssh_public_key}" > /root/.ssh/authorized_keys
-chmod 600 /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys
-chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+echo "Configuring SSH authorized_keys..."
+if [ -n "${ssh_public_key}" ]; then # ssh_public_key is substituted by templatefile
+  mkdir -p /home/ubuntu/.ssh /root/.ssh
+  echo "${ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+  echo "${ssh_public_key}" >> /root/.ssh/authorized_keys
+  sort -u /home/ubuntu/.ssh/authorized_keys -o /home/ubuntu/.ssh/authorized_keys
+  sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
+  chmod 700 /home/ubuntu/.ssh /root/.ssh
+  chmod 600 /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys
+  chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+  chown -R root:root /root/.ssh
+  echo "SSH public key added to authorized_keys."
+else
+  echo "No explicit SSH public key provided via template; relying on EC2 instance key pair."
+fi
 
-# 3. Kubernetes prerequisites
+# 3. Kubernetes prerequisites (kernel modules, sysctl)
+echo "Configuring Kubernetes prerequisites (kernel modules, sysctl)..."
 cat > /etc/modules-load.d/k8s.conf << EOF
 overlay
 br_netfilter
 EOF
-
 modprobe overlay
 modprobe br_netfilter
 
@@ -35,77 +71,209 @@ net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
-
 sysctl --system
 
 # Disable swap
+echo "Disabling swap..."
 swapoff -a
-sed -i '/swap/d' /etc/fstab
+sed -i.bak '/swap/s/^/#/' /etc/fstab || echo "No swap entries found in /etc/fstab or sed failed."
 
-# 4. Install containerd
-apt-get install -y containerd
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-systemctl restart containerd
-systemctl enable containerd
+# 4. Install CRI-O (Container Runtime)
+echo "Installing and configuring CRI-O..."
+#CRIO_K8S_MAJOR_MINOR="${K8S_MAJOR_MINOR}" # Use the K8S_MAJOR_MINOR passed from Terraform
 
-# 5. Install Kubernetes
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+# Add CRI-O repository
+mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
 
-apt-get update
-apt-get install -y kubeadm=1.28.3-1.1 kubelet=1.28.3-1.1 kubectl=1.28.3-1.1
+apt-get update -y
+apt-get install -y cri-o cri-o-runc # cri-o-runc is often a dependency but good to be explicit
+echo "CRI-O packages installed."
+
+# Configure CRI-O to use systemd cgroup driver (usually default but good to ensure)
+# CRI-O config is typically at /etc/crio/crio.conf or /etc/crio/crio.conf.d/
+# We'll ensure the main config uses systemd cgroup.
+# Kubeadm usually prefers systemd cgroup driver.
+# If /etc/crio/crio.conf exists, check/modify it.
+CRIO_CONF="/etc/crio/crio.conf"
+if [ -f "$CRIO_CONF" ]; then
+    if grep -q "cgroup_manager" "$CRIO_CONF"; then
+        sed -i 's/cgroup_manager = "cgroupfs"/cgroup_manager = "systemd"/' "$CRIO_CONF"
+    else # Add it under [crio.runtime] if not present
+        if grep -q "\[crio.runtime\]" "$CRIO_CONF"; then
+            sed -i '/\[crio.runtime\]/a \cgroup_manager = "systemd"' "$CRIO_CONF"
+        else # Add the section and the setting
+            echo -e "\n[crio.runtime]\ncgroup_manager = \"systemd\"" >> "$CRIO_CONF"
+        fi
+    fi
+else
+    echo "Warning: CRI-O main config $CRIO_CONF not found. Assuming default is systemd or will be set by drop-in."
+    # Create a drop-in to enforce systemd cgroup manager
+    mkdir -p /etc/crio/crio.conf.d
+    cat > /etc/crio/crio.conf.d/01-cgroup-manager.conf << EOF
+[crio.runtime]
+cgroup_manager = "systemd"
+EOF
+fi
+echo "Ensured CRI-O is configured for systemd cgroup manager."
+
+systemctl daemon-reload
+systemctl enable --now crio
+systemctl restart crio # Restart to apply any config changes
+echo "CRI-O started and enabled."
+
+# 5. Install Kubernetes components (kubeadm, kubelet, kubectl)
+# K8S_VERSION_FULL, K8S_PACKAGE_VERSION, K8S_MAJOR_MINOR are substituted by templatefile
+echo "Installing Kubernetes components (kubeadm, kubelet, kubectl) version ${K8S_VERSION_FULL} (package version ${K8S_PACKAGE_VERSION})..."
+
+# Kubernetes apt repository (already uses K8S_MAJOR_MINOR from templatefile)
+mkdir -p -m 755 /etc/apt/keyrings # Redundant if CRI-O section did it, but harmless
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+
+apt-get update -y
+apt-get install -y kubeadm="${K8S_PACKAGE_VERSION}" kubelet="${K8S_PACKAGE_VERSION}" kubectl="${K8S_PACKAGE_VERSION}"
 apt-mark hold kubeadm kubelet kubectl
+echo "Kubernetes components installed and held."
 
-# 6. Get instance metadata
-PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+# 6. Get instance metadata and prepare kubeadm config values
+echo "Fetching instance metadata (using IMDSv2 where possible)..."
+IMDS_TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s -f)
+if [ -n "$IMDS_TOKEN" ]; then
+    echo "Acquired IMDSv2 token."
+    PRIVATE_IP=$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
+    PUBLIC_IP=$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
+else
+    echo "Warning: Failed to get IMDSv2 token or IMDSv2 is disabled. Attempting IMDSv1."
+    PRIVATE_IP=$(curl -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
+    PUBLIC_IP=$(curl -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
+fi
 
-# 7. Initialize Kubernetes
-cat > /tmp/kubeadm-config.yaml << EOF
+if [ -z "$PRIVATE_IP" ]; then
+  echo "FATAL: Could not determine Private IP from instance metadata."
+  exit 1
+fi
+echo "Private IP: $PRIVATE_IP"
+if [ -n "$PUBLIC_IP" ]; then
+  echo "Public IP: $PUBLIC_IP"
+else
+  echo "Public IP not found or not assigned to this instance."
+fi
+
+if [ -z "${POD_CIDR}" ]; then # POD_CIDR is substituted by templatefile
+  echo "FATAL: POD_CIDR variable not set in template. Exiting."
+  exit 1
+fi
+echo "Using POD_CIDR: ${POD_CIDR}"
+echo "Using bootstrap token prefix: $(echo "${token_formatted}" | cut -d. -f1).*****" # token_formatted is from templatefile
+
+# 7. Construct and Initialize Kubernetes with Kubeadm
+echo "Constructing kubeadm configuration..."
+mkdir -p /etc/kubernetes/kubeadm
+# NEW_HOSTNAME is a bash variable, derived from template variable ${TOKEN_SUFFIX}
+# PRIVATE_IP is a bash variable
+# Variables like ${token_formatted}, ${K8S_VERSION_FULL}, ${POD_CIDR} are substituted by templatefile
+cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 bootstrapTokens:
 - token: "${token_formatted}"
-  description: "initial token for worker join"
+  description: "Initial token for worker nodes to join"
   ttl: "24h"
+localAPIEndpoint:
+  advertiseAddress: $PRIVATE_IP
+  bindPort: 6443
 nodeRegistration:
+  name: $NEW_HOSTNAME
+  criSocket: "unix:///run/crio/crio.sock" # Specify CRI-O socket
   kubeletExtraArgs:
-    cloud-provider: external
+    cloud-provider: "external"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-networking:
-  podSubnet: "${POD_CIDR}"
+kubernetesVersion: "v${K8S_VERSION_FULL}" # Use template variable
+controlPlaneEndpoint: "$PRIVATE_IP:6443"
 apiServer:
   certSANs:
   - "$PRIVATE_IP"
-  - "$PUBLIC_IP"
+$( [ -n "$PUBLIC_IP" ] && echo "  - \"$PUBLIC_IP\"" )
+  - "$NEW_HOSTNAME"
   - "127.0.0.1"
   - "localhost"
+  - "kubernetes"
+  - "kubernetes.default"
+  - "kubernetes.default.svc"
+  - "kubernetes.default.svc.cluster.local"
 controllerManager:
   extraArgs:
-    cloud-provider: external
+    cloud-provider: "external"
+networking:
+  podSubnet: "${POD_CIDR}"
+  serviceSubnet: "10.96.0.0/12"
 EOF
 
-# Initialize cluster
-kubeadm init --config=/tmp/kubeadm-config.yaml --skip-phases=addon/kube-proxy
+echo "Kubeadm configuration generated. Contents:"
+cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
 
-# Setup kubeconfig
+echo "Running kubeadm init..."
+kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs
+echo "Kubeadm init completed."
+
+# 8. Setup kubeconfig for root and ubuntu users
+echo "Setting up kubeconfig..."
 mkdir -p /root/.kube /home/ubuntu/.kube
-cp /etc/kubernetes/admin.conf /root/.kube/config
-cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+cp -i /etc/kubernetes/admin.conf /root/.kube/config
+cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+chown root:root /root/.kube/config
+chown ubuntu:ubuntu /home/ubuntu/.kube/config
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
+chown -R root:root /root/.kube
+echo "Kubeconfig setup complete."
 
-# Install Calico
 export KUBECONFIG=/etc/kubernetes/admin.conf
-kubectl apply -f https://docs.projectcalico.org/v3.25/manifests/calico.yaml
 
-# Store join command in secrets manager
+# 9. Install CNI (Calico)
+echo "Installing Calico CNI (v3.26.4)..."
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml
+echo "Calico CNI installation initiated."
+
+# 10. Install AWS Cloud Controller Manager (CCM) - Reminder
+echo "---------------------------------------------------------------------"
+echo "IMPORTANT: 'cloud-provider: external' was specified in kubeadm config."
+echo "You MUST deploy the AWS Cloud Controller Manager manually."
+echo "Refer to: https://github.com/kubernetes/cloud-provider-aws"
+echo "Select a CCM version compatible with Kubernetes ${K8S_VERSION_FULL}." # Uses template variable
+echo "Example (replace vX.Y.Z with a compatible version):"
+echo "# kubectl apply -f https://raw.githubusercontent.com/kubernetes/cloud-provider-aws/master/releases/vX.Y.Z/aws-cloud-controller-manager.yaml"
+echo "---------------------------------------------------------------------"
+
+# 11. Store a fresh join command in AWS Secrets Manager
+echo "Creating and storing new Kubeadm join command in AWS Secrets Manager..."
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
-aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}" || true
-aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_LATEST_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}" || true
+if [ -z "$JOIN_COMMAND" ]; then
+  echo "FATAL: Failed to create a new join command with kubeadm."
+  exit 1
+fi
 
-echo "Control plane initialization completed at $(date)"
+# These secret name variables are passed from Terraform via templatefile
+if [ -z "${region}" ] || [ -z "${JOIN_COMMAND_SECRET}" ] || [ -z "${JOIN_COMMAND_LATEST_SECRET}" ]; then
+    echo "FATAL: region or secret name variables not set in template. Cannot update Secrets Manager."
+    exit 1
+fi
+
+echo "Attempting to store join command in Secret: ${JOIN_COMMAND_SECRET}"
+if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}"; then
+  echo "Successfully stored join command in ${JOIN_COMMAND_SECRET}."
+else
+  echo "ERROR: Failed to store join command in ${JOIN_COMMAND_SECRET}."
+fi
+
+echo "Attempting to store join command in Secret: ${JOIN_COMMAND_LATEST_SECRET}"
+if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_LATEST_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}"; then
+  echo "Successfully stored join command in ${JOIN_COMMAND_LATEST_SECRET}."
+else
+  echo "ERROR: Failed to store join command in ${JOIN_COMMAND_LATEST_SECRET}."
+fi
+
+echo "--- Control plane initialization script completed at $(date) ---"

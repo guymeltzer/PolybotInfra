@@ -730,6 +730,7 @@ module "kubernetes_resources" {
   ]
 }
 
+
 # Add display information at the start of deployment
 resource "terraform_data" "deployment_information" {
   # Run only on first apply or when Terraform files change

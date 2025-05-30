@@ -20,6 +20,7 @@ pod_cidr = "10.244.0.0/16"  # Flannel default
 route53_zone_id = "ZXXXXXXXXXX"
 
 key_name          = "polybot-key"           # SSH key for instance access
+ssh_private_key_file_path = "~/.ssh/polybot-key.pem" 
 vpc_id            = ""                      # Leave empty to create a new VPC
 subnet_ids        = []                      # Leave empty to create new subnets
 git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"

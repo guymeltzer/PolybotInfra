@@ -227,3 +227,10 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "ssh_private_key_file_path" {
+  description = "Local path to the SSH private key file (e.g., '~/.ssh/polybot-key.pem')."
+  type        = string
+  default     = null # Or you can provide a default, but since it's in your .tfvars, null or no default is fine.
+                     # If you want to make it strictly required from the .tfvars, remove the default.
+}
