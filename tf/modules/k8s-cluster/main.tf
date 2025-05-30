@@ -41,6 +41,18 @@ resource "random_string" "token_part2" {
 # Format the token for kubeadm (must be in format AAAAAA.BBBBBBBBBBBBBBBB)
 locals {
   kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
+  
+  # Token suffix for hostname generation
+  token_suffix_for_template = random_string.token_part1.result
+
+  # === Updated Kubernetes & CRI-O Versioning for ~May 2025 ===
+  # Targeting Kubernetes v1.31.x
+  k8s_version_full_for_template    = "1.31.9"
+  k8s_major_minor_for_template     = join(".", slice(split(".", "1.31.9"), 0, 2)) # This will be "1.31"
+  k8s_package_version_for_template = "1.31.9-1.1" # e.g., "1.31.0-00"
+
+  # CRI-O versioning aligns with Kubernetes major.minor
+  crio_k8s_major_minor_for_template  = join(".", slice(split(".", "1.31.9"), 0, 2)) # This will be "1.31"
 
   # Determine pod CIDR for the cluster
   pod_cidr = var.pod_cidr
@@ -620,6 +632,11 @@ resource "aws_instance" "control_plane" {
       cluster_name      = var.cluster_name,
       # Add these required variables to fix templating issues
       token_formatted   = local.kubeadm_token,
+      TOKEN_SUFFIX      = local.token_suffix_for_template,
+      K8S_VERSION_FULL  = local.k8s_version_full_for_template,
+      K8S_PACKAGE_VERSION = local.k8s_package_version_for_template,
+      K8S_MAJOR_MINOR   = local.k8s_major_minor_for_template,
+      CRIO_K8S_MAJOR_MINOR = local.crio_k8s_major_minor_for_template,
       JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
       JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
       KUBERNETES_JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
@@ -1357,9 +1374,18 @@ resource "aws_launch_template" "worker_lt" {
       "${path.module}/bootstrap_worker.sh",
       {
         SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""),
+        region = var.region,  # Fix: lowercase 'region' to match the script
+        cluster_name = var.cluster_name,
         JOIN_COMMAND_SECRET = aws_secretsmanager_secret.kubernetes_join_command.name,
         JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name,
-        REGION = var.region
+        # Add missing K8s versioning variables
+        K8S_PACKAGE_VERSION_TO_INSTALL = local.k8s_package_version_for_template,
+        K8S_MAJOR_MINOR_FOR_REPO = local.k8s_major_minor_for_template,
+        CRIO_K8S_MAJOR_MINOR_FOR_REPO = local.crio_k8s_major_minor_for_template,
+        KUBELET_DROPIN_DIR = "/etc/systemd/system/kubelet.service.d",
+        # === Placeholder variables for bash variables set dynamically ===
+        PRIVATE_IP_FROM_META = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT",
+        NODE_NAME = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT"
       }
     )
   )
