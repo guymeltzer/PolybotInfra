@@ -234,12 +234,24 @@ variable "ssh_private_key_file_path" {
   default     = null # Or you can provide a default, but since it's in your .tfvars, null or no default is fine.
                      # If you want to make it strictly required from the .tfvars, remove the default.
 }
-variable "root_key_name" { # Using a different name to avoid confusion if you also have var.key_name in root for other things
-        type    = string
-        default = "" 
-      }
+
+variable "root_key_name" {
+  description = "Root SSH key name for EC2 instances"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
 
 variable "root_ssh_private_key_file_path" {
-  type    = string
-  default = ""
+  description = "Path to the root SSH private key file"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "root_ssh_public_key" {
+  description = "Root SSH public key content"
+  type        = string
+  default     = ""
+  sensitive   = true
 }

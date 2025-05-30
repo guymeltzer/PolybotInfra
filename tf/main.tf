@@ -63,21 +63,19 @@ module "k8s-cluster" {
   vpc_id                       = var.vpc_id
   subnet_ids                   = var.subnet_ids
   route53_zone_id              = var.route53_zone_id
-  key_name                     = var.root_key_name
+  key_name                     = var.key_name
   control_plane_ami            = var.control_plane_ami
   worker_ami                   = var.worker_ami
   control_plane_instance_type  = var.control_plane_instance_type
   worker_instance_type         = var.worker_instance_type
   worker_count                 = var.desired_worker_nodes
   instance_type                = var.instance_type
-  ssh_public_key              = var.root_ssh_public_key
+  ssh_public_key              = var.ssh_public_key
   skip_api_verification       = var.skip_api_verification
   skip_token_verification     = var.skip_token_verification
   verification_max_attempts   = var.verification_max_attempts
   verification_wait_seconds   = var.verification_wait_seconds
   pod_cidr                    = var.pod_cidr
-  ssh_private_key_file_path   = var.root_ssh_private_key_file_path
-  desired_worker_nodes        = var.desired_worker_nodes 
   
   # Optional parameters
   tags = {

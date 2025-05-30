@@ -19,11 +19,11 @@ pod_cidr = "10.244.0.0/16"  # Flannel default
 # Route53 zone ID (replace with your actual zone ID)
 route53_zone_id = "Z02842682SGSPDJQMJGFT"
 
-key_name          = "polybot-key"           # SSH key for instance access
-ssh_private_key_file_path = "~/.ssh/polybot-key.pem" 
-vpc_id            = ""                      # Leave empty to create a new VPC
-subnet_ids        = []                      # Leave empty to create new subnets
-git_repo_url      = "https://github.com/guymeltzer/PolybotInfra.git"
+key_name                   = "polybot-key"           # SSH key for instance access
+ssh_private_key_file_path  = "~/.ssh/polybot-key.pem" 
+vpc_id                     = ""                      # Leave empty to create a new VPC
+subnet_ids                 = []                      # Leave empty to create new subnets
+git_repo_url               = "https://github.com/guymeltzer/PolybotInfra.git"
 
 # Telegram token values (replace with your actual tokens)
 telegram_token_dev  = "YOUR_DEV_TELEGRAM_TOKEN"
@@ -44,5 +44,6 @@ docker_password = "Candy2025!" # Your Docker Hub password
 # These credentials should NEVER be hardcoded in production
 # For development/testing only
 
+# Legacy variable names for backward compatibility (will be ignored with warnings)
 root_key_name                  = "polybot-key"
 root_ssh_private_key_file_path = "~/.ssh/polybot-key.pem"
