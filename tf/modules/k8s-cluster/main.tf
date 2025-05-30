@@ -2332,16 +2332,14 @@ resource "aws_launch_template" "worker_lt" {
     SSH_PUBLIC_KEY               = local.actual_key_name != "" && var.key_name == "" ? tls_private_key.ssh[0].public_key_openssh : "" 
                                  # More robust SSH key logic: only pass generated key if var.key_name is not set.
                                  # If var.key_name is set, pass empty, script handles it.
-
     JOIN_COMMAND_SECRET          = aws_secretsmanager_secret.kubernetes_join_command.name
     JOIN_COMMAND_LATEST_SECRET   = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-
     # === ADD/ENSURE THESE ARE PASSED ===
     K8S_PACKAGE_VERSION_TO_INSTALL = local.k8s_package_version_for_template
     K8S_MAJOR_MINOR_FOR_REPO     = local.k8s_major_minor_for_template
     CRIO_K8S_MAJOR_MINOR_FOR_REPO= local.crio_k8s_major_minor_for_template
+    KUBELET_DROPIN_DIR           = "/etc/systemd/system/kubelet.service.d"
     # ====================================
-
     # worker_asg_name remains commented out to prevent cycles;
     # bootstrap_worker.sh dynamically discovers the ASG name if needed for lifecycle hooks.
     # worker_asg_name              = aws_autoscaling_group.worker_asg.name 
