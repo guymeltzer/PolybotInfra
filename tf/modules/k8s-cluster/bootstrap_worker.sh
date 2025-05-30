@@ -90,8 +90,8 @@ get_metadata() {
       value=$(curl -s -f "http://169.254.169.254/latest/meta-data/$key" 2>/dev/null || echo "")
     fi
     if [ -n "$value" ] && [ "$value" != "404 - Not Found" ]; then echo "$value"; return 0; fi
-    # Escape bash-specific ${imds_token:0:5} for templatefile
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get metadata: $key (attempt $attempt/$max_attempts). Token: [$${imds_token:0:5}...]. Value: [$value]"
+    # Avoid bash substring syntax that conflicts with templatefile parsing
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get metadata: $key (attempt $attempt/$max_attempts). Token: [token truncated...]. Value: [$value]"
     sleep "$wait_time"; attempt=$((attempt + 1)); wait_time=$((wait_time * 2))
   done
   echo ""; return 1
