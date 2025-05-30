@@ -1523,10 +1523,7 @@ resource "null_resource" "cleanup_existing_asg" {
 
 # Data source to check if ASG already exists
 data "aws_autoscaling_groups" "existing_worker_asg" {
-  filter {
-    name   = "auto-scaling-group-name"
-    values = ["guy-polybot-asg"]
-  }
+  names = ["guy-polybot-asg"]
 }
 
 # Terraform data resource to track ASG state
