@@ -88,7 +88,7 @@ curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/
 echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
 
 apt-get update -y
-apt-get install -y cri-o cri-o-runc # cri-o-runc is often a dependency but good to be explicit
+apt-get install -y cri-o
 echo "CRI-O packages installed."
 
 # Configure CRI-O to use systemd cgroup driver (usually default but good to ensure)

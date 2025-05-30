@@ -147,7 +147,7 @@ curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR_F
 echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR_FOR_REPO}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
 
 apt-get update -y
-apt-get install -y cri-o cri-o-runc
+apt-get install -y cri-o 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] CRI-O packages installed."
 
 CRIO_CONF_DIR="/etc/crio/crio.conf.d"

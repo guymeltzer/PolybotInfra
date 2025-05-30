@@ -131,18 +131,23 @@ locals {
   kubeadm_token_part2 = random_string.token_part2.result
   kubeadm_token       = "${local.kubeadm_token_part1}.${local.kubeadm_token_part2}"
 
-  token_suffix_for_template = local.kubeadm_token_part1 # For control_plane_user_data.sh
+  token_suffix_for_template = local.kubeadm_token_part1 # Used for control plane hostname
 
-  # === Centralized Kubernetes Versioning ===
-  # Used by control_plane_user_data.sh and now also for bootstrap_worker.sh
-  k8s_version_for_template           = "1.28.3"
-  k8s_major_minor_for_template       = join(".", slice(split(".", local.k8s_version_for_template), 0, 2)) # "1.28"
-  k8s_package_version_for_template   = "${local.k8s_version_for_template}-1.1" # "1.28.3-1.1"
-  # CRIO versioning typically aligns with Kubernetes major.minor
-  crio_k8s_major_minor_for_template  = local.k8s_major_minor_for_template # "1.28"
-  # =======================================
+  # === Updated Kubernetes & CRI-O Versioning for ~May 2025 ===
+  # Targeting Kubernetes v1.31.x
+  # (Assuming 1.31.0 is a stable release by this date for the project)
+  k8s_version_full_for_template    = "1.31.9"
+  k8s_major_minor_for_template     = join(".", slice(split(".", local.k8s_version_full_for_template), 0, 2)) # This will be "1.31"
+  # Package versions typically end in "-00" or a similar build suffix like "-1.1".
+  # We'll use "-00" as a common default. Check pkgs.k8s.io for exact naming if needed.
+  k8s_package_version_for_template = "1.31.9-1.1" # e.g., "1.31.0-00"
+
+  # CRI-O versioning aligns with Kubernetes major.minor
+  crio_k8s_major_minor_for_template  = local.k8s_major_minor_for_template # This will be "1.31"
+  # ====================================================================
 
   pod_cidr = var.pod_cidr != "" ? var.pod_cidr : "10.244.0.0/16"
+
   actual_key_name = var.key_name != "" ? var.key_name : (length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : "")
 }
 
@@ -703,7 +708,7 @@ resource "aws_instance" "control_plane" {
     JOIN_COMMAND_LATEST_SECRET  = aws_secretsmanager_secret.kubernetes_join_command_latest.name
     region                      = var.region
     TOKEN_SUFFIX                = local.token_suffix_for_template
-    K8S_VERSION_FULL            = local.k8s_version_for_template
+    K8S_VERSION_FULL            = local.k8s_version_full_for_template
     K8S_PACKAGE_VERSION          = local.k8s_package_version_for_template
     K8S_MAJOR_MINOR              = local.k8s_major_minor_for_template
     CRIO_K8S_MAJOR_MINOR         = local.crio_k8s_major_minor_for_template
