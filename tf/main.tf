@@ -71,7 +71,6 @@ module "k8s-cluster" {
   worker_count                 = var.desired_worker_nodes
   instance_type                = var.instance_type
   ssh_public_key              = var.ssh_public_key
-  ssh_private_key_file_path   = var.ssh_private_key_file_path
   skip_api_verification       = var.skip_api_verification
   skip_token_verification     = var.skip_token_verification
   verification_max_attempts   = var.verification_max_attempts

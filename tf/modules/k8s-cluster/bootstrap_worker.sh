@@ -100,6 +100,7 @@ get_metadata() {
 # Use ${region} passed from Terraform template as the primary source for EFFECTIVE_REGION
 EFFECTIVE_REGION="${region}" # ${region} is from templatefile
 INSTANCE_ID_FROM_META=$(get_metadata "instance-id")
+# Override the placeholder values from templatefile with actual instance metadata
 PRIVATE_IP_FROM_META=$(get_metadata "local-ipv4")
 AZ_FROM_META=$(get_metadata "placement/availability-zone")
 
@@ -109,6 +110,7 @@ if [ -z "$PRIVATE_IP_FROM_META" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [FATA
 if [ -z "$AZ_FROM_META" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not retrieve Availability Zone. Using fallback."; AZ_FROM_META="$${EFFECTIVE_REGION}a"; fi # Escape for templatefile
 
 NODE_NAME_SUFFIX=$(echo "$INSTANCE_ID_FROM_META" | cut -d'-' -f2)
+# Override the placeholder value from templatefile with actual node name
 NODE_NAME="worker-$NODE_NAME_SUFFIX"
 hostnamectl set-hostname "$NODE_NAME"
 echo "127.0.0.1 $NODE_NAME" >> /etc/hosts
@@ -182,9 +184,9 @@ mkdir -p "${KUBELET_DROPIN_DIR}"
 # Use a filename like 20-crio-override.conf to ensure it's applied appropriately
 cat > "${KUBELET_DROPIN_DIR}/20-crio-override.conf" << EOF
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=\${PRIVATE_IP_FROM_META} --hostname-override=\${NODE_NAME} --cloud-provider=external"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=${PRIVATE_IP_FROM_META} --hostname-override=${NODE_NAME} --cloud-provider=external"
 EOF
-# Note: Using \$ to escape the variable references so they're not processed by templatefile
+# Note: Now using actual bash variables set from instance metadata
 
 systemctl daemon-reload
 systemctl restart kubelet # Restart to ensure it picks up the drop-in *before* kubeadm join
