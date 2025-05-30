@@ -923,1082 +923,66 @@ resource "null_resource" "worker_asg_debug" {
   }
 }
 
-resource "aws_autoscaling_group" "worker_asg" {
-  name                = "guy-polybot-asg"
-  max_size            = 3
-  min_size            = 1
-  desired_capacity    = 2
-  vpc_zone_identifier = module.vpc.public_subnets
-  target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
-  health_check_type   = "EC2"
-  health_check_grace_period = 300
-  default_cooldown    = 300
-  
-  launch_template {
-    id      = aws_launch_template.worker_lt.id
-    version = aws_launch_template.worker_lt.latest_version
-  }
-
-  tag {
-    key                 = "k8s.io-cluster-autoscaler-enabled" # This one is fine as-is if it works, but if not, k8s-io-cluster-autoscaler-enabled
-    value               = "true"
-    propagate_at_launch = true
-  }
-  tag {
-    # MODIFIED KEY: Replaced / with -
-    key                 = "k8s-io-cluster-autoscaler-${var.cluster_name}" 
-    value               = "owned"
-    propagate_at_launch = true
-  }
-  tag {
-    key                 = "Name"
-    value               = "guy-worker-node-${random_id.suffix.hex}"
-    propagate_at_launch = true
-  }
-  tag {
-    key                 = "kubernetes-io-cluster-${var.cluster_name}" # This is already good (uses hyphens)
-    value               = "owned"
-    propagate_at_launch = true
-  }
-  tag {
-    # MODIFIED KEY: Replaced / with -
-    key                 = "k8s-io-role-node" 
-    value               = "true" # Or "" if you prefer
-    propagate_at_launch = true
-  }
-  tag {
-    key                 = "ClusterIdentifier" 
-    value               = "${var.cluster_name}-${random_id.suffix.hex}"
-    propagate_at_launch = true
-  }
-  
-  depends_on = [
-    null_resource.worker_asg_debug,
-    aws_secretsmanager_secret.kubernetes_join_command,
-    aws_secretsmanager_secret.kubernetes_join_command_latest,
-    null_resource.verify_control_plane_readiness,
-    null_resource.update_join_command,
-  ]
-  
-  lifecycle {
-    replace_triggered_by = [
-      aws_launch_template.worker_lt.id, 
-      terraform_data.worker_script_details,
-    ]
-    ignore_changes = [
-      desired_capacity,
-      launch_template[0].version 
-    ]
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = "echo -e \"\\033[0;32m✅ Worker node Auto Scaling Group '${var.cluster_name}-worker-asg' created!\\033[0m\""
-  }
-}
-
-  resource "aws_security_group" "worker_sg" {
-  name        = "Guy-WorkerNodes-SG-${random_id.suffix.hex}"
-  description = "Security group for Kubernetes worker nodes"
-  vpc_id      = module.vpc.vpc_id
-
-  # Allow SSH from anywhere for debugging
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow SSH access from anywhere"
-  }
-
-  # Allow HTTP traffic
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP traffic"
-  }
-
-  # Allow HTTPS traffic
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS traffic"
-  }
-
-  # Kubelet API for control plane communication
-  ingress {
-    from_port   = 10250
-    to_port     = 10250
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Kubelet API - required for control plane communication"
-  }
-
-  # Read-only Kubelet API
-  ingress {
-    from_port   = 10255
-    to_port     = 10255
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Read-only Kubelet API"
-  }
-
-  # NodePort services range
-  ingress {
-    from_port   = 30000
-    to_port     = 32767
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "NodePort services for external access"
-  }
-
-  # Kubernetes API server access for worker nodes
-  ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Kubernetes API server access"
-  }
-
-  # Allow all internal VPC traffic for cluster communication
-  ingress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Allow all internal VPC traffic for cluster communication"
-  }
-
-  # Calico overlay networking (VXLAN) - required for pod-to-pod communication
-  ingress {
-    from_port   = 4789
-    to_port     = 4789
-    protocol    = "udp"
-    self        = true
-    description = "Calico VXLAN overlay - required for pod networking"
-  }
-
-  # Calico BGP traffic - required for network policy
-  ingress {
-    from_port   = 179
-    to_port     = 179
-    protocol    = "tcp"
-    self        = true
-    description = "Calico BGP traffic - required for network policy"
-  }
-
-  # Container runtime ports (containerd/Docker)
-  ingress {
-    from_port   = 2376
-    to_port     = 2377
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Container runtime communication"
-  }
-
-  # All outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  tags = {
-    Name = "guy-worker-sg-${random_id.suffix.hex}"
-    # Adjusted tag key to avoid invalid characters (replaced / with -)
-    "kubernetes.io-cluster-${var.cluster_name}" = "owned"
-    "kubernetes.io-role-node"                  = "true"
-  }
-}
-
-resource "aws_iam_role" "worker_role" {
-  name = "Guy-K8S-WorkerNode-Role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-  
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_iam_role_policy_attachment" "worker_policies" {
-  for_each = toset([
-    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
-    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
-    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy",  # VALIDATION: Added for EBS dynamic volumes
-    "arn:aws:iam::aws:policy/AmazonS3FullAccess"
-  ])
-
-  role       = aws_iam_role.worker_role.name
-  policy_arn = each.value
-}
-
-# Worker node inline policies
-resource "aws_iam_role_policy" "worker_secrets_access_policy" {
-  name = "SecretsManagerEnhancedAccess"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret",
-          "secretsmanager:ListSecrets",
-          "secretsmanager:ListSecretVersionIds"
-        ]
-        Resource = "arn:aws:secretsmanager:${var.region}:*:secret:kubernetes-join-command*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:ListSecrets"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_ec2_tags_policy" {
-  name = "EC2TagsManagement"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:CreateTags",
-          "ec2:DeleteTags",
-          "ec2:DescribeTags",
-          "ec2:DescribeInstances"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_autoscaling_lifecycle_policy" {
-  name = "AutoscalingLifecycleActions"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = "autoscaling:CompleteLifecycleAction"
-        Resource = "arn:aws:autoscaling:${var.region}:*:autoScalingGroup:*:autoScalingGroupName/guy-polybot-asg"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_cluster_autoscaler_policy" {
-  name = "ClusterAutoscalerPolicy"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:DescribeAutoScalingGroups",
-          "autoscaling:DescribeAutoScalingInstances",
-          "autoscaling:DescribeLaunchConfigurations",
-          "autoscaling:DescribeScalingActivities",
-          "ec2:DescribeImages",
-          "ec2:DescribeInstanceTypes",
-          "ec2:DescribeLaunchTemplateVersions",
-          "ec2:GetInstanceTypesFromInstanceRequirements",
-          "eks:DescribeNodegroup"
-        ]
-        Resource = ["*"]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:SetDesiredCapacity",
-          "autoscaling:TerminateInstanceInAutoScalingGroup"
-        ]
-        Resource = ["*"]
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_ec2_ecr_policy" {
-  name = "EC2andECRAccess"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeRegions",
-          "ecr:GetAuthorizationToken",
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:GetRepositoryPolicy",
-          "ecr:DescribeRepositories",
-          "ecr:ListImages",
-          "ecr:BatchGetImage"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_ssm_parameters_policy" {
-  name = "SSMParametersAccess"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid = "Statement1"
-        Effect = "Allow"
-        Action = [
-          "ssm:GetParameter",
-          "ssm:PutParameter"
-        ]
-        Resource = [
-          "arn:aws:ssm:*:*:parameter/k8s/worker-node-counter"
-        ]
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "control_plane_ssm_policy" {
-  name = "SSMSecretsManager"
-  role = aws_iam_role.control_plane_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "ssm:SendCommand",
-          "ssm:GetCommandInvocation",
-          "ssm:DescribeInstanceInformation",
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_storage_policy" {
-  name = "S3_SQS_SecretsAccess"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret",
-          "secretsmanager:ListSecrets"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = "s3:*"
-        Resource = [
-          "${aws_s3_bucket.worker_logs.arn}",
-          "${aws_s3_bucket.worker_logs.arn}/*"
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          "arn:aws:s3:::guy-polybot-bucket",
-          "arn:aws:s3:::guy-polybot-bucket/*"
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "sqs:SendMessage",
-          "sqs:ReceiveMessage",
-          "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes"
-        ]
-        Resource = "arn:aws:sqs:${var.region}:*:guy-polybot-queue"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_cloudwatch_policy" {
-  name = "CloudWatchMonitoring"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "cloudwatch:DescribeAlarmsForMetric",
-          "cloudwatch:DescribeAlarmHistory",
-          "cloudwatch:DescribeAlarms",
-          "cloudwatch:ListMetrics",
-          "cloudwatch:GetMetricData",
-          "cloudwatch:GetInsightRuleReport",
-          "logs:DescribeLogGroups",
-          "logs:GetLogGroupFields",
-          "logs:StartQuery",
-          "logs:StopQuery",
-          "logs:GetQueryResults",
-          "logs:GetLogEvents",
-          "ec2:DescribeTags",
-          "ec2:DescribeInstances",
-          "ec2:DescribeRegions",
-          "tag:GetResources"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_sns_publish_policy" {
-  name = "SNSPublishPolicy"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = "sns:Publish"
-        Resource = "arn:aws:sns:${var.region}:*:Guy-netflix-event-topic"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_lambda_invoke_policy" {
-  name = "LambdaInvokePolicy"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = "lambda:InvokeFunction"
-        Resource = "arn:aws:lambda:${var.region}:*:function:*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_elb_policy" {
-  name = "EC2TaggingAndELBPermissions"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid = "AllowEC2Tagging"
-        Effect = "Allow"
-        Action = [
-          "ec2:CreateTags",
-          "ec2:DescribeTags",
-          "ec2:DescribeInstances",
-          "ec2:DescribeSubnets",
-          "ec2:DescribeSecurityGroups",
-          "ec2:DescribeRouteTables",
-          "ec2:DescribeVpcs"
-        ]
-        Resource = "*"
-      },
-      {
-        Sid = "AllowELBPermissions"
-        Effect = "Allow"
-        Action = [
-          "elasticloadbalancing:CreateLoadBalancer",
-          "elasticloadbalancing:DeleteLoadBalancer",
-          "elasticloadbalancing:ModifyLoadBalancerAttributes",
-          "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
-          "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
-          "elasticloadbalancing:SetLoadBalancerPoliciesOfListener",
-          "elasticloadbalancing:SetLoadBalancerPoliciesForBackendServer",
-          "elasticloadbalancing:AddTags",
-          "elasticloadbalancing:CreateLoadBalancerListeners",
-          "elasticloadbalancing:CreateLoadBalancerPolicy",
-          "elasticloadbalancing:DeleteLoadBalancerListeners",
-          "elasticloadbalancing:DeleteLoadBalancerPolicy",
-          "elasticloadbalancing:DeregisterTargets",
-          "elasticloadbalancing:RegisterTargets"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "worker_debug_policy" {
-  name = "WorkerNodeDebugAccess"
-  role = aws_iam_role.worker_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogStreams",
-          "ec2:DescribeInstances",
-          "ec2:DescribeTags",
-          "ec2:CreateTags",
-          "ec2:DescribeSecurityGroups",
-          "ec2:DescribeNetworkInterfaces",
-          "ssm:UpdateInstanceInformation",
-          "ssm:ListInstanceAssociations",
-          "ssm:DescribeInstanceProperties",
-          "ssm:DescribeDocumentParameters"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_lb" "polybot_alb" {
-  name               = "guy-polybot-lg"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = module.vpc.public_subnets
-
-  # Critical: Enable deletion protection to prevent accidental removal
-  enable_deletion_protection = false
-
-  tags = {
-    Name = "guy-polybot-lg"
-    # Critical: AWS cloud provider integration tags
-    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
-    "kubernetes.io/role/elb" = "1"
-    # Required for AWS Load Balancer Controller
-    "elbv2.k8s.aws/cluster" = var.cluster_name
-  }
-}
-
-resource "aws_lb_target_group" "http_tg" {
-  name        = "guy-polybot-http-tg"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = module.vpc.vpc_id
-  target_type = "instance"
-  deregistration_delay = 30
-}
-
-resource "aws_lb_target_group" "https_tg" {
-  name        = "guy-polybot-https-tg"
-  port        = 443
-  protocol    = "HTTPS"
-  vpc_id      = module.vpc.vpc_id
-  target_type = "instance"
-  deregistration_delay = 30
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.polybot_alb.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.http_tg.arn
-  }
-}
-
-# Commented out HTTPS listener until proper certificate is available
-/* 
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.polybot_alb.arn
-  port              = 443
-  protocol          = "HTTPS"
-  certificate_arn   = aws_acm_certificate.polybot_cert.arn
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.https_tg.arn
-  }
-}
-*/
-
-resource "aws_security_group" "alb_sg" {
-  name        = "guy-LB-SG"
-  description = "Security group for ALB"
-  vpc_id      = module.vpc.vpc_id
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTP traffic"
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow HTTPS traffic"
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "Allow all outbound traffic"
-  }
-
-  tags = {
-    Name = "guy-alb-sg"
-    # Critical: AWS cloud provider integration tags
-    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
-    "kubernetes.io/role/elb" = "1"
-  }
-}
-
-# Commented out until proper domain and route53 setup
-/*
-resource "aws_acm_certificate" "polybot_cert" {
-  domain_name       = "guy-polybot-lg.devops-int-college.com"
-  validation_method = "DNS"
-
-  tags = {
-    Name = "polybot-cert"
-  }
-}
-
-resource "aws_route53_record" "cert_validation" {
-  zone_id = var.route53_zone_id
-  name    = tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_name
-  type    = tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_type
-  ttl     = 300
-  records = [tolist(aws_acm_certificate.polybot_cert.domain_validation_options)[0].resource_record_value]
-  allow_overwrite = true
-}
-*/
-
-resource "aws_iam_role_policy" "control_plane_inline_policy" {
-  name   = "control-plane-inline-policy"
-  role   = aws_iam_role.control_plane_role.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeRegions",
-          "ecr:GetAuthorizationToken",
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:GetRepositoryPolicy",
-          "ecr:DescribeRepositories",
-          "ecr:ListImages",
-          "ecr:BatchGetImage",
-          "autoscaling:DescribeAutoScalingGroups",
-          "autoscaling:UpdateAutoScalingGroup",
-          "autoscaling:DescribeAutoScalingInstances",
-          "autoscaling:DescribeTags",
-          "autoscaling:DescribeLaunchConfigurations",
-          "autoscaling:SetDesiredCapacity",
-          "autoscaling:TerminateInstanceInAutoScalingGroup",
-          "elasticloadbalancing:DescribeLoadBalancers",
-          "elasticloadbalancing:DescribeLoadBalancerAttributes",
-          "elasticloadbalancing:DescribeListeners",
-          "elasticloadbalancing:DescribeListenerCertificates",
-          "elasticloadbalancing:DescribeSSLPolicies",
-          "elasticloadbalancing:DescribeRules",
-          "elasticloadbalancing:DescribeTargetGroups",
-          "elasticloadbalancing:DescribeTargetGroupAttributes",
-          "elasticloadbalancing:DescribeTargetHealth",
-          "elasticloadbalancing:DescribeTags",
-          "ssm:DescribeAssociation",
-          "ssm:GetDeployablePatchSnapshotForInstance",
-          "ssm:GetDocument",
-          "ssm:DescribeDocument",
-          "ssm:GetManifest",
-          "ssm:GetParameter",
-          "ssm:GetParameters",
-          "ssm:ListAssociations",
-          "ssm:ListInstanceAssociations",
-          "ssm:PutInventory",
-          "ssm:PutComplianceItems",
-          "ssm:PutConfigurePackageResult",
-          "ssm:UpdateAssociationStatus",
-          "ssm:UpdateInstanceAssociationStatus",
-          "ssm:UpdateInstanceInformation",
-          "ssmmessages:CreateControlChannel",
-          "ssmmessages:CreateDataChannel",
-          "ssmmessages:OpenControlChannel",
-          "ssmmessages:OpenDataChannel",
-          "ec2messages:AcknowledgeMessage",
-          "ec2messages:DeleteMessage",
-          "ec2messages:FailMessage",
-          "ec2messages:GetEndpoint",
-          "ec2messages:GetMessages",
-          "ec2messages:SendReply"
-        ]
-        Effect   = "Allow"
-        Resource = "*"
-      },
-    ]
-  })
-}
-
-# Generate a key pair for SSH access if none is provided or if the provided one doesn't exist
-resource "tls_private_key" "ssh" {
-  count     = var.key_name == "" ? 1 : 0
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
-# Save the private key locally
-resource "local_file" "private_key" {
-  count           = var.key_name == "" ? 1 : 0
-  content         = tls_private_key.ssh[0].private_key_pem
-  filename        = "${path.root}/generated-ssh-key.pem"
-  file_permission = "0400"
-}
-
-# Create the key pair in AWS
-resource "aws_key_pair" "generated_key" {
-  count      = var.key_name == "" ? 1 : 0
-  key_name   = "k8s-cluster-auto-key"
-  public_key = tls_private_key.ssh[0].public_key_openssh
-}
-
-# Final progress reporter
-resource "terraform_data" "completion_progress" {
-  depends_on = [
-    aws_autoscaling_group.worker_asg,
-    aws_instance.control_plane
-  ]
-  
-  triggers_replace = {
+# Resource to clean up existing ASG if it exists
+resource "null_resource" "cleanup_existing_asg" {
+  triggers = {
+    asg_name = "guy-polybot-asg"
     timestamp = timestamp()
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      # ... (initial echo statements) ...
-      CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
-
-      # Determine local SSH key path for kubectl
-      LOCAL_SSH_KEY_FOR_KUBECTL=""
-      if [ -n "${var.key_name}" ]; then
-        if [ -n "${var.ssh_private_key_file_path}" ]; then
-          eval ACTUAL_KEY_PATH_KUBECTL="${var.ssh_private_key_file_path}"
-          LOCAL_SSH_KEY_FOR_KUBECTL="$ACTUAL_KEY_PATH_KUBECTL"
-        else
-          echo -e "\\033[0;33mWarning: var.key_name (${var.key_name}) is set, but var.ssh_private_key_file_path is not provided. Trying default locations...\\033[0m"
-          # Try common key locations
-          if [ -f "${path.root}/${var.key_name}.pem" ]; then
-            LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/${var.key_name}.pem"
-          elif [ -f "$HOME/.ssh/${var.key_name}.pem" ]; then
-            LOCAL_SSH_KEY_FOR_KUBECTL="$HOME/.ssh/${var.key_name}.pem"
-          elif [ -f "${path.root}/polybot-key.pem" ]; then
-            LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/polybot-key.pem"
-          else
-            echo -e "\\033[0;33mNo SSH key found in default locations. Will try SSH without specific key file.\\033[0m"
-            LOCAL_SSH_KEY_FOR_KUBECTL=""
-          fi
-        fi
-      else
-        LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/generated-ssh-key.pem"
-      fi
-
-      SSH_IDENTITY_ARG_KUBECTL=""
-      if [ ! -f "$LOCAL_SSH_KEY_FOR_KUBECTL" ]; then
-        echo -e "\\033[0;31mSSH Key Error: Private key file for kubectl not found at [$LOCAL_SSH_KEY_FOR_KUBECTL]. Will try SSH without specific key.\\033[0m"
-      else
-        SSH_IDENTITY_ARG_KUBECTL="-i \"$LOCAL_SSH_KEY_FOR_KUBECTL\""
-      fi
-        
-      check_cluster_status() {
-        local attempt=$1
-        echo -e "\\033[0;33m🔍 Checking Kubernetes cluster status (Attempt $attempt/5) using key $LOCAL_SSH_KEY_FOR_KUBECTL...\\033[0m"
-        # Use $SSH_IDENTITY_ARG_KUBECTL which includes -i "path" or is empty
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $SSH_IDENTITY_ARG_KUBECTL ubuntu@$CONTROL_PLANE_IP "kubectl get nodes" > /tmp/nodes_output 2>&1
-        # ... (rest of the function)
-      }
-      # ... (rest of the script)
-    EOT
-  }
-}
-
-# New resource to verify control plane is fully ready
-resource "null_resource" "verify_control_plane_readiness" {
-  depends_on = [
-    aws_instance.control_plane,
-    null_resource.control_plane_bootstrap_debug
-  ]
-
-  triggers = {
-    control_plane_ip = aws_instance.control_plane.public_ip
-    control_plane_id = aws_instance.control_plane.id
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      # Set environment variables for the script
-      export CP_INSTANCE_ID="${aws_instance.control_plane.id}"
-      export AWS_REGION_VAR="${var.region}"
-      export JOIN_COMMAND_LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
-      # Pass the shell variable SKIP_K8S_VERIFICATION if it's set in the TF execution environment
-      export SKIP_K8S_VERIFICATION_VAR="$${SKIP_K8S_VERIFICATION:-false}"
-
-      SCRIPT_PATH="${path.module}/scripts/verify_control_plane_readiness.sh"
-      chmod +x "$SCRIPT_PATH"
-      "$SCRIPT_PATH"
-    EOT
-  }
-}
-
-# Simplified join command resource that relies on the control plane to generate tokens
-resource "null_resource" "update_join_command" {
-  depends_on = [
-    aws_instance.control_plane,
-    aws_secretsmanager_secret.kubernetes_join_command,
-    aws_secretsmanager_secret.kubernetes_join_command_latest,
-    null_resource.verify_control_plane_readiness
-  ]
-
-  # This will cause this resource to be recreated whenever the control plane IP changes
-  triggers = {
-    control_plane_ip = aws_instance.control_plane.public_ip
-    control_plane_id = aws_instance.control_plane.id
-    # The verification resource ID ensures we wait for control plane readiness
-    verification_id = null_resource.verify_control_plane_readiness.id
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      # Allow skipping join command update with environment variable
-      if [ "$${SKIP_JOIN_COMMAND_UPDATE:-false}" == "true" ]; then
-        echo "SKIP_JOIN_COMMAND_UPDATE is set to true, skipping join command update"
-        exit 0
-      fi
+      #!/bin/bash
+      ASG_NAME="guy-polybot-asg"
       
-      # Log file for errors and debugging
-      ERROR_LOG="/tmp/join_command_error.log"
-      touch $ERROR_LOG
-      exec > >(tee -a $ERROR_LOG) 2>&1
+      echo "🔍 Checking for existing Auto Scaling Group: $ASG_NAME"
       
-      echo "[$(date)] Verifying and updating Kubernetes join command for control plane IP: ${aws_instance.control_plane.public_ip}"
-      
-      # Function to handle errors with retry logic
-      function retry_command {
-        local max_attempts=5
-        local attempt=1
-        local sleep_time=10
-        local command="$1"
-        local error_msg="$2"
+      # Check if ASG exists
+      if aws autoscaling describe-auto-scaling-groups \
+         --region ${var.region} \
+         --auto-scaling-group-names "$ASG_NAME" \
+         --query "AutoScalingGroups[0].AutoScalingGroupName" \
+         --output text 2>/dev/null | grep -q "$ASG_NAME"; then
         
-        while [ $attempt -le $max_attempts ]; do
-          echo "[$(date)] Attempt $attempt/$max_attempts: $error_msg"
-          
-          # Execute the command and capture result
-          local result=$(eval $command 2>&1)
-          local status=$?
-          
-          if [ $status -eq 0 ]; then
-            echo "[$(date)] Command succeeded!"
-            echo "$result"
-            return 0
-          else
-            echo "[$(date)] Command failed. Error: $result"
-            attempt=$((attempt+1))
-            if [ $attempt -le $max_attempts ]; then
-              echo "[$(date)] Retrying in $sleep_time seconds..."
-              sleep $sleep_time
-            fi
-          fi
-        done
+        echo "⚠️  Found existing ASG: $ASG_NAME. Deleting it..."
         
-        echo "[$(date)] Failed after $max_attempts attempts: $error_msg"
-        return 1
-      }
-      
-      # Primary method: Read the join command from Secrets Manager (it should already exist)
-      echo "[$(date)] Reading join command from Secrets Manager..."
-      JOIN_CMD=$(aws secretsmanager get-secret-value \
-        --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-        --region ${var.region} \
-        --query SecretString \
-        --output text 2>/dev/null)
+        # First, set desired capacity to 0 to gracefully terminate instances
+        echo "📉 Setting desired capacity to 0 for graceful shutdown..."
+        aws autoscaling update-auto-scaling-group \
+          --region ${var.region} \
+          --auto-scaling-group-name "$ASG_NAME" \
+          --desired-capacity 0 \
+          --min-size 0 || echo "Failed to update capacity, continuing..."
         
-      # Validate the join command format
-      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
-        echo "[$(date)] Successfully retrieved valid join command from Secrets Manager: $JOIN_CMD"
-      else
-        echo "[$(date)] Retrieved command is not valid. Attempting to refresh token..."
+        # Wait a bit for instances to terminate
+        echo "⏳ Waiting 30 seconds for instances to terminate..."
+        sleep 30
         
-        # Trigger token refresh via SSM with multiple approaches
-        echo "[$(date)] Triggering token refresh via control plane's service..."
-        TOKEN_REFRESH_ATTEMPTS=3
+        # Delete the ASG
+        echo "🗑️  Deleting Auto Scaling Group: $ASG_NAME"
+        aws autoscaling delete-auto-scaling-group \
+          --region ${var.region} \
+          --auto-scaling-group-name "$ASG_NAME" \
+          --force-delete || echo "Failed to delete ASG, it may not exist"
         
-        for ((i=1; i<=TOKEN_REFRESH_ATTEMPTS; i++)); do
-          echo "[$(date)] Token refresh attempt $i/$TOKEN_REFRESH_ATTEMPTS"
-          
-          # First method: Try the service
-          if [[ $i -eq 1 ]]; then
-            aws ssm send-command \
-              --instance-ids ${aws_instance.control_plane.id} \
-              --document-name "AWS-RunShellScript" \
-              --parameters commands="sudo systemctl start k8s-token-creator.service" \
-              --timeout-seconds 300 \
-              --region ${var.region} \
-              --output text \
-              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
-          
-          # Second method: Try the script directly
-          elif [[ $i -eq 2 ]]; then
-            aws ssm send-command \
-              --instance-ids ${aws_instance.control_plane.id} \
-              --document-name "AWS-RunShellScript" \
-              --parameters commands="sudo /usr/local/bin/refresh-join-token.sh" \
-              --timeout-seconds 300 \
-              --region ${var.region} \
-              --output text \
-              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
-          
-          # Third method: Try kubeadm directly
-          else
-            aws ssm send-command \
-              --instance-ids ${aws_instance.control_plane.id} \
-              --document-name "AWS-RunShellScript" \
-              --parameters commands="sudo kubeadm token create --print-join-command" \
-              --timeout-seconds 300 \
-              --region ${var.region} \
-              --output text \
-              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
-          fi
-          
-          # Wait for token to be updated
-          echo "[$(date)] Waiting for token to be updated in Secrets Manager..."
-          sleep 15
-          
-          # Try reading the secret again
-          JOIN_CMD=$(aws secretsmanager get-secret-value \
-            --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-            --region ${var.region} \
-            --query SecretString \
-            --output text 2>/dev/null)
-            
-          if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
-            echo "[$(date)] Successfully retrieved valid join command after refresh: $JOIN_CMD"
+        # Wait for deletion to complete
+        echo "⏳ Waiting for ASG deletion to complete..."
+        for attempt in {1..30}; do
+          if ! aws autoscaling describe-auto-scaling-groups \
+             --region ${var.region} \
+             --auto-scaling-group-names "$ASG_NAME" \
+             --query "AutoScalingGroups[0].AutoScalingGroupName" \
+             --output text 2>/dev/null | grep -q "$ASG_NAME"; then
+            echo "✅ ASG successfully deleted"
             break
           fi
-          
-          if [[ $i -eq $TOKEN_REFRESH_ATTEMPTS ]]; then
-            echo "[$(date)] Failed to get valid join command after all refresh attempts."
-            echo "[$(date)] Cluster may not be ready yet. Worker nodes will retry joining when possible."
-            # Continue with the rest of the deployment - workers will have retry logic
-            JOIN_CMD=""
-          fi
+          echo "Still waiting for ASG deletion... (attempt $attempt/30)"
+          sleep 10
         done
-      fi
-      
-      if [[ -n "$JOIN_CMD" ]]; then
-        # Verify both secrets are accessible and identical
-        echo "[$(date)] Verifying both secrets are up to date..."
-        MAIN_SECRET=$(aws secretsmanager get-secret-value \
-          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
-          --region ${var.region} \
-          --query SecretString \
-          --output text 2>/dev/null)
-          
-        # If secrets don't match, update main secret to match latest
-        if [[ "$MAIN_SECRET" != "$JOIN_CMD" ]]; then
-          echo "[$(date)] Secrets don't match. Updating main secret to match latest..."
-          aws secretsmanager put-secret-value \
-            --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
-            --secret-string "$JOIN_CMD" \
-            --region ${var.region} || echo "[$(date)] Failed to update main secret, but continuing"
-        else
-          echo "[$(date)] Both secrets contain matching valid join commands."
-        fi
-        
-        # Create timestamped backup for audit trail
-        TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-        BACKUP_SECRET_NAME="${aws_secretsmanager_secret.kubernetes_join_command.name}-$TIMESTAMP"
-        aws secretsmanager create-secret \
-          --name "$BACKUP_SECRET_NAME" \
-          --secret-string "$JOIN_CMD" \
-          --description "Kubernetes join command backup created at $TIMESTAMP" \
-          --region ${var.region} || echo "[$(date)] Failed to create backup secret, but continuing"
-        
-        echo "[$(date)] ✅ Join command verification and update complete"
       else
-        echo "[$(date)] ⚠️ Could not obtain a valid join command. Worker nodes will use built-in retry logic."
+        echo "✅ No existing ASG found with name: $ASG_NAME"
       fi
-      
-      # Always upload logs to S3 for troubleshooting
-      aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$(date +"%Y%m%d%H%M%S").log --region ${var.region} || echo "[$(date)] Failed to upload logs to S3"
-      
-      # Always exit with success to allow deployment to continue
-      exit 0
     EOT
   }
 }
@@ -2658,6 +1642,81 @@ resource "aws_iam_instance_profile" "worker_profile" {
   
   lifecycle {
     create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "worker_asg" {
+  name                = "guy-polybot-asg"
+  max_size            = 3
+  min_size            = 1
+  desired_capacity    = 2
+  vpc_zone_identifier = module.vpc.public_subnets
+  target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
+  health_check_type   = "EC2"
+  health_check_grace_period = 300
+  default_cooldown    = 300
+  
+  launch_template {
+    id      = aws_launch_template.worker_lt.id
+    version = aws_launch_template.worker_lt.latest_version
+  }
+
+  tag {
+    key                 = "k8s.io-cluster-autoscaler-enabled" # This one is fine as-is if it works, but if not, k8s-io-cluster-autoscaler-enabled
+    value               = "true"
+    propagate_at_launch = true
+  }
+  tag {
+    # MODIFIED KEY: Replaced / with -
+    key                 = "k8s-io-cluster-autoscaler-${var.cluster_name}" 
+    value               = "owned"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "Name"
+    value               = "guy-worker-node-${random_id.suffix.hex}"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "kubernetes-io-cluster-${var.cluster_name}" # This is already good (uses hyphens)
+    value               = "owned"
+    propagate_at_launch = true
+  }
+  tag {
+    # MODIFIED KEY: Replaced / with -
+    key                 = "k8s-io-role-node" 
+    value               = "true" # Or "" if you prefer
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "ClusterIdentifier" 
+    value               = "${var.cluster_name}-${random_id.suffix.hex}"
+    propagate_at_launch = true
+  }
+  
+  depends_on = [
+    null_resource.cleanup_existing_asg,  # Add cleanup dependency
+    null_resource.worker_asg_debug,
+    aws_secretsmanager_secret.kubernetes_join_command,
+    aws_secretsmanager_secret.kubernetes_join_command_latest,
+    null_resource.verify_control_plane_readiness,
+    null_resource.update_join_command,
+  ]
+  
+  lifecycle {
+    replace_triggered_by = [
+      aws_launch_template.worker_lt.id, 
+      terraform_data.worker_script_details,
+    ]
+    ignore_changes = [
+      desired_capacity,
+      launch_template[0].version 
+    ]
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = "echo -e \"\\033[0;32m✅ Worker node Auto Scaling Group '${var.cluster_name}-worker-asg' created!\\033[0m\""
   }
 }
 
