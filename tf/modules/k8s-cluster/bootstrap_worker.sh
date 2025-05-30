@@ -176,8 +176,8 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubernetes components installed and he
 
 # 9. Configure Kubelet to use CRI-O
 mark_progress "Configuring Kubelet for CRI-O"
-KUBELET_DROPIN_DIR="/etc/systemd/system/kubelet.service.d" # CORRECT PATH
-mkdir -p "$KUBELET_DROPIN_DIR"
+# Use KUBELET_DROPIN_DIR from templatefile
+mkdir -p "${KUBELET_DROPIN_DIR}"
 
 # Use a filename like 20-crio-override.conf to ensure it's applied appropriately
 cat > "${KUBELET_DROPIN_DIR}/20-crio-override.conf" << EOF

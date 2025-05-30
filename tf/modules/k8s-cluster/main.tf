@@ -2338,6 +2338,7 @@ resource "aws_launch_template" "worker_lt" {
     K8S_PACKAGE_VERSION_TO_INSTALL = local.k8s_package_version_for_template
     K8S_MAJOR_MINOR_FOR_REPO     = local.k8s_major_minor_for_template
     CRIO_K8S_MAJOR_MINOR_FOR_REPO= local.crio_k8s_major_minor_for_template
+    KUBELET_DROPIN_DIR           = "/etc/systemd/system/kubelet.service.d"
     # ====================================
     # worker_asg_name remains commented out to prevent cycles;
     # bootstrap_worker.sh dynamically discovers the ASG name if needed for lifecycle hooks.
