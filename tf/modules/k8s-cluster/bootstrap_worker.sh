@@ -200,8 +200,8 @@ RAW_JOIN_COMMAND=""
 MAX_SECRET_FETCH_ATTEMPTS=10
 for attempt in $(seq 1 $MAX_SECRET_FETCH_ATTEMPTS); do
   echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $attempt/$MAX_SECRET_FETCH_ATTEMPTS to retrieve join command secret"
-  # Correctly escaped for templatefile, so bash sees ${JOIN_SECRETS_TO_TRY[@]}
-  for secret_id_to_try in "$${JOIN_SECRETS_TO_TRY[@]}"; do 
+  # Correctly escaped for templatefile, iterate through array elements differently
+  for secret_id_to_try in $${JOIN_SECRETS_TO_TRY[*]}; do
     if [ -z "$secret_id_to_try" ]; then continue; fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying to retrieve secret: $secret_id_to_try"
     
