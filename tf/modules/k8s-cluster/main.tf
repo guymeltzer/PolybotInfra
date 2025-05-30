@@ -1749,9 +1749,18 @@ resource "terraform_data" "completion_progress" {
           eval ACTUAL_KEY_PATH_KUBECTL="${var.ssh_private_key_file_path}"
           LOCAL_SSH_KEY_FOR_KUBECTL="$ACTUAL_KEY_PATH_KUBECTL"
         else
-          echo -e "\\033[0;31mConfiguration Error: var.key_name (${var.key_name}) is set, but var.ssh_private_key_file_path is not for kubectl SSH. Cannot proceed with this check reliably.\\033[0m"
-          # Exit or set SSH_IDENTITY_ARG_KUBECTL to empty and let it try default keys
-          exit 1 # Or some other handling
+          echo -e "\\033[0;33mWarning: var.key_name (${var.key_name}) is set, but var.ssh_private_key_file_path is not provided. Trying default locations...\\033[0m"
+          # Try common key locations
+          if [ -f "${path.root}/${var.key_name}.pem" ]; then
+            LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/${var.key_name}.pem"
+          elif [ -f "$HOME/.ssh/${var.key_name}.pem" ]; then
+            LOCAL_SSH_KEY_FOR_KUBECTL="$HOME/.ssh/${var.key_name}.pem"
+          elif [ -f "${path.root}/polybot-key.pem" ]; then
+            LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/polybot-key.pem"
+          else
+            echo -e "\\033[0;33mNo SSH key found in default locations. Will try SSH without specific key file.\\033[0m"
+            LOCAL_SSH_KEY_FOR_KUBECTL=""
+          fi
         fi
       else
         LOCAL_SSH_KEY_FOR_KUBECTL="${path.root}/generated-ssh-key.pem"
