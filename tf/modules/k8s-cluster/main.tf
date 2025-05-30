@@ -1362,6 +1362,30 @@ resource "aws_iam_role_policy_attachment" "worker_s3_access" {
   policy_arn = aws_iam_policy.worker_s3_access.arn
 }
 
+# Alternative inline policy for S3 access to avoid policy limit
+resource "aws_iam_role_policy" "worker_s3_access_inline" {
+  name = "WorkerS3AccessInline"
+  role = aws_iam_role.worker_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "${aws_s3_bucket.worker_logs.arn}",
+          "${aws_s3_bucket.worker_logs.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
 resource "aws_launch_template" "worker_lt" {
   name_prefix   = "guy-polybot-worker-"
   image_id      = var.worker_ami
@@ -1497,6 +1521,28 @@ resource "null_resource" "cleanup_existing_asg" {
   }
 }
 
+# Data source to check if ASG already exists
+data "aws_autoscaling_groups" "existing_worker_asg" {
+  filter {
+    name   = "auto-scaling-group-name"
+    values = ["guy-polybot-asg"]
+  }
+}
+
+# Terraform data resource to track ASG state
+resource "terraform_data" "asg_state_tracker" {
+  input = {
+    asg_exists = length(data.aws_autoscaling_groups.existing_worker_asg.names) > 0
+    cleanup_completed = null_resource.cleanup_existing_asg.id
+  }
+  
+  lifecycle {
+    replace_triggered_by = [
+      null_resource.cleanup_existing_asg
+    ]
+  }
+}
+
 resource "aws_autoscaling_group" "worker_asg" {
   name                = "guy-polybot-asg"
   max_size            = 3
@@ -1551,6 +1597,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   
   depends_on = [
     null_resource.cleanup_existing_asg,  # Add cleanup dependency
+    terraform_data.asg_state_tracker,   # Add state tracker dependency
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
@@ -1569,6 +1616,17 @@ resource "aws_autoscaling_group" "worker_asg" {
       desired_capacity,
       launch_template[0].version
     ]
+  }
+
+  # Additional lifecycle rule to handle tag updates gracefully
+  lifecycle {
+    ignore_changes = [
+      # Ignore tag changes if ASG is being recreated
+      tag,
+    ]
+    
+    # Create before destroy to handle recreation
+    create_before_destroy = true
   }
 
   # Report progress after ASG is created
