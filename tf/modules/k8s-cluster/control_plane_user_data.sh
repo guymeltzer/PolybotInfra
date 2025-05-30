@@ -22,7 +22,7 @@ if [ -z "${token_formatted}" ]; then # This is substituted by templatefile
   exit 1
 fi
 # TOKEN_SUFFIX is substituted by templatefile
-NEW_HOSTNAME="k8s-control-plane-${TOKEN_SUFFIX}"
+NEW_HOSTNAME="guy-control-plane-${TOKEN_SUFFIX}"
 hostnamectl set-hostname "$NEW_HOSTNAME"
 if grep -q "127.0.0.1 $NEW_HOSTNAME" /etc/hosts; then
     echo "Hostname $NEW_HOSTNAME already in /etc/hosts for 127.0.0.1."

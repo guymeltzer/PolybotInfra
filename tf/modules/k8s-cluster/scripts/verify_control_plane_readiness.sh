@@ -147,43 +147,49 @@ check_api_server_readiness() {
   echo "  Method 1: Checking port 6443 with 'ss'..."
   PORT_CHECK_SS_OUTPUT_RAW=$(run_ssm_command "sudo ss -tlnp | grep :6443 || echo port-not-listening" "ss port check")
   local ssm_ss_exit_status=$?
+  # Check if the command succeeded AND the output does not contain "port-not-listening" AND the output is not empty
   if [[ "$ssm_ss_exit_status" -eq 0 && "$PORT_CHECK_SS_OUTPUT_RAW" != *"port-not-listening"* && -n "$PORT_CHECK_SS_OUTPUT_RAW" ]]; then
-    echo "    Port 6443 seems open via 'ss': $PORT_CHECK_SS_OUTPUT_RAW"
+    echo "    Port 6443 seems open via 'ss'. Raw output:"
+    echo "$PORT_CHECK_SS_OUTPUT_RAW" | sed 's/^/    | /' # Indent multi-line output
     port_open_success=true
   else
-    echo "    'ss' check failed or port not ready. SSM Exit: $ssm_ss_exit_status, Output: [$PORT_CHECK_SS_OUTPUT_RAW]"
+    echo "    'ss' check failed or port not ready. SSM Exit: $ssm_ss_exit_status. Raw output:"
+    echo "$PORT_CHECK_SS_OUTPUT_RAW" | sed 's/^/    | /'
     # Fallback Method 2: Check port 6443 with nc (netcat)
     echo "  Fallback Method 2: Checking port 6443 with 'nc'..."
     PORT_CHECK_NC_OUTPUT_RAW=$(run_ssm_command "nc -zv localhost 6443 2>&1 || echo connection-failed" "nc port check")
     local ssm_nc_exit_status=$?
     # nc outputs to stderr on success for -z, so check for "succeeded" or "open"
     if [[ "$ssm_nc_exit_status" -eq 0 && ("$PORT_CHECK_NC_OUTPUT_RAW" == *"succeeded"* || "$PORT_CHECK_NC_OUTPUT_RAW" == *"open"*) ]]; then
-        echo "    Port 6443 seems open via 'nc': $PORT_CHECK_NC_OUTPUT_RAW"
+        echo "    Port 6443 seems open via 'nc'. Raw output:"
+        echo "$PORT_CHECK_NC_OUTPUT_RAW" | sed 's/^/    | /'
         port_open_success=true
     else
-        echo "    'nc' check failed or port not open. SSM Exit: $ssm_nc_exit_status, Output: [$PORT_CHECK_NC_OUTPUT_RAW]"
+        echo "    'nc' check failed or port not open. SSM Exit: $ssm_nc_exit_status. Raw output:"
+        echo "$PORT_CHECK_NC_OUTPUT_RAW" | sed 's/^/    | /'
     fi
   fi
 
   if $port_open_success; then
     echo "  Port 6443 appears open. Checking API server health endpoint..."
-    # Use curl for healthz check as kubectl might not be fully set up or might have its own issues initially
-    # The --cacert is important if self-signed certs are used by kubeadm initially before any LB/ingress
-    # The -k flag is used to ignore certificate errors for this local health check if CA is not easily available to curl via SSM
-    API_HEALTHZ_OUTPUT_RAW=$(run_ssm_command "curl -kfsS https://localhost:6443/healthz || echo not-healthy" "curl healthz check")
+    # Use curl for healthz check. The -k flag ignores certificate errors for this local health check.
+    # The command sent to SSM will be just the curl command.
+    API_HEALTHZ_SSM_COMMAND_OUTPUT_RAW=$(run_ssm_command "curl -kfsS https://localhost:6443/healthz || echo not-healthy" "curl healthz check")
     local ssm_healthz_exit_status=$?
 
-    # Trim whitespace/newlines from the output for comparison
-    API_HEALTHZ_OUTPUT_TRIMMED=$(echo "$API_HEALTHZ_OUTPUT_RAW" | xargs)
+    # Extract the *actual* output of the curl command from the verbose output of run_ssm_command
+    # The actual command output is the last non-empty line from run_ssm_command's stdout.
+    ACTUAL_CURL_HEALTHZ_OUTPUT=$(echo "$API_HEALTHZ_SSM_COMMAND_OUTPUT_RAW" | awk 'NF' | tail -n 1 | xargs)
 
-    if [[ "$ssm_healthz_exit_status" -eq 0 && "$API_HEALTHZ_OUTPUT_TRIMMED" == "ok" ]]; then
+    echo "    SSM call exit status for healthz: $ssm_healthz_exit_status"
+    echo "    Raw healthz output from SSM function: [$API_HEALTHZ_SSM_COMMAND_OUTPUT_RAW]"
+    echo "    Extracted last line (actual curl output): [$ACTUAL_CURL_HEALTHZ_OUTPUT]"
+
+    if [[ "$ssm_healthz_exit_status" -eq 0 && "$ACTUAL_CURL_HEALTHZ_OUTPUT" == "ok" ]]; then
       echo "    API server /healthz endpoint returned 'ok'."
       return 0 # Success
     else
-      echo "    API server /healthz check failed or returned unhealthy."
-      echo "      SSM call exit status for healthz: $ssm_healthz_exit_status"
-      echo "      Raw healthz output: [$API_HEALTHZ_OUTPUT_RAW]"
-      echo "      Trimmed healthz output: [$API_HEALTHZ_OUTPUT_TRIMMED]"
+      echo "    API server /healthz check failed or did not return 'ok'."
     fi
   fi
 

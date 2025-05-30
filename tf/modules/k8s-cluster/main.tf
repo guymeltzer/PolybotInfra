@@ -940,12 +940,13 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
 
   tag {
-    key                 = "k8s.io/cluster-autoscaler/enabled"
+    key                 = "k8s.io-cluster-autoscaler-enabled" # This one is fine as-is if it works, but if not, k8s-io-cluster-autoscaler-enabled
     value               = "true"
     propagate_at_launch = true
   }
   tag {
-    key                 = "k8s.io/cluster-autoscaler/${var.cluster_name}"
+    # MODIFIED KEY: Replaced / with -
+    key                 = "k8s-io-cluster-autoscaler-${var.cluster_name}" 
     value               = "owned"
     propagate_at_launch = true
   }
@@ -955,13 +956,14 @@ resource "aws_autoscaling_group" "worker_asg" {
     propagate_at_launch = true
   }
   tag {
-    key                 = "kubernetes-io-cluster-${var.cluster_name}"
+    key                 = "kubernetes-io-cluster-${var.cluster_name}" # This is already good (uses hyphens)
     value               = "owned"
     propagate_at_launch = true
   }
   tag {
-    key                 = "k8s.io/role/node"
-    value               = "true"
+    # MODIFIED KEY: Replaced / with -
+    key                 = "k8s-io-role-node" 
+    value               = "true" # Or "" if you prefer
     propagate_at_launch = true
   }
   tag {
@@ -989,7 +991,6 @@ resource "aws_autoscaling_group" "worker_asg" {
     ]
   }
 
-  # This is the correctly placed provisioner
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = "echo -e \"\\033[0;32m✅ Worker node Auto Scaling Group '${var.cluster_name}-worker-asg' created!\\033[0m\""
@@ -2357,18 +2358,17 @@ resource "aws_launch_template" "worker_lt" {
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name                                        = "guy-worker-node" # Name will be further customized by script if using SSM counter
-      "kubernetes.io/cluster/${var.cluster_name}" = "owned"
-      "k8s.io/role/node"                          = "" # Common practice is an empty value or "node"
+      Name                                        = "guy-worker-node" 
+      "kubernetes-io-cluster-${var.cluster_name}" = "owned" # This was fixed in the previous step
+      "k8s-io-role-node"                          = "" # Or "true", ensure consistency with ASG tag value if needed by tools
       "DebugEnabled"                              = "true"
     }
   }
-
   tag_specifications {
     resource_type = "volume"
     tags = {
       Name                                        = "guy-worker-node-volume"
-      "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+      "kubernetes-io-cluster-${var.cluster_name}" = "owned" # This was fixed in the previous step
       "DebugEnabled"                              = "true"
     }
   }

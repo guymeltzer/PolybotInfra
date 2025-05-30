@@ -143,3 +143,9 @@ variable "ssh_private_key_file_path" {
   type        = string
   default     = "" # You will set this to "~/.ssh/polybot-key.pem" when using your existing key
 }
+
+variable "desired_worker_nodes" {
+  description = "Desired number of worker nodes for the Auto Scaling Group."
+  type        = number
+  default     = 2 # Or another appropriate default if you want one for the module
+}

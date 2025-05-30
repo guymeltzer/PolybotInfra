@@ -17,7 +17,7 @@ desired_worker_nodes = 2
 pod_cidr = "10.244.0.0/16"  # Flannel default
 
 # Route53 zone ID (replace with your actual zone ID)
-route53_zone_id = "ZXXXXXXXXXX"
+route53_zone_id = "Z02842682SGSPDJQMJGFT"
 
 key_name          = "polybot-key"           # SSH key for instance access
 ssh_private_key_file_path = "~/.ssh/polybot-key.pem" 
@@ -44,3 +44,5 @@ docker_password = "Candy2025!" # Your Docker Hub password
 # These credentials should NEVER be hardcoded in production
 # For development/testing only
 
+root_key_name                  = "polybot-key"
+root_ssh_private_key_file_path = "~/.ssh/polybot-key.pem"
