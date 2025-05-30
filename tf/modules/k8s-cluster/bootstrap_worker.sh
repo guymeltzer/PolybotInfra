@@ -182,9 +182,9 @@ mkdir -p "$KUBELET_DROPIN_DIR"
 # Use a filename like 20-crio-override.conf to ensure it's applied appropriately
 cat > "${KUBELET_DROPIN_DIR}/20-crio-override.conf" << EOF
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=$${PRIVATE_IP_FROM_META} --hostname-override=$${NODE_NAME} --cloud-provider=external"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=\${PRIVATE_IP_FROM_META} --hostname-override=\${NODE_NAME} --cloud-provider=external"
 EOF
-# Note the $$ to escape for templatefile, so bash sees ${PRIVATE_IP_FROM_META} and ${NODE_NAME}
+# Note: Using \$ to escape the variable references so they're not processed by templatefile
 
 systemctl daemon-reload
 systemctl restart kubelet # Restart to ensure it picks up the drop-in *before* kubeadm join
