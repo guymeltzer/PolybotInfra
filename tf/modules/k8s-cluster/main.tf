@@ -1614,13 +1614,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     # Ignore certain changes that would cause replacement
     ignore_changes = [
       desired_capacity,
-      launch_template[0].version
-    ]
-  }
-
-  # Additional lifecycle rule to handle tag updates gracefully
-  lifecycle {
-    ignore_changes = [
+      launch_template[0].version,
       # Ignore tag changes if ASG is being recreated
       tag,
     ]
