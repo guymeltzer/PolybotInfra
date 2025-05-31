@@ -498,7 +498,7 @@ resource "null_resource" "cluster_readiness_check" {
           fi
         fi
         
-        echo "⏳ Waiting ${CHECK_INTERVAL}s before next check..."
+        echo "⏳ Waiting $${CHECK_INTERVAL}s before next check..."
         sleep $CHECK_INTERVAL
       done
       
@@ -549,11 +549,11 @@ resource "null_resource" "pre_argocd_health_check" {
         
         if kubectl -n $namespace get deployment $component >/dev/null 2>&1; then
           echo "  ✅ $component deployment found"
-          if kubectl -n $namespace wait --for=condition=available deployment/$component --timeout=${timeout}s; then
+          if kubectl -n $namespace wait --for=condition=available deployment/$component --timeout=\$${timeout}s; then
             echo "  ✅ $component is ready"
             return 0
           else
-            echo "  ❌ $component not ready within ${timeout}s"
+            echo "  ❌ $component not ready within \$${timeout}s"
             kubectl -n $namespace get deployment $component -o wide
             kubectl -n $namespace get pods -l $selector -o wide
             return 1
