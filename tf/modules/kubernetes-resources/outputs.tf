@@ -5,7 +5,7 @@ output "storage_classes_id" {
 
 output "disk_cleanup_id" {
   description = "ID of the disk cleanup resource"
-  value       = try(null_resource.improved_disk_cleanup[0].id, "")
+  value       = try(null_resource.install_disk_cleanup_daemonset[0].id, "")
 }
 
 output "mongodb_id" {
