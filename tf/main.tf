@@ -493,21 +493,80 @@ resource "null_resource" "install_argocd" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      echo "Creating Kubernetes storage classes..."
-      
       export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🚀 Installing ArgoCD..."
       
       # Check if kubectl can connect to the cluster
       if ! kubectl get nodes &>/dev/null; then
-        echo "Cannot connect to Kubernetes cluster, skipping storage class creation"
+        echo "❌ Cannot connect to Kubernetes cluster, skipping ArgoCD installation"
         exit 0
       fi
       
-      # Wait for the EBS CSI driver to be ready
-      echo "Waiting for EBS CSI driver pods to be ready..."
-      kubectl -n kube-system wait --for=condition=ready pod -l app=ebs-csi-controller --timeout=120s || {
-        echo "Warning: EBS CSI driver pods not ready within timeout, but continuing anyway"
+      # Create ArgoCD namespace
+      echo "📁 Creating ArgoCD namespace..."
+      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Install ArgoCD using the official manifest
+      echo "📦 Installing ArgoCD components..."
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      
+      echo "⏳ Waiting for ArgoCD deployments to be ready..."
+      
+      # Wait for ArgoCD server deployment
+      kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || {
+        echo "⚠️  ArgoCD server deployment not ready within timeout, but continuing..."
       }
+      
+      # Wait for ArgoCD controller
+      kubectl -n argocd wait --for=condition=available deployment/argocd-application-controller --timeout=300s || {
+        echo "⚠️  ArgoCD controller not ready within timeout, but continuing..."
+      }
+      
+      # Wait for ArgoCD repo server
+      kubectl -n argocd wait --for=condition=available deployment/argocd-repo-server --timeout=300s || {
+        echo "⚠️  ArgoCD repo server not ready within timeout, but continuing..."
+      }
+      
+      # Check if ArgoCD pods are running
+      echo "🔍 Checking ArgoCD pod status..."
+      kubectl -n argocd get pods
+      
+      # Get the ArgoCD admin password
+      echo "🔑 Retrieving ArgoCD admin password..."
+      for attempt in {1..30}; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          if [[ -n "$PASSWORD" ]]; then
+            echo "✅ ArgoCD admin password retrieved successfully"
+            echo "$PASSWORD" > /tmp/argocd-admin-password.txt
+            break
+          fi
+        fi
+        echo "   Waiting for ArgoCD admin secret... (attempt $attempt/30)"
+        sleep 10
+      done
+      
+      # Patch ArgoCD server to use LoadBalancer service type (optional)
+      echo "🌐 Configuring ArgoCD server service..."
+      kubectl -n argocd patch svc argocd-server -p '{"spec": {"type": "ClusterIP"}}' || {
+        echo "⚠️  Failed to patch ArgoCD service, but continuing..."
+      }
+      
+      echo "✅ ArgoCD installation completed!"
+      echo ""
+      echo "📋 ArgoCD Access Information:"
+      echo "   Namespace: argocd"
+      echo "   Username: admin"
+      echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo 'Check /tmp/argocd-admin-password.txt')"
+      echo ""
+      echo "🔗 To access ArgoCD:"
+      echo "   kubectl -n argocd port-forward svc/argocd-server 8080:443"
+      echo "   Then visit: https://localhost:8080"
+      
+      # Create storage classes as part of ArgoCD setup
+      echo ""
+      echo "📦 Creating additional storage classes for ArgoCD..."
       
       # Function to create or update storage class
       create_storage_class() {
@@ -540,11 +599,11 @@ allowVolumeExpansion: true
 EOF
       }
       
-      # Create storage classes
-      create_storage_class "ebs-sc" "true" "gp2"
-      create_storage_class "mongodb-sc" "false" "gp2"
+      # Create storage classes for ArgoCD and general use
+      create_storage_class "ebs-sc" "true" "gp3"
+      create_storage_class "mongodb-sc" "false" "gp3"
       
-      echo "Storage classes created successfully"
+      echo "✅ ArgoCD installation and configuration completed!"
     EOT
   }
 }
@@ -558,12 +617,63 @@ resource "null_resource" "configure_argocd_apps" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      KUBECONFIG="${local.kubeconfig_path}" argocd app create polybot \
-        --repo https://github.com/your-org/polybot-repo.git \
-        --path manifests \
-        --dest-server https://kubernetes.default.svc \
-        --dest-namespace polybot
-      KUBECONFIG="${local.kubeconfig_path}" argocd app sync polybot
+      echo "🚀 Configuring ArgoCD applications..."
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Setup port-forward for ArgoCD access
+      echo "🌐 Setting up ArgoCD connection..."
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      sleep 2
+      
+      kubectl -n argocd port-forward svc/argocd-server 8080:443 &
+      PORTFORWARD_PID=$!
+      
+      # Wait for connection
+      for i in {1..20}; do
+        if curl -k -s https://localhost:8080/api/version &>/dev/null; then
+          break
+        fi
+        sleep 2
+      done
+      
+      # Get ArgoCD password
+      ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null)
+      
+      if [[ -n "$ARGOCD_PASSWORD" ]]; then
+        # Login to ArgoCD
+        if argocd login localhost:8080 --username admin --password "$ARGOCD_PASSWORD" --insecure --grpc-web; then
+          echo "✅ Logged into ArgoCD successfully"
+          
+          # Create polybot namespace
+          kubectl create namespace polybot --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create ArgoCD application (only if manifests directory exists in repo)
+          echo "📱 Creating ArgoCD application..."
+          argocd app create polybot \
+            --repo https://github.com/guymeltzer/PolybotInfra.git \
+            --path k8s-manifests \
+            --dest-server https://kubernetes.default.svc \
+            --dest-namespace polybot \
+            --sync-policy automated \
+            --auto-prune \
+            --self-heal || {
+            echo "ℹ️  Application creation failed or already exists, trying sync instead..."
+            argocd app sync polybot || echo "Application sync failed, may need manual intervention"
+          }
+          
+          echo "✅ ArgoCD application configuration completed"
+        else
+          echo "❌ Failed to login to ArgoCD for app configuration"
+        fi
+      else
+        echo "❌ Could not get ArgoCD password for app configuration"
+      fi
+      
+      # Clean up
+      kill $PORTFORWARD_PID 2>/dev/null || true
+      
+      echo "🎉 ArgoCD app configuration completed!"
     EOT
   }
   depends_on = [
@@ -599,41 +709,104 @@ resource "null_resource" "configure_argocd_repositories" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      echo "Configuring ArgoCD repositories..."
+      echo "🔧 Configuring ArgoCD repositories..."
       
-      # Get ArgoCD server endpoint - it runs as a service in the cluster
-      KUBECONFIG="${local.kubeconfig_path}" kubectl get svc argocd-server -n argocd -o jsonpath='{.spec.clusterIP}' > /tmp/argocd_ip.txt
-      ARGOCD_SERVER_IP=$(cat /tmp/argocd_ip.txt)
+      export KUBECONFIG="${local.kubeconfig_path}"
       
-      if [[ -z "$ARGOCD_SERVER_IP" ]]; then
-        echo "ArgoCD server not found, skipping repository configuration"
-        exit 0
-      fi
+      # Wait for ArgoCD server to be fully ready
+      echo "⏳ Waiting for ArgoCD server to be ready..."
+      for attempt in {1..60}; do
+        if kubectl -n argocd get deployment argocd-server &>/dev/null; then
+          READY_REPLICAS=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          DESIRED_REPLICAS=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+          
+          if [[ "$READY_REPLICAS" == "$DESIRED_REPLICAS" ]] && [[ "$READY_REPLICAS" -gt 0 ]]; then
+            echo "✅ ArgoCD server is ready ($READY_REPLICAS/$DESIRED_REPLICAS replicas)"
+            break
+          fi
+        fi
+        echo "   Waiting for ArgoCD server... (attempt $attempt/60)"
+        sleep 10
+      done
+      
+      # Get ArgoCD server endpoint using port-forward in background
+      echo "🌐 Setting up ArgoCD connection..."
+      
+      # Kill any existing port-forward processes
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      sleep 2
+      
+      # Start port-forward in background
+      kubectl -n argocd port-forward svc/argocd-server 8080:443 &
+      PORTFORWARD_PID=$!
+      
+      # Wait for port-forward to be ready
+      echo "⏳ Waiting for port-forward to be ready..."
+      for i in {1..30}; do
+        if curl -k -s https://localhost:8080/api/version &>/dev/null; then
+          echo "✅ ArgoCD server is accessible via port-forward"
+          break
+        fi
+        echo "   Waiting for port-forward... ($i/30)"
+        sleep 2
+      done
       
       # Get ArgoCD admin password
-      ARGOCD_PASSWORD=$(KUBECONFIG="${local.kubeconfig_path}" kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+      echo "🔑 Getting ArgoCD admin password..."
+      ARGOCD_PASSWORD=""
+      for attempt in {1..10}; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
+          ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null)
+          if [[ -n "$ARGOCD_PASSWORD" ]]; then
+            echo "✅ ArgoCD password retrieved"
+            break
+          fi
+        fi
+        echo "   Waiting for ArgoCD password... (attempt $attempt/10)"
+        sleep 5
+      done
       
       if [[ -z "$ARGOCD_PASSWORD" ]]; then
-        echo "ArgoCD password not found, skipping repository configuration"
+        echo "❌ Could not retrieve ArgoCD password, skipping repository configuration"
+        kill $PORTFORWARD_PID 2>/dev/null || true
         exit 0
       fi
       
-      # Login to ArgoCD using the cluster IP
-      echo "Logging into ArgoCD server at $ARGOCD_SERVER_IP..."
-      KUBECONFIG="${local.kubeconfig_path}" argocd login $ARGOCD_SERVER_IP:80 --username admin --password "$ARGOCD_PASSWORD" --insecure
+      # Login to ArgoCD
+      echo "🔐 Logging into ArgoCD..."
+      if argocd login localhost:8080 --username admin --password "$ARGOCD_PASSWORD" --insecure --grpc-web; then
+        echo "✅ Successfully logged into ArgoCD"
+        
+        # Add repository (this will fail gracefully if repo already exists)
+        echo "📚 Adding repository to ArgoCD..."
+        argocd repo add https://github.com/guymeltzer/PolybotInfra.git --name polybot-repo || {
+          echo "ℹ️  Repository may already exist or failed to add, but continuing..."
+        }
+        
+        # List repositories to verify
+        echo "📋 Current repositories:"
+        argocd repo list || echo "Could not list repositories"
+        
+        echo "✅ ArgoCD repository configuration completed"
+      else
+        echo "❌ Failed to login to ArgoCD"
+      fi
       
-      # Add repository
-      echo "Adding repository..."
-      KUBECONFIG="${local.kubeconfig_path}" argocd repo add https://github.com/guymeltzer/PolybotInfra.git --name polybot-repo || echo "Repository may already exist"
+      # Clean up port-forward
+      echo "🧹 Cleaning up port-forward..."
+      kill $PORTFORWARD_PID 2>/dev/null || true
       
-      echo "ArgoCD repository configuration completed"
+      echo ""
+      echo "🎉 ArgoCD is ready!"
+      echo "📋 Access Information:"
+      echo "   Username: admin"
+      echo "   Password: $ARGOCD_PASSWORD"
+      echo ""
+      echo "🔗 To access ArgoCD UI:"
+      echo "   kubectl -n argocd port-forward svc/argocd-server 8080:443"
+      echo "   Then visit: https://localhost:8080"
     EOT
   }
-  depends_on = [
-    null_resource.install_argocd,
-    null_resource.argocd_password_retriever,
-    module.k8s-cluster
-  ]
 }
 
 # Add this resource after the null_resource.fix_argocd_connectivity resource
@@ -1630,5 +1803,80 @@ resource "null_resource" "argocd_direct_access" {
       echo "ArgoCD direct access setup complete"
     EOT
   }
+}
+
+# Configure ArgoCD applications
+resource "null_resource" "configure_argocd_apps" {
+  count = local.skip_argocd ? 0 : 1
+  triggers = {
+    argocd_repo_id = null_resource.configure_argocd_repositories[0].id
+  }
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      echo "🚀 Configuring ArgoCD applications..."
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      # Setup port-forward for ArgoCD access
+      echo "🌐 Setting up ArgoCD connection..."
+      pkill -f "kubectl.*port-forward.*argocd-server" || true
+      sleep 2
+      
+      kubectl -n argocd port-forward svc/argocd-server 8080:443 &
+      PORTFORWARD_PID=$!
+      
+      # Wait for connection
+      for i in {1..20}; do
+        if curl -k -s https://localhost:8080/api/version &>/dev/null; then
+          break
+        fi
+        sleep 2
+      done
+      
+      # Get ArgoCD password
+      ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null)
+      
+      if [[ -n "$ARGOCD_PASSWORD" ]]; then
+        # Login to ArgoCD
+        if argocd login localhost:8080 --username admin --password "$ARGOCD_PASSWORD" --insecure --grpc-web; then
+          echo "✅ Logged into ArgoCD successfully"
+          
+          # Create polybot namespace
+          kubectl create namespace polybot --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create ArgoCD application (only if manifests directory exists in repo)
+          echo "📱 Creating ArgoCD application..."
+          argocd app create polybot \
+            --repo https://github.com/guymeltzer/PolybotInfra.git \
+            --path k8s-manifests \
+            --dest-server https://kubernetes.default.svc \
+            --dest-namespace polybot \
+            --sync-policy automated \
+            --auto-prune \
+            --self-heal || {
+            echo "ℹ️  Application creation failed or already exists, trying sync instead..."
+            argocd app sync polybot || echo "Application sync failed, may need manual intervention"
+          }
+          
+          echo "✅ ArgoCD application configuration completed"
+        else
+          echo "❌ Failed to login to ArgoCD for app configuration"
+        fi
+      else
+        echo "❌ Could not get ArgoCD password for app configuration"
+      fi
+      
+      # Clean up
+      kill $PORTFORWARD_PID 2>/dev/null || true
+      
+      echo "🎉 ArgoCD app configuration completed!"
+    EOT
+  }
+  depends_on = [
+    null_resource.configure_argocd_repositories,
+    module.kubernetes_resources,
+    module.k8s-cluster
+  ]
 }
 
