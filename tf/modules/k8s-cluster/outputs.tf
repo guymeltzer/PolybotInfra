@@ -213,19 +213,19 @@ output "ssh_key_name" {
 }
 
 output "ssh_private_key_path" {
-  description = "Path to the SSH private key" #OUTPUT
-  value = var.key_name == "" ? local_file.private_key[0].filename : "Using your provided key: ${var.key_name}"
+  description = "Path to SSH private key file for accessing instances"
+  value = var.key_name == "" ? local_file.ssh_private_key[0].filename : "Using your provided key: ${var.key_name}"
 }
 
 #OUTPUT - Enhanced SSH commands with visual formatting
 output "ssh_command_control_plane" {
-  description = "Enhanced SSH command for control plane access" #UX
-  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip}"
+  description = "SSH command to access the control plane"
+  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.ssh_private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip}"
 }
 
 output "ssh_command_worker_nodes" {
-  description = "Enhanced SSH command template for worker node access" #UX
-  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@WORKER_PUBLIC_IP"
+  description = "SSH command template for worker nodes (replace WORKER_PUBLIC_IP)"
+  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.ssh_private_key[0].filename} ubuntu@WORKER_PUBLIC_IP"
 }
 
 # =============================================================================
@@ -270,7 +270,7 @@ output "troubleshoot_worker_init" {
 
 output "rotate_join_token" {
   description = "Command to rotate Kubernetes join token" #OUTPUT
-  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip} \"sudo systemctl start k8s-token-creator.service\""
+  value = "ssh -i ${var.key_name != "" ? var.key_name : local_file.ssh_private_key[0].filename} ubuntu@${aws_instance.control_plane.public_ip} \"sudo systemctl start k8s-token-creator.service\""
 }
 
 # =============================================================================

@@ -1888,3 +1888,191 @@ resource "terraform_data" "cluster_health_assessment" {
   depends_on = [aws_instance.control_plane]
 }
 
+# Simplified join command resource that relies on the control plane to generate tokens
+resource "null_resource" "update_join_command" {
+  depends_on = [
+    aws_instance.control_plane,
+    aws_secretsmanager_secret.kubernetes_join_command,
+    aws_secretsmanager_secret.kubernetes_join_command_latest,
+    null_resource.wait_for_control_plane
+  ]
+
+  # This will cause this resource to be recreated whenever the control plane IP changes
+  triggers = {
+    control_plane_ip = aws_instance.control_plane.public_ip
+    control_plane_id = aws_instance.control_plane.id
+    # The verification resource ID ensures we wait for control plane readiness
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      # Allow skipping join command update with environment variable
+      if [ "$${SKIP_JOIN_COMMAND_UPDATE:-false}" == "true" ]; then
+        echo "SKIP_JOIN_COMMAND_UPDATE is set to true, skipping join command update"
+        exit 0
+      fi
+      
+      # Log file for errors and debugging
+      ERROR_LOG="/tmp/join_command_error.log"
+      touch $ERROR_LOG
+      exec > >(tee -a $ERROR_LOG) 2>&1
+      
+      echo "[$(date)] Verifying and updating Kubernetes join command for control plane IP: ${aws_instance.control_plane.public_ip}"
+      
+      # Function to handle errors with retry logic
+      function retry_command {
+        local max_attempts=5
+        local attempt=1
+        local sleep_time=10
+        local command="$1"
+        local error_msg="$2"
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "[$(date)] Attempt $attempt/$max_attempts: $error_msg"
+          
+          # Execute the command and capture result
+          local result=$(eval $command 2>&1)
+          local status=$?
+          
+          if [ $status -eq 0 ]; then
+            echo "[$(date)] Command succeeded!"
+            echo "$result"
+            return 0
+          else
+            echo "[$(date)] Command failed. Error: $result"
+            attempt=$((attempt+1))
+            if [ $attempt -le $max_attempts ]; then
+              echo "[$(date)] Retrying in $sleep_time seconds..."
+              sleep $sleep_time
+            fi
+          fi
+        done
+        
+        echo "[$(date)] Failed after $max_attempts attempts: $error_msg"
+        return 1
+      }
+      
+      # Primary method: Read the join command from Secrets Manager (it should already exist)
+      echo "[$(date)] Reading join command from Secrets Manager..."
+      JOIN_CMD=$(aws secretsmanager get-secret-value \
+        --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+        --region ${var.region} \
+        --query SecretString \
+        --output text 2>/dev/null)
+        
+      # Validate the join command format
+      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+        echo "[$(date)] Successfully retrieved valid join command from Secrets Manager: $JOIN_CMD"
+      else
+        echo "[$(date)] Retrieved command is not valid. Attempting to refresh token..."
+        
+        # Trigger token refresh via SSM with multiple approaches
+        echo "[$(date)] Triggering token refresh via control plane's service..."
+        TOKEN_REFRESH_ATTEMPTS=3
+        
+        for ((i=1; i<=TOKEN_REFRESH_ATTEMPTS; i++)); do
+          echo "[$(date)] Token refresh attempt $i/$TOKEN_REFRESH_ATTEMPTS"
+          
+          # First method: Try the service
+          if [[ $i -eq 1 ]]; then
+            aws ssm send-command \
+              --instance-ids ${aws_instance.control_plane.id} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands="sudo systemctl start k8s-token-creator.service" \
+              --timeout-seconds 300 \
+              --region ${var.region} \
+              --output text \
+              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
+          
+          # Second method: Try the script directly
+          elif [[ $i -eq 2 ]]; then
+            aws ssm send-command \
+              --instance-ids ${aws_instance.control_plane.id} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands="sudo /usr/local/bin/refresh-join-token.sh" \
+              --timeout-seconds 300 \
+              --region ${var.region} \
+              --output text \
+              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
+          
+          # Third method: Try kubeadm directly
+          else
+            aws ssm send-command \
+              --instance-ids ${aws_instance.control_plane.id} \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands="sudo kubeadm token create --print-join-command" \
+              --timeout-seconds 300 \
+              --region ${var.region} \
+              --output text \
+              --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
+          fi
+          
+          # Wait for token to be updated
+          echo "[$(date)] Waiting for token to be updated in Secrets Manager..."
+          sleep 15
+          
+          # Try reading the secret again
+          JOIN_CMD=$(aws secretsmanager get-secret-value \
+            --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
+            --region ${var.region} \
+            --query SecretString \
+            --output text 2>/dev/null)
+            
+          if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
+            echo "[$(date)] Successfully retrieved valid join command after refresh: $JOIN_CMD"
+            break
+          fi
+          
+          if [[ $i -eq $TOKEN_REFRESH_ATTEMPTS ]]; then
+            echo "[$(date)] Failed to get valid join command after all refresh attempts."
+            echo "[$(date)] Cluster may not be ready yet. Worker nodes will retry joining when possible."
+            # Continue with the rest of the deployment - workers will have retry logic
+            JOIN_CMD=""
+          fi
+        done
+      fi
+      
+      if [[ -n "$JOIN_CMD" ]]; then
+        # Verify both secrets are accessible and identical
+        echo "[$(date)] Verifying both secrets are up to date..."
+        MAIN_SECRET=$(aws secretsmanager get-secret-value \
+          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
+          --region ${var.region} \
+          --query SecretString \
+          --output text 2>/dev/null)
+          
+        # If secrets don't match, update main secret to match latest
+        if [[ "$MAIN_SECRET" != "$JOIN_CMD" ]]; then
+          echo "[$(date)] Secrets don't match. Updating main secret to match latest..."
+          aws secretsmanager put-secret-value \
+            --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
+            --secret-string "$JOIN_CMD" \
+            --region ${var.region} || echo "[$(date)] Failed to update main secret, but continuing"
+        else
+          echo "[$(date)] Both secrets contain matching valid join commands."
+        fi
+        
+        # Create timestamped backup for audit trail
+        TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+        BACKUP_SECRET_NAME="${aws_secretsmanager_secret.kubernetes_join_command.name}-$TIMESTAMP"
+        aws secretsmanager create-secret \
+          --name "$BACKUP_SECRET_NAME" \
+          --secret-string "$JOIN_CMD" \
+          --description "Kubernetes join command backup created at $TIMESTAMP" \
+          --region ${var.region} || echo "[$(date)] Failed to create backup secret, but continuing"
+        
+        echo "[$(date)] ✅ Join command verification and update complete"
+      else
+        echo "[$(date)] ⚠️ Could not obtain a valid join command. Worker nodes will use built-in retry logic."
+      fi
+      
+      # Always upload logs to S3 for troubleshooting
+      aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$(date +"%Y%m%d%H%M%S").log --region ${var.region} || echo "[$(date)] Failed to upload logs to S3"
+      
+      # Always exit with success to allow deployment to continue
+      exit 0
+    EOT
+  }
+}
+
