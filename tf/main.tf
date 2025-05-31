@@ -1769,21 +1769,21 @@ resource "null_resource" "deploy_secrets" {
   
   depends_on = [
     null_resource.install_argocd,
-    null_resource.cluster_readiness_check
+    null_resource.cluster_readiness_check,
+    aws_s3_bucket.polybot_storage,
+    aws_sqs_queue.polybot_queue
   ]
   
   triggers = {
     argocd_install_id = null_resource.install_argocd[0].id
-    # Trigger when secret variables change
+    # Trigger when generated resources change
     secrets_hash = md5(join("", [
-      var.telegram_token,
-      var.sqs_queue_url,
-      var.s3_bucket_name,
-      var.telegram_app_url,
-      var.mongo_uri,
-      var.polybot_url,
-      var.docker_username,
-      var.docker_password
+      local.generated_secrets.telegram_token,
+      local.generated_secrets.sqs_queue_url,
+      local.generated_secrets.s3_bucket_name,
+      local.generated_secrets.telegram_app_url,
+      local.generated_secrets.mongo_uri,
+      local.generated_secrets.polybot_url
     ]))
   }
   
@@ -1816,16 +1816,16 @@ metadata:
   namespace: prod
 type: Opaque
 stringData:
-  telegram_token: "${var.telegram_token}"
-  sqs_queue_url: "${var.sqs_queue_url}"
-  s3_bucket_name: "${var.s3_bucket_name}"
-  telegram_app_url: "${var.telegram_app_url}"
-  aws_access_key_id: "${var.aws_access_key_id}"
-  aws_secret_access_key: "${var.aws_secret_access_key}"
-  mongo_collection: "${var.mongo_collection}"
-  mongo_db: "${var.mongo_db}"
-  mongo_uri: "${var.mongo_uri}"
-  polybot_url: "${var.polybot_url}"
+  telegram_token: "${local.generated_secrets.telegram_token}"
+  sqs_queue_url: "${local.generated_secrets.sqs_queue_url}"
+  s3_bucket_name: "${local.generated_secrets.s3_bucket_name}"
+  telegram_app_url: "${local.generated_secrets.telegram_app_url}"
+  aws_access_key_id: "${local.generated_secrets.aws_access_key_id}"
+  aws_secret_access_key: "${local.generated_secrets.aws_secret_access_key}"
+  mongo_collection: "${local.generated_secrets.mongo_collection}"
+  mongo_db: "${local.generated_secrets.mongo_db}"
+  mongo_uri: "${local.generated_secrets.mongo_uri}"
+  polybot_url: "${local.generated_secrets.polybot_url}"
 POLYBOT_EOF
       
       # Deploy TLS secret
@@ -1838,7 +1838,7 @@ POLYBOT_EOF
       
       # Process docker registry secret with actual values
       echo "📝 Creating docker-registry-credentials..."
-      DOCKER_AUTH=$(echo -n "${var.docker_username}:${var.docker_password}" | base64 -w 0)
+      DOCKER_AUTH=$(echo -n "${local.generated_secrets.docker_username}:${local.generated_secrets.docker_password}" | base64 -w 0)
       kubectl apply -f - <<DOCKER_EOF
 apiVersion: v1
 kind: Secret
@@ -1851,8 +1851,8 @@ stringData:
     {
       "auths": {
         "https://index.docker.io/v1/": {
-          "username": "${var.docker_username}",
-          "password": "${var.docker_password}",
+          "username": "${local.generated_secrets.docker_username}",
+          "password": "${local.generated_secrets.docker_password}",
           "auth": "$DOCKER_AUTH"
         }
       }

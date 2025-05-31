@@ -69,39 +69,44 @@ variable "telegram_token_prod" {
 }
 
 variable "telegram_token" {
-  description = "Telegram bot token for Polybot"
+  description = "Telegram bot token for Polybot (required - get this from @BotFather on Telegram)"
   type        = string
   sensitive   = true
 }
 
 variable "sqs_queue_url" {
-  description = "SQS queue URL for Polybot"
+  description = "SQS queue URL for Polybot (auto-generated if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "s3_bucket_name" {
-  description = "S3 bucket name for Polybot"
+  description = "S3 bucket name for Polybot (auto-generated if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "telegram_app_url" {
-  description = "Telegram app URL for Polybot"
+  description = "Telegram app URL for Polybot (auto-generated if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "aws_access_key_id" {
-  description = "AWS access key ID for Polybot"
+  description = "AWS access key ID for Polybot (uses current AWS credentials if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "aws_secret_access_key" {
-  description = "AWS secret access key for Polybot"
+  description = "AWS secret access key for Polybot (uses current AWS credentials if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "mongo_collection" {
@@ -117,25 +122,27 @@ variable "mongo_db" {
 }
 
 variable "mongo_uri" {
-  description = "MongoDB URI for Polybot"
+  description = "MongoDB URI for Polybot (auto-generated for in-cluster MongoDB if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "polybot_url" {
-  description = "Polybot application URL"
+  description = "Polybot application URL (auto-generated if not provided)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "docker_username" {
-  description = "Docker registry username"
+  description = "Docker registry username (required for pulling private images)"
   type        = string
   sensitive   = true
 }
 
 variable "docker_password" {
-  description = "Docker registry password"
+  description = "Docker registry password (required for pulling private images)"
   type        = string
   sensitive   = true
 }
