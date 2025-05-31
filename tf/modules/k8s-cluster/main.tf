@@ -2173,7 +2173,7 @@ resource "null_resource" "verify_cluster_readiness" {
       echo "⏳ Waiting up to $MAX_WAIT_TIME seconds for cluster to be ready..."
       
       while [ $WAITED -lt $MAX_WAIT_TIME ]; do
-        echo "🔄 Check $((WAITED / SLEEP_INTERVAL + 1)) - Time elapsed: ${WAITED}s"
+        echo "🔄 Check $((WAITED / SLEEP_INTERVAL + 1)) - Time elapsed: $${WAITED}s"
         
         if check_cluster_via_ssm; then
           echo ""
