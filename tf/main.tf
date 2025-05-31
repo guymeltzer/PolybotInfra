@@ -17,26 +17,26 @@ locals {
     log_path  = "logs/"
     timestamp = timestamp()
   }
-  
+
   # Structured logging for all components
   debug_environment = {
     TF_LOG                = "DEBUG"
-    TF_LOG_CORE          = "DEBUG" 
+    TF_LOG_CORE          = "DEBUG"
     TF_LOG_PATH          = "${local.debug_config.log_path}terraform-${local.debug_config.timestamp}.log"
     TF_LOG_PROVIDER      = "DEBUG"
     AWS_LOG_LEVEL        = "debug"
   }
-  
+
   # Debug log file path
   debug_log = "${local.debug_config.log_path}tf_debug.log"
-  
+
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
   ssh_private_key_path = var.key_name != "" ? (
-    fileexists("${path.module}/${var.key_name}.pem") ? 
-    "${path.module}/${var.key_name}.pem" : 
-    (fileexists("$HOME/.ssh/${var.key_name}.pem") ? 
-     "$HOME/.ssh/${var.key_name}.pem" : 
-     "${path.module}/polybot-key.pem")
+    fileexists("${path.module}/${var.key_name}.pem") ?
+    "${path.module}/${var.key_name}.pem" :
+    (fileexists("$HOME/.ssh/${var.key_name}.pem") ?
+      "$HOME/.ssh/${var.key_name}.pem" :
+      "${path.module}/polybot-key.pem")
   ) : "${path.module}/polybot-key.pem"
   skip_argocd     = false # Enable ArgoCD deployment
   skip_namespaces = false # Enable namespace creation
@@ -44,10 +44,10 @@ locals {
   kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml")
   # Only consider Kubernetes ready if we have a real kubeconfig (not the placeholder)
   k8s_ready = local.kubeconfig_exists && (
-    !strcontains(
-      try(file("${path.module}/kubeconfig.yaml"), ""),
-      "server: https://placeholder:6443"
-    )
+  !strcontains(
+    try(file("${path.module}/kubeconfig.yaml"), ""),
+    "server: https://placeholder:6443"
+  )
   )
   # Add the control_plane_ip from the second locals block
   control_plane_ip = try(
@@ -59,7 +59,7 @@ locals {
 # K8S-CLUSTER MODULE - Main Kubernetes cluster infrastructure
 module "k8s-cluster" {
   source = "./modules/k8s-cluster"
-  
+
   # Required parameters
   region                       = var.region
   cluster_name                 = "guy-cluster"  # Fixed cluster name
@@ -79,7 +79,7 @@ module "k8s-cluster" {
   verification_max_attempts   = var.verification_max_attempts
   verification_wait_seconds   = var.verification_wait_seconds
   pod_cidr                    = var.pod_cidr
-  
+
   # Optional parameters
   tags = {
     Environment = "production"
@@ -396,17 +396,17 @@ resource "null_resource" "wait_for_kubernetes" {
 # Resource that checks if ArgoCD is already deployed before spending time installing it
 resource "null_resource" "check_argocd_status" {
   count = local.skip_argocd ? 0 : 1
-  
+
   depends_on = [
     null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config
   ]
-  
+
   # Only trigger on kubeconfig changes, not directly on control plane changes
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
@@ -435,7 +435,7 @@ resource "null_resource" "cluster_readiness_check" {
     null_resource.install_ebs_csi_driver,
     terraform_data.kubectl_provider_config
   ]
-  
+
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     calico_id = null_resource.install_calico.id
@@ -719,12 +719,12 @@ resource "null_resource" "pre_deployment_cleanup" {
     terraform_data.kubectl_provider_config,
     null_resource.cluster_readiness_check
   ]
-  
+
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     cluster_ready_id = null_resource.cluster_readiness_check.id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -823,23 +823,23 @@ resource "null_resource" "deploy_mongodb_directly" {
 # Use the kubernetes-resources module for all Kubernetes-specific resources
 module "kubernetes_resources" {
   source = "./modules/kubernetes-resources"
-  
+
   # Required parameters
   region            = var.region
   kubeconfig_path   = local.kubeconfig_path
   module_path       = path.module
   key_name          = var.key_name
-  
+
   # Optional parameters with defaults
   enable_resources    = true
   skip_mongodb        = false
-  
+
   # Resource dependencies - simplified to avoid cycles
   kubeconfig_trigger_id = terraform_data.kubectl_provider_config[0].id
   kubernetes_dependency = null_resource.wait_for_kubernetes
   ebs_csi_dependency    = null_resource.install_ebs_csi_driver
   control_plane_id      = module.k8s-cluster.control_plane_instance_id
-  
+
   depends_on = [
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
@@ -852,7 +852,7 @@ module "kubernetes_resources" {
 resource "terraform_data" "deployment_information" {
   # Run only on first apply or when Terraform files change
   triggers_replace = {
-    module_hash = filemd5("${path.module}/main.tf") 
+    module_hash = filemd5("${path.module}/main.tf")
     variables_hash = filemd5("${path.module}/variables.tf")
   }
 
@@ -991,7 +991,7 @@ EOFINNER
 echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
 EOF
   }
-  
+
   depends_on = [module.k8s-cluster]
 }
 
@@ -1003,13 +1003,13 @@ resource "null_resource" "install_ebs_csi_driver" {
     null_resource.install_calico,  # Install after Calico is ready
     terraform_data.kubectl_provider_config
   ]
-  
+
   # Trigger reinstall when the role check is run
   triggers = {
     ebs_role_check = null_resource.check_ebs_role.id
     calico_ready = null_resource.install_calico.id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
@@ -1085,11 +1085,11 @@ resource "null_resource" "install_node_termination_handler" {
     null_resource.install_ebs_csi_driver,
     terraform_data.kubectl_provider_config
   ]
-  
+
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1313,12 +1313,12 @@ EOF
 # Replaces: install_argocd (simplified), configure_argocd_repositories, check_argocd_status, argocd_direct_access
 resource "null_resource" "install_argocd" {
   count = local.skip_argocd ? 0 : 1
-  
+
   depends_on = [
     null_resource.cluster_readiness_check,  # Only depend on comprehensive readiness check
     terraform_data.kubectl_provider_config
   ]
-  
+
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
@@ -1454,18 +1454,18 @@ EOF
 # Replaces: configure_argocd_apps and create_argocd_app_simple
 resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
-  
+
   depends_on = [
     null_resource.install_argocd,
     null_resource.deploy_secrets
   ]
-  
+
   triggers = {
     argocd_install_id = null_resource.install_argocd[0].id
     secrets_ready_id = null_resource.deploy_secrets[0].id
     app_config_version = "streamlined-v3"  # Updated version to include secrets dependency
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1525,12 +1525,12 @@ resource "null_resource" "install_calico" {
     terraform_data.kubectl_provider_config,
     module.k8s-cluster
   ]
-  
+
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1878,14 +1878,14 @@ EOF
 # Process and deploy secrets before ArgoCD applications
 resource "null_resource" "deploy_secrets" {
   count = local.skip_argocd ? 0 : 1
-  
+
   depends_on = [
     null_resource.install_argocd,
     null_resource.cluster_readiness_check,
     aws_s3_bucket.polybot_storage,
     aws_sqs_queue.polybot_queue
   ]
-  
+
   triggers = {
     argocd_install_id = null_resource.install_argocd[0].id
     # Trigger when generated resources change
@@ -1898,7 +1898,7 @@ resource "null_resource" "deploy_secrets" {
       local.generated_secrets.polybot_url
     ]))
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1993,11 +1993,11 @@ DOCKER_EOF
 # This creates a comprehensive diagnostic report for troubleshooting node issues
 resource "null_resource" "diagnose_notready_nodes" {
   count = 0  # Set to 1 to enable diagnostics when needed
-  
+
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -2177,7 +2177,7 @@ SUMMARY_EOF
       echo ""
     EOT
   }
-  
+
   depends_on = [
     module.k8s-cluster,
     terraform_data.kubectl_provider_config
@@ -2188,12 +2188,12 @@ SUMMARY_EOF
 # This resource monitors worker node health and can remediate issues
 resource "null_resource" "node_health_monitor" {
   count = 0  # Set to 1 to enable monitoring
-  
+
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
     check_interval = timestamp()  # Run periodically
   }
-  
+
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -2431,7 +2431,7 @@ SUMMARY_EOF
       fi
     EOT
   }
-  
+
   depends_on = [
     module.k8s-cluster,
     terraform_data.kubectl_provider_config
