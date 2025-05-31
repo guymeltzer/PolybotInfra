@@ -84,8 +84,8 @@ echo "Installing and configuring CRI-O..."
 
 # Add CRI-O repository
 mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${CRIO_K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
+curl -fsSL "https$${":"//pkgs.k8s.io/addons$${":"}cri-o$${":"}stable$${":"}v${CRIO_K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https$${":"//pkgs.k8s.io/addons$${":"}cri-o$${":"}stable$${":"}v${CRIO_K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
 
 apt-get update -y
 apt-get install -y cri-o
@@ -129,8 +129,8 @@ echo "Installing Kubernetes components (kubeadm, kubelet, kubectl) version ${K8S
 
 # Kubernetes apt repository (already uses K8S_MAJOR_MINOR from templatefile)
 mkdir -p -m 755 /etc/apt/keyrings # Redundant if CRI-O section did it, but harmless
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+curl -fsSL "https$${":"//pkgs.k8s.io/core$${":"}stable$${":"}v${K8S_MAJOR_MINOR}/deb/Release.key" | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https$${":"//pkgs.k8s.io/core$${":"}stable$${":"}v${K8S_MAJOR_MINOR}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
 
 apt-get update -y
 apt-get install -y kubeadm="${K8S_PACKAGE_VERSION}" kubelet="${K8S_PACKAGE_VERSION}" kubectl="${K8S_PACKAGE_VERSION}"
