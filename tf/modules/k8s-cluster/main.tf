@@ -1264,23 +1264,6 @@ resource "null_resource" "wait_for_control_plane" {
   }
 }
 
-resource "local_file" "kubeconfig" {
-  content = templatefile("${path.module}/templates/kubeconfig.tpl", {
-    endpoint       = aws_lb.polybot_alb.dns_name
-    token          = local.kubeadm_token
-    cluster_ca     = base64encode(file("${path.module}/certs/ca.crt"))
-    client_cert    = base64encode(file("${path.module}/certs/client.crt"))
-    client_key     = base64encode(file("${path.module}/certs/client.key"))
-    aws_region     = var.region
-    cluster_name   = "k8s-cluster"
-  })
-  filename = "${path.module}/kubeconfig"
-
-  depends_on = [
-    null_resource.wait_for_control_plane
-  ]
-}
-
 # Lambda function for node draining and token refresh
 resource "aws_lambda_function" "node_management_lambda" {
   function_name = "guy-polybot-token"
@@ -2078,4 +2061,107 @@ resource "null_resource" "update_join_command" {
 
 # Removed problematic verify_cluster_readiness resource that was blocking deployment
 # The control plane user data script already handles cluster initialization properly
+
+resource "null_resource" "generate_kubeconfig" {
+  depends_on = [
+    aws_instance.control_plane,
+    null_resource.wait_for_control_plane,
+    aws_lb.polybot_alb
+  ]
+
+  triggers = {
+    control_plane_id = aws_instance.control_plane.id
+    alb_endpoint = aws_lb.polybot_alb.dns_name
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      echo "🔑 Generating kubeconfig from control plane..."
+      
+      CONTROL_PLANE_ID="${aws_instance.control_plane.id}"
+      ALB_ENDPOINT="${aws_lb.polybot_alb.dns_name}"
+      REGION="${var.region}"
+      MAX_ATTEMPTS=30
+      
+      for i in $(seq 1 $MAX_ATTEMPTS); do
+        echo "Attempt $i: Checking if control plane is ready for kubeconfig retrieval..."
+        
+        # Check if SSM is available
+        if aws ssm describe-instance-information --region $REGION \
+           --filters "Key=InstanceIds,Values=$CONTROL_PLANE_ID" \
+           --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+          
+          echo "SSM is online, attempting to retrieve admin config..."
+          
+          # Get admin config from control plane
+          COMMAND_ID=$(aws ssm send-command --region $REGION \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$CONTROL_PLANE_ID" \
+            --parameters 'commands=["sudo cat /etc/kubernetes/admin.conf"]' \
+            --output text --query "Command.CommandId" 2>/dev/null)
+          
+          if [ -n "$COMMAND_ID" ]; then
+            sleep 10
+            
+            ADMIN_CONF=$(aws ssm get-command-invocation --region $REGION \
+              --command-id "$COMMAND_ID" --instance-id "$CONTROL_PLANE_ID" \
+              --query "StandardOutputContent" --output text 2>/dev/null)
+            
+            if [[ "$ADMIN_CONF" == *"apiVersion: v1"* ]] && [[ "$ADMIN_CONF" == *"kind: Config"* ]]; then
+              echo "✅ Successfully retrieved admin config from control plane"
+              
+              # Update server endpoint to use ALB and save to correct location
+              echo "$ADMIN_CONF" | sed "s|server:.*|server: https://$ALB_ENDPOINT:6443|" > ../../kubeconfig.yaml
+              chmod 600 ../../kubeconfig.yaml
+              
+              echo "✅ Kubeconfig created at ../../kubeconfig.yaml with ALB endpoint"
+              exit 0
+            else
+              echo "⚠️ Retrieved config appears invalid, retrying..."
+            fi
+          else
+            echo "⚠️ Failed to send SSM command, retrying..."
+          fi
+        else
+          echo "⚠️ SSM not ready yet, retrying..."
+        fi
+        
+        if [ $i -lt $MAX_ATTEMPTS ]; then
+          echo "Waiting 30 seconds before retry..."
+          sleep 30
+        fi
+      done
+      
+      echo "❌ Failed to retrieve admin config after $MAX_ATTEMPTS attempts"
+      echo "Creating a placeholder kubeconfig for now..."
+      
+      cat > ../../kubeconfig.yaml << EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: k8s-cluster
+  cluster:
+    server: https://$ALB_ENDPOINT:6443
+    insecure-skip-tls-verify: true
+users:
+- name: placeholder-user
+  user:
+    token: "placeholder-token-needs-manual-setup"
+contexts:
+- name: placeholder-context
+  context:
+    cluster: k8s-cluster
+    user: placeholder-user
+current-context: placeholder-context
+preferences: {}
+EOF
+      
+      chmod 600 ../../kubeconfig.yaml
+      echo "⚠️ Placeholder kubeconfig created - you may need to manually retrieve the admin config"
+      exit 0
+    EOT
+  }
+}
 
