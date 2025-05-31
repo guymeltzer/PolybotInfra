@@ -1214,7 +1214,6 @@ resource "aws_autoscaling_group" "worker_asg" {
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
-    null_resource.verify_cluster_readiness,  # Add cluster readiness dependency
     terraform_data.force_asg_update,
     terraform_data.worker_progress,
     null_resource.update_join_command
@@ -2077,115 +2076,6 @@ resource "null_resource" "update_join_command" {
   }
 }
 
-# Enhanced cluster readiness check to verify taint resolution
-resource "null_resource" "verify_cluster_readiness" {
-  depends_on = [
-    aws_instance.control_plane,
-    null_resource.wait_for_control_plane
-  ]
-
-  triggers = {
-    control_plane_id = aws_instance.control_plane.id
-    control_plane_public_ip = aws_instance.control_plane.public_ip
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<EOT
-      #!/bin/bash
-      
-      echo "🔍 Verifying cluster basic readiness..."
-      
-      CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
-      CONTROL_PLANE_ID="${aws_instance.control_plane.id}"
-      MAX_WAIT_TIME=300  # 5 minutes only - don't block deployment
-      SLEEP_INTERVAL=30
-      WAITED=0
-      
-      # Function to check cluster via SSM  
-      check_cluster_via_ssm() {
-        echo "📡 Checking basic cluster status via SSM..."
-        
-        # Check if SSM is available
-        if ! aws ssm describe-instance-information --region ${var.region} \
-           --filters "Key=InstanceIds,Values=$CONTROL_PLANE_ID" \
-           --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-          echo "❌ SSM not available on control plane yet"
-          return 1
-        fi
-        
-        # Get basic cluster status - simpler check
-        COMMAND_ID=$(aws ssm send-command --region ${var.region} \
-          --document-name "AWS-RunShellScript" \
-          --instance-ids "$CONTROL_PLANE_ID" \
-          --parameters 'commands=["export KUBECONFIG=/etc/kubernetes/admin.conf && kubectl get nodes --no-headers | wc -l && kubectl get pods -n kube-system --no-headers | wc -l"]' \
-          --output text --query "Command.CommandId" 2>/dev/null)
-        
-        if [ -z "$COMMAND_ID" ]; then
-          echo "❌ Failed to send SSM command"
-          return 1
-        fi
-        
-        sleep 10
-        
-        # Get command output
-        CLUSTER_STATUS=$(aws ssm get-command-invocation --region ${var.region} \
-          --command-id "$COMMAND_ID" --instance-id "$CONTROL_PLANE_ID" \
-          --query "StandardOutputContent" --output text 2>/dev/null)
-        
-        if [ -z "$CLUSTER_STATUS" ]; then
-          echo "❌ Failed to get cluster status"
-          return 1
-        fi
-        
-        # Just check if we have any nodes and system pods
-        NODE_COUNT=$(echo "$CLUSTER_STATUS" | head -1 | tr -d '\r\n' || echo "0")
-        SYSTEM_POD_COUNT=$(echo "$CLUSTER_STATUS" | tail -1 | tr -d '\r\n' || echo "0")
-        
-        echo "📈 Basic Status:"
-        echo "  Nodes: $NODE_COUNT"
-        echo "  System pods: $SYSTEM_POD_COUNT"
-        
-        # Very basic readiness check - just need control plane responding
-        if [ "$NODE_COUNT" -ge 1 ] && [ "$SYSTEM_POD_COUNT" -ge 5 ]; then
-          echo "✅ Control plane is responding with basic cluster state!"
-          return 0
-        else
-          echo "⏳ Control plane still initializing..."
-          return 1
-        fi
-      }
-      
-      # Wait for basic cluster readiness (don't block deployment)
-      echo "⏳ Waiting up to $MAX_WAIT_TIME seconds for basic cluster readiness..."
-      echo "ℹ️  This check won't block deployment - worker nodes will be created regardless"
-      
-      while [ $WAITED -lt $MAX_WAIT_TIME ]; do
-        echo "🔄 Check $((WAITED / SLEEP_INTERVAL + 1)) - Time elapsed: $${WAITED}s"
-        
-        if check_cluster_via_ssm; then
-          echo ""
-          echo "🎉 SUCCESS: Control plane basic readiness confirmed!"
-          echo "🎯 Proceeding with worker node deployment."
-          exit 0
-        fi
-        
-        sleep $SLEEP_INTERVAL
-        WAITED=$((WAITED + SLEEP_INTERVAL))
-        
-        if [ $WAITED -lt $MAX_WAIT_TIME ]; then
-          echo "⏳ Retrying in $SLEEP_INTERVAL seconds... ($((MAX_WAIT_TIME - WAITED))s remaining)"
-        fi
-      done
-      
-      echo ""
-      echo "⚠️  TIMEOUT: Basic readiness check timed out after $MAX_WAIT_TIME seconds"
-      echo "ℹ️  This is not critical - proceeding with deployment anyway"
-      echo "🎯 Worker nodes will be created and may help complete cluster initialization"
-      
-      # Always exit with success to not block deployment
-      exit 0
-    EOT
-  }
-}
+# Removed problematic verify_cluster_readiness resource that was blocking deployment
+# The control plane user data script already handles cluster initialization properly
 
