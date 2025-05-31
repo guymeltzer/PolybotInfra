@@ -2457,48 +2457,84 @@ resource "null_resource" "verify_control_plane_readiness" {
         echo "Checking Kubernetes API server readiness (attempt $1)..."
         local success=false
         
+        # Function to execute SSM command and wait for result
+        execute_ssm_command() {
+          local command="$1"
+          local description="$2"
+          
+          echo "Executing: $description"
+          
+          # Send the command
+          local command_id=$(aws ssm send-command \
+            --instance-ids $INSTANCE_ID \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[$command]" \
+            --region $REGION \
+            --output text \
+            --query "Command.CommandId" 2>/dev/null)
+          
+          if [[ -z "$command_id" ]]; then
+            echo "Failed to send SSM command"
+            return 1
+          fi
+          
+          # Wait for command to complete
+          local max_wait=30
+          local wait_count=0
+          while [ $wait_count -lt $max_wait ]; do
+            local status=$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id $INSTANCE_ID \
+              --region $REGION \
+              --query "Status" \
+              --output text 2>/dev/null)
+            
+            if [[ "$status" == "Success" ]]; then
+              # Get the output
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id $INSTANCE_ID \
+                --region $REGION \
+                --query "StandardOutputContent" \
+                --output text 2>/dev/null
+              return 0
+            elif [[ "$status" == "Failed" ]]; then
+              echo "SSM command failed"
+              return 1
+            fi
+            
+            sleep 2
+            wait_count=$((wait_count + 1))
+          done
+          
+          echo "SSM command timed out"
+          return 1
+        }
+        
         # Method 1: Check if port 6443 is listening using ss
         echo "Method 1: Checking if port 6443 is listening using ss"
-        PORT_CHECK=$(aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters 'commands=["sudo ss -tlnp | grep 6443 || echo not-ready"]' \
-          --region $REGION \
-          --output text \
-          --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null || echo "SSM command failed")
-          
+        PORT_CHECK=$(execute_ssm_command "sudo ss -tlnp | grep 6443 || echo not-ready" "Port check with ss")
+        
         echo "Port check result: $PORT_CHECK"
         
-        if [[ "$PORT_CHECK" != "not-ready" ]] && [[ "$PORT_CHECK" != "SSM command failed" ]] && [[ "$PORT_CHECK" != "None" ]]; then
+        if [[ "$PORT_CHECK" != "not-ready" ]] && [[ "$PORT_CHECK" != "SSM command failed" ]] && [[ -n "$PORT_CHECK" ]]; then
           echo "Port 6443 is open according to ss command"
           success=true
         else
           # Method 2: Try netstat as an alternative
           echo "Method 2: Checking if port 6443 is listening using netstat"
-          NETSTAT_CHECK=$(aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["sudo netstat -tlnp | grep 6443 || echo not-ready"]' \
-            --region $REGION \
-            --output text \
-            --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null || echo "SSM command failed")
-            
+          NETSTAT_CHECK=$(execute_ssm_command "sudo netstat -tlnp | grep 6443 || echo not-ready" "Port check with netstat")
+          
           echo "Netstat check result: $NETSTAT_CHECK"
           
-          if [[ "$NETSTAT_CHECK" != "not-ready" ]] && [[ "$NETSTAT_CHECK" != "SSM command failed" ]] && [[ "$NETSTAT_CHECK" != "None" ]]; then
+          if [[ "$NETSTAT_CHECK" != "not-ready" ]] && [[ "$NETSTAT_CHECK" != "SSM command failed" ]] && [[ -n "$NETSTAT_CHECK" ]]; then
             echo "Port 6443 is open according to netstat command"
             success=true
           else
             # Method 3: Direct TCP connection check using nc
             echo "Method 3: Checking direct TCP connection to port 6443"
-            NC_CHECK=$(aws ssm send-command \
-              --instance-ids $INSTANCE_ID \
-              --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["nc -zv localhost 6443 2>&1 || echo connection-failed"]' \
-              --region $REGION \
-              --output text \
-              --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null || echo "SSM command failed")
-              
+            NC_CHECK=$(execute_ssm_command "nc -zv localhost 6443 2>&1 || echo connection-failed" "TCP connection test")
+            
             echo "NC connection check result: $NC_CHECK"
             
             if [[ "$NC_CHECK" == *"succeeded"* ]] || [[ "$NC_CHECK" == *"open"* ]]; then
@@ -2511,14 +2547,8 @@ resource "null_resource" "verify_control_plane_readiness" {
         # Check the API health endpoint as final validation
         if $success; then
           echo "Port appears to be open, checking API server health endpoint"
-          API_CHECK=$(aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw=/healthz 2>/dev/null || echo not-ready"]' \
-            --region $REGION \
-            --output text \
-            --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null || echo "SSM command failed")
-            
+          API_CHECK=$(execute_ssm_command "sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw=/healthz 2>/dev/null || echo not-ready" "API health check")
+          
           echo "API health check result: $API_CHECK"
           
           if [[ "$API_CHECK" == *"ok"* ]]; then
@@ -2532,17 +2562,11 @@ resource "null_resource" "verify_control_plane_readiness" {
         # If we've reached the last few attempts, try one last alternative check
         if [ $1 -ge $((MAX_ATTEMPTS - 3)) ]; then
           echo "Last resort check: Looking for kube-apiserver process"
-          PROCESS_CHECK=$(aws ssm send-command \
-            --instance-ids $INSTANCE_ID \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["ps aux | grep kube-apiserver | grep -v grep || echo not-running"]' \
-            --region $REGION \
-            --output text \
-            --query "CommandInvocations[].CommandPlugins[].Output" 2>/dev/null || echo "SSM command failed")
-            
+          PROCESS_CHECK=$(execute_ssm_command "ps aux | grep kube-apiserver | grep -v grep || echo not-running" "Process check")
+          
           echo "API server process check result: $PROCESS_CHECK"
           
-          if [[ "$PROCESS_CHECK" != "not-running" ]] && [[ "$PROCESS_CHECK" != "SSM command failed" ]] && [[ "$PROCESS_CHECK" != "None" ]]; then
+          if [[ "$PROCESS_CHECK" != "not-running" ]] && [[ "$PROCESS_CHECK" != "SSM command failed" ]] && [[ -n "$PROCESS_CHECK" ]]; then
             echo "kube-apiserver process is running, considering this sufficient"
             return 0
           fi
@@ -2580,14 +2604,9 @@ resource "null_resource" "verify_control_plane_readiness" {
       trigger_token_creation() {
         echo "Attempting to trigger token creation..."
         
-        aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
-          --document-name "AWS-RunShellScript" \
-          --parameters 'commands=["sudo systemctl start k8s-token-creator.service || sudo /usr/local/bin/refresh-join-token.sh || sudo kubeadm token create --print-join-command"]' \
-          --region $REGION \
-          --output text \
-          --query "CommandInvocations[].CommandPlugins[].Output" > /dev/null 2>&1
-          
+        # Use the same execute_ssm_command function for consistency
+        execute_ssm_command "sudo systemctl start k8s-token-creator.service || sudo /usr/local/bin/refresh-join-token.sh || sudo kubeadm token create --print-join-command" "Token creation trigger" > /dev/null 2>&1
+        
         echo "Token creation triggered. Waiting before next attempt..."
         return 0
       }
