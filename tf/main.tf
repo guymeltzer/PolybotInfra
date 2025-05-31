@@ -1145,6 +1145,7 @@ resource "null_resource" "cleanup_stale_nodes" {
     null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
     null_resource.install_node_termination_handler,
+    null_resource.remove_orphaned_nodes,  # Run after orphaned nodes are removed
     module.k8s-cluster
   ]
 
@@ -1249,7 +1250,7 @@ resource "null_resource" "cleanup_stale_nodes" {
         if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" != "True" ]]; then
           echo "⚠️  Node $NODE_NAME is not ready, checking if it should be removed..."
           
-          # Check node age - only remove nodes that have been NotReady for more than 10 minutes
+          # Check node age - be more aggressive: remove nodes that have been NotReady for more than 5 minutes
           NODE_AGE_SECONDS=0
           if [[ "$NODE_AGE_RAW" =~ ^([0-9]+)m$ ]]; then
             NODE_AGE_SECONDS=$(($${BASH_REMATCH[1]} * 60))
@@ -1259,15 +1260,28 @@ resource "null_resource" "cleanup_stale_nodes" {
             NODE_AGE_SECONDS=$(($${BASH_REMATCH[1]} * 86400))
           fi
           
-          # If node is older than 10 minutes and still NotReady, check if EC2 instance exists
-          if [[ $NODE_AGE_SECONDS -gt 600 ]]; then
-            echo "   Node has been around for >10 minutes and is still NotReady, checking EC2 instance..."
+          # If node is older than 5 minutes and still NotReady, check if EC2 instance exists
+          if [[ $NODE_AGE_SECONDS -gt 300 ]]; then
+            echo "   Node has been around for >5 minutes and is still NotReady, checking EC2 instance..."
             
             # Initialize instance check flag
             INSTANCE_EXISTS=""
             
-            # Extract hash from worker node name (format: worker-<hash>)
-            if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
+            # Extract instance ID from worker node name - try multiple patterns
+            if [[ "$NODE_NAME" =~ worker-([a-f0-9]{17})$ ]]; then
+              # Pattern: worker-<17-char-instance-id>
+              INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+              echo "   Extracted instance ID from node name: $INSTANCE_ID"
+              
+              # Check if this exact instance exists and is running
+              INSTANCE_EXISTS=$(aws ec2 describe-instances \
+                --region ${var.region} \
+                --instance-ids "$INSTANCE_ID" \
+                --filters "Name=instance-state-name,Values=running" \
+                --query "Reservations[*].Instances[*].InstanceId" \
+                --output text 2>/dev/null | head -1)
+                
+            elif [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
               NODE_HASH="$${BASH_REMATCH[1]}"
               echo "   Looking for EC2 instance with hash: $NODE_HASH"
               
@@ -1312,7 +1326,7 @@ resource "null_resource" "cleanup_stale_nodes" {
               echo "   📝 Will try to recover this node instead of removing it"
             fi
           else
-            echo "   ⏰ Node is NotReady but still young (<10 min old), giving it more time to recover"
+            echo "   ⏰ Node is NotReady but still young (<5 min old), giving it more time to recover"
           fi
         else
           echo "   ✅ Node $NODE_NAME is healthy (Status: $NODE_STATUS, Ready: $NODE_READY)"
@@ -2245,6 +2259,163 @@ resource "null_resource" "argocd_direct_access" {
       kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || true
       
       echo "ArgoCD direct access setup complete"
+    EOT
+  }
+}
+
+# Immediate orphaned node cleanup - runs right after cluster is ready
+resource "null_resource" "remove_orphaned_nodes" {
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config
+  ]
+
+  # Run this whenever cluster readiness changes
+  triggers = {
+    cluster_ready = null_resource.cluster_readiness_check.id
+    control_plane_id = module.k8s-cluster.control_plane_instance_id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔍 Checking for orphaned worker nodes..."
+      
+      # Check if kubectl can connect to the cluster
+      if ! kubectl get nodes &>/dev/null; then
+        echo "❌ Cannot connect to Kubernetes cluster, skipping orphaned node cleanup"
+        exit 0
+      fi
+      
+      # Get all worker nodes from Kubernetes
+      WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
+      
+      if [[ -z "$WORKER_NODES" ]]; then
+        echo "ℹ️  No worker nodes found in cluster"
+        exit 0
+      fi
+      
+      echo "📋 Found worker nodes in Kubernetes: $WORKER_NODES"
+      
+      # Get all running EC2 instances from ASG
+      echo "📋 Getting running EC2 instances..."
+      RUNNING_INSTANCES=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].InstanceId" \
+        --output text 2>/dev/null | tr '\t' '\n' | sort)
+      
+      echo "📋 Running EC2 instances: $RUNNING_INSTANCES"
+      
+      ORPHANED_NODES=()
+      
+      # Check each worker node to see if it has a backing instance
+      for NODE_NAME in $WORKER_NODES; do
+        echo ""
+        echo "🔍 Checking node: $NODE_NAME"
+        
+        INSTANCE_FOUND=false
+        
+        # Try to extract instance ID from node name
+        if [[ "$NODE_NAME" =~ worker-([a-f0-9]{17})$ ]]; then
+          # Pattern: worker-<17-char-instance-id>
+          INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+          echo "   Extracted instance ID: $INSTANCE_ID"
+          
+          # Check if this instance is in our running instances list
+          if echo "$RUNNING_INSTANCES" | grep -q "^$INSTANCE_ID$"; then
+            echo "   ✅ Found matching running instance: $INSTANCE_ID"
+            INSTANCE_FOUND=true
+          fi
+          
+        elif [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
+          # Pattern: worker-<hash> - check if any running instance contains this hash
+          NODE_HASH="$${BASH_REMATCH[1]}"
+          echo "   Looking for instances containing hash: $NODE_HASH"
+          
+          for INSTANCE_ID in $RUNNING_INSTANCES; do
+            if [[ "$INSTANCE_ID" == *"$NODE_HASH"* ]]; then
+              echo "   ✅ Found matching running instance: $INSTANCE_ID"
+              INSTANCE_FOUND=true
+              break
+            fi
+          done
+          
+        elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
+          # Pattern: ip-<ip-with-dashes> - check by private IP
+          PRIVATE_IP="$${BASH_REMATCH[1]}.$${BASH_REMATCH[2]}.$${BASH_REMATCH[3]}.$${BASH_REMATCH[4]}"
+          echo "   Looking for instance with private IP: $PRIVATE_IP"
+          
+          MATCHING_INSTANCE=$(aws ec2 describe-instances \
+            --region ${var.region} \
+            --filters "Name=private-ip-address,Values=$PRIVATE_IP" "Name=instance-state-name,Values=running" \
+            --query "Reservations[*].Instances[*].InstanceId" \
+            --output text 2>/dev/null | head -1)
+            
+          if [[ -n "$MATCHING_INSTANCE" ]] && [[ "$MATCHING_INSTANCE" != "None" ]]; then
+            echo "   ✅ Found matching running instance: $MATCHING_INSTANCE"
+            INSTANCE_FOUND=true
+          fi
+        fi
+        
+        # If no backing instance found, mark as orphaned
+        if [[ "$INSTANCE_FOUND" == false ]]; then
+          echo "   ❌ No backing EC2 instance found for node $NODE_NAME"
+          ORPHANED_NODES+=("$NODE_NAME")
+        fi
+      done
+      
+      # Remove orphaned nodes immediately
+      if [[ $${#ORPHANED_NODES[@]} -gt 0 ]]; then
+        echo ""
+        echo "🗑️  Found $${#ORPHANED_NODES[@]} orphaned nodes to remove immediately:"
+        for NODE_NAME in "$${ORPHANED_NODES[@]}"; do
+          echo "   - $NODE_NAME"
+        done
+        
+        echo ""
+        echo "🧹 Removing orphaned nodes..."
+        
+        for NODE_NAME in "$${ORPHANED_NODES[@]}"; do
+          echo "🗑️  Removing orphaned node: $NODE_NAME"
+          
+          # First, force delete any pods on this node
+          echo "   Force deleting all pods on node $NODE_NAME..."
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json | \
+            jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
+            while read -r pod; do
+              if [[ -n "$pod" ]]; then
+                echo "     Force deleting pod: $pod"
+                kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
+              fi
+            done
+          
+          # Remove the node from cluster
+          echo "   Deleting node $NODE_NAME from cluster..."
+          if kubectl delete node "$NODE_NAME" --timeout=30s; then
+            echo "   ✅ Successfully removed orphaned node: $NODE_NAME"
+          else
+            echo "   ❌ Failed to delete node $NODE_NAME, trying force delete..."
+            kubectl delete node "$NODE_NAME" --force --grace-period=0 || true
+          fi
+        done
+        
+        echo ""
+        echo "✅ Orphaned node cleanup completed! Removed $${#ORPHANED_NODES[@]} nodes."
+        
+      else
+        echo ""
+        echo "✅ No orphaned nodes found - all worker nodes have backing EC2 instances"
+      fi
+      
+      # Show final cluster state
+      echo ""
+      echo "📋 Final cluster state after orphaned node cleanup:"
+      kubectl get nodes -o wide
+      
     EOT
   }
 }
