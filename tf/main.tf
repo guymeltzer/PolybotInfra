@@ -402,7 +402,7 @@ resource "null_resource" "check_argocd_status" {
   count = local.skip_argocd ? 0 : 1
 
   depends_on = [
-    null_resource.wait_for_kubernetes,
+    null_resource.wait_for_kubernetes[0],
     terraform_data.kubectl_provider_config
   ]
 
@@ -434,7 +434,7 @@ resource "null_resource" "check_argocd_status" {
 # Replaces: cluster_readiness_check and pre_argocd_health_check
 resource "null_resource" "cluster_readiness_check" {
   depends_on = [
-    null_resource.wait_for_kubernetes,
+    null_resource.wait_for_kubernetes[0],
     # null_resource.install_calico,  # REMOVED: Calico now installed in control plane
     null_resource.install_ebs_csi_driver,
     terraform_data.kubectl_provider_config
@@ -864,14 +864,14 @@ module "kubernetes_resources" {
 
   # Resource dependencies - simplified to avoid cycles
   kubeconfig_trigger_id = terraform_data.kubectl_provider_config[0].id
-  kubernetes_dependency = null_resource.wait_for_kubernetes
+  kubernetes_dependency = null_resource.wait_for_kubernetes[0]
   ebs_csi_dependency    = null_resource.install_ebs_csi_driver
   control_plane_id      = module.k8s-cluster.control_plane_instance_id
 
   depends_on = [
     terraform_data.kubectl_provider_config,
     null_resource.install_ebs_csi_driver,
-    null_resource.wait_for_kubernetes,
+    null_resource.wait_for_kubernetes[0],
     module.k8s-cluster
   ]
 }
@@ -1026,7 +1026,7 @@ EOF
 # Install EBS CSI Driver as a Kubernetes component
 resource "null_resource" "install_ebs_csi_driver" {
   depends_on = [
-    null_resource.wait_for_kubernetes,
+    null_resource.wait_for_kubernetes[0],
     null_resource.check_ebs_role,
     # null_resource.install_calico,  # REMOVED: Calico now installed in control plane
     terraform_data.kubectl_provider_config
@@ -1036,7 +1036,7 @@ resource "null_resource" "install_ebs_csi_driver" {
   triggers = {
     ebs_role_check = null_resource.check_ebs_role.id
     # calico_ready = null_resource.install_calico.id  # REMOVED: Calico handled by control plane
-    cluster_ready = null_resource.wait_for_kubernetes.id  # Use kubernetes readiness instead
+    cluster_ready = null_resource.wait_for_kubernetes[0].id  # Use kubernetes readiness instead
   }
 
   provisioner "local-exec" {
@@ -1552,7 +1552,7 @@ resource "null_resource" "install_calico" {
   count = 0  # DISABLED: Calico is now installed in control plane user data script with taint handling
   
   depends_on = [
-    null_resource.wait_for_kubernetes,
+    null_resource.wait_for_kubernetes[0],
     terraform_data.kubectl_provider_config,
     module.k8s-cluster
   ]
