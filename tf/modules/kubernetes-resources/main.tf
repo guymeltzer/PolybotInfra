@@ -90,39 +90,13 @@ EOF
   }
 }
 
-# Improved disk cleanup resource - DISABLED to prevent terminating healthy worker nodes
-resource "null_resource" "improved_disk_cleanup" {
-  count = var.enable_resources ? 1 : 0
-  triggers = {
-    control_plane_id = var.control_plane_id
-  }
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
-      echo "🔍 DISK CLEANUP DISABLED - Would have checked for worker nodes to clean up"
-      echo "Note: The previous version of this resource was terminating worker nodes, which is incorrect during cluster deployment"
-      echo "If you need disk cleanup, implement it as a Kubernetes CronJob or DaemonSet instead"
-      
-      # Show what instances would have been affected (for debugging)
-      echo "Worker instances that would have been checked:"
-      aws ec2 describe-instances --region ${var.region} \
-        --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
-        --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0]]" \
-        --output table || echo "Could not list instances"
-    EOT
-  }
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-# Worker node cleanup
-resource "null_resource" "cleanup_worker_nodes" {
+# Proper disk cleanup using Kubernetes DaemonSet (replaces the destructive instance termination approach)
+resource "null_resource" "install_disk_cleanup_daemonset" {
   count = var.enable_resources ? 1 : 0
   
   depends_on = [
     var.kubernetes_dependency,
-    null_resource.improved_disk_cleanup
+    var.ebs_csi_dependency
   ]
   
   triggers = {
@@ -131,77 +105,154 @@ resource "null_resource" "cleanup_worker_nodes" {
   
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    command = <<-EOT
       #!/bin/bash
       export KUBECONFIG="${var.kubeconfig_path}"
       
-      echo "Checking worker nodes for disk pressure..."
-      WORKER_NODES=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name | cut -d'/' -f2)
+      echo "🧹 Installing proper disk cleanup DaemonSet..."
       
-      if [ -z "$WORKER_NODES" ]; then
-        echo "No worker nodes found, skipping cleanup"
-        exit 0
-      fi
-      
-      NODES_WITH_PRESSURE=""
-      for NODE in $WORKER_NODES; do
-        DISK_PRESSURE=$(kubectl get node $NODE -o jsonpath='{.status.conditions[?(@.type=="DiskPressure")].status}')
-        if [ "$DISK_PRESSURE" == "True" ]; then
-          NODES_WITH_PRESSURE="$NODES_WITH_PRESSURE $NODE"
-          echo "Node $NODE has disk pressure"
-        fi
-      done
-      
-      if [ -z "$NODES_WITH_PRESSURE" ]; then
-        echo "No nodes with disk pressure, but cleaning all nodes as a precaution"
-        NODES_WITH_PRESSURE="$WORKER_NODES"
-      fi
-      
-      for NODE in $NODES_WITH_PRESSURE; do
-        echo "Cleaning up disk space on $NODE..."
-        kubectl debug node/$NODE --image=ubuntu:20.04 -- bash -c "
-          echo 'Cleaning up files on $NODE'
-          find /host/var/log -type f -name '*.log*' -size +50M -delete
-          find /host/var/log -type f -name '*.gz' -delete
-          find /host/var/log -type f -name '*.1' -delete
-          find /host/var/log -type f -name '*.old' -delete
-          find /host/var/log -type f -name '*.tar' -delete
-          find /host/tmp -type f -mtime +1 -delete
-          find /host/var/lib/docker/containers -path '*/*-json.log*' -size +10M -delete
+      # Create a DaemonSet that runs disk cleanup on all worker nodes
+      kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: disk-cleanup
+  namespace: kube-system
+  labels:
+    app: disk-cleanup
+spec:
+  selector:
+    matchLabels:
+      app: disk-cleanup
+  template:
+    metadata:
+      labels:
+        app: disk-cleanup
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      hostPID: true
+      hostNetwork: true
+      containers:
+      - name: disk-cleanup
+        image: alpine:3.18
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          set -e
+          echo "Starting disk cleanup on node: $NODE_NAME"
           
-          # Also truncate large log files instead of deleting
-          find /host/var/log -type f -name '*.log' -size +10M -exec truncate -s 0 {} \;
+          # Function to clean disk space
+          cleanup_disk() {
+            echo "=== Disk Cleanup Started at $(date) ==="
+            
+            # Show disk usage before cleanup
+            echo "Disk usage before cleanup:"
+            df -h /host
+            
+            # Clean container logs (Docker/containerd)
+            echo "Cleaning container logs..."
+            find /host/var/lib/docker/containers -name "*.log" -type f -size +10M -exec truncate -s 10M {} \; 2>/dev/null || true
+            find /host/var/lib/containerd -name "*.log" -type f -size +10M -exec truncate -s 10M {} \; 2>/dev/null || true
+            
+            # Clean system logs
+            echo "Cleaning system logs..."
+            find /host/var/log -name "*.log.*" -type f -mtime +3 -delete 2>/dev/null || true
+            find /host/var/log -name "*.gz" -type f -mtime +3 -delete 2>/dev/null || true
+            find /host/var/log -name "*.old" -type f -mtime +1 -delete 2>/dev/null || true
+            
+            # Truncate large current log files
+            find /host/var/log -name "*.log" -type f -size +100M -exec truncate -s 50M {} \; 2>/dev/null || true
+            
+            # Clean temporary files
+            echo "Cleaning temporary files..."
+            find /host/tmp -type f -mtime +1 -delete 2>/dev/null || true
+            find /host/var/tmp -type f -mtime +1 -delete 2>/dev/null || true
+            
+            # Clean package caches
+            echo "Cleaning package caches..."
+            rm -rf /host/var/cache/apt/archives/*.deb 2>/dev/null || true
+            rm -rf /host/var/cache/yum/* 2>/dev/null || true
+            
+            # Clean old journal logs (systemd)
+            echo "Cleaning old journal logs..."
+            chroot /host journalctl --vacuum-time=3d 2>/dev/null || true
+            chroot /host journalctl --vacuum-size=100M 2>/dev/null || true
+            
+            # Show disk usage after cleanup
+            echo "Disk usage after cleanup:"
+            df -h /host
+            
+            echo "=== Disk Cleanup Completed at $(date) ==="
+          }
           
-          # Check disk space after cleanup
-          df -h /host
+          # Run cleanup immediately
+          cleanup_disk
           
-          # List largest files remaining for troubleshooting
-          echo 'Largest files remaining:'
-          find /host -type f -size +10M | xargs ls -lh | sort -hr | head -10
-        " || echo "Warning: Debug container on $NODE failed, but continuing"
-      done
+          # Then run cleanup every 6 hours
+          while true; do
+            sleep 21600  # 6 hours
+            cleanup_disk
+          done
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+        - name: host-var-log
+          mountPath: /host/var/log
+        - name: host-var-lib-docker
+          mountPath: /host/var/lib/docker
+          readOnly: false
+        - name: host-var-lib-containerd
+          mountPath: /host/var/lib/containerd
+          readOnly: false
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      - name: host-var-log
+        hostPath:
+          path: /var/log
+      - name: host-var-lib-docker
+        hostPath:
+          path: /var/lib/docker
+      - name: host-var-lib-containerd
+        hostPath:
+          path: /var/lib/containerd
+      nodeSelector:
+        kubernetes.io/os: linux
+EOF
+
+      echo "⏳ Waiting for disk cleanup DaemonSet to be ready..."
+      kubectl -n kube-system rollout status daemonset/disk-cleanup --timeout=180s || {
+        echo "⚠️  Disk cleanup DaemonSet not ready within timeout, but continuing..."
+        kubectl -n kube-system get daemonset disk-cleanup -o wide
+        kubectl -n kube-system get pods -l app=disk-cleanup -o wide
+      }
       
-      echo "Worker node cleanup completed"
-      sleep 5
-      
-      # Check if any nodes still have disk pressure
-      echo "Checking for remaining disk pressure after cleanup..."
-      REMAINING_PRESSURE="false"
-      for NODE in $WORKER_NODES; do
-        DISK_PRESSURE=$(kubectl get node $NODE -o jsonpath='{.status.conditions[?(@.type=="DiskPressure")].status}')
-        if [ "$DISK_PRESSURE" == "True" ]; then
-          REMAINING_PRESSURE="true"
-          echo "Node $NODE still has disk pressure after cleanup"
-        fi
-      done
-      
-      if [ "$REMAINING_PRESSURE" == "true" ]; then
-        echo "Warning: Some nodes still have disk pressure after cleanup"
-        echo "You may need to increase instance size or add additional EBS volumes"
-      else
-        echo "All nodes are now free of disk pressure"
-      fi
+      echo "✅ Disk cleanup DaemonSet installed successfully"
+      echo "ℹ️  Disk cleanup will run every 6 hours on all nodes"
     EOT
+  }
+  
+  lifecycle {
+    create_before_destroy = true
   }
 }
 

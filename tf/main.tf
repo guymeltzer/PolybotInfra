@@ -427,11 +427,53 @@ resource "null_resource" "cluster_readiness_check" {
         sleep 10
       done
       
-      # Wait for CoreDNS to be fully ready
-      echo "⏳ Waiting for CoreDNS to be ready..."
+      # CRITICAL: Wait for CoreDNS to be fully ready (required for ArgoCD)
+      echo "⏳ Waiting for CoreDNS to be fully functional..."
       kubectl -n kube-system wait --for=condition=available deployment/coredns --timeout=300s || {
-        echo "⚠️  CoreDNS not ready within timeout, but continuing..."
+        echo "❌ CoreDNS not ready within timeout. Checking CoreDNS status..."
+        echo "CoreDNS deployment status:"
+        kubectl -n kube-system get deployment coredns -o wide
+        echo "CoreDNS pods:"
+        kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+        echo "CoreDNS pod logs:"
+        kubectl -n kube-system logs -l k8s-app=kube-dns --tail=20 || true
+        exit 1
       }
+      
+      # CRITICAL: Wait for Calico to be ready (required for networking)
+      echo "⏳ Waiting for Calico controllers to be ready..."
+      if kubectl -n kube-system get deployment calico-kube-controllers &>/dev/null; then
+        kubectl -n kube-system wait --for=condition=available deployment/calico-kube-controllers --timeout=300s || {
+          echo "❌ Calico controllers not ready. Checking Calico status..."
+          echo "Calico deployment status:"
+          kubectl -n kube-system get deployment calico-kube-controllers -o wide
+          echo "Calico controller pods:"
+          kubectl -n kube-system get pods -l k8s-app=calico-kube-controllers -o wide
+          echo "Calico node pods:"
+          kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+          exit 1
+        }
+      else
+        echo "⚠️  Calico kube-controllers deployment not found"
+      fi
+      
+      # CRITICAL: Wait for EBS CSI controller to be ready (required for storage)
+      echo "⏳ Waiting for EBS CSI controller to be ready..."
+      if kubectl -n kube-system get deployment ebs-csi-controller &>/dev/null; then
+        kubectl -n kube-system wait --for=condition=available deployment/ebs-csi-controller --timeout=300s || {
+          echo "❌ EBS CSI controller not ready. Checking EBS CSI status..."
+          echo "EBS CSI deployment status:"
+          kubectl -n kube-system get deployment ebs-csi-controller -o wide
+          echo "EBS CSI pods:"
+          kubectl -n kube-system get pods -l app=ebs-csi-controller -o wide
+          echo "Checking for storage classes:"
+          kubectl get storageclass
+          echo "❌ CRITICAL: EBS CSI controller must be ready for ArgoCD storage"
+          exit 1
+        }
+      else
+        echo "⚠️  EBS CSI controller deployment not found - this will cause storage issues"
+      fi
       
       # Wait for essential system pods
       echo "⏳ Waiting for essential system pods..."
@@ -468,14 +510,116 @@ resource "null_resource" "cluster_readiness_check" {
   }
 }
 
+# Pre-ArgoCD system health check
+resource "null_resource" "pre_argocd_health_check" {
+  depends_on = [
+    null_resource.install_ebs_csi_driver,
+    null_resource.install_node_termination_handler,
+    null_resource.remove_orphaned_nodes,
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    cluster_ready = null_resource.cluster_readiness_check.id
+    ebs_ready = null_resource.install_ebs_csi_driver.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🏥 Pre-ArgoCD System Health Check..."
+      
+      HEALTH_ISSUES=0
+      
+      # Check CoreDNS
+      echo "🔍 Checking CoreDNS..."
+      if kubectl -n kube-system get deployment coredns &>/dev/null; then
+        COREDNS_READY=$(kubectl -n kube-system get deployment coredns -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        COREDNS_DESIRED=$(kubectl -n kube-system get deployment coredns -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        if [[ "$COREDNS_READY" == "$COREDNS_DESIRED" ]] && [[ "$COREDNS_READY" -gt 0 ]]; then
+          echo "   ✅ CoreDNS: $COREDNS_READY/$COREDNS_DESIRED replicas ready"
+        else
+          echo "   ❌ CoreDNS: Only $COREDNS_READY/$COREDNS_DESIRED replicas ready"
+          HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+        fi
+      else
+        echo "   ❌ CoreDNS deployment not found"
+        HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+      fi
+      
+      # Check Calico
+      echo "🔍 Checking Calico..."
+      if kubectl -n kube-system get deployment calico-kube-controllers &>/dev/null; then
+        CALICO_READY=$(kubectl -n kube-system get deployment calico-kube-controllers -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        CALICO_DESIRED=$(kubectl -n kube-system get deployment calico-kube-controllers -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        if [[ "$CALICO_READY" == "$CALICO_DESIRED" ]] && [[ "$CALICO_READY" -gt 0 ]]; then
+          echo "   ✅ Calico Controllers: $CALICO_READY/$CALICO_DESIRED replicas ready"
+        else
+          echo "   ❌ Calico Controllers: Only $CALICO_READY/$CALICO_DESIRED replicas ready"
+          HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+        fi
+      else
+        echo "   ❌ Calico kube-controllers deployment not found"
+        HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+      fi
+      
+      # Check EBS CSI
+      echo "🔍 Checking EBS CSI Driver..."
+      if kubectl -n kube-system get deployment ebs-csi-controller &>/dev/null; then
+        EBS_READY=$(kubectl -n kube-system get deployment ebs-csi-controller -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        EBS_DESIRED=$(kubectl -n kube-system get deployment ebs-csi-controller -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        if [[ "$EBS_READY" == "$EBS_DESIRED" ]] && [[ "$EBS_READY" -gt 0 ]]; then
+          echo "   ✅ EBS CSI Controller: $EBS_READY/$EBS_DESIRED replicas ready"
+        else
+          echo "   ❌ EBS CSI Controller: Only $EBS_READY/$EBS_DESIRED replicas ready"
+          HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+        fi
+      else
+        echo "   ❌ EBS CSI controller deployment not found"
+        HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+      fi
+      
+      # Check node readiness
+      echo "🔍 Checking Node Readiness..."
+      TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l)
+      READY_NODES=$(kubectl get nodes --no-headers | grep " Ready " | wc -l)
+      if [[ "$READY_NODES" == "$TOTAL_NODES" ]] && [[ "$READY_NODES" -gt 0 ]]; then
+        echo "   ✅ All nodes ready: $READY_NODES/$TOTAL_NODES"
+      else
+        echo "   ❌ Not all nodes ready: $READY_NODES/$TOTAL_NODES"
+        kubectl get nodes
+        HEALTH_ISSUES=$((HEALTH_ISSUES + 1))
+      fi
+      
+      # Summary
+      echo ""
+      if [[ "$HEALTH_ISSUES" -eq 0 ]]; then
+        echo "🎉 System Health Check PASSED - All critical components are ready for ArgoCD installation"
+      else
+        echo "❌ System Health Check FAILED - Found $HEALTH_ISSUES issues that need to be resolved"
+        echo "🔍 Detailed system status:"
+        echo "CoreDNS pods:"
+        kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+        echo "Calico pods:"
+        kubectl -n kube-system get pods -l k8s-app=calico-kube-controllers -o wide
+        echo "EBS CSI pods:"
+        kubectl -n kube-system get pods -l app=ebs-csi-controller -o wide
+        exit 1
+      fi
+    EOT
+  }
+}
+
 # Install ArgoCD only if not already installed
 resource "null_resource" "install_argocd" {
   count = local.skip_argocd ? 0 : 1
   
   depends_on = [
-    null_resource.install_ebs_csi_driver,
-    null_resource.install_node_termination_handler,
-    null_resource.cluster_readiness_check,
+    null_resource.pre_argocd_health_check,  # Ensure system components are healthy first
     terraform_data.kubectl_provider_config,
     null_resource.wait_for_kubernetes
   ]
@@ -483,299 +627,86 @@ resource "null_resource" "install_argocd" {
   # Only run when cluster is stable and ready
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    cluster_ready_id = null_resource.cluster_readiness_check.id
+    health_check_id = null_resource.pre_argocd_health_check.id
     # Add a timestamp to force re-run if needed
-    force_update = "argocd-v3-fixed"
+    force_update = "argocd-v4-system-health-first"
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      set -euo pipefail
+      set -e
       
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "🚀 Installing ArgoCD and Prerequisites..."
+      echo "🚀 Installing ArgoCD..."
 
-      # Function to verify kubectl works reliably
-      verify_kubectl() {
-        local attempts=10
-        local attempt=1
-        echo "Verifying kubectl connectivity..."
-        while [ $attempt -le $attempts ]; do
-          if kubectl version --client --request-timeout=10s &>/dev/null && \
-             kubectl get nodes --request-timeout=10s &>/dev/null; then
-            echo "✅ kubectl connectivity verified"
-            return 0
+      # Check if kubectl works
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ kubectl not working, cannot install ArgoCD"
+        exit 1
+      fi
+
+      # Check if ArgoCD is already installed and healthy
+      if kubectl get namespace argocd >/dev/null 2>&1; then
+        echo "ℹ️  ArgoCD namespace already exists, checking health..."
+        if kubectl -n argocd get deployment argocd-server >/dev/null 2>&1; then
+          if kubectl -n argocd rollout status deployment/argocd-server --timeout=30s >/dev/null 2>&1; then
+            echo "✅ ArgoCD already installed and healthy"
+            exit 0
+          else
+            echo "⚠️  ArgoCD exists but unhealthy, cleaning up..."
+            kubectl delete namespace argocd --ignore-not-found=true --timeout=60s || true
+            sleep 10
           fi
-          echo "⏳ kubectl verification attempt $attempt/$attempts... waiting 10s"
-          sleep 10
-          attempt=$((attempt + 1))
-        done
-        echo "❌ kubectl verification failed after $attempts attempts"
-        return 1
+        fi
+      fi
+
+      # Create ArgoCD namespace
+      echo "📁 Creating ArgoCD namespace..."
+      kubectl create namespace argocd || true
+
+      # Install ArgoCD using official manifest
+      echo "📦 Installing ArgoCD components..."
+      MANIFEST_URL="https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
+      if ! curl -fsSL "$MANIFEST_URL" | kubectl apply -n argocd -f -; then
+        echo "❌ Failed to install ArgoCD"
+        exit 1
+      fi
+
+      # Wait for ArgoCD server to be ready
+      echo "⏳ Waiting for ArgoCD server to be ready..."
+      kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || {
+        echo "❌ ArgoCD server not ready within timeout"
+        kubectl -n argocd get deployments
+        kubectl -n argocd get pods
+        exit 1
       }
 
-      # 0. Verify kubectl connectivity first
-      if ! verify_kubectl; then
-        echo "❌ CRITICAL: Cannot verify kubectl connectivity. ArgoCD installation cannot proceed."
-        exit 1
-      fi
-
-      # 1. Idempotency Check & Potential Cleanup for Re-installation
-      if kubectl get namespace argocd &>/dev/null; then
-        echo "ℹ️  ArgoCD namespace already exists. Checking health of existing installation..."
-        if kubectl -n argocd get deployment argocd-server &>/dev/null; then
-          echo "ℹ️  ArgoCD server deployment found. Attempting quick health check (30s timeout)..."
-          if kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=30s; then
-            echo "✅ Existing ArgoCD installation appears healthy and available."
-            echo "📦 Ensuring storage classes exist (idempotent apply)..."
-            kubectl apply -f - <<'EOFSC1' || echo "WARN: Failed to apply ebs-sc, but continuing as ArgoCD is healthy."
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp3
-  encrypted: "true"
-allowVolumeExpansion: true
-EOFSC1
-            kubectl apply -f - <<'EOFSC2' || echo "WARN: Failed to apply mongodb-sc, but continuing as ArgoCD is healthy."
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp3
-  encrypted: "true"
-allowVolumeExpansion: true
-EOFSC2
-            echo "🎉 ArgoCD already healthy and storage classes ensured. Install script considers this a success."
-            exit 0 
-          else
-            echo "⚠️  Existing ArgoCD server deployment found but is NOT healthy/available. Proceeding with cleanup and reinstall."
-            kubectl delete namespace argocd --ignore-not-found=true --wait=true --timeout=120s
-            cleanup_attempts=30 
-            cleanup_attempt=1  
-            echo "⏳ Waiting for existing 'argocd' namespace to terminate..."
-            while kubectl get namespace argocd &>/dev/null && [ $cleanup_attempt -le $cleanup_attempts ]; do
-              echo "    Attempt $cleanup_attempt/$cleanup_attempts: Waiting for namespace 'argocd' deletion..."
-              sleep 5
-              cleanup_attempt=$((cleanup_attempt + 1))
-            done
-            if kubectl get namespace argocd &>/dev/null; then
-               echo "❌ Namespace 'argocd' still exists after cleanup attempt. Manual intervention likely needed."
-               exit 1
-            fi
-            echo "✅ Namespace 'argocd' successfully cleaned up for re-installation."
-          fi
-        else 
-          echo "ℹ️  ArgoCD namespace exists but 'argocd-server' deployment not found. Assuming partial/failed install, will proceed with standard install."
-        fi
-      fi
-
-      # 2. Create ArgoCD namespace (if it doesn't exist or was just deleted)
-      echo "📁 Creating ArgoCD namespace..."
-      kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-      if ! kubectl get namespace argocd &>/dev/null; then
-        echo "❌ Failed to create/verify ArgoCD namespace after attempt."
-        exit 1
-      fi
-      echo "✅ ArgoCD namespace 'argocd' is ready."
-
-      # 3. Install ArgoCD components using official manifest
-      echo "📦 Installing ArgoCD components..."
-      install_success=false
-      install_attempts=3
-      install_attempt=1
-      ARGOCD_MANIFEST_URL="https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
-
-      while [ $install_attempt -le $install_attempts ] && [ "$install_success" = "false" ]; do
-        echo "    ArgoCD manifest application attempt $install_attempt/$install_attempts from $ARGOCD_MANIFEST_URL..."
-        if curl -fsSL --connect-timeout 30 --max-time 120 "$ARGOCD_MANIFEST_URL" | kubectl apply -n argocd -f -; then
-          echo "✅ ArgoCD manifests applied successfully on attempt $install_attempt."
-          install_success=true
-        else
-          echo "❌ ArgoCD manifest application failed on attempt $install_attempt."
-          if [ $install_attempt -eq $install_attempts ]; then
-            echo "❌ All ArgoCD manifest application attempts failed."
-            exit 1
-          fi
-          echo "    Retrying manifest application in 20 seconds..."
-          sleep 20
-        fi
-        install_attempt=$((install_attempt + 1))
-      done
-
-      # 4. Wait for critical ArgoCD components (both Deployments and StatefulSets)
-      echo "⏳ Waiting for critical ArgoCD components to become ready..."
-      
-      # Define required components with their types
-      declare -A required_components
-      required_components["argocd-server"]="deployment"
-      required_components["argocd-repo-server"]="deployment"
-      required_components["argocd-dex-server"]="deployment"
-      required_components["argocd-redis"]="deployment"
-      required_components["argocd-applicationset-controller"]="deployment"
-      required_components["argocd-notifications-controller"]="deployment"
-      required_components["argocd-application-controller"]="statefulset"
-      
-      all_components_ready=false
-      wait_total_attempts=24  # 4 minutes total
-      for ((i=1; i<=wait_total_attempts; i++)); do
-        echo "  Checking ArgoCD components readiness (attempt $i/$wait_total_attempts)..."
-        all_ready_this_iteration=true
-        ready_count=0
-        
-        for component_name in "$${!required_components[@]}"; do
-          component_type="$${required_components[$component_name]}"
-          
-          if [ "$component_type" = "deployment" ]; then
-            if kubectl -n argocd get deployment "$component_name" -o name &>/dev/null; then
-              if kubectl -n argocd rollout status deployment/"$component_name" --timeout=5s &>/dev/null; then
-                echo "    ✅ Deployment $component_name is ready"
-                ready_count=$((ready_count + 1))
-              else
-                echo "    ⏳ Deployment $component_name found but not yet ready"
-                all_ready_this_iteration=false
-                break
-              fi
-            else
-              echo "    ⏳ Deployment $component_name not found yet..."
-              all_ready_this_iteration=false
-              break
-            fi
-          elif [ "$component_type" = "statefulset" ]; then
-            if kubectl -n argocd get statefulset "$component_name" -o name &>/dev/null; then
-              if kubectl -n argocd rollout status statefulset/"$component_name" --timeout=5s &>/dev/null; then
-                echo "    ✅ StatefulSet $component_name is ready"
-                ready_count=$((ready_count + 1))
-              else
-                echo "    ⏳ StatefulSet $component_name found but not yet ready"
-                all_ready_this_iteration=false
-                break
-              fi
-            else
-              echo "    ⏳ StatefulSet $component_name not found yet..."
-              all_ready_this_iteration=false
-              break
-            fi
-          fi
-        done
-
-        if $all_ready_this_iteration && [ "$ready_count" -eq "$${#required_components[@]}" ]; then
-          echo "✅ All critical ArgoCD components are ready!"
-          all_components_ready=true
-          break
-        fi
-
-        if [ "$i" -eq "$wait_total_attempts" ]; then
-          echo "❌ Not all ArgoCD components became ready after $wait_total_attempts attempts."
-          echo "Current deployment status in 'argocd' namespace:"
-          kubectl -n argocd get deployments
-          echo "Current statefulset status in 'argocd' namespace:"
-          kubectl -n argocd get statefulsets
-          echo "Current pod status in 'argocd' namespace:"
-          kubectl -n argocd get pods
-          exit 1
-        fi
-        echo "   Waiting 10s before next check..."
-        sleep 10
-      done
-      
-      echo "⏳ Final verification: waiting for ArgoCD server pods to be ready..."
-      if ! kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=180s; then
-        echo "❌ ArgoCD server pods not ready within timeout."
-        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server --show-labels || true
-        kubectl -n argocd describe pods -l app.kubernetes.io/name=argocd-server || true
-        exit 1
-      fi
-      echo "✅ ArgoCD server pods are ready."
-      
-      echo "🔍 Verifying ArgoCD server service..."
-      if ! kubectl -n argocd get service argocd-server &>/dev/null; then
-        echo "❌ ArgoCD server service not found."
-        kubectl -n argocd get services || true
-        exit 1
-      fi
-      echo "✅ ArgoCD server service verified."
-      
-      echo "🔑 Retrieving ArgoCD admin password..."
-      password_attempts=10
-      password_attempt=1
-      password_retrieved=false
-      password=""
-      while [ $password_attempt -le $password_attempts ] && [ "$password_retrieved" = "false" ]; do
-        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
-          password=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
-          if [[ -n "$password" ]] && [[ $${#password} -gt 5 ]]; then
-            echo "✅ ArgoCD admin password retrieved."
-            echo "$password" > /tmp/argocd-admin-password.txt
+      # Get ArgoCD admin password
+      echo "🔑 Getting ArgoCD admin password..."
+      for i in {1..10}; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret >/dev/null 2>&1; then
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null || echo "")
+          if [ -n "$PASSWORD" ]; then
+            echo "$PASSWORD" > /tmp/argocd-admin-password.txt
             chmod 600 /tmp/argocd-admin-password.txt
-            password_retrieved=true
+            echo "✅ ArgoCD password saved"
+            break
           fi
         fi
-        if [ "$password_retrieved" = "false" ]; then
-          echo "    Waiting for ArgoCD admin secret (attempt $password_attempt/$password_attempts)..."
-          sleep 15
-          password_attempt=$((password_attempt + 1))
-        fi
+        echo "   Waiting for ArgoCD password... ($i/10)"
+        sleep 15
       done
-      if [ "$password_retrieved" = "false" ]; then 
-        echo "⚠️  Could not retrieve ArgoCD admin password within timeout. It might become available later."
-      fi
-      
-      echo "📦 Creating/Ensuring storage classes (idempotent)..."
-      kubectl apply -f - <<'EOFSC1' || echo "WARN: Failed to apply ebs-sc, but continuing."
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: ebs-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp3
-  encrypted: "true"
-allowVolumeExpansion: true
-EOFSC1
-      kubectl apply -f - <<'EOFSC2' || echo "WARN: Failed to apply mongodb-sc, but continuing."
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: mongodb-sc
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: gp3
-  encrypted: "true"
-allowVolumeExpansion: true
-EOFSC2
-      echo "✅ Storage classes ensured."
-      
-      echo "🔍 Final ArgoCD installation verification..."
-      kubectl -n argocd get deployments
-      kubectl -n argocd get statefulsets
-      kubectl -n argocd get pods
-      kubectl -n argocd get services
 
-      echo ""
-      echo "🎉 ArgoCD installation and initial setup completed successfully!"
+      echo "✅ ArgoCD installation completed successfully!"
       echo ""
       echo "📋 ArgoCD Access Information:"
-      echo "   Namespace: argocd"
-      echo "   Username: admin"
-      echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo '(retrieve manually using kubectl)')"
-      echo ""
-      echo "🔗 To access ArgoCD:"
-      echo "   Run: kubectl -n argocd port-forward svc/argocd-server 8080:443"
+      echo "   URL: kubectl -n argocd port-forward svc/argocd-server 8080:443"
       echo "   Then visit: https://localhost:8080"
-      echo ""
-      echo "✅ ArgoCD is ready for application configuration by subsequent steps!"
+      echo "   Username: admin"
+      echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo 'Check /tmp/argocd-admin-password.txt')"
     EOT
   }
 }
@@ -1043,19 +974,84 @@ resource "null_resource" "configure_argocd_apps" {
 
 # Modify Calico/Tigera installation to be more robust
 resource "null_resource" "install_calico" {
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config,
+    module.k8s-cluster
+  ]
+  
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
   }
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      KUBECONFIG="${local.kubeconfig_path}" kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🌐 Installing Calico CNI..."
+      
+      # Check if Calico is already installed
+      if kubectl -n kube-system get deployment calico-kube-controllers &>/dev/null; then
+        echo "ℹ️  Calico appears to already be installed. Checking health..."
+        if kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=30s &>/dev/null; then
+          echo "✅ Existing Calico installation is healthy"
+          exit 0
+        else
+          echo "⚠️  Existing Calico installation has issues, will reinstall"
+          kubectl delete -f https://docs.projectcalico.org/manifests/calico.yaml --ignore-not-found=true || true
+          sleep 15
+        fi
+      fi
+      
+      echo "📦 Applying Calico manifest..."
+      if ! curl -fsSL --connect-timeout 30 --max-time 120 https://docs.projectcalico.org/manifests/calico.yaml | kubectl apply -f -; then
+        echo "❌ Failed to apply Calico manifest"
+        exit 1
+      fi
+      
+      echo "⏳ Waiting for Calico components to be ready..."
+      
+      # Wait for Calico kube-controllers deployment
+      echo "   Waiting for calico-kube-controllers deployment..."
+      if ! kubectl -n kube-system wait --for=condition=available deployment/calico-kube-controllers --timeout=300s; then
+        echo "❌ Calico kube-controllers deployment not ready"
+        echo "Deployment status:"
+        kubectl -n kube-system get deployment calico-kube-controllers -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-kube-controllers -o wide
+        exit 1
+      fi
+      
+      # Wait for Calico node DaemonSet to be ready
+      echo "   Waiting for calico-node DaemonSet..."
+      if ! kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s; then
+        echo "❌ Calico node DaemonSet not ready"
+        echo "DaemonSet status:"
+        kubectl -n kube-system get daemonset calico-node -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+        exit 1
+      fi
+      
+      # Verify all nodes have Calico pods running
+      echo "   Verifying Calico pod distribution..."
+      TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l)
+      CALICO_PODS_READY=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers | wc -l)
+      
+      if [[ "$CALICO_PODS_READY" -lt "$TOTAL_NODES" ]]; then
+        echo "⚠️  Only $CALICO_PODS_READY/$TOTAL_NODES Calico node pods are running"
+        echo "Checking pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+      else
+        echo "✅ All $TOTAL_NODES nodes have Calico pods running"
+      fi
+      
+      echo "✅ Calico CNI installation completed successfully"
     EOT
   }
-  depends_on = [
-    null_resource.wait_for_kubernetes,
-    module.k8s-cluster
-  ]
 }
 
 # Configure ArgoCD with repository credentials
@@ -1150,11 +1146,11 @@ resource "null_resource" "cleanup_stale_nodes" {
     module.k8s-cluster
   ]
 
-  # Run cleanup when there are actual issues or on explicit trigger
+  # Run cleanup only when there are actual issues - more selective triggering
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
-    # Add a trigger for manual runs
-    run_cleanup = "enhanced-v3-aggressive"
+    # Only run when cluster is actually having node issues, not on every apply
+    run_cleanup = "selective-v1"
   }
 
   provisioner "local-exec" {
@@ -1203,9 +1199,11 @@ resource "null_resource" "cleanup_stale_nodes" {
           if [[ -n "$TERMINATING_PODS" ]]; then
             echo "   Found terminating pods on NotReady node $NODE_NAME:"
             echo "$TERMINATING_PODS" | while read -r pod; do
-              if [[ -n "$pod" ]]; then
-                echo "     Force deleting terminating pod: $pod"
-                kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
+              if [[ -n "$pod" ]] && [[ "$pod" == *"/"* ]]; then
+                NAMESPACE=$(echo "$pod" | cut -d'/' -f1)
+                PODNAME=$(echo "$pod" | cut -d'/' -f2)
+                echo "     Force deleting terminating pod: $NAMESPACE/$PODNAME"
+                kubectl delete pod "$PODNAME" -n "$NAMESPACE" --force --grace-period=0 --timeout=10s || true
               fi
             done
           fi
@@ -1219,9 +1217,11 @@ resource "null_resource" "cleanup_stale_nodes" {
           if [[ -n "$STUCK_PENDING_PODS" ]]; then
             echo "   Found stuck pending pods on NotReady node $NODE_NAME:"
             echo "$STUCK_PENDING_PODS" | while read -r pod; do
-              if [[ -n "$pod" ]]; then
-                echo "     Deleting stuck pending pod: $pod"
-                kubectl delete pod "$pod" --timeout=30s --grace-period=10 || true
+              if [[ -n "$pod" ]] && [[ "$pod" == *"/"* ]]; then
+                NAMESPACE=$(echo "$pod" | cut -d'/' -f1)
+                PODNAME=$(echo "$pod" | cut -d'/' -f2)
+                echo "     Deleting stuck pending pod: $NAMESPACE/$PODNAME"
+                kubectl delete pod "$PODNAME" -n "$NAMESPACE" --timeout=30s --force --grace-period=0 || true
               fi
             done
           fi
@@ -1374,9 +1374,11 @@ resource "null_resource" "cleanup_stale_nodes" {
                 kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json | \
                   jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
                   while read -r pod; do
-                    if [[ -n "$pod" ]]; then
-                      echo "     Force deleting pod: $pod"
-                      kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
+                    if [[ -n "$pod" ]] && [[ "$pod" == *"/"* ]]; then
+                      NAMESPACE=$(echo "$pod" | cut -d'/' -f1)
+                      PODNAME=$(echo "$pod" | cut -d'/' -f2)
+                      echo "     Force deleting pod: $NAMESPACE/$PODNAME"
+                      kubectl delete pod "$PODNAME" -n "$NAMESPACE" --force --grace-period=0 --timeout=10s || true
                     fi
                   done
               }
@@ -1417,9 +1419,11 @@ resource "null_resource" "cleanup_stale_nodes" {
       
       if [[ -n "$STUCK_PODS" ]]; then
         echo "$STUCK_PODS" | while read -r pod; do
-          if [[ -n "$pod" ]]; then
-            echo "     Deleting clearly stuck pod: $pod"
-            kubectl delete pod "$pod" --timeout=30s --force --grace-period=0 || true
+          if [[ -n "$pod" ]] && [[ "$pod" == *"/"* ]]; then
+            NAMESPACE=$(echo "$pod" | cut -d'/' -f1)
+            PODNAME=$(echo "$pod" | cut -d'/' -f2)
+            echo "     Deleting clearly stuck pod: $NAMESPACE/$PODNAME"
+            kubectl delete pod "$PODNAME" -n "$NAMESPACE" --timeout=30s --force --grace-period=0 || true
           fi
         done
       fi
@@ -1973,33 +1977,81 @@ resource "null_resource" "install_ebs_csi_driver" {
   depends_on = [
     null_resource.wait_for_kubernetes,
     null_resource.check_ebs_role,
+    null_resource.install_calico,  # Install after Calico is ready
     terraform_data.kubectl_provider_config
   ]
   
   # Trigger reinstall when the role check is run
   triggers = {
     ebs_role_check = null_resource.check_ebs_role.id
+    calico_ready = null_resource.install_calico.id
   }
   
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      echo "Installing AWS EBS CSI Driver..."
-      
-      # Use kubectl directly since it's already set up
       export KUBECONFIG=${local.kubeconfig_path}
+      
+      echo "💾 Installing AWS EBS CSI Driver..."
+      
+      # Check if EBS CSI driver is already installed and healthy
+      if kubectl -n kube-system get deployment ebs-csi-controller &>/dev/null; then
+        echo "ℹ️  EBS CSI driver appears to already be installed. Checking health..."
+        if kubectl -n kube-system rollout status deployment/ebs-csi-controller --timeout=30s &>/dev/null; then
+          echo "✅ Existing EBS CSI driver installation is healthy"
+          exit 0
+        else
+          echo "⚠️  Existing EBS CSI driver has issues, will reinstall"
+          kubectl delete -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19" --ignore-not-found=true || true
+          sleep 15
+        fi
+      fi
       
       # Create required namespace
       kubectl create namespace kube-system --dry-run=client -o yaml | kubectl apply -f -
       
-      # Install the EBS CSI driver using the official YAML
-      kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19"
+      echo "📦 Installing EBS CSI driver using official kustomize..."
+      if ! kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19"; then
+        echo "❌ Failed to install EBS CSI driver"
+        exit 1
+      fi
       
-      echo "Waiting for EBS CSI driver pods to start..."
-      kubectl -n kube-system wait --for=condition=ready pod -l app=ebs-csi-controller --timeout=120s || true
+      echo "⏳ Waiting for EBS CSI controller to be ready..."
+      if ! kubectl -n kube-system wait --for=condition=available deployment/ebs-csi-controller --timeout=300s; then
+        echo "❌ EBS CSI controller deployment not ready"
+        echo "Deployment status:"
+        kubectl -n kube-system get deployment ebs-csi-controller -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l app=ebs-csi-controller -o wide
+        echo "Checking for any scheduling issues:"
+        kubectl -n kube-system describe pods -l app=ebs-csi-controller | grep -A 10 "Events:" || true
+        exit 1
+      fi
       
-      echo "EBS CSI Driver installation complete"
+      echo "⏳ Waiting for EBS CSI node DaemonSet to be ready..."
+      if ! kubectl -n kube-system rollout status daemonset/ebs-csi-node --timeout=300s; then
+        echo "❌ EBS CSI node DaemonSet not ready"
+        echo "DaemonSet status:"
+        kubectl -n kube-system get daemonset ebs-csi-node -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l app=ebs-csi-node -o wide
+        exit 1
+      fi
+      
+      echo "🔍 Verifying EBS CSI installation..."
+      CONTROLLER_READY=$(kubectl -n kube-system get deployment ebs-csi-controller -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+      NODE_READY=$(kubectl -n kube-system get daemonset ebs-csi-node -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+      
+      echo "   EBS CSI Controller: $CONTROLLER_READY replicas ready"
+      echo "   EBS CSI Node: $NODE_READY pods ready"
+      
+      if [[ "$CONTROLLER_READY" -lt 1 ]] || [[ "$NODE_READY" -lt 1 ]]; then
+        echo "❌ EBS CSI driver not fully ready"
+        exit 1
+      fi
+      
+      echo "✅ AWS EBS CSI Driver installation completed successfully"
     EOT
   }
 }
@@ -2350,7 +2402,7 @@ resource "null_resource" "remove_orphaned_nodes" {
         elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
           # Pattern: ip-<ip-with-dashes> - check by private IP
           PRIVATE_IP="$${BASH_REMATCH[1]}.$${BASH_REMATCH[2]}.$${BASH_REMATCH[3]}.$${BASH_REMATCH[4]}"
-          echo "   Looking for instance with private IP: $PRIVATE_IP"
+          echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
           
           MATCHING_INSTANCE=$(aws ec2 describe-instances \
             --region ${var.region} \
@@ -2387,12 +2439,12 @@ resource "null_resource" "remove_orphaned_nodes" {
           
           # First, force delete any pods on this node
           echo "   Force deleting all pods on node $NODE_NAME..."
-          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json | \
-            jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
-            while read -r pod; do
-              if [[ -n "$pod" ]]; then
-                echo "     Force deleting pod: $pod"
-                kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" --no-headers | \
+            awk '{print $1 " " $2}' | \
+            while read -r namespace podname; do
+              if [[ -n "$namespace" ]] && [[ -n "$podname" ]]; then
+                echo "     Force deleting pod: $namespace/$podname"
+                kubectl delete pod "$podname" -n "$namespace" --force --grace-period=0 --timeout=10s || true
               fi
             done
           
