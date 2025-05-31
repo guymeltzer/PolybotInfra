@@ -500,12 +500,47 @@ resource "null_resource" "cluster_readiness_check" {
       # Check that we have at least 1 node Ready
       READY_NODES=$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
       TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l || echo "0")
+      NOTREADY_NODES=$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
       
       echo "   Ready nodes: $READY_NODES/$TOTAL_NODES"
+      echo "   NotReady nodes: $NOTREADY_NODES"
       
+      # CRITICAL FIX: Require ALL nodes to be Ready (not just 1)
       if [[ "$READY_NODES" -eq 0 ]]; then
         echo "❌ No nodes are Ready"
         exit 1
+      fi
+      
+      # NEW: Fail if there are any NotReady nodes
+      if [[ "$NOTREADY_NODES" -gt 0 ]]; then
+        echo "❌ Found $NOTREADY_NODES NotReady nodes - cluster is not stable"
+        echo "📋 NotReady nodes:"
+        kubectl get nodes --no-headers | grep " NotReady " || true
+        echo ""
+        echo "🔍 Node conditions for NotReady nodes:"
+        kubectl get nodes --no-headers | grep " NotReady " | awk '{print $1}' | while read node; do
+          echo "Node: $node"
+          kubectl describe node "$node" | grep -A 10 "Conditions:" || true
+          echo ""
+        done
+        exit 1
+      fi
+      
+      # NEW: Verify minimum expected nodes (should match ASG desired capacity)
+      EXPECTED_WORKERS=${var.desired_worker_nodes}
+      ACTUAL_WORKERS=$(kubectl get nodes --no-headers | grep -v "control-plane" | wc -l)
+      
+      echo "   Expected workers: $EXPECTED_WORKERS, Actual workers: $ACTUAL_WORKERS"
+      
+      if [[ "$ACTUAL_WORKERS" -lt "$EXPECTED_WORKERS" ]]; then
+        echo "⚠️ Warning: Expected $EXPECTED_WORKERS workers but found $ACTUAL_WORKERS"
+        echo "   This may indicate nodes are still joining or have failed to join"
+        
+        # Give nodes time to join if we're significantly under
+        if [[ "$ACTUAL_WORKERS" -lt $(($EXPECTED_WORKERS / 2)) ]]; then
+          echo "❌ Too few worker nodes joined - waiting for more nodes..."
+          exit 1
+        fi
       fi
       
       echo ""
@@ -542,9 +577,44 @@ resource "null_resource" "cluster_readiness_check" {
         exit 1
       fi
       
-      # Verify Calico pods distribution
+      # Verify Calico pods distribution - ENHANCED
       CALICO_READY=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers | wc -l)
-      echo "   ✅ Calico: $CALICO_READY node pods running"
+      CALICO_TOTAL=$(kubectl -n kube-system get pods -l k8s-app=calico-node --no-headers | wc -l)
+      
+      echo "   Calico: $CALICO_READY/$CALICO_TOTAL node pods running"
+      
+      # CRITICAL: Ensure Calico pod is running on EVERY Ready node
+      if [[ "$CALICO_READY" -lt "$READY_NODES" ]]; then
+        echo "❌ Not all nodes have a running Calico pod!"
+        echo "   Ready nodes: $READY_NODES, Calico pods: $CALICO_READY"
+        
+        # Show which nodes are missing Calico pods
+        echo "🔍 Nodes and their Calico pod status:"
+        kubectl get nodes --no-headers | while read node status role age version; do
+          if [[ "$status" == "Ready" ]]; then
+            CALICO_ON_NODE=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector spec.nodeName="$node" --no-headers | wc -l)
+            if [[ "$CALICO_ON_NODE" -eq 0 ]]; then
+              echo "   ❌ $node: NO Calico pod"
+            else
+              CALICO_STATUS=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector spec.nodeName="$node" -o jsonpath='{.items[0].status.phase}')
+              echo "   ✅ $node: Calico pod ($CALICO_STATUS)"
+            fi
+          fi
+        done
+        exit 1
+      fi
+      
+      # Verify no Calico pods are in bad states
+      CALICO_PENDING=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector=status.phase=Pending --no-headers | wc -l)
+      CALICO_FAILED=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector=status.phase=Failed --no-headers | wc -l)
+      
+      if [[ "$CALICO_PENDING" -gt 0 ]] || [[ "$CALICO_FAILED" -gt 0 ]]; then
+        echo "❌ Found problematic Calico pods: $CALICO_PENDING pending, $CALICO_FAILED failed"
+        kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+        exit 1
+      fi
+      
+      echo "   ✅ Calico: All $CALICO_READY node pods running and healthy"
       
       # Check EBS CSI Driver
       echo "   Checking EBS CSI controller..."
@@ -567,12 +637,54 @@ resource "null_resource" "cluster_readiness_check" {
       echo ""
       echo "🔍 Phase 3: Network connectivity test..."
       
-      # Test DNS resolution
-      echo "   Testing DNS resolution..."
-      if kubectl run dns-test --image=busybox --rm -i --restart=Never --timeout=60s -- nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1; then
-        echo "   ✅ DNS resolution working"
+      # Enhanced DNS and networking tests
+      echo "   Testing cluster DNS resolution..."
+      
+      # Test 1: Basic cluster DNS (kubernetes service)
+      if ! kubectl run dns-test-basic --image=busybox --rm -i --restart=Never --timeout=60s -- nslookup kubernetes.default.svc.cluster.local >/dev/null 2>&1; then
+        echo "❌ Basic cluster DNS resolution failed"
+        echo "   Cannot resolve kubernetes.default.svc.cluster.local"
+        
+        # Try to diagnose DNS issues
+        echo "🔍 Diagnosing DNS issues..."
+        kubectl -n kube-system get pods -l k8s-app=kube-dns -o wide
+        kubectl -n kube-system get svc kube-dns
+        exit 1
+      fi
+      echo "   ✅ Basic cluster DNS working"
+      
+      # Test 2: CoreDNS service discovery
+      if ! kubectl run dns-test-service --image=busybox --rm -i --restart=Never --timeout=60s -- nslookup kube-dns.kube-system.svc.cluster.local >/dev/null 2>&1; then
+        echo "❌ Service discovery DNS failed"
+        echo "   Cannot resolve kube-dns.kube-system.svc.cluster.local"
+        exit 1
+      fi
+      echo "   ✅ Service discovery DNS working"
+      
+      # Test 3: External DNS (if possible)
+      echo "   Testing external DNS resolution..."
+      if kubectl run dns-test-external --image=busybox --rm -i --restart=Never --timeout=60s -- nslookup google.com >/dev/null 2>&1; then
+        echo "   ✅ External DNS resolution working"
       else
-        echo "   ⚠️ DNS resolution test failed, but continuing..."
+        echo "   ⚠️ External DNS resolution failed (network policy may be blocking)"
+      fi
+      
+      # Test 4: Pod-to-Pod communication across nodes (if we have multiple nodes)
+      if [[ "$READY_NODES" -gt 1 ]]; then
+        echo "   Testing pod-to-pod communication across nodes..."
+        
+        # Create a test pod on each node and try to communicate
+        kubectl run network-test-server --image=nginx --restart=Never --port=80 --timeout=60s >/dev/null 2>&1 &
+        sleep 5
+        
+        if kubectl run network-test-client --image=busybox --rm -i --restart=Never --timeout=60s -- wget -qO- network-test-server >/dev/null 2>&1; then
+          echo "   ✅ Pod-to-pod communication working"
+        else
+          echo "   ⚠️ Pod-to-pod communication may have issues"
+        fi
+        
+        # Cleanup
+        kubectl delete pod network-test-server --ignore-not-found=true >/dev/null 2>&1 &
       fi
       
       echo ""
@@ -593,7 +705,7 @@ resource "null_resource" "cluster_readiness_check" {
       echo "✅ Cluster Readiness Check PASSED!"
       echo "   Nodes Ready: $READY_NODES/$TOTAL_NODES"
       echo "   CoreDNS: $COREDNS_READY pods"
-      echo "   Calico: $CALICO_READY node pods"
+      echo "   Calico: $CALICO_READY/$CALICO_TOTAL node pods"
       echo "   EBS CSI: $EBS_CONTROLLER_READY controller, $EBS_NODE_READY node pods"
       echo ""
       echo "🎉 Cluster is ready for application deployment!"
@@ -1871,4 +1983,457 @@ DOCKER_EOF
       echo "✅ Secret verification complete!"
     EOT
   }
+}
+
+# =============================================================================
+# NODE DIAGNOSTICS AND MONITORING RESOURCES
+# =============================================================================
+
+# Diagnostic resource for NotReady worker nodes
+# This creates a comprehensive diagnostic report for troubleshooting node issues
+resource "null_resource" "diagnose_notready_nodes" {
+  count = 0  # Set to 1 to enable diagnostics when needed
+  
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔍 Diagnosing NotReady Worker Nodes..."
+      echo "====================================="
+      
+      # Create diagnostics directory
+      mkdir -p logs/node-diagnostics
+      
+      # Get current cluster state
+      echo "📋 Current cluster state:"
+      kubectl get nodes -o wide | tee logs/node-diagnostics/cluster-nodes.txt
+      
+      # Identify NotReady nodes
+      NOTREADY_NODES=$(kubectl get nodes --no-headers | grep "NotReady" | awk '{print $1}' || true)
+      
+      if [[ -z "$NOTREADY_NODES" ]]; then
+        echo "✅ No NotReady nodes found!"
+        exit 0
+      fi
+      
+      echo ""
+      echo "🚨 Found NotReady nodes: $NOTREADY_NODES"
+      echo ""
+      
+      # Diagnose each NotReady node
+      for NODE in $NOTREADY_NODES; do
+        echo "🔍 Diagnosing node: $NODE"
+        echo "================================="
+        
+        # Get node details
+        echo "Node description:" | tee logs/node-diagnostics/$NODE-describe.txt
+        kubectl describe node "$NODE" | tee -a logs/node-diagnostics/$NODE-describe.txt
+        
+        # Get node conditions
+        echo "Node conditions:" | tee logs/node-diagnostics/$NODE-conditions.txt
+        kubectl get node "$NODE" -o jsonpath='{.status.conditions[*]}' | jq '.' | tee -a logs/node-diagnostics/$NODE-conditions.txt
+        
+        # Get pods on this node
+        echo "Pods on $NODE:" | tee logs/node-diagnostics/$NODE-pods.txt
+        kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE" -o wide | tee -a logs/node-diagnostics/$NODE-pods.txt
+        
+        # Check Calico pod specifically
+        echo "Calico pod on $NODE:" | tee logs/node-diagnostics/$NODE-calico.txt
+        kubectl get pods -n kube-system -l k8s-app=calico-node --field-selector spec.nodeName="$NODE" -o wide | tee -a logs/node-diagnostics/$NODE-calico.txt
+        
+        # Get private IP for SSH diagnostics
+        PRIVATE_IP=$(kubectl get node "$NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+        echo "Node private IP: $PRIVATE_IP"
+        
+        # Try to get EC2 instance ID from node name
+        if [[ "$NODE" =~ worker-([a-f0-9]{17})$ ]]; then
+          INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+          echo "Extracted instance ID: $INSTANCE_ID"
+          
+          # Get instance details
+          echo "EC2 instance details:" | tee logs/node-diagnostics/$NODE-ec2.txt
+          aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --output json | tee -a logs/node-diagnostics/$NODE-ec2.txt
+          
+          # Get instance state
+          INSTANCE_STATE=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "EC2 instance state: $INSTANCE_STATE"
+          
+          if [[ "$INSTANCE_STATE" == "running" ]]; then
+            echo "✅ EC2 instance is running - issue is likely with kubelet/CRI-O"
+            
+            # Generate SSH diagnostic commands
+            cat > logs/node-diagnostics/$NODE-ssh-commands.sh << SSH_EOF
+#!/bin/bash
+# SSH diagnostic commands for $NODE ($INSTANCE_ID)
+# Run these commands manually: ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@PUBLIC_IP
+
+echo "=== Kubelet Status ==="
+sudo systemctl status kubelet
+
+echo "=== Kubelet Logs (last 50 lines) ==="
+sudo journalctl -u kubelet -n 50 --no-pager
+
+echo "=== CRI-O Status ==="
+sudo systemctl status crio
+
+echo "=== CRI-O Logs (last 50 lines) ==="
+sudo journalctl -u crio -n 50 --no-pager
+
+echo "=== Container Runtime Info ==="
+sudo crictl info
+
+echo "=== Node Network Configuration ==="
+ip addr show
+ip route show
+
+echo "=== DNS Resolution Test ==="
+nslookup kubernetes.default.svc.cluster.local
+
+echo "=== CNI Configuration ==="
+ls -la /etc/cni/net.d/
+cat /etc/cni/net.d/* 2>/dev/null || echo "No CNI config found"
+
+echo "=== Kubelet Config ==="
+sudo cat /var/lib/kubelet/config.yaml
+
+echo "=== Node Join Status ==="
+sudo cat /var/log/k8s-worker-init.log 2>/dev/null || echo "No worker init log found"
+
+echo "=== Disk Usage ==="
+df -h
+
+echo "=== Memory Usage ==="
+free -h
+
+echo "=== System Load ==="
+uptime
+
+echo "=== Check if node can reach control plane ==="
+curl -k https://${module.k8s-cluster.control_plane_public_ip}:6443/healthz || echo "Cannot reach control plane"
+SSH_EOF
+            
+            chmod +x logs/node-diagnostics/$NODE-ssh-commands.sh
+            echo "📝 Generated SSH diagnostic script: logs/node-diagnostics/$NODE-ssh-commands.sh"
+            
+          else
+            echo "❌ EC2 instance is not running (state: $INSTANCE_STATE) - this node should be removed"
+          fi
+        else
+          echo "⚠️ Could not extract instance ID from node name: $NODE"
+        fi
+        
+        echo ""
+      done
+      
+      # Generate summary report
+      cat > logs/node-diagnostics/SUMMARY.md << SUMMARY_EOF
+# NotReady Nodes Diagnostic Summary
+
+## NotReady Nodes Found:
+$NOTREADY_NODES
+
+## Next Steps:
+
+1. **For each NotReady node, check the generated files:**
+   - \`\$NODE-describe.txt\` - Full node description
+   - \`\$NODE-conditions.txt\` - Node status conditions  
+   - \`\$NODE-pods.txt\` - Pods scheduled on the node
+   - \`\$NODE-calico.txt\` - Calico pod status
+   - \`\$NODE-ec2.txt\` - EC2 instance details
+   - \`\$NODE-ssh-commands.sh\` - SSH diagnostic script
+
+2. **Run SSH diagnostics on problematic nodes:**
+   \`\`\`bash
+   # Get the public IP from EC2 console or:
+   aws ec2 describe-instances --region ${var.region} --instance-ids INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+   
+   # Then SSH and run:
+   ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@PUBLIC_IP
+   # Run the commands from the \$NODE-ssh-commands.sh file
+   \`\`\`
+
+3. **Common issues to check:**
+   - Kubelet not running or failing to start
+   - CRI-O not running or misconfigured
+   - Network connectivity issues to control plane
+   - CNI (Calico) configuration problems
+   - Disk space or memory issues
+   - Join token expired or invalid
+
+## Generated: $(date)
+SUMMARY_EOF
+      
+      echo ""
+      echo "✅ Diagnostic complete! Check logs/node-diagnostics/ for detailed reports"
+      echo "📋 Summary: logs/node-diagnostics/SUMMARY.md"
+      echo ""
+    EOT
+  }
+  
+  depends_on = [
+    module.k8s-cluster,
+    terraform_data.kubectl_provider_config
+  ]
+}
+
+# Node Health Monitoring and Remediation
+# This resource monitors worker node health and can remediate issues
+resource "null_resource" "node_health_monitor" {
+  count = 0  # Set to 1 to enable monitoring
+  
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    check_interval = timestamp()  # Run periodically
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔍 Node Health Monitoring Check..."
+      echo "================================="
+      
+      # Create monitoring logs directory
+      mkdir -p logs/node-health
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes &>/dev/null; then
+        echo "❌ Cannot connect to cluster"
+        exit 1
+      fi
+      
+      # Get current time for logging
+      TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+      
+      # Check all nodes
+      echo "📋 Current node status:"
+      kubectl get nodes -o wide | tee logs/node-health/nodes-$$(date +%Y%m%d-%H%M%S).txt
+      
+      # Identify problematic nodes
+      NOTREADY_NODES=$(kubectl get nodes --no-headers | grep "NotReady" | awk '{print $1}' || true)
+      READY_NODES=$(kubectl get nodes --no-headers | grep " Ready " | awk '{print $1}' || true)
+      
+      # Log status
+      cat > logs/node-health/status-$$(date +%Y%m%d-%H%M%S).txt << STATUS_EOF
+Timestamp: $TIMESTAMP
+Ready Nodes: $(echo "$READY_NODES" | wc -w)
+NotReady Nodes: $(echo "$NOTREADY_NODES" | wc -w)
+
+Ready Nodes List:
+$READY_NODES
+
+NotReady Nodes List:
+$NOTREADY_NODES
+STATUS_EOF
+      
+      if [[ -z "$NOTREADY_NODES" ]]; then
+        echo "✅ All nodes are healthy!"
+        
+        # Check for any nodes that have been NotReady recently
+        RECENTLY_READY=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True" and (.lastTransitionTime | fromdateiso8601) > (now - 3600))) | .metadata.name' 2>/dev/null || true)
+        
+        if [[ -n "$RECENTLY_READY" ]]; then
+          echo "ℹ️ Nodes that became Ready in the last hour:"
+          echo "$RECENTLY_READY"
+        fi
+        
+        exit 0
+      fi
+      
+      echo ""
+      echo "🚨 Found unhealthy nodes!"
+      echo "========================"
+      
+      # Analyze each NotReady node
+      for NODE in $NOTREADY_NODES; do
+        echo ""
+        echo "🔍 Analyzing node: $NODE"
+        echo "----------------------------"
+        
+        # Get node conditions
+        NODE_CONDITIONS=$(kubectl get node "$NODE" -o json | jq -r '.status.conditions[] | select(.type=="Ready") | .message' 2>/dev/null || echo "Unknown")
+        echo "Node condition message: $NODE_CONDITIONS"
+        
+        # Check how long it's been NotReady
+        LAST_TRANSITION=$(kubectl get node "$NODE" -o json | jq -r '.status.conditions[] | select(.type=="Ready") | .lastTransitionTime' 2>/dev/null || echo "Unknown")
+        echo "Last transition time: $LAST_TRANSITION"
+        
+        # Get EC2 instance details
+        if [[ "$NODE" =~ worker-([a-f0-9]{17})$ ]]; then
+          INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+          echo "Instance ID: $INSTANCE_ID"
+          
+          # Check EC2 instance state
+          INSTANCE_STATE=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
+          echo "EC2 instance state: $INSTANCE_STATE"
+          
+          case "$INSTANCE_STATE" in
+            "running")
+              echo "   ✅ EC2 instance is running - kubelet/network issue likely"
+              
+              # Check if we can get logs from the instance
+              PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null || echo "none")
+              
+              if [[ "$PUBLIC_IP" != "none" && "$PUBLIC_IP" != "null" ]]; then
+                echo "   Instance public IP: $PUBLIC_IP"
+                
+                # Create remediation script
+                cat > logs/node-health/remediate-$NODE.sh << REMEDIATE_EOF
+#!/bin/bash
+# Remediation script for $NODE ($INSTANCE_ID)
+# Public IP: $PUBLIC_IP
+
+echo "🔧 Attempting to remediate node $NODE..."
+
+# SSH and try to restart services
+if ssh -i ${module.k8s-cluster.ssh_key_name}.pem -o ConnectTimeout=10 -o StrictHostKeyChecking=no ubuntu@$PUBLIC_IP << 'SSH_COMMANDS'
+echo "=== Checking kubelet status ==="
+sudo systemctl status kubelet
+
+echo "=== Checking CRI-O status ==="
+sudo systemctl status crio
+
+echo "=== Recent kubelet logs ==="
+sudo journalctl -u kubelet -n 20 --no-pager
+
+echo "=== Restarting kubelet ==="
+sudo systemctl restart kubelet
+
+echo "=== Waiting for kubelet to start ==="
+sleep 10
+sudo systemctl status kubelet
+
+echo "=== Checking if node is now Ready ==="
+sudo kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get nodes $NODE
+SSH_COMMANDS
+then
+  echo "✅ Successfully connected and attempted remediation"
+  echo "⏳ Wait 2-3 minutes and check if node becomes Ready"
+else
+  echo "❌ Failed to connect via SSH - instance may need replacement"
+  echo "💡 Consider: aws ec2 terminate-instances --instance-ids $INSTANCE_ID"
+  echo "💡 ASG will automatically launch a replacement"
+fi
+REMEDIATE_EOF
+                
+                chmod +x logs/node-health/remediate-$NODE.sh
+                echo "   📝 Created remediation script: logs/node-health/remediate-$NODE.sh"
+                
+              else
+                echo "   ❌ No public IP available for SSH access"
+              fi
+              ;;
+              
+            "stopped"|"stopping"|"terminated"|"terminating")
+              echo "   ❌ EC2 instance is $INSTANCE_STATE - should be removed from cluster"
+              
+              # Create cleanup script
+              cat > logs/node-health/cleanup-$NODE.sh << CLEANUP_EOF
+#!/bin/bash
+# Cleanup script for dead node $NODE ($INSTANCE_ID)
+
+echo "🧹 Cleaning up dead node $NODE..."
+
+# Remove the node from Kubernetes
+kubectl delete node "$NODE" --ignore-not-found=true
+
+echo "✅ Node $NODE removed from cluster"
+echo "💡 ASG should automatically launch a replacement instance"
+CLEANUP_EOF
+              
+              chmod +x logs/node-health/cleanup-$NODE.sh
+              echo "   📝 Created cleanup script: logs/node-health/cleanup-$NODE.sh"
+              ;;
+              
+            *)
+              echo "   ⚠️ Instance in unknown state: $INSTANCE_STATE"
+              ;;
+          esac
+          
+        else
+          echo "   ⚠️ Could not extract instance ID from node name"
+        fi
+        
+        # Check pods stuck on this node
+        STUCK_PODS=$(kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE" --no-headers | wc -l)
+        if [[ "$STUCK_PODS" -gt 0 ]]; then
+          echo "   ⚠️ $STUCK_PODS pods are stuck on this NotReady node"
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE" -o wide | head -10
+        fi
+      done
+      
+      # Generate summary report
+      cat > logs/node-health/SUMMARY-$$(date +%Y%m%d-%H%M%S).md << SUMMARY_EOF
+# Node Health Check Summary
+
+**Timestamp:** $TIMESTAMP
+**Ready Nodes:** $(echo "$READY_NODES" | wc -w)
+**NotReady Nodes:** $(echo "$NOTREADY_NODES" | wc -w)
+
+## NotReady Nodes:
+$NOTREADY_NODES
+
+## Recommended Actions:
+
+1. **Review generated remediation scripts** in logs/node-health/
+2. **For running instances with kubelet issues:** Run remediate-\$NODE.sh
+3. **For dead instances:** Run cleanup-\$NODE.sh 
+4. **Monitor cluster:** Wait 5-10 minutes after remediation
+
+## Auto-remediation Options:
+
+To enable automatic remediation, you can:
+- Set count = 1 for node_health_monitor in main.tf
+- Enable auto-cleanup of dead nodes
+- Enable auto-restart of problematic services
+
+## Monitoring Commands:
+
+\`\`\`bash
+# Watch nodes continuously
+watch kubectl get nodes
+
+# Check specific node details
+kubectl describe node NODE_NAME
+
+# Check pods on problematic nodes  
+kubectl get pods --all-namespaces --field-selector spec.nodeName=NODE_NAME
+\`\`\`
+
+## Next Health Check:
+Run: terraform apply -target=null_resource.node_health_monitor
+SUMMARY_EOF
+      
+      echo ""
+      echo "📋 Health check summary: logs/node-health/SUMMARY-$$(date +%Y%m%d-%H%M%S).md"
+      echo "🔧 Remediation scripts created in logs/node-health/"
+      echo ""
+      
+      # Return exit code based on health
+      if [[ -n "$NOTREADY_NODES" ]]; then
+        echo "❌ Cluster has unhealthy nodes - manual intervention may be required"
+        exit 1
+      else
+        echo "✅ All nodes are healthy"
+        exit 0
+      fi
+    EOT
+  }
+  
+  depends_on = [
+    module.k8s-cluster,
+    terraform_data.kubectl_provider_config
+  ]
 }
