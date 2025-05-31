@@ -1266,7 +1266,7 @@ resource "null_resource" "cleanup_stale_nodes" {
           
           # Extract hash from worker node name (format: worker-<hash>)
           if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
-            NODE_HASH="${BASH_REMATCH[1]}"
+            NODE_HASH="$${BASH_REMATCH[1]}"
             echo "   Looking for EC2 instance with hash: $NODE_HASH"
             
             # Search for running instance with this hash in name or instance ID
@@ -1278,7 +1278,7 @@ resource "null_resource" "cleanup_stale_nodes" {
               
           elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
             # Format: ip-<ip-with-dashes>
-            PRIVATE_IP="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+            PRIVATE_IP="$${BASH_REMATCH[1]}.$${BASH_REMATCH[2]}.$${BASH_REMATCH[3]}.$${BASH_REMATCH[4]}"
             echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
             
             # Search for running instance with this private IP
