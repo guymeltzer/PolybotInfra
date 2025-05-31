@@ -760,40 +760,124 @@ resource "terraform_data" "deployment_information" {
   }
 }
 
-# Check for existing EBS service-linked role and continue if it exists
-resource "null_resource" "check_ebs_role" {
-  # Only run this once, not on every apply
-  triggers = {
-    run_once = "check-ebs-role-v1"
+# Configure Kubernetes provider with the kubeconfig file
+resource "terraform_data" "kubectl_provider_config" {
+  count = 1
+
+  triggers_replace = {
+    control_plane_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_path  = local.kubeconfig_path
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<EOF
 #!/bin/bash
-echo "Checking if EBS service-linked role already exists..."
+set -e
 
-# Try to get the role ARN
-ROLE_ARN=$(aws iam get-role --role-name AWSServiceRoleForEBS --query 'Role.Arn' --output text 2>/dev/null || echo "")
+echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
 
-if [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ]; then
-  echo "EBS service-linked role already exists: $ROLE_ARN"
-else
-  echo "EBS service-linked role does not exist, attempting to create it..."
+# Function to retrieve kubeconfig from control plane with retries
+fetch_kubeconfig() {
+  local MAX_ATTEMPTS=10
+  local RETRY_DELAY=30
+  local attempt=1
   
-  # Try to create the role - this might fail due to permissions
-  aws iam create-service-linked-role --aws-service-name ebs.amazonaws.com 2>/dev/null || {
-    # Try with ec2 service name as fallback
-    aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com 2>/dev/null || {
-      echo "Warning: Could not create EBS service-linked role - this is normal if you don't have sufficient IAM permissions"
-      echo "The EBS CSI driver might still work if the role already exists at the account level"
-    }
-  }
-fi
+  echo "Retrieving kubeconfig from control plane instance..."
+  
+  while [ $attempt -le $MAX_ATTEMPTS ]; do
+    echo "Attempt $attempt/$MAX_ATTEMPTS to get kubeconfig"
+    
+    # Get the instance ID of the control plane - as a single line command
+    INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text | tr -d '\r\n')
+        
+    if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+      echo "No running control plane instance found, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "Found control plane instance: $INSTANCE_ID"
+    
+    # Use SSM to get the kubeconfig from the instance - as a single line command
+    COMMAND_ID=$(aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" --instance-ids "$INSTANCE_ID" --parameters commands="sudo cat /etc/kubernetes/admin.conf" --output text --query "Command.CommandId" 2>/dev/null | tr -d '\r\n')
+        
+    if [ -z "$COMMAND_ID" ]; then
+      echo "Failed to send SSM command, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+      continue
+    fi
+    
+    echo "SSM command sent, waiting for completion..."
+    sleep 10
+    
+    # Get the command output - as a single line command
+    KUBECONFIG_CONTENT=$(aws ssm get-command-invocation --region ${var.region} --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text 2>/dev/null)
+        
+    if [ -n "$KUBECONFIG_CONTENT" ] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+      echo "Successfully retrieved kubeconfig"
+      echo "$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
+      chmod 600 ${local.kubeconfig_path}
+      
+      # Update the server address in the kubeconfig to use public IP - as a single line command
+      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text | tr -d '\r\n')
+          
+      if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "None" ]; then
+        echo "Updating kubeconfig to use public IP: $PUBLIC_IP"
+        # Different sed syntax for macOS and Linux
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          sed -i '' "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        else
+          sed -i "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
+        fi
+      fi
+      
+      echo "Kubeconfig saved to ${local.kubeconfig_path}"
+      return 0
+    else
+      echo "Invalid kubeconfig content received, retrying in $RETRY_DELAY seconds..."
+      sleep $RETRY_DELAY
+      attempt=$(expr $attempt + 1)
+    fi
+  done
+  
+  echo "Failed to retrieve kubeconfig after $MAX_ATTEMPTS attempts"
+  return 1
+}
 
-echo "Continuing with deployment..."
+# Call the function to fetch the kubeconfig
+fetch_kubeconfig || {
+  echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
+  mkdir -p $(dirname "${local.kubeconfig_path}")
+  cat > ${local.kubeconfig_path} << EOFINNER
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://placeholder:6443
+  name: kubernetes
+contexts:
+- context:
+    cluster: kubernetes
+    user: kubernetes-admin
+  name: kubernetes-admin@kubernetes
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+  user:
+    client-certificate-data: placeholder
+    client-key-data: placeholder
+EOFINNER
+  chmod 600 ${local.kubeconfig_path}
+}
+
+echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
 EOF
   }
+  
+  depends_on = [module.k8s-cluster]
 }
 
 # Install EBS CSI Driver as a Kubernetes component
@@ -1314,5 +1398,314 @@ EOF
       fi
       
     EOT
+  }
+}
+
+# Modify Calico/Tigera installation to be more robust
+resource "null_resource" "install_calico" {
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config,
+    module.k8s-cluster
+  ]
+  
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🌐 Installing Calico CNI..."
+      
+      # Check if Calico is already installed
+      if kubectl -n kube-system get deployment calico-kube-controllers &>/dev/null; then
+        echo "ℹ️  Calico appears to already be installed. Checking health..."
+        if kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=30s &>/dev/null; then
+          echo "✅ Existing Calico installation is healthy"
+          exit 0
+        else
+          echo "⚠️  Existing Calico installation has issues, will reinstall"
+          kubectl delete -f https://docs.projectcalico.org/manifests/calico.yaml --ignore-not-found=true || true
+          sleep 15
+        fi
+      fi
+      
+      echo "📦 Applying Calico manifest..."
+      if ! curl -fsSL --connect-timeout 30 --max-time 120 https://docs.projectcalico.org/manifests/calico.yaml | kubectl apply -f -; then
+        echo "❌ Failed to apply Calico manifest"
+        exit 1
+      fi
+      
+      echo "⏳ Waiting for Calico components to be ready..."
+      
+      # Wait for Calico kube-controllers deployment
+      echo "   Waiting for calico-kube-controllers deployment..."
+      if ! kubectl -n kube-system wait --for=condition=available deployment/calico-kube-controllers --timeout=300s; then
+        echo "❌ Calico kube-controllers deployment not ready"
+        echo "Deployment status:"
+        kubectl -n kube-system get deployment calico-kube-controllers -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-kube-controllers -o wide
+        exit 1
+      fi
+      
+      # Wait for Calico node DaemonSet to be ready
+      echo "   Waiting for calico-node DaemonSet..."
+      if ! kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s; then
+        echo "❌ Calico node DaemonSet not ready"
+        echo "DaemonSet status:"
+        kubectl -n kube-system get daemonset calico-node -o wide
+        echo "Pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+        exit 1
+      fi
+      
+      # Verify all nodes have Calico pods running
+      echo "   Verifying Calico pod distribution..."
+      TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l)
+      CALICO_PODS_READY=$(kubectl -n kube-system get pods -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers | wc -l)
+      
+      if [[ "$CALICO_PODS_READY" -lt "$TOTAL_NODES" ]]; then
+        echo "⚠️  Only $CALICO_PODS_READY/$TOTAL_NODES Calico node pods are running"
+        echo "Checking pod status:"
+        kubectl -n kube-system get pods -l k8s-app=calico-node -o wide
+      else
+        echo "✅ All $TOTAL_NODES nodes have Calico pods running"
+      fi
+      
+      echo "✅ Calico CNI installation completed successfully"
+    EOT
+  }
+}
+
+# CONSOLIDATED: Single robust node cleanup resource
+# Replaces: cleanup_stale_nodes, remove_orphaned_nodes, emergency_cluster_cleanup
+resource "null_resource" "cleanup_orphaned_nodes" {
+  depends_on = [
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+
+  # Only run when there are actual issues - more selective triggering
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    # Use a more stable trigger that doesn't cause unnecessary runs
+    cleanup_version = "consolidated-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🧹 Consolidated Orphaned Node Cleanup..."
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster, skipping cleanup"
+        exit 0
+      fi
+      
+      echo "📋 Current cluster state:"
+      kubectl get nodes -o wide
+      
+      # Phase 1: Identify orphaned nodes (nodes without backing EC2 instances)
+      echo ""
+      echo "🔍 Phase 1: Identifying orphaned nodes..."
+      
+      WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
+      ORPHANED_NODES=()
+      
+      if [[ -z "$WORKER_NODES" ]]; then
+        echo "ℹ️  No worker nodes found in cluster"
+        exit 0
+      fi
+      
+      echo "📋 Found worker nodes: $WORKER_NODES"
+      
+      # Get all EC2 instances from ASG (any state, not just running)
+      EXISTING_INSTANCES=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+        --query "Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress}" \
+        --output json 2>/dev/null)
+      
+      echo "📋 EC2 instances from ASG:"
+      echo "$EXISTING_INSTANCES" | jq -c '.[][]' 2>/dev/null || echo "No instances found"
+      
+      # Check each worker node
+      for NODE_NAME in $WORKER_NODES; do
+        echo ""
+        echo "🔍 Checking node: $NODE_NAME"
+        
+        # Get node status and age
+        NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
+        NODE_READY=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        
+        echo "   Status: $NODE_STATUS (Ready: $NODE_READY)"
+        
+        # Only consider removing NotReady nodes
+        if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" != "True" ]]; then
+          echo "   ⚠️  Node is NotReady, checking for backing instance..."
+          
+          INSTANCE_FOUND=false
+          
+          # Method 1: Extract instance ID from node name pattern
+          if [[ "$NODE_NAME" =~ worker-([a-f0-9]{17})$ ]]; then
+            POTENTIAL_INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+            echo "     Checking extracted instance ID: $POTENTIAL_INSTANCE_ID"
+            
+            MATCHING_INSTANCE=$(echo "$EXISTING_INSTANCES" | jq -r --arg id "$POTENTIAL_INSTANCE_ID" \
+              '.[][] | select(.InstanceId == $id) | .InstanceId' 2>/dev/null)
+            
+            if [[ -n "$MATCHING_INSTANCE" ]]; then
+              INSTANCE_STATE=$(echo "$EXISTING_INSTANCES" | jq -r --arg id "$POTENTIAL_INSTANCE_ID" \
+                '.[][] | select(.InstanceId == $id) | .State' 2>/dev/null)
+              echo "     ✅ Found backing instance: $MATCHING_INSTANCE (State: $INSTANCE_STATE)"
+              INSTANCE_FOUND=true
+            fi
+          fi
+          
+          # Method 2: Check by private IP if instance ID method failed
+          if [[ "$INSTANCE_FOUND" == false ]]; then
+            NODE_PRIVATE_IP=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "unknown")
+            if [[ "$NODE_PRIVATE_IP" != "unknown" ]]; then
+              echo "     Checking by private IP: $NODE_PRIVATE_IP"
+              
+              MATCHING_INSTANCE=$(echo "$EXISTING_INSTANCES" | jq -r --arg ip "$NODE_PRIVATE_IP" \
+                '.[][] | select(.PrivateIp == $ip) | .InstanceId' 2>/dev/null)
+              
+              if [[ -n "$MATCHING_INSTANCE" ]]; then
+                INSTANCE_STATE=$(echo "$EXISTING_INSTANCES" | jq -r --arg ip "$NODE_PRIVATE_IP" \
+                  '.[][] | select(.PrivateIp == $ip) | .State' 2>/dev/null)
+                echo "     ✅ Found backing instance by IP: $MATCHING_INSTANCE (State: $INSTANCE_STATE)"
+                INSTANCE_FOUND=true
+              fi
+            fi
+          fi
+          
+          # If no backing instance found, mark for removal
+          if [[ "$INSTANCE_FOUND" == false ]]; then
+            echo "     ❌ No backing EC2 instance found - marking for removal"
+            ORPHANED_NODES+=("$NODE_NAME")
+          fi
+        else
+          echo "   ✅ Node is healthy (Ready)"
+        fi
+      done
+      
+      # Phase 2: Clean up identified orphaned nodes
+      if [[ $${#ORPHANED_NODES[@]} -gt 0 ]]; then
+        echo ""
+        echo "🗑️  Phase 2: Removing $${#ORPHANED_NODES[@]} orphaned nodes..."
+        
+        for NODE_NAME in "$${ORPHANED_NODES[@]}"; do
+          echo ""
+          echo "🗑️  Cleaning up orphaned node: $NODE_NAME"
+          
+          # Force delete terminating pods first
+          echo "     Cleaning terminating pods..."
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json 2>/dev/null | \
+            jq -r '.items[] | select(.metadata.deletionTimestamp != null) | "\(.metadata.namespace) \(.metadata.name)"' | \
+            while read -r namespace podname; do
+              if [[ -n "$namespace" ]] && [[ -n "$podname" ]]; then
+                echo "       Force deleting terminating pod: $namespace/$podname"
+                kubectl delete pod "$podname" -n "$namespace" --force --grace-period=0 --timeout=10s || true
+              fi
+            done
+          
+          # Force delete all remaining pods on the node
+          echo "     Force deleting all remaining pods..."
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" --no-headers 2>/dev/null | \
+            while read -r namespace podname rest; do
+              if [[ -n "$namespace" ]] && [[ -n "$podname" ]]; then
+                echo "       Force deleting pod: $namespace/$podname"
+                kubectl delete pod "$podname" -n "$namespace" --force --grace-period=0 --timeout=10s || true
+              fi
+            done
+          
+          # Remove the node from cluster
+          echo "     Removing node from cluster..."
+          if kubectl delete node "$NODE_NAME" --timeout=30s; then
+            echo "     ✅ Successfully removed orphaned node: $NODE_NAME"
+          else
+            echo "     ⚠️  Standard delete failed, trying force delete..."
+            kubectl delete node "$NODE_NAME" --force --grace-period=0 || true
+          fi
+        done
+        
+        echo ""
+        echo "✅ Orphaned node cleanup completed! Removed $${#ORPHANED_NODES[@]} nodes."
+      else
+        echo ""
+        echo "✅ No orphaned nodes found - all worker nodes have backing instances"
+      fi
+      
+      # Phase 3: Clean up general problematic pods (not tied to specific nodes)
+      echo ""
+      echo "🧹 Phase 3: General pod cleanup..."
+      
+      # Clean up completed pods
+      echo "   Removing completed pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Succeeded -o name 2>/dev/null | \
+        head -10 | xargs -r kubectl delete --timeout=15s 2>/dev/null || true
+      
+      # Clean up failed pods
+      echo "   Removing failed pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o name 2>/dev/null | \
+        head -10 | xargs -r kubectl delete --timeout=15s 2>/dev/null || true
+      
+      echo ""
+      echo "📋 Final cluster state:"
+      kubectl get nodes -o wide
+      
+      echo ""
+      echo "✅ Consolidated node cleanup completed successfully!"
+    EOT
+  }
+}
+
+# Check for existing EBS service-linked role and continue if it exists
+resource "null_resource" "check_ebs_role" {
+  # Only run this once, not on every apply
+  triggers = {
+    run_once = "check-ebs-role-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<EOF
+#!/bin/bash
+echo "Checking if EBS service-linked role already exists..."
+
+# Try to get the role ARN
+ROLE_ARN=$(aws iam get-role --role-name AWSServiceRoleForEBS --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+if [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ]; then
+  echo "EBS service-linked role already exists: $ROLE_ARN"
+else
+  echo "EBS service-linked role does not exist, attempting to create it..."
+  
+  # Try to create the role - this might fail due to permissions
+  aws iam create-service-linked-role --aws-service-name ebs.amazonaws.com 2>/dev/null || {
+    # Try with ec2 service name as fallback
+    aws iam create-service-linked-role --aws-service-name ec2.amazonaws.com 2>/dev/null || {
+      echo "Warning: Could not create EBS service-linked role - this is normal if you don't have sufficient IAM permissions"
+      echo "The EBS CSI driver might still work if the role already exists at the account level"
+    }
+  }
+fi
+
+echo "Continuing with deployment..."
+EOF
   }
 }
