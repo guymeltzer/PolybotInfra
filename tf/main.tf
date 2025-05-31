@@ -79,6 +79,10 @@ module "k8s-cluster" {
   verification_max_attempts   = var.verification_max_attempts
   verification_wait_seconds   = var.verification_wait_seconds
   pod_cidr                    = var.pod_cidr
+  
+  # ASG Control Variables
+  desired_worker_nodes         = var.desired_worker_nodes
+  force_cleanup_asg           = var.force_cleanup_asg
 
   # Optional parameters
   tags = {
@@ -529,18 +533,42 @@ resource "null_resource" "cluster_readiness_check" {
       # NEW: Verify minimum expected nodes (should match ASG desired capacity)
       EXPECTED_WORKERS=${var.desired_worker_nodes}
       ACTUAL_WORKERS=$(kubectl get nodes --no-headers | grep -v "control-plane" | wc -l)
+      EXPECTED_TOTAL=$((EXPECTED_WORKERS + 1))  # +1 for control plane
       
+      echo "   Expected total nodes: $EXPECTED_TOTAL (1 control plane + $EXPECTED_WORKERS workers)"
+      echo "   Actual total nodes: $TOTAL_NODES"
       echo "   Expected workers: $EXPECTED_WORKERS, Actual workers: $ACTUAL_WORKERS"
       
-      if [[ "$ACTUAL_WORKERS" -lt "$EXPECTED_WORKERS" ]]; then
-        echo "⚠️ Warning: Expected $EXPECTED_WORKERS workers but found $ACTUAL_WORKERS"
-        echo "   This may indicate nodes are still joining or have failed to join"
+      # STRICT CHECK: Require exact expected number of nodes
+      if [[ "$READY_NODES" -lt "$EXPECTED_TOTAL" ]]; then
+        echo "❌ Not enough nodes ready: expected $EXPECTED_TOTAL, got $READY_NODES"
+        echo "   This indicates the ASG hasn't reached desired capacity or nodes failed to join"
         
-        # Give nodes time to join if we're significantly under
-        if [[ "$ACTUAL_WORKERS" -lt $(($EXPECTED_WORKERS / 2)) ]]; then
-          echo "❌ Too few worker nodes joined - waiting for more nodes..."
-          exit 1
-        fi
+        # Show current ASG state for debugging
+        echo ""
+        echo "🔍 ASG Status Check:"
+        aws autoscaling describe-auto-scaling-groups \
+          --region ${var.region} \
+          --auto-scaling-group-names "guy-polybot-asg" \
+          --query "AutoScalingGroups[0].{DesiredCapacity:DesiredCapacity,MinSize:MinSize,MaxSize:MaxSize,Instances:length(Instances)}" \
+          --output table || echo "Could not fetch ASG details"
+        
+        # Show EC2 instances in the ASG
+        echo ""
+        echo "🔍 EC2 Instances in ASG:"
+        aws ec2 describe-instances \
+          --region ${var.region} \
+          --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" "Name=instance-state-name,Values=running,pending" \
+          --query "Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,LaunchTime:LaunchTime}" \
+          --output table || echo "Could not fetch EC2 instances"
+        
+        exit 1
+      fi
+      
+      if [[ "$ACTUAL_WORKERS" -lt "$EXPECTED_WORKERS" ]]; then
+        echo "❌ Worker node count mismatch: expected $EXPECTED_WORKERS workers but found $ACTUAL_WORKERS"
+        echo "   This indicates ASG scaling issues or nodes failed to join properly"
+        exit 1
       fi
       
       echo ""
@@ -1667,12 +1695,33 @@ resource "null_resource" "cleanup_orphaned_nodes" {
         # Get node status and age
         NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
         NODE_READY=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        NODE_AGE=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $3}' || echo "Unknown")
         
-        echo "   Status: $NODE_STATUS (Ready: $NODE_READY)"
+        echo "   Status: $NODE_STATUS (Ready: $NODE_READY, Age: $NODE_AGE)"
         
-        # Only consider removing NotReady nodes
+        # Only consider removing NotReady nodes that have been NotReady for a while
         if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" != "True" ]]; then
           echo "   ⚠️  Node is NotReady, checking for backing instance..."
+          
+          # Check how long the node has been NotReady (grace period)
+          LAST_TRANSITION=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}' 2>/dev/null || echo "")
+          
+          if [[ -n "$LAST_TRANSITION" ]]; then
+            # Convert to timestamp and check if it's been NotReady for more than 10 minutes
+            LAST_TRANSITION_TS=$(date -d "$LAST_TRANSITION" +%s 2>/dev/null || echo "0")
+            CURRENT_TS=$(date +%s)
+            NOTREADY_DURATION=$((CURRENT_TS - LAST_TRANSITION_TS))
+            GRACE_PERIOD=600  # 10 minutes in seconds
+            
+            echo "   Node has been NotReady for: $((NOTREADY_DURATION / 60)) minutes"
+            
+            if [[ "$NOTREADY_DURATION" -lt "$GRACE_PERIOD" ]]; then
+              echo "   ✅ Within grace period ($((GRACE_PERIOD / 60)) minutes), giving node more time"
+              continue
+            else
+              echo "   ⚠️  Beyond grace period, checking for backing instance..."
+            fi
+          fi
           
           INSTANCE_FOUND=false
           
@@ -1688,7 +1737,15 @@ resource "null_resource" "cleanup_orphaned_nodes" {
               INSTANCE_STATE=$(echo "$EXISTING_INSTANCES" | jq -r --arg id "$POTENTIAL_INSTANCE_ID" \
                 '.[][] | select(.InstanceId == $id) | .State' 2>/dev/null)
               echo "     ✅ Found backing instance: $MATCHING_INSTANCE (State: $INSTANCE_STATE)"
-              INSTANCE_FOUND=true
+              
+              # Only consider it missing if the instance is terminated/terminating
+              if [[ "$INSTANCE_STATE" == "terminated" ]] || [[ "$INSTANCE_STATE" == "terminating" ]]; then
+                echo "     ❌ Instance is terminated/terminating"
+                INSTANCE_FOUND=false
+              else
+                echo "     ✅ Instance is alive ($INSTANCE_STATE)"
+                INSTANCE_FOUND=true
+              fi
             fi
           fi
           
@@ -1705,14 +1762,22 @@ resource "null_resource" "cleanup_orphaned_nodes" {
                 INSTANCE_STATE=$(echo "$EXISTING_INSTANCES" | jq -r --arg ip "$NODE_PRIVATE_IP" \
                   '.[][] | select(.PrivateIp == $ip) | .State' 2>/dev/null)
                 echo "     ✅ Found backing instance by IP: $MATCHING_INSTANCE (State: $INSTANCE_STATE)"
-                INSTANCE_FOUND=true
+                
+                # Only consider it missing if the instance is terminated/terminating
+                if [[ "$INSTANCE_STATE" == "terminated" ]] || [[ "$INSTANCE_STATE" == "terminating" ]]; then
+                  echo "     ❌ Instance is terminated/terminating"
+                  INSTANCE_FOUND=false
+                else
+                  echo "     ✅ Instance is alive ($INSTANCE_STATE)"
+                  INSTANCE_FOUND=true
+                fi
               fi
             fi
           fi
           
-          # If no backing instance found, mark for removal
+          # If no backing instance found or it's terminated, mark for removal
           if [[ "$INSTANCE_FOUND" == false ]]; then
-            echo "     ❌ No backing EC2 instance found - marking for removal"
+            echo "     ❌ No backing EC2 instance found or instance is terminated - marking for removal"
             ORPHANED_NODES+=("$NODE_NAME")
           fi
         else

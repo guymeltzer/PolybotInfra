@@ -1455,9 +1455,12 @@ resource "terraform_data" "force_asg_update" {
 
 # Resource to clean up existing ASG if it exists
 resource "null_resource" "cleanup_existing_asg" {
+  count = var.force_cleanup_asg ? 1 : 0  # Only run when explicitly requested
+  
   triggers = {
     asg_name = "guy-polybot-asg"
-    timestamp = timestamp()
+    # Remove timestamp() to prevent running on every apply
+    force_cleanup = var.force_cleanup_asg
   }
 
   provisioner "local-exec" {
@@ -1466,7 +1469,8 @@ resource "null_resource" "cleanup_existing_asg" {
       #!/bin/bash
       ASG_NAME="guy-polybot-asg"
       
-      echo "🔍 Checking for existing Auto Scaling Group: $ASG_NAME"
+      echo "🔍 FORCED CLEANUP: Checking for existing Auto Scaling Group: $ASG_NAME"
+      echo "⚠️  WARNING: This will delete and recreate the ASG, causing worker node replacement!"
       
       # Check if ASG exists
       if aws autoscaling describe-auto-scaling-groups \
@@ -1485,9 +1489,9 @@ resource "null_resource" "cleanup_existing_asg" {
           --desired-capacity 0 \
           --min-size 0 || echo "Failed to update capacity, continuing..."
         
-        # Wait a bit for instances to terminate
-        echo "⏳ Waiting 30 seconds for instances to terminate..."
-        sleep 30
+        # Wait longer for graceful shutdown
+        echo "⏳ Waiting 120 seconds for instances to gracefully terminate..."
+        sleep 120
         
         # Delete the ASG
         echo "🗑️  Deleting Auto Scaling Group: $ASG_NAME"
@@ -1513,6 +1517,8 @@ resource "null_resource" "cleanup_existing_asg" {
       else
         echo "✅ No existing ASG found with name: $ASG_NAME"
       fi
+      
+      echo "🎯 ASG cleanup completed. New ASG will be created shortly."
     EOT
   }
 }
@@ -1520,12 +1526,12 @@ resource "null_resource" "cleanup_existing_asg" {
 # Terraform data resource to track ASG state
 resource "terraform_data" "asg_state_tracker" {
   input = {
-    cleanup_completed = null_resource.cleanup_existing_asg.id
+    cleanup_completed = var.force_cleanup_asg ? (length(null_resource.cleanup_existing_asg) > 0 ? null_resource.cleanup_existing_asg[0].id : "no-cleanup") : "no-cleanup"
   }
   
   lifecycle {
     replace_triggered_by = [
-      null_resource.cleanup_existing_asg
+      # Only replace when cleanup actually runs
     ]
   }
 }
@@ -1598,7 +1604,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
   
   depends_on = [
-    null_resource.cleanup_existing_asg,  # Add cleanup dependency
+    # Only depend on cleanup if it's enabled
     terraform_data.asg_state_tracker,   # Add state tracker dependency
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
@@ -2351,19 +2357,62 @@ resource "terraform_data" "completion_progress" {
       
       CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
       
+      # Determine the SSH key to use
+      SSH_KEY_ARG=""
+      if [ -n "${var.key_name}" ]; then
+        # User provided key name, try to find the private key
+        if [ -n "${var.ssh_private_key_file_path}" ]; then
+          # Expand tilde if present
+          SSH_KEY_PATH=$(eval echo "${var.ssh_private_key_file_path}")
+          if [ -f "$SSH_KEY_PATH" ]; then
+            SSH_KEY_ARG="-i $SSH_KEY_PATH"
+            echo -e "\\033[0;32m🔑 Using provided SSH key: $SSH_KEY_PATH\\033[0m"
+          else
+            echo -e "\\033[0;33m⚠️  SSH key not found at $SSH_KEY_PATH, trying default locations...\\033[0m"
+            # Try common locations
+            for key_path in "${var.key_name}.pem" "~/.ssh/${var.key_name}.pem" "./tf/${var.key_name}.pem"; do
+              expanded_path=$(eval echo "$key_path")
+              if [ -f "$expanded_path" ]; then
+                SSH_KEY_ARG="-i $expanded_path"
+                echo -e "\\033[0;32m🔑 Found SSH key at: $expanded_path\\033[0m"
+                break
+              fi
+            done
+          fi
+        fi
+      else
+        # Module generated key
+        if [ -f "${path.module}/generated-ssh-key.pem" ]; then
+          SSH_KEY_ARG="-i ${path.module}/generated-ssh-key.pem"
+          echo -e "\\033[0;32m🔑 Using module-generated SSH key\\033[0m"
+        fi
+      fi
+      
+      if [ -z "$SSH_KEY_ARG" ]; then
+        echo -e "\\033[0;31m❌ No valid SSH key found. Cannot verify cluster status via SSH.\\033[0m"
+        echo -e "\\033[0;33m⚠️  Skipping SSH-based verification, but deployment continues.\\033[0m"
+        exit 0
+      fi
+      
       # Simple function to check cluster status
       check_cluster_status() {
         local attempt=$1
         echo -e "\\033[0;33m🔍 Checking Kubernetes cluster status (Attempt $attempt/5)...\\033[0m"
         
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$CONTROL_PLANE_IP "kubectl get nodes" > /tmp/nodes_output 2>&1
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP "kubectl get nodes" > /tmp/nodes_output 2>&1
+        local ssh_exit_code=$?
         
-        if grep -q "Ready" /tmp/nodes_output; then
+        if [ $ssh_exit_code -eq 0 ] && grep -q "Ready" /tmp/nodes_output; then
           echo -e "\\033[0;32m✅ Kubernetes nodes found and ready!\\033[0m"
           cat /tmp/nodes_output
           return 0
         else
-          echo -e "\\033[0;33m⏱️  Cluster not ready yet. Output from control plane:\\033[0m"
+          echo -e "\\033[0;33m⏱️  Cluster not ready yet. SSH exit code: $ssh_exit_code\\033[0m"
+          if [ $ssh_exit_code -ne 0 ]; then
+            echo -e "\\033[0;33m🔍 SSH connection issue. Output:\\033[0m"
+          else
+            echo -e "\\033[0;33m🔍 Cluster status output:\\033[0m"
+          fi
           cat /tmp/nodes_output
           echo ""
           return 1
@@ -2379,9 +2428,9 @@ resource "terraform_data" "completion_progress" {
           echo -e "\\033[1;32m     🎉 Kubernetes Deployment Complete! 🎉\\033[0m"
           echo -e "\\033[1;34m================================================================\\033[0m"
           echo -e "\\033[0;32m📋 Cluster Information:\\033[0m"
-          echo -e "\\033[0;32m   🖥️  Control Plane: ssh ubuntu@$CONTROL_PLANE_IP\\033[0m"
+          echo -e "\\033[0;32m   🖥️  Control Plane: ssh $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP\\033[0m"
           echo -e "\\033[0;32m   🔍 Check Status: kubectl --kubeconfig=./kubeconfig.yaml get nodes\\033[0m"
-          echo -e "\\033[0;32m   📜 View Logs: ssh ubuntu@$CONTROL_PLANE_IP \"cat /var/log/k8s-control-plane-init.log\"\\033[0m"
+          echo -e "\\033[0;32m   📜 View Logs: ssh $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP \"cat /var/log/k8s-control-plane-init.log\"\\033[0m"
           echo -e "\\033[1;34m================================================================\\033[0m"
           exit 0
         fi
@@ -2397,9 +2446,9 @@ resource "terraform_data" "completion_progress" {
       echo -e "\\033[0;33m⚠️  Control plane initialization in progress.\\033[0m"
       echo -e "\\033[0;33m⚠️  Deployment continuing, but manual verification recommended.\\033[0m"
       echo -e "\\033[0;33m⚠️  Try these commands to check the cluster status:\\033[0m"
-      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"sudo systemctl status kubelet\"\\033[0m"
-      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"sudo journalctl -u kubelet\"\\033[0m"
-      echo -e "\\033[0;36m   ssh ubuntu@$CONTROL_PLANE_IP \"kubectl get nodes\"\\033[0m"
+      echo -e "\\033[0;36m   ssh $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP \"sudo systemctl status kubelet\"\\033[0m"
+      echo -e "\\033[0;36m   ssh $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP \"sudo journalctl -u kubelet\"\\033[0m"
+      echo -e "\\033[0;36m   ssh $SSH_KEY_ARG ubuntu@$CONTROL_PLANE_IP \"kubectl get nodes\"\\033[0m"
       echo -e "\\033[1;34m================================================================\\033[0m"
     EOT
   }

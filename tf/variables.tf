@@ -177,6 +177,12 @@ variable "desired_worker_nodes" {
   default     = 2
 }
 
+variable "force_cleanup_asg" {
+  description = "If true, will delete the existing worker ASG before creating a new one. Use with caution - causes worker node replacement."
+  type        = bool
+  default     = false
+}
+
 variable "ssh_public_key" {
   description = "SSH public key to use for the instances (will be generated if not provided)"
   type        = string
