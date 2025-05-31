@@ -506,7 +506,34 @@ resource "null_resource" "configure_argocd_repositories" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      KUBECONFIG="${local.kubeconfig_path}" argocd repo add https://github.com/your-org/polybot-repo.git --name polybot-repo
+      echo "Configuring ArgoCD repositories..."
+      
+      # Get ArgoCD server endpoint - it runs as a service in the cluster
+      KUBECONFIG="${local.kubeconfig_path}" kubectl get svc argocd-server -n argocd -o jsonpath='{.spec.clusterIP}' > /tmp/argocd_ip.txt
+      ARGOCD_SERVER_IP=$(cat /tmp/argocd_ip.txt)
+      
+      if [[ -z "$ARGOCD_SERVER_IP" ]]; then
+        echo "ArgoCD server not found, skipping repository configuration"
+        exit 0
+      fi
+      
+      # Get ArgoCD admin password
+      ARGOCD_PASSWORD=$(KUBECONFIG="${local.kubeconfig_path}" kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+      
+      if [[ -z "$ARGOCD_PASSWORD" ]]; then
+        echo "ArgoCD password not found, skipping repository configuration"
+        exit 0
+      fi
+      
+      # Login to ArgoCD using the cluster IP
+      echo "Logging into ArgoCD server at $ARGOCD_SERVER_IP..."
+      KUBECONFIG="${local.kubeconfig_path}" argocd login $ARGOCD_SERVER_IP:80 --username admin --password "$ARGOCD_PASSWORD" --insecure
+      
+      # Add repository
+      echo "Adding repository..."
+      KUBECONFIG="${local.kubeconfig_path}" argocd repo add https://github.com/guymeltzer/PolybotInfra.git --name polybot-repo || echo "Repository may already exist"
+      
+      echo "ArgoCD repository configuration completed"
     EOT
   }
   depends_on = [
@@ -1176,6 +1203,144 @@ resource "null_resource" "argocd_direct_access" {
       kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || true
       
       echo "ArgoCD direct access setup complete"
+    EOT
+  }
+}
+
+# Add this resource after the null_resource.fix_argocd_connectivity resource
+resource "null_resource" "cleanup_stale_nodes" {
+  depends_on = [
+    null_resource.wait_for_kubernetes,
+    terraform_data.kubectl_provider_config,
+    module.k8s-cluster
+  ]
+
+  # Run this periodically or when cluster changes
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    timestamp = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🧹 Cleaning up stale Kubernetes nodes..."
+      
+      # Check if kubectl can connect to the cluster
+      if ! kubectl get nodes &>/dev/null; then
+        echo "Cannot connect to Kubernetes cluster, skipping node cleanup"
+        exit 0
+      fi
+      
+      # Get all worker nodes (excluding control plane)
+      echo "Getting all worker nodes..."
+      WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
+      
+      if [[ -z "$WORKER_NODES" ]]; then
+        echo "No worker nodes found in cluster"
+        exit 0
+      fi
+      
+      echo "Found worker nodes: $WORKER_NODES"
+      
+      # Check each worker node
+      for NODE_NAME in $WORKER_NODES; do
+        echo "Checking node: $NODE_NAME"
+        
+        # Get node status
+        NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
+        echo "Node $NODE_NAME status: $NODE_STATUS"
+        
+        # If node is NotReady, check if corresponding EC2 instance exists
+        if [[ "$NODE_STATUS" == "NotReady" ]]; then
+          echo "Node $NODE_NAME is NotReady, checking if EC2 instance exists..."
+          
+          # Extract instance ID or IP from node name
+          # Node names are typically in format: worker-<hash> or ip-<ip-with-dashes>
+          if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
+            # Format: worker-<hash>
+            NODE_HASH="${BASH_REMATCH[1]}"
+            echo "Looking for EC2 instance with hash: $NODE_HASH"
+            
+            # Search for running instance with this hash in name or tags
+            INSTANCE_EXISTS=$(aws ec2 describe-instances \
+              --region ${var.region} \
+              --filters "Name=instance-state-name,Values=running" \
+              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_HASH') || contains(PrivateIpAddress, '$NODE_HASH')]" \
+              --output text 2>/dev/null | head -1)
+              
+          elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
+            # Format: ip-<ip-with-dashes>
+            PRIVATE_IP="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+            echo "Looking for EC2 instance with private IP: $PRIVATE_IP"
+            
+            # Search for running instance with this private IP
+            INSTANCE_EXISTS=$(aws ec2 describe-instances \
+              --region ${var.region} \
+              --filters "Name=private-ip-address,Values=$PRIVATE_IP" "Name=instance-state-name,Values=running" \
+              --query "Reservations[*].Instances[*].InstanceId" \
+              --output text 2>/dev/null | head -1)
+              
+          else
+            # Generic search - look for any worker instance with similar name
+            echo "Generic search for node: $NODE_NAME"
+            INSTANCE_EXISTS=$(aws ec2 describe-instances \
+              --region ${var.region} \
+              --filters "Name=tag:Name,Values=*worker*" "Name=instance-state-name,Values=running" \
+              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_NAME')]" \
+              --output text 2>/dev/null | head -1)
+          fi
+          
+          # If no running instance found, remove the node
+          if [[ -z "$INSTANCE_EXISTS" ]] || [[ "$INSTANCE_EXISTS" == "None" ]]; then
+            echo "⚠️  No running EC2 instance found for node $NODE_NAME, removing from cluster..."
+            
+            # First drain the node to move pods safely
+            echo "Draining node $NODE_NAME..."
+            kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=60s || {
+              echo "Failed to drain node $NODE_NAME, but continuing with deletion"
+            }
+            
+            # Delete the node from the cluster
+            echo "Deleting node $NODE_NAME from cluster..."
+            kubectl delete node "$NODE_NAME" || {
+              echo "Failed to delete node $NODE_NAME"
+            }
+            
+            echo "✅ Removed stale node: $NODE_NAME"
+          else
+            echo "✅ Node $NODE_NAME has corresponding running EC2 instance"
+          fi
+        else
+          echo "✅ Node $NODE_NAME is in good state: $NODE_STATUS"
+        fi
+      done
+      
+      # Clean up completed and failed pods on remaining nodes
+      echo "🧹 Cleaning up completed and failed pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Succeeded -o name | xargs -r kubectl delete || true
+      kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o name | xargs -r kubectl delete || true
+      
+      # Clean up pending pods that have been stuck for more than 10 minutes
+      echo "🧹 Cleaning up stuck pending pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Pending -o json | \
+        jq -r '.items[] | select(.metadata.creationTimestamp | fromdateiso8601 < (now - 600)) | "\(.metadata.namespace)/\(.metadata.name)"' | \
+        while read pod; do
+          if [[ -n "$pod" ]]; then
+            echo "Deleting stuck pending pod: $pod"
+            kubectl delete pod "$pod" --timeout=30s || true
+          fi
+        done || true
+      
+      echo "🎉 Node cleanup completed!"
+      
+      # Show current cluster state
+      echo "Current cluster state:"
+      kubectl get nodes
+      kubectl get pods --all-namespaces | grep -E "(Pending|Failed|Unknown)" || echo "No problematic pods found"
     EOT
   }
 }
