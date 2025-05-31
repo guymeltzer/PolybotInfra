@@ -6,7 +6,7 @@
 - Access to AWS account with required permissions
 - SSH key pair for access to EC2 instances
 
-## Deployment Instructions
+### Deployment Instructions
 
 ### 1. Create or update terraform.tfvars
 Ensure your terraform.tfvars file contains all required variables:
