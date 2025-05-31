@@ -383,13 +383,13 @@ echo "$(date): WARNING: Cloud controller manager did not initialize the node wit
 echo "$(date): Attempting to remove the uninitialized taint to unblock system pods"
 
 # Remove the uninitialized taint to allow system pods to schedule
-if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null; then
+if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized$${":"}NoSchedule- 2>/dev/null; then
     echo "$(date): Successfully removed NoSchedule taint"
 else
     echo "$(date): NoSchedule taint was not present or already removed"
 fi
 
-if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoExecute- 2>/dev/null; then
+if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized$${":"}NoExecute- 2>/dev/null; then
     echo "$(date): Successfully removed NoExecute taint"
 else
     echo "$(date): NoExecute taint was not present or already removed"
