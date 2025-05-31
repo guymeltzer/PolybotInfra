@@ -451,7 +451,7 @@ wait_for_deployment() {
     local timeout=$${3$${":"}$${"-"}300}  # 5 minutes default
     
     echo "Waiting for deployment $deployment in namespace $namespace to be ready..."
-    if kubectl wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment" -n "$namespace"; then
+    if kubectl wait --for=condition=available --timeout="$${timeout}s" deployment/"$deployment" -n "$namespace"; then
         echo "✅ Deployment $deployment is ready"
         return 0
     else
