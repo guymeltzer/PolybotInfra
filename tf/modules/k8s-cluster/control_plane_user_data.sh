@@ -238,6 +238,283 @@ echo "Installing Calico CNI (v3.26.4)..."
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml
 echo "Calico CNI installation initiated."
 
+# 9.1. Handle cloud-provider=external taint for system pods
+echo "Handling cloud-provider=external taint for critical system pods..."
+
+# Wait a moment for the Calico deployment to be created
+sleep 10
+
+# Patch calico-kube-controllers to tolerate the uninitialized cloud provider taint
+echo "Patching calico-kube-controllers deployment to tolerate cloud provider uninitialized taint..."
+kubectl patch deployment calico-kube-controllers -n kube-system -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "tolerations": [
+          {
+            "key": "node-role.kubernetes.io/control-plane",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node-role.kubernetes.io/master",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node.cloudprovider.kubernetes.io/uninitialized",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node.cloudprovider.kubernetes.io/uninitialized",
+            "operator": "Exists",
+            "effect": "NoExecute"
+          }
+        ]
+      }
+    }
+  }
+}' || echo "Warning: Failed to patch calico-kube-controllers tolerations"
+
+# Patch CoreDNS to tolerate the uninitialized cloud provider taint
+echo "Patching CoreDNS deployment to tolerate cloud provider uninitialized taint..."
+kubectl patch deployment coredns -n kube-system -p '{
+  "spec": {
+    "template": {
+      "spec": {
+        "tolerations": [
+          {
+            "key": "CriticalAddonsOnly",
+            "operator": "Exists"
+          },
+          {
+            "key": "node-role.kubernetes.io/control-plane",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node-role.kubernetes.io/master",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node.kubernetes.io/not-ready",
+            "operator": "Exists",
+            "effect": "NoExecute",
+            "tolerationSeconds": 300
+          },
+          {
+            "key": "node.kubernetes.io/unreachable",
+            "operator": "Exists",
+            "effect": "NoExecute",
+            "tolerationSeconds": 300
+          },
+          {
+            "key": "node.cloudprovider.kubernetes.io/uninitialized",
+            "operator": "Exists",
+            "effect": "NoSchedule"
+          },
+          {
+            "key": "node.cloudprovider.kubernetes.io/uninitialized",
+            "operator": "Exists",
+            "effect": "NoExecute"
+          }
+        ]
+      }
+    }
+  }
+}' || echo "Warning: Failed to patch CoreDNS tolerations"
+
+# Create a background script to manage the cloud provider taint
+echo "Creating cloud provider taint management script..."
+cat > /usr/local/bin/manage-cloud-provider-taint.sh << 'TAINT_SCRIPT_EOF'
+#!/bin/bash
+# Script to manage cloud provider uninitialized taint
+
+LOGFILE="/var/log/cloud-provider-taint-manager.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+echo "$(date): Starting cloud provider taint management"
+
+export KUBECONFIG=/etc/kubernetes/admin.conf
+NODE_NAME=$(hostname)
+
+# Function to check if cloud controller manager is running
+check_ccm_running() {
+    kubectl get pods -A -l app=aws-cloud-controller-manager 2>/dev/null | grep -q Running
+    return $?
+}
+
+# Function to check if node has provider ID set
+check_provider_id() {
+    kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}' | grep -q "aws://"
+    return $?
+}
+
+# Wait up to 10 minutes for CCM to initialize the node
+CCM_TIMEOUT=600  # 10 minutes
+WAITED=0
+SLEEP_INTERVAL=30
+
+echo "$(date): Waiting up to $CCM_TIMEOUT seconds for cloud controller manager to initialize node..."
+
+while [ $WAITED -lt $CCM_TIMEOUT ]; do
+    # Check if CCM is running and has set provider ID
+    if check_ccm_running && check_provider_id; then
+        echo "$(date): Cloud controller manager has initialized the node successfully"
+        echo "$(date): Provider ID: $(kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}')"
+        exit 0
+    fi
+    
+    # Check if the taint is already gone (CCM removed it)
+    if ! kubectl get node "$NODE_NAME" -o json | jq -r '.spec.taints[]? | select(.key == "node.cloudprovider.kubernetes.io/uninitialized") | .key' | grep -q uninitialized; then
+        echo "$(date): Cloud provider uninitialized taint has been removed by cloud controller manager"
+        exit 0
+    fi
+    
+    sleep $SLEEP_INTERVAL
+    WAITED=$((WAITED + SLEEP_INTERVAL))
+    echo "$(date): Still waiting for CCM initialization... ($WAITED/$CCM_TIMEOUT seconds)"
+done
+
+# If we reach here, CCM didn't initialize the node in time
+echo "$(date): WARNING: Cloud controller manager did not initialize the node within $CCM_TIMEOUT seconds"
+echo "$(date): Attempting to remove the uninitialized taint to unblock system pods"
+
+# Remove the uninitialized taint to allow system pods to schedule
+if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null; then
+    echo "$(date): Successfully removed NoSchedule taint"
+else
+    echo "$(date): NoSchedule taint was not present or already removed"
+fi
+
+if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoExecute- 2>/dev/null; then
+    echo "$(date): Successfully removed NoExecute taint"
+else
+    echo "$(date): NoExecute taint was not present or already removed"
+fi
+
+# Set a basic provider ID if none exists (fallback mechanism)
+if ! check_provider_id; then
+    echo "$(date): Setting fallback provider ID for node"
+    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    AVAILABILITY_ZONE=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+    
+    if [ -n "$INSTANCE_ID" ] && [ -n "$AVAILABILITY_ZONE" ]; then
+        PROVIDER_ID="aws:///$AVAILABILITY_ZONE/$INSTANCE_ID"
+        echo "$(date): Setting provider ID to: $PROVIDER_ID"
+        kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" || echo "$(date): Failed to set provider ID"
+    fi
+fi
+
+echo "$(date): Cloud provider taint management completed"
+TAINT_SCRIPT_EOF
+
+chmod +x /usr/local/bin/manage-cloud-provider-taint.sh
+
+# Create systemd service for taint management
+echo "Creating systemd service for cloud provider taint management..."
+cat > /etc/systemd/system/cloud-provider-taint-manager.service << 'SERVICE_EOF'
+[Unit]
+Description=Cloud Provider Taint Manager
+After=kubelet.service
+Wants=kubelet.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/manage-cloud-provider-taint.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+# Enable and start the service
+systemctl daemon-reload
+systemctl enable cloud-provider-taint-manager.service
+
+# Start the taint manager in the background (don't block initialization)
+echo "Starting cloud provider taint manager in background..."
+nohup /usr/local/bin/manage-cloud-provider-taint.sh &
+
+# 9.2. Wait for critical system pods to become ready
+echo "Waiting for critical system pods to become ready..."
+
+# Function to wait for deployment readiness
+wait_for_deployment() {
+    local namespace=$1
+    local deployment=$2
+    local timeout=${3:-300}  # 5 minutes default
+    
+    echo "Waiting for deployment $deployment in namespace $namespace to be ready..."
+    if kubectl wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment" -n "$namespace"; then
+        echo "✅ Deployment $deployment is ready"
+        return 0
+    else
+        echo "❌ Timeout waiting for deployment $deployment"
+        return 1
+    fi
+}
+
+# Function to wait for daemonset readiness
+wait_for_daemonset() {
+    local namespace=$1
+    local daemonset=$2
+    local timeout=${3:-300}  # 5 minutes default
+    
+    echo "Waiting for daemonset $daemonset in namespace $namespace to be ready..."
+    local end_time=$(($(date +%s) + timeout))
+    
+    while [ $(date +%s) -lt $end_time ]; do
+        local desired=$(kubectl get daemonset "$daemonset" -n "$namespace" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+        local ready=$(kubectl get daemonset "$daemonset" -n "$namespace" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+        
+        if [ "$desired" -gt 0 ] && [ "$ready" -eq "$desired" ]; then
+            echo "✅ DaemonSet $daemonset is ready ($ready/$desired)"
+            return 0
+        fi
+        
+        echo "Still waiting for daemonset $daemonset: $ready/$desired ready"
+        sleep 10
+    done
+    
+    echo "❌ Timeout waiting for daemonset $daemonset"
+    return 1
+}
+
+# Wait for calico-node (DaemonSet)
+wait_for_daemonset kube-system calico-node 300
+
+# Wait for calico-kube-controllers (Deployment)
+wait_for_deployment kube-system calico-kube-controllers 300
+
+# Wait for CoreDNS (Deployment)
+wait_for_deployment kube-system coredns 300
+
+# Verify all system pods are running
+echo "Final verification of system pod status..."
+kubectl get pods -n kube-system -o wide
+echo ""
+
+# Check for any pods that are still pending and show their events
+echo "Checking for any pending pods and their events..."
+PENDING_PODS=$(kubectl get pods -A --field-selector=status.phase=Pending -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | head -5)
+
+if [ -n "$PENDING_PODS" ]; then
+    echo "Found pending pods, showing events:"
+    for pod in $PENDING_PODS; do
+        echo "Events for pod $pod:"
+        kubectl describe pod "$pod" -A | grep -A 10 "Events:" || echo "No events found"
+        echo "---"
+    done
+else
+    echo "✅ No pending pods found"
+fi
+
 # 10. Install AWS Cloud Controller Manager (CCM) - Reminder
 echo "---------------------------------------------------------------------"
 echo "IMPORTANT: 'cloud-provider: external' was specified in kubeadm config."

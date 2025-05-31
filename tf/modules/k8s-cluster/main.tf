@@ -1214,6 +1214,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     null_resource.wait_for_control_plane,
+    null_resource.verify_cluster_readiness,  # Add cluster readiness dependency
     terraform_data.force_asg_update,
     terraform_data.worker_progress,
     null_resource.update_join_command
@@ -2071,6 +2072,151 @@ resource "null_resource" "update_join_command" {
       aws s3 cp $ERROR_LOG s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$(date +"%Y%m%d%H%M%S").log --region ${var.region} || echo "[$(date)] Failed to upload logs to S3"
       
       # Always exit with success to allow deployment to continue
+      exit 0
+    EOT
+  }
+}
+
+# Enhanced cluster readiness check to verify taint resolution
+resource "null_resource" "verify_cluster_readiness" {
+  depends_on = [
+    aws_instance.control_plane,
+    null_resource.wait_for_control_plane
+  ]
+
+  triggers = {
+    control_plane_id = aws_instance.control_plane.id
+    control_plane_public_ip = aws_instance.control_plane.public_ip
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<EOT
+      #!/bin/bash
+      
+      echo "🔍 Verifying cluster readiness and cloud provider taint resolution..."
+      
+      CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
+      CONTROL_PLANE_ID="${aws_instance.control_plane.id}"
+      MAX_WAIT_TIME=900  # 15 minutes
+      SLEEP_INTERVAL=30
+      WAITED=0
+      
+      # Function to check cluster via SSM
+      check_cluster_via_ssm() {
+        echo "📡 Checking cluster status via SSM..."
+        
+        # Check if SSM is available
+        if ! aws ssm describe-instance-information --region ${var.region} \
+           --filters "Key=InstanceIds,Values=$CONTROL_PLANE_ID" \
+           --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
+          echo "❌ SSM not available on control plane"
+          return 1
+        fi
+        
+        # Get cluster status
+        COMMAND_ID=$(aws ssm send-command --region ${var.region} \
+          --document-name "AWS-RunShellScript" \
+          --instance-ids "$CONTROL_PLANE_ID" \
+          --parameters 'commands=["export KUBECONFIG=/etc/kubernetes/admin.conf && echo \"=== NODE STATUS ===\" && kubectl get nodes -o wide && echo \"\" && echo \"=== SYSTEM PODS ===\" && kubectl get pods -n kube-system -o wide && echo \"\" && echo \"=== CLOUD PROVIDER TAINT CHECK ===\" && kubectl get nodes -o json | jq -r \".items[].spec.taints[]? | select(.key == \\\"node.cloudprovider.kubernetes.io/uninitialized\\\") | .key\" || echo \"No cloud provider taint found\" && echo \"\" && echo \"=== PENDING PODS ===\" && kubectl get pods -A --field-selector=status.phase=Pending | head -10"]' \
+          --output text --query "Command.CommandId" 2>/dev/null)
+        
+        if [ -z "$COMMAND_ID" ]; then
+          echo "❌ Failed to send SSM command"
+          return 1
+        fi
+        
+        sleep 10
+        
+        # Get command output
+        CLUSTER_STATUS=$(aws ssm get-command-invocation --region ${var.region} \
+          --command-id "$COMMAND_ID" --instance-id "$CONTROL_PLANE_ID" \
+          --query "StandardOutputContent" --output text 2>/dev/null)
+        
+        if [ -z "$CLUSTER_STATUS" ]; then
+          echo "❌ Failed to get cluster status"
+          return 1
+        fi
+        
+        echo "📊 Cluster Status:"
+        echo "$CLUSTER_STATUS"
+        echo ""
+        
+        # Analyze the status
+        local ready_nodes=$(echo "$CLUSTER_STATUS" | grep -c " Ready " || echo "0")
+        local running_coredns=$(echo "$CLUSTER_STATUS" | grep "coredns" | grep -c "Running" || echo "0")
+        local running_calico_controllers=$(echo "$CLUSTER_STATUS" | grep "calico-kube-controllers" | grep -c "Running" || echo "0")
+        local cloud_taint=$(echo "$CLUSTER_STATUS" | grep "node.cloudprovider.kubernetes.io/uninitialized" || echo "")
+        local pending_pods=$(echo "$CLUSTER_STATUS" | grep "Pending" | wc -l || echo "0")
+        
+        echo "📈 Analysis:"
+        echo "  Ready nodes: $ready_nodes"
+        echo "  CoreDNS running: $running_coredns"
+        echo "  Calico controllers running: $running_calico_controllers"
+        echo "  Cloud provider taint: $${cloud_taint:-"Not found (good!)"}"
+        echo "  Pending pods: $pending_pods"
+        
+        # Check if cluster is ready
+        if [ "$ready_nodes" -ge 1 ] && [ "$running_coredns" -ge 1 ] && [ "$running_calico_controllers" -ge 1 ] && [ -z "$cloud_taint" ]; then
+          echo "✅ Cluster is ready! System pods are running and cloud provider taint is resolved."
+          return 0
+        else
+          echo "⏳ Cluster not ready yet..."
+          if [ -n "$cloud_taint" ]; then
+            echo "⚠️  Cloud provider taint still present: $cloud_taint"
+          fi
+          return 1
+        fi
+      }
+      
+      # Wait for cluster to be ready
+      echo "⏳ Waiting up to $MAX_WAIT_TIME seconds for cluster to be ready..."
+      
+      while [ $WAITED -lt $MAX_WAIT_TIME ]; do
+        echo "🔄 Check $((WAITED / SLEEP_INTERVAL + 1)) - Time elapsed: ${WAITED}s"
+        
+        if check_cluster_via_ssm; then
+          echo ""
+          echo "🎉 SUCCESS: Cluster is ready and cloud provider taint issue is resolved!"
+          echo "🎯 You can now proceed with worker node deployment and ArgoCD installation."
+          exit 0
+        fi
+        
+        sleep $SLEEP_INTERVAL
+        WAITED=$((WAITED + SLEEP_INTERVAL))
+        
+        if [ $WAITED -lt $MAX_WAIT_TIME ]; then
+          echo "⏳ Retrying in $SLEEP_INTERVAL seconds... ($((MAX_WAIT_TIME - WAITED))s remaining)"
+        fi
+      done
+      
+      echo ""
+      echo "❌ TIMEOUT: Cluster did not become ready within $MAX_WAIT_TIME seconds"
+      echo ""
+      echo "🔧 Troubleshooting suggestions:"
+      echo "1. Check cloud provider taint manager logs:"
+      echo "   ssh -i ${local.actual_key_name}.pem ubuntu@$CONTROL_PLANE_IP"
+      echo "   sudo journalctl -u cloud-provider-taint-manager.service -f"
+      echo ""
+      echo "2. Check cloud provider taint manager script logs:"
+      echo "   ssh -i ${local.actual_key_name}.pem ubuntu@$CONTROL_PLANE_IP"
+      echo "   sudo tail -f /var/log/cloud-provider-taint-manager.log"
+      echo ""
+      echo "3. Manual taint removal if needed:"
+      echo "   ssh -i ${local.actual_key_name}.pem ubuntu@$CONTROL_PLANE_IP"
+      echo "   sudo kubectl taint node --all node.cloudprovider.kubernetes.io/uninitialized:NoSchedule-"
+      echo "   sudo kubectl taint node --all node.cloudprovider.kubernetes.io/uninitialized:NoExecute-"
+      echo ""
+      echo "4. Check system pod status:"
+      echo "   ssh -i ${local.actual_key_name}.pem ubuntu@$CONTROL_PLANE_IP"
+      echo "   sudo kubectl get pods -n kube-system -o wide"
+      echo "   sudo kubectl describe pod -n kube-system <pod-name>"
+      echo ""
+      
+      # Don't fail the entire deployment, just warn
+      echo "⚠️  Continuing deployment despite readiness check timeout..."
+      echo "💡 You may need to manually resolve the cloud provider taint issue."
+      
       exit 0
     EOT
   }

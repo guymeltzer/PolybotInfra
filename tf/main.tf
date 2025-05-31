@@ -435,16 +435,16 @@ resource "null_resource" "check_argocd_status" {
 resource "null_resource" "cluster_readiness_check" {
   depends_on = [
     null_resource.wait_for_kubernetes,
-    null_resource.install_calico,
+    # null_resource.install_calico,  # REMOVED: Calico now installed in control plane
     null_resource.install_ebs_csi_driver,
     terraform_data.kubectl_provider_config
   ]
 
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    calico_id = null_resource.install_calico.id
+    # calico_id = null_resource.install_calico.id  # REMOVED: Calico now handled by control plane
     ebs_csi_id = null_resource.install_ebs_csi_driver.id
-    readiness_version = "consolidated-v2"
+    readiness_version = "consolidated-v3"  # Updated version
   }
 
   provisioner "local-exec" {
@@ -1028,14 +1028,15 @@ resource "null_resource" "install_ebs_csi_driver" {
   depends_on = [
     null_resource.wait_for_kubernetes,
     null_resource.check_ebs_role,
-    null_resource.install_calico,  # Install after Calico is ready
+    # null_resource.install_calico,  # REMOVED: Calico now installed in control plane
     terraform_data.kubectl_provider_config
   ]
 
   # Trigger reinstall when the role check is run
   triggers = {
     ebs_role_check = null_resource.check_ebs_role.id
-    calico_ready = null_resource.install_calico.id
+    # calico_ready = null_resource.install_calico.id  # REMOVED: Calico handled by control plane
+    cluster_ready = null_resource.wait_for_kubernetes.id  # Use kubernetes readiness instead
   }
 
   provisioner "local-exec" {
@@ -1548,6 +1549,8 @@ EOF
 
 # Modify Calico/Tigera installation to be more robust
 resource "null_resource" "install_calico" {
+  count = 0  # DISABLED: Calico is now installed in control plane user data script with taint handling
+  
   depends_on = [
     null_resource.wait_for_kubernetes,
     terraform_data.kubectl_provider_config,
