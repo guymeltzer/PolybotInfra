@@ -290,111 +290,92 @@ resource "terraform_data" "manage_secrets" {
 }
 
 # Resource to ensure proper initialization before anything else runs
-resource "terraform_data" "init_environment" {
-  depends_on = [terraform_data.manage_secrets]
-
-  # Use a more deterministic trigger that won't cause cycles
-  triggers_replace = {
-    # Trigger on kubeconfig presence/absence without referencing module.k8s-cluster
-    run_kubeconfig = fileexists("./kubeconfig.yaml") ? filemd5("./kubeconfig.yaml") : "notexists"
-  }
-
-  # Create a valid kubeconfig before any resources are created
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      #!/bin/bash
-      
-      # Look for control plane instance
-      INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters Name=tag:Name,Values=guy-control-plane Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
-      
-      # Look for public IP if instance exists
-      if [ "$INSTANCE_ID" != "None" ] && [ ! -z "$INSTANCE_ID" ]; then
-        PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-        
-        # If we have a public IP, try to get the real kubeconfig
-        if [ "$PUBLIC_IP" != "None" ] && [ ! -z "$PUBLIC_IP" ]; then
-          echo "Control plane found with IP: $PUBLIC_IP, checking for kubeconfig"
-          
-          if aws ssm describe-instance-information --region ${var.region} --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-             --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-            
-            echo "Control plane has SSM available, retrieving kubeconfig"
-            # Try to get a real kubeconfig
-            aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" \
-              --instance-ids "$INSTANCE_ID" --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
-              --output text --query "Command.CommandId" > /tmp/command_id.txt
-            
-            sleep 5
-            
-            # Get the kubeconfig content
-            aws ssm get-command-invocation --region ${var.region} --command-id $(cat /tmp/command_id.txt) \
-              --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text > /tmp/admin_conf.txt
-            
-            # Check if we got a valid kubeconfig
-            if [ -s /tmp/admin_conf.txt ] && grep -q "apiVersion: v1" /tmp/admin_conf.txt; then
-              echo "Got valid kubeconfig, updating with correct IP"
-              cat /tmp/admin_conf.txt | sed "s|server:.*|server: https://$PUBLIC_IP:6443|" > ./kubeconfig.yaml
-              chmod 600 ./kubeconfig.yaml
-              echo "Successfully created kubeconfig with real IP"
-              exit 0
-            fi
-          fi
-        fi
-      fi
-      
-      # If we're at this point, we didn't get a valid kubeconfig
-      echo "Creating placeholder kubeconfig"
-      
-      # Since we should only get here during initial setup, if a valid kubeconfig exists, DON'T overwrite it
-      if [ -f "./kubeconfig.yaml" ] && ! grep -q "server: https://placeholder:6443" ./kubeconfig.yaml; then
-        echo "Found existing valid kubeconfig, not overwriting with placeholder"
-        exit 0
-      fi
-      
-      # Create a minimal placeholder kubeconfig that won't cause connection errors
-      cat > "./kubeconfig.yaml" << EOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://127.0.0.1:9999
-    insecure-skip-tls-verify: true
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: admin
-  user:
-    token: placeholder
-EOF
-
-      chmod 600 "./kubeconfig.yaml"
-      echo "Created placeholder kubeconfig successfully with unused local address"
-    EOT
-  }
-}
+# DISABLED: init_environment resource removed to prevent kubeconfig conflicts
+# This resource was creating placeholder kubeconfig files that interfered with
+# the proper kubeconfig management in terraform_data.kubectl_provider_config
+# All kubeconfig creation is now handled by the robust kubectl_provider_config resource
 
 # Resource to wait for Kubernetes API to be fully available - with improved triggers
 resource "null_resource" "wait_for_kubernetes" {
   count = 1
+  
+  # Depend on the kubeconfig being properly created
   triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     cluster_id = module.k8s-cluster.control_plane_instance_id
   }
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      until KUBECONFIG="${local.kubeconfig_path}" kubectl get nodes --request-timeout=10s; do
-        echo "Waiting for Kubernetes API..."
-        sleep 10
+      #!/bin/bash
+      set -e
+      
+      echo "🔄 Waiting for Kubernetes API to be ready..."
+      echo "📁 Using kubeconfig: ${local.kubeconfig_path}"
+      
+      # Validate kubeconfig file exists and has correct content
+      if [[ ! -f "${local.kubeconfig_path}" ]]; then
+        echo "❌ FATAL: Kubeconfig file not found at ${local.kubeconfig_path}"
+        exit 1
+      fi
+      
+      # Check if kubeconfig has a valid server endpoint (not placeholder)
+      SERVER_ENDPOINT=$(grep "server:" "${local.kubeconfig_path}" | head -1 | awk '{print $2}' || echo "")
+      if [[ -z "$SERVER_ENDPOINT" ]]; then
+        echo "❌ FATAL: No server endpoint found in kubeconfig"
+        exit 1
+      fi
+      
+      if [[ "$SERVER_ENDPOINT" == *"placeholder"* ]] || [[ "$SERVER_ENDPOINT" == *"127.0.0.1:9999"* ]]; then
+        echo "❌ FATAL: Kubeconfig still contains placeholder endpoint: $SERVER_ENDPOINT"
+        echo "📋 Kubeconfig content:"
+        cat "${local.kubeconfig_path}"
+        exit 1
+      fi
+      
+      echo "✅ Kubeconfig validation passed"
+      echo "🔗 Server endpoint: $SERVER_ENDPOINT"
+      
+      # Wait for Kubernetes API with proper timeout and retry logic
+      MAX_ATTEMPTS=30  # 5 minutes total (30 * 10 seconds)
+      ATTEMPT=1
+      
+      while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+        echo "🔄 Attempt $ATTEMPT/$MAX_ATTEMPTS: Testing Kubernetes API connection..."
+        
+        if KUBECONFIG="${local.kubeconfig_path}" kubectl get nodes --request-timeout=10s >/dev/null 2>&1; then
+          echo "✅ Successfully connected to Kubernetes API!"
+          echo "📋 Cluster nodes:"
+          KUBECONFIG="${local.kubeconfig_path}" kubectl get nodes -o wide
+          exit 0
+        else
+          echo "⏳ API not ready yet, waiting 10 seconds... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+          if [[ $ATTEMPT -eq $MAX_ATTEMPTS ]]; then
+            echo ""
+            echo "❌ FATAL: Failed to connect to Kubernetes API after $MAX_ATTEMPTS attempts"
+            echo "🔍 Troubleshooting information:"
+            echo "   Kubeconfig path: ${local.kubeconfig_path}"
+            echo "   Server endpoint: $SERVER_ENDPOINT"
+            echo ""
+            echo "📋 Last kubectl error:"
+            KUBECONFIG="${local.kubeconfig_path}" kubectl get nodes --request-timeout=10s || true
+            echo ""
+            echo "📋 Kubeconfig content:"
+            cat "${local.kubeconfig_path}"
+            exit 1
+          fi
+          sleep 10
+          ATTEMPT=$((ATTEMPT + 1))
+        fi
       done
     EOT
   }
-  depends_on = [module.k8s-cluster]
+  
+  depends_on = [
+    terraform_data.kubectl_provider_config,  # CRITICAL: Wait for kubeconfig to be created
+    module.k8s-cluster
+  ]
 }
 
 # Resource that checks if ArgoCD is already deployed before spending time installing it
@@ -907,120 +888,141 @@ resource "terraform_data" "deployment_information" {
 resource "terraform_data" "kubectl_provider_config" {
   count = 1
 
+  # Use module outputs directly instead of resource discovery
   triggers_replace = {
-    control_plane_id = module.k8s-cluster.control_plane_instance_id
-    kubeconfig_path  = local.kubeconfig_path
+    control_plane_id  = module.k8s-cluster.control_plane_instance_id
+    control_plane_ip  = module.k8s-cluster.control_plane_public_ip
+    kubeconfig_version = "v3-robust" # Increment when logic changes
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<EOF
-#!/bin/bash
-set -e
-
-echo "Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
-
-# Function to retrieve kubeconfig from control plane with retries
-fetch_kubeconfig() {
-  local MAX_ATTEMPTS=10
-  local RETRY_DELAY=30
-  local attempt=1
-  
-  echo "Retrieving kubeconfig from control plane instance..."
-  
-  while [ $attempt -le $MAX_ATTEMPTS ]; do
-    echo "Attempt $attempt/$MAX_ATTEMPTS to get kubeconfig"
-    
-    # Get the instance ID of the control plane - as a single line command
-    INSTANCE_ID=$(aws ec2 describe-instances --region ${var.region} --filters "Name=tag:Name,Values=guy-control-plane" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text | tr -d '\r\n')
-        
-    if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-      echo "No running control plane instance found, retrying in $RETRY_DELAY seconds..."
-      sleep $RETRY_DELAY
-      attempt=$(expr $attempt + 1)
-      continue
-    fi
-    
-    echo "Found control plane instance: $INSTANCE_ID"
-    
-    # Use SSM to get the kubeconfig from the instance - as a single line command
-    COMMAND_ID=$(aws ssm send-command --region ${var.region} --document-name "AWS-RunShellScript" --instance-ids "$INSTANCE_ID" --parameters commands="sudo cat /etc/kubernetes/admin.conf" --output text --query "Command.CommandId" 2>/dev/null | tr -d '\r\n')
-        
-    if [ -z "$COMMAND_ID" ]; then
-      echo "Failed to send SSM command, retrying in $RETRY_DELAY seconds..."
-      sleep $RETRY_DELAY
-      attempt=$(expr $attempt + 1)
-      continue
-    fi
-    
-    echo "SSM command sent, waiting for completion..."
-    sleep 10
-    
-    # Get the command output - as a single line command
-    KUBECONFIG_CONTENT=$(aws ssm get-command-invocation --region ${var.region} --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query "StandardOutputContent" --output text 2>/dev/null)
-        
-    if [ -n "$KUBECONFIG_CONTENT" ] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
-      echo "Successfully retrieved kubeconfig"
-      echo "$KUBECONFIG_CONTENT" > ${local.kubeconfig_path}
-      chmod 600 ${local.kubeconfig_path}
+    command = <<-EOT
+      #!/bin/bash
+      set -e  # Exit on any error
       
-      # Update the server address in the kubeconfig to use public IP - as a single line command
-      PUBLIC_IP=$(aws ec2 describe-instances --region ${var.region} --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text | tr -d '\r\n')
-          
-      if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "None" ]; then
-        echo "Updating kubeconfig to use public IP: $PUBLIC_IP"
-        # Different sed syntax for macOS and Linux
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-          sed -i '' "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
-        else
-          sed -i "s|server:.*|server: https://$PUBLIC_IP:6443|g" ${local.kubeconfig_path}
-        fi
+      echo "🔑 Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+      
+      # Use module outputs directly (more reliable than tag discovery)
+      INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
+      PUBLIC_IP="${module.k8s-cluster.control_plane_public_ip}"
+      REGION="${var.region}"
+      
+      if [[ -z "$INSTANCE_ID" || -z "$PUBLIC_IP" ]]; then
+        echo "❌ ERROR: Missing required module outputs"
+        echo "   Instance ID: $INSTANCE_ID"
+        echo "   Public IP: $PUBLIC_IP"
+        exit 1
       fi
       
-      echo "Kubeconfig saved to ${local.kubeconfig_path}"
-      return 0
-    else
-      echo "Invalid kubeconfig content received, retrying in $RETRY_DELAY seconds..."
-      sleep $RETRY_DELAY
-      attempt=$(expr $attempt + 1)
-    fi
-  done
-  
-  echo "Failed to retrieve kubeconfig after $MAX_ATTEMPTS attempts"
-  return 1
-}
-
-# Call the function to fetch the kubeconfig
-fetch_kubeconfig || {
-  echo "ERROR: Could not retrieve kubeconfig, creating a placeholder file"
-  mkdir -p $(dirname "${local.kubeconfig_path}")
-  cat > ${local.kubeconfig_path} << EOFINNER
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://placeholder:6443
-  name: kubernetes
-contexts:
-- context:
-    cluster: kubernetes
-    user: kubernetes-admin
-  name: kubernetes-admin@kubernetes
-current-context: kubernetes-admin@kubernetes
-users:
-- name: kubernetes-admin
-  user:
-    client-certificate-data: placeholder
-    client-key-data: placeholder
-EOFINNER
-  chmod 600 ${local.kubeconfig_path}
-}
-
-echo "Kubeconfig file is ready at ${local.kubeconfig_path}"
-EOF
+      echo "📡 Using control plane instance: $INSTANCE_ID (IP: $PUBLIC_IP)"
+      
+      # Function to retrieve kubeconfig with retries and validation
+      fetch_kubeconfig() {
+        local max_attempts=10
+        local retry_delay=30
+        
+        for attempt in $(seq 1 $max_attempts); do
+          echo "🔄 Attempt $attempt/$max_attempts to retrieve kubeconfig..."
+          
+          # Check if SSM agent is online
+          if ! aws ssm describe-instance-information \
+               --region "$REGION" \
+               --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+               --query "InstanceInformationList[0].PingStatus" \
+               --output text | grep -q "Online"; then
+            echo "⏳ SSM agent not online yet, waiting $retry_delay seconds..."
+            sleep $retry_delay
+            continue
+          fi
+          
+          echo "✅ SSM agent online, fetching kubeconfig..."
+          
+          # Send command to get admin.conf
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$INSTANCE_ID" \
+            --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
+            --output text \
+            --query "Command.CommandId")
+          
+          if [[ -z "$COMMAND_ID" ]]; then
+            echo "❌ Failed to send SSM command"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Wait for command completion
+          echo "⏳ Waiting for SSM command to complete (ID: $COMMAND_ID)..."
+          sleep 15
+          
+          # Get command output with retries
+          for output_attempt in $(seq 1 5); do
+            KUBECONFIG_CONTENT=$(aws ssm get-command-invocation \
+              --region "$REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "StandardOutputContent" \
+              --output text 2>/dev/null || echo "")
+            
+            if [[ -n "$KUBECONFIG_CONTENT" ]]; then
+              break
+            fi
+            echo "⏳ Waiting for command output (attempt $output_attempt/5)..."
+            sleep 5
+          done
+          
+          # Validate kubeconfig content
+          if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config"; then
+            echo "✅ Successfully retrieved valid kubeconfig content"
+            
+            # Create kubeconfig with public IP
+            echo "$KUBECONFIG_CONTENT" | sed "s|server:.*|server: https://$PUBLIC_IP:6443|g" > "${local.kubeconfig_path}"
+            chmod 600 "${local.kubeconfig_path}"
+            
+            # Validate the created file
+            if [[ -f "${local.kubeconfig_path}" ]] && grep -q "server: https://$PUBLIC_IP:6443" "${local.kubeconfig_path}"; then
+              echo "✅ Kubeconfig created successfully at ${local.kubeconfig_path}"
+              echo "🔗 Server endpoint: https://$PUBLIC_IP:6443"
+              return 0
+            else
+              echo "❌ Failed to create valid kubeconfig file"
+            fi
+          else
+            echo "❌ Invalid or empty kubeconfig content received"
+            if [[ -n "$KUBECONFIG_CONTENT" ]]; then
+              echo "Content preview: $(echo "$KUBECONFIG_CONTENT" | head -3)"
+            fi
+          fi
+          
+          echo "⏳ Retrying in $retry_delay seconds..."
+          sleep $retry_delay
+        done
+        
+        echo "❌ FATAL: Failed to retrieve valid kubeconfig after $max_attempts attempts"
+        return 1
+      }
+      
+      # Create kubeconfig directory
+      mkdir -p "$(dirname "${local.kubeconfig_path}")"
+      
+      # Call the function
+      if fetch_kubeconfig; then
+        echo "✅ Kubeconfig setup completed successfully"
+        echo "📁 File location: ${local.kubeconfig_path}"
+        echo "🔍 Server endpoint: $(grep 'server:' "${local.kubeconfig_path}" | head -1)"
+      else
+        echo "❌ FATAL ERROR: Could not create valid kubeconfig"
+        echo "🚨 Terraform apply will fail - this is intentional to prevent invalid deployments"
+        exit 1
+      fi
+    EOT
   }
 
-  depends_on = [module.k8s-cluster]
+  depends_on = [
+    module.k8s-cluster
+  ]
 }
 
 # Install EBS CSI Driver as a Kubernetes component
