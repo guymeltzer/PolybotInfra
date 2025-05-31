@@ -61,6 +61,181 @@ locals {
   actual_key_name = var.key_name != "" ? var.key_name : (length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : "polybot-key")
 }
 
+# Secrets Manager for Kubernetes join command
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+resource "aws_secretsmanager_secret" "kubernetes_join_command" {
+  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
+  description             = "Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
+  force_overwrite_replica_secret = true
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
+  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
+  description             = "Latest Kubernetes join command for worker nodes"
+  recovery_window_in_days = 0  # No recovery window for easy replacement
+  force_overwrite_replica_secret = true
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_security_group" "control_plane_sg" {
+  name        = "Guy-Control-Plane-SG"
+  description = "Allows SSH and API server access to the cluster"
+  vpc_id      = module.vpc.vpc_id
+
+  ingress {
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow worker nodes to connect to API server"
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["10.0.0.0/16"]
+    description = "Allow all internal VPC traffic"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    "kubernetes.io/cluster/kubernetes" = "owned"
+  }
+}
+
+# Resource to clean up existing ASG if it exists
+resource "null_resource" "cleanup_existing_asg" {
+  # Run when manually forced OR when health assessment determines it's needed
+  count = var.force_cleanup_asg || (
+    fileexists("/tmp/asg_cleanup_needed.txt") ? 
+    (file("/tmp/asg_cleanup_needed.txt") == "true\n" || file("/tmp/asg_cleanup_needed.txt") == "true") : 
+    false
+  ) ? 1 : 0
+
+  triggers = {
+    asg_name = "guy-polybot-asg"
+    # Trigger on manual force or health assessment
+    force_cleanup = var.force_cleanup_asg
+    health_assessment = try(terraform_data.cluster_health_assessment.id, "no-assessment")
+    # Include health status to trigger cleanup when assessment changes
+    health_status = fileexists("/tmp/cluster_health_status.txt") ? file("/tmp/cluster_health_status.txt") : "unknown"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      ASG_NAME="guy-polybot-asg"
+      
+      # Determine cleanup reason
+      MANUAL_FORCE="${var.force_cleanup_asg}"
+      AUTO_CLEANUP="false"
+      HEALTH_STATUS="unknown"
+      
+      if [[ -f "/tmp/asg_cleanup_needed.txt" ]]; then
+        AUTO_CLEANUP=$(cat /tmp/asg_cleanup_needed.txt)
+      fi
+      
+      if [[ -f "/tmp/cluster_health_status.txt" ]]; then
+        HEALTH_STATUS=$(cat /tmp/cluster_health_status.txt)
+      fi
+      
+      echo "🔍 ASG CLEANUP INITIATED"
+      echo "========================"
+      if [[ "$MANUAL_FORCE" == "true" ]]; then
+        echo "🔧 REASON: Manual force cleanup (force_cleanup_asg=true)"
+        echo "⚠️  WARNING: This will delete and recreate the ASG, causing worker node replacement!"
+      elif [[ "$AUTO_CLEANUP" == "true" ]]; then
+        echo "🤖 REASON: Automatic cleanup triggered by health assessment"
+        echo "📊 Health status: $HEALTH_STATUS"
+        echo "🎯 This will clean up problematic worker nodes and recreate the ASG"
+      else
+        echo "ℹ️  REASON: Unknown trigger condition"
+      fi
+      echo ""
+      
+      # Check if ASG exists
+      if aws autoscaling describe-auto-scaling-groups \
+         --region ${var.region} \
+         --auto-scaling-group-names "$ASG_NAME" \
+         --query "AutoScalingGroups[0].AutoScalingGroupName" \
+         --output text 2>/dev/null | grep -q "$ASG_NAME"; then
+        
+        echo "⚠️  Found existing ASG: $ASG_NAME. Deleting it..."
+        
+        # First, set desired capacity to 0 to gracefully terminate instances
+        echo "📉 Setting desired capacity to 0 for graceful shutdown..."
+        aws autoscaling update-auto-scaling-group \
+          --region ${var.region} \
+          --auto-scaling-group-name "$ASG_NAME" \
+          --desired-capacity 0 \
+          --min-size 0 || echo "Failed to update capacity, continuing..."
+        
+        # Wait longer for graceful shutdown
+        echo "⏳ Waiting 120 seconds for instances to gracefully terminate..."
+        sleep 120
+        
+        # Delete the ASG
+        echo "🗑️  Deleting Auto Scaling Group: $ASG_NAME"
+        aws autoscaling delete-auto-scaling-group \
+          --region ${var.region} \
+          --auto-scaling-group-name "$ASG_NAME" \
+          --force-delete || echo "Failed to delete ASG, it may not exist"
+        
+        # Wait for deletion to complete
+        echo "⏳ Waiting for ASG deletion to complete..."
+        for attempt in {1..30}; do
+          if ! aws autoscaling describe-auto-scaling-groups \
+             --region ${var.region} \
+             --auto-scaling-group-names "$ASG_NAME" \
+             --query "AutoScalingGroups[0].AutoScalingGroupName" \
+             --output text 2>/dev/null | grep -q "$ASG_NAME"; then
+            echo "✅ ASG successfully deleted"
+            break
+          fi
+          echo "Still waiting for ASG deletion... (attempt $attempt/30)"
+          sleep 10
+        done
+      else
+        echo "✅ No existing ASG found with name: $ASG_NAME"
+      fi
+      
+      echo "🎯 ASG cleanup completed. New ASG will be created shortly."
+      
+      # Clear the health assessment flags after successful cleanup
+      rm -f /tmp/asg_cleanup_needed.txt /tmp/cluster_health_status.txt
+      echo "🧹 Cleared health assessment flags"
+    EOT
+  }
+
+  depends_on = [terraform_data.cluster_health_assessment]
+}
+
 # Security Group for Kubernetes Cluster Resources
 resource "aws_security_group" "k8s_sg" {
   name        = "Guy-K8S-SG"
@@ -1564,8 +1739,6 @@ resource "terraform_data" "force_asg_update" {
     var.rebuild_workers
   ]
 }
-
-# Secrets Manager for Kubernetes join command (already defined earlier, removing duplicate)
 
 # Automatic cluster health assessment to determine if ASG recreation is needed
 resource "terraform_data" "cluster_health_assessment" {
