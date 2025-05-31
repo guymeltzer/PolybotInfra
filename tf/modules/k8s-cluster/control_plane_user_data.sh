@@ -348,7 +348,7 @@ check_ccm_running() {
 
 # Function to check if node has provider ID set
 check_provider_id() {
-    kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}' | grep -q "aws://"
+    kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}' | grep -q "aws$${":"}//"
     return $?
 }
 
@@ -403,7 +403,7 @@ if ! check_provider_id; then
     AVAILABILITY_ZONE=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
     
     if [ -n "$INSTANCE_ID" ] && [ -n "$AVAILABILITY_ZONE" ]; then
-        PROVIDER_ID="aws:///$AVAILABILITY_ZONE/$INSTANCE_ID"
+        PROVIDER_ID="aws$${":"}//$${":"}/$AVAILABILITY_ZONE/$INSTANCE_ID"
         echo "$(date): Setting provider ID to: $PROVIDER_ID"
         kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" || echo "$(date): Failed to set provider ID"
     fi
