@@ -386,6 +386,7 @@ resource "null_resource" "cluster_readiness_check" {
   depends_on = [
     null_resource.install_ebs_csi_driver,
     null_resource.install_node_termination_handler,
+    null_resource.remove_orphaned_nodes,  # Clean up orphaned nodes first
     terraform_data.kubectl_provider_config
   ]
   
@@ -2270,10 +2271,12 @@ resource "null_resource" "remove_orphaned_nodes" {
     terraform_data.kubectl_provider_config
   ]
 
-  # Run this whenever cluster readiness changes
+  # Run this immediately when cluster is ready, not when readiness check completes
   triggers = {
-    cluster_ready = null_resource.cluster_readiness_check.id
+    kubeconfig_ready = terraform_data.kubectl_provider_config[0].id
     control_plane_id = module.k8s-cluster.control_plane_instance_id
+    # Force immediate run to clean up orphaned nodes
+    force_run = "immediate-cleanup-v1"
   }
 
   provisioner "local-exec" {

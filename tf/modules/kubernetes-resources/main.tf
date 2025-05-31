@@ -90,7 +90,7 @@ EOF
   }
 }
 
-# Improved disk cleanup resource
+# Improved disk cleanup resource - DISABLED to prevent terminating healthy worker nodes
 resource "null_resource" "improved_disk_cleanup" {
   count = var.enable_resources ? 1 : 0
   triggers = {
@@ -99,9 +99,16 @@ resource "null_resource" "improved_disk_cleanup" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
+      echo "🔍 DISK CLEANUP DISABLED - Would have checked for worker nodes to clean up"
+      echo "Note: The previous version of this resource was terminating worker nodes, which is incorrect during cluster deployment"
+      echo "If you need disk cleanup, implement it as a Kubernetes CronJob or DaemonSet instead"
+      
+      # Show what instances would have been affected (for debugging)
+      echo "Worker instances that would have been checked:"
       aws ec2 describe-instances --region ${var.region} \
         --filters "Name=tag:Name,Values=*worker-node*" "Name=instance-state-name,Values=running" \
-        --query "Reservations[*].Instances[*].InstanceId" --output text | xargs -I {} aws ec2 terminate-instances --region ${var.region} --instance-ids {}
+        --query "Reservations[*].Instances[*].[InstanceId,Tags[?Key=='Name'].Value|[0]]" \
+        --output table || echo "Could not list instances"
     EOT
   }
   lifecycle {
