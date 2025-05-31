@@ -56,12 +56,7 @@ if ! command -v aws &> /dev/null; then
     export PATH=$PATH:/usr/local/bin # May not persist for later commands if not in .bashrc
 else
     log "AWS CLI already installed."
-fi
-aws --version || { log "AWS CLI setup failed"; exit 1; }
-
-
-# Get metadata token with retry
-log "Retrieving metadata token..."
+finame
 IMDS_TOKEN=$(retry 5 10 "curl -s -f -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600'")
 if [ -z "$IMDS_TOKEN" ]; then
     log "Warning: Failed to get IMDSv2 token. Attempting IMDSv1 for region."
