@@ -186,14 +186,14 @@ localAPIEndpoint:
   bindPort: 6443
 nodeRegistration:
   name: $NEW_HOSTNAME
-  criSocket: "unix:///run/crio/crio.sock" # Specify CRI-O socket
+  criSocket: "unix$${":"///run/crio/crio.sock" # Specify CRI-O socket
   kubeletExtraArgs:
     cloud-provider: "external"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
 kubernetesVersion: "v${K8S_VERSION_FULL}" # Use template variable
-controlPlaneEndpoint: "$PRIVATE_IP:6443"
+controlPlaneEndpoint: "$PRIVATE_IP$${":"}6443"
 apiServer:
   certSANs:
   - "$PRIVATE_IP"
@@ -478,7 +478,7 @@ wait_for_daemonset() {
             return 0
         fi
         
-        echo "Still waiting for daemonset $daemonset: $ready/$desired ready"
+        echo "Still waiting for daemonset $daemonset$${":"} $ready/$desired ready"
         sleep 10
     done
     
@@ -507,7 +507,7 @@ PENDING_PODS=$(kubectl get pods -A --field-selector=status.phase=Pending -o json
 if [ -n "$PENDING_PODS" ]; then
     echo "Found pending pods, showing events:"
     for pod in $PENDING_PODS; do
-        echo "Events for pod $pod:"
+        echo "Events for pod $pod$${":"}""
         kubectl describe pod "$pod" -A | grep -A 10 "Events:" || echo "No events found"
         echo "---"
     done
