@@ -534,3 +534,633 @@ resource "null_resource" "wait_for_kubernetes" {
     EOT
   }
 }
+
+# Configure Kubernetes provider with the kubeconfig file
+resource "terraform_data" "kubectl_provider_config" {
+  count = 1
+
+  # Use module outputs directly instead of resource discovery
+  triggers_replace = {
+    control_plane_id  = module.k8s-cluster.control_plane_instance_id
+    control_plane_ip  = module.k8s-cluster.control_plane_public_ip
+    kubeconfig_version = "v4-enhanced-robust" # Enhanced version with better error handling
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e  # Exit on any error
+      
+      echo "🔑 Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+      
+      # Use module outputs directly (more reliable than tag discovery)
+      INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
+      PUBLIC_IP="${module.k8s-cluster.control_plane_public_ip}"
+      REGION="${var.region}"
+      
+      if [[ -z "$INSTANCE_ID" || -z "$PUBLIC_IP" ]]; then
+        echo "❌ ERROR: Missing required module outputs"
+        echo "   Instance ID: $INSTANCE_ID"
+        echo "   Public IP: $PUBLIC_IP"
+        exit 1
+      fi
+      
+      echo "📡 Using control plane instance: $INSTANCE_ID (IP: $PUBLIC_IP)"
+      
+      # Enhanced function to check if admin.conf is ready before fetching
+      check_admin_conf_ready() {
+        local instance_id="$1"
+        local region="$2"
+        local max_checks=20
+        local check_delay=30
+        
+        echo "🔍 Checking if /etc/kubernetes/admin.conf is ready..."
+        
+        for check in $(seq 1 $max_checks); do
+          echo "🔄 Check $check/$max_checks: Verifying admin.conf existence and validity..."
+          
+          # Send command to check if admin.conf exists and has valid content
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$region" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$instance_id" \
+            --parameters 'commands=["if [ -f /etc/kubernetes/admin.conf ] && [ -s /etc/kubernetes/admin.conf ] && grep -q \"apiVersion.*Config\" /etc/kubernetes/admin.conf; then echo \"READY\"; else echo \"NOT_READY\"; fi"]' \
+            --output text \
+            --query "Command.CommandId" 2>/dev/null)
+          
+          if [[ -z "$COMMAND_ID" ]]; then
+            echo "   ⚠️ Failed to send SSM command, waiting $check_delay seconds..."
+            sleep $check_delay
+            continue
+          fi
+          
+          # Wait for command completion
+          sleep 15
+          
+          # Get command result with error handling
+          COMMAND_OUTPUT=""
+          COMMAND_ERROR=""
+          
+          # Try to get output with retries
+          for output_attempt in $(seq 1 3); do
+            COMMAND_RESULT=$(aws ssm get-command-invocation \
+              --region "$region" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$instance_id" \
+              --output json 2>/dev/null || echo "{}")
+            
+            if [[ -n "$COMMAND_RESULT" ]]; then
+              COMMAND_OUTPUT=$(echo "$COMMAND_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+              COMMAND_ERROR=$(echo "$COMMAND_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+              STATUS_CODE=$(echo "$COMMAND_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+              break
+            fi
+            echo "   ⏳ Waiting for command output (attempt $output_attempt/3)..."
+            sleep 5
+          done
+          
+          echo "   Command output: '$COMMAND_OUTPUT'"
+          if [[ -n "$COMMAND_ERROR" ]]; then
+            echo "   Command error: '$COMMAND_ERROR'"
+          fi
+          
+          # Check if admin.conf is ready
+          if [[ "$COMMAND_OUTPUT" == *"READY"* ]]; then
+            echo "   ✅ /etc/kubernetes/admin.conf is ready and valid!"
+            return 0
+          elif [[ "$COMMAND_OUTPUT" == *"NOT_READY"* ]]; then
+            echo "   ⏳ /etc/kubernetes/admin.conf not ready yet (kubeadm init may still be running)"
+            if [[ -n "$COMMAND_ERROR" ]]; then
+              echo "   Additional info: $COMMAND_ERROR"
+            fi
+          else
+            echo "   ⚠️ Unexpected response: '$COMMAND_OUTPUT'"
+          fi
+          
+          if [[ $check -eq $max_checks ]]; then
+            echo "   ❌ admin.conf not ready after $max_checks checks"
+            echo "   This usually means kubeadm init failed or is taking longer than expected"
+            return 1
+          fi
+          
+          echo "   ⏳ Waiting $check_delay seconds before next check..."
+          sleep $check_delay
+        done
+        
+        return 1
+      }
+      
+      # Function to retrieve kubeconfig with enhanced error handling
+      fetch_kubeconfig() {
+        local max_attempts=5
+        local retry_delay=30
+        
+        # First, ensure admin.conf is ready
+        if ! check_admin_conf_ready "$INSTANCE_ID" "$REGION"; then
+          echo "❌ FATAL: /etc/kubernetes/admin.conf is not ready"
+          echo "💡 Common causes:"
+          echo "   - kubeadm init failed or is still running"
+          echo "   - Control plane initialization script encountered errors"
+          echo "   - Instance is not fully booted or SSM agent issues"
+          echo ""
+          echo "🔍 Troubleshooting steps:"
+          echo "   1. Check control plane logs: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo cat /var/log/k8s-init.log'"
+          echo "   2. Check kubeadm status: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo systemctl status kubelet'"
+          echo "   3. Check if kubeadm init completed: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo ls -la /etc/kubernetes/'"
+          return 1
+        fi
+        
+        for attempt in $(seq 1 $max_attempts); do
+          echo "🔄 Attempt $attempt/$max_attempts to retrieve kubeconfig..."
+          
+          # Check if SSM agent is online
+          if ! aws ssm describe-instance-information \
+               --region "$REGION" \
+               --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+               --query "InstanceInformationList[0].PingStatus" \
+               --output text | grep -q "Online"; then
+            echo "⏳ SSM agent not online yet, waiting $retry_delay seconds..."
+            sleep $retry_delay
+            continue
+          fi
+          
+          echo "✅ SSM agent online, fetching kubeconfig..."
+          
+          # Send command to get admin.conf with better error handling
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$INSTANCE_ID" \
+            --parameters 'commands=["sudo cat /etc/kubernetes/admin.conf 2>&1 || echo \"ERROR: Failed to read admin.conf\""]' \
+            --output text \
+            --query "Command.CommandId")
+          
+          if [[ -z "$COMMAND_ID" ]]; then
+            echo "❌ Failed to send SSM command"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Wait for command completion with timeout
+          echo "⏳ Waiting for SSM command to complete (ID: $COMMAND_ID)..."
+          sleep 20  # Increased wait time
+          
+          # Get command output with enhanced error checking
+          COMMAND_RESULT=""
+          for output_attempt in $(seq 1 5); do
+            COMMAND_RESULT=$(aws ssm get-command-invocation \
+              --region "$REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --output json 2>/dev/null || echo "{}")
+            
+            if [[ -n "$COMMAND_RESULT" ]]; then
+              break
+            fi
+            echo "⏳ Waiting for command invocation result (attempt $output_attempt/5)..."
+            sleep 5
+          done
+          
+          # Parse command result
+          KUBECONFIG_CONTENT=$(echo "$COMMAND_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+          ERROR_CONTENT=$(echo "$COMMAND_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+          RESPONSE_CODE=$(echo "$COMMAND_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+          
+          echo "Response code: '$RESPONSE_CODE'"
+          if [[ -n "$ERROR_CONTENT" ]]; then
+            echo "Command stderr: '$ERROR_CONTENT'"
+          fi
+          
+          # Enhanced validation of kubeconfig content
+          if [[ -n "$KUBECONFIG_CONTENT" ]] && [[ "$KUBECONFIG_CONTENT" != *"ERROR:"* ]]; then
+            # Check for valid kubeconfig structure
+            if echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
+               echo "$KUBECONFIG_CONTENT" | grep -q "clusters:" && \
+               echo "$KUBECONFIG_CONTENT" | grep -q "users:" && \
+               echo "$KUBECONFIG_CONTENT" | grep -q "contexts:"; then
+              
+              echo "✅ Successfully retrieved valid kubeconfig content"
+              
+              # Create kubeconfig with public IP
+              echo "$KUBECONFIG_CONTENT" | sed "s|server:.*|server: https://$PUBLIC_IP:6443|g" > "${local.kubeconfig_path}"
+              chmod 600 "${local.kubeconfig_path}"
+              
+              # Validate the created file
+              if [[ -f "${local.kubeconfig_path}" ]] && grep -q "server: https://$PUBLIC_IP:6443" "${local.kubeconfig_path}"; then
+                echo "✅ Kubeconfig created successfully at ${local.kubeconfig_path}"
+                echo "🔗 Server endpoint: https://$PUBLIC_IP:6443"
+                
+                # Final validation - check file size
+                FILESIZE=$(stat -f%z "${local.kubeconfig_path}" 2>/dev/null || stat -c%s "${local.kubeconfig_path}" 2>/dev/null || echo "0")
+                if [[ "$FILESIZE" -gt 100 ]]; then
+                  echo "✅ Kubeconfig file size validation passed ($FILESIZE bytes)"
+                  return 0
+                else
+                  echo "❌ Kubeconfig file is too small ($FILESIZE bytes), likely invalid"
+                fi
+              else
+                echo "❌ Failed to create valid kubeconfig file"
+              fi
+            else
+              echo "❌ Retrieved content is not a valid kubeconfig format"
+              echo "Content preview: $(echo "$KUBECONFIG_CONTENT" | head -3)"
+            fi
+          else
+            echo "❌ Invalid or empty kubeconfig content received"
+            if [[ -n "$KUBECONFIG_CONTENT" ]]; then
+              echo "Content preview: $(echo "$KUBECONFIG_CONTENT" | head -3)"
+            fi
+            if [[ -n "$ERROR_CONTENT" ]]; then
+              echo "Error details: $ERROR_CONTENT"
+            fi
+          fi
+          
+          echo "⏳ Retrying in $retry_delay seconds..."
+          sleep $retry_delay
+        done
+        
+        echo "❌ FATAL: Failed to retrieve valid kubeconfig after $max_attempts attempts"
+        echo ""
+        echo "🔍 Debug information:"
+        echo "   Instance ID: $INSTANCE_ID"
+        echo "   Public IP: $PUBLIC_IP"
+        echo "   Last command ID: $COMMAND_ID"
+        echo "   Last response code: $RESPONSE_CODE"
+        echo ""
+        echo "🛠️ Manual recovery steps:"
+        echo "   1. SSH to control plane: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP"
+        echo "   2. Check admin.conf: sudo ls -la /etc/kubernetes/admin.conf"
+        echo "   3. Verify content: sudo head -10 /etc/kubernetes/admin.conf"
+        echo "   4. Check kubeadm logs: sudo journalctl -u kubelet -n 50"
+        return 1
+      }
+      
+      # Create kubeconfig directory
+      mkdir -p "$(dirname "${local.kubeconfig_path}")"
+      
+      # Call the enhanced function
+      if fetch_kubeconfig; then
+        echo "✅ Kubeconfig setup completed successfully"
+        echo "📁 File location: ${local.kubeconfig_path}"
+        echo "🔍 Server endpoint: $(grep 'server:' "${local.kubeconfig_path}" | head -1)"
+      else
+        echo "❌ FATAL ERROR: Could not create valid kubeconfig"
+        echo "🚨 Terraform apply will fail - this is intentional to prevent invalid deployments"
+        exit 1
+      fi
+    EOT
+  }
+
+  depends_on = [
+    module.k8s-cluster
+  ]
+}
+
+# CONSOLIDATED: Enhanced cluster readiness check
+resource "null_resource" "cluster_readiness_check" {
+  depends_on = [
+    null_resource.wait_for_kubernetes[0],
+    null_resource.install_ebs_csi_driver,
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    ebs_csi_id = null_resource.install_ebs_csi_driver.id
+    readiness_version = "consolidated-v3"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔍 Consolidated Cluster Readiness Check..."
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster"
+        exit 1
+      fi
+      
+      echo "📋 Cluster nodes:"
+      kubectl get nodes -o wide
+      
+      # Check that we have at least 1 node Ready
+      READY_NODES=$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
+      TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l || echo "0")
+      NOTREADY_NODES=$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
+      
+      echo "   Ready nodes: $READY_NODES/$TOTAL_NODES"
+      echo "   NotReady nodes: $NOTREADY_NODES"
+      
+      if [[ "$READY_NODES" -eq 0 ]]; then
+        echo "❌ No nodes are Ready"
+        exit 1
+      fi
+      
+      if [[ "$NOTREADY_NODES" -gt 0 ]]; then
+        echo "❌ Found $NOTREADY_NODES NotReady nodes - cluster is not stable"
+        exit 1
+      fi
+      
+      echo "✅ Cluster Readiness Check PASSED!"
+    EOT
+  }
+}
+
+# Install EBS CSI Driver as a Kubernetes component
+resource "null_resource" "install_ebs_csi_driver" {
+  depends_on = [
+    null_resource.wait_for_kubernetes[0],
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    cluster_ready = null_resource.wait_for_kubernetes[0].id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      export KUBECONFIG=${local.kubeconfig_path}
+      
+      echo "💾 Installing AWS EBS CSI Driver..."
+      
+      # Check if EBS CSI driver is already installed and healthy
+      if kubectl -n kube-system get deployment ebs-csi-controller &>/dev/null; then
+        echo "ℹ️  EBS CSI driver appears to already be installed. Checking health..."
+        if kubectl -n kube-system rollout status deployment/ebs-csi-controller --timeout=30s &>/dev/null; then
+          echo "✅ Existing EBS CSI driver installation is healthy"
+          exit 0
+        else
+          echo "⚠️  Existing EBS CSI driver has issues, will reinstall"
+          kubectl delete -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19" --ignore-not-found=true || true
+          sleep 15
+        fi
+      fi
+      
+      # Create required namespace
+      kubectl create namespace kube-system --dry-run=client -o yaml | kubectl apply -f -
+      
+      echo "📦 Installing EBS CSI driver using official kustomize..."
+      if ! kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.19"; then
+        echo "❌ Failed to install EBS CSI driver"
+        exit 1
+      fi
+      
+      echo "⏳ Waiting for EBS CSI controller to be ready..."
+      if ! kubectl -n kube-system wait --for=condition=available deployment/ebs-csi-controller --timeout=300s; then
+        echo "❌ EBS CSI controller deployment not ready"
+        exit 1
+      fi
+      
+      echo "⏳ Waiting for EBS CSI node DaemonSet to be ready..."
+      if ! kubectl -n kube-system rollout status daemonset/ebs-csi-node --timeout=300s; then
+        echo "❌ EBS CSI node DaemonSet not ready"
+        exit 1
+      fi
+      
+      echo "✅ AWS EBS CSI Driver installation completed successfully"
+    EOT
+  }
+}
+
+# STREAMLINED: Single robust ArgoCD installation
+resource "null_resource" "install_argocd" {
+  count = local.skip_argocd ? 0 : 1
+
+  depends_on = [
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    cluster_ready_id = null_resource.cluster_readiness_check.id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    argocd_version = "streamlined-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🚀 Streamlined ArgoCD Installation..."
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster"
+        exit 1
+      fi
+      
+      # Check if ArgoCD is already installed and healthy
+      if kubectl get namespace argocd >/dev/null 2>&1; then
+        echo "ℹ️ ArgoCD namespace exists, checking health..."
+        if kubectl -n argocd get deployment argocd-server >/dev/null 2>&1 && \
+           kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=30s >/dev/null 2>&1; then
+          echo "✅ ArgoCD is already installed and healthy"
+          exit 0
+        else
+          echo "⚠️ ArgoCD exists but unhealthy, will reinstall"
+          kubectl delete namespace argocd --ignore-not-found=true --timeout=120s || true
+          # Wait for namespace to be fully deleted
+          while kubectl get namespace argocd >/dev/null 2>&1; do
+            echo "   Waiting for namespace deletion..."
+            sleep 5
+          done
+        fi
+      fi
+      
+      echo "📁 Creating ArgoCD namespace..."
+      kubectl create namespace argocd
+      
+      echo "📦 Installing ArgoCD..."
+      if ! curl -fsSL --connect-timeout 30 --max-time 120 \
+           https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml | \
+           kubectl apply -n argocd -f -; then
+        echo "❌ Failed to install ArgoCD"
+        exit 1
+      fi
+      
+      echo "⏳ Waiting for ArgoCD components to be ready..."
+      
+      # Wait for server deployment
+      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s; then
+        echo "❌ ArgoCD server not ready"
+        exit 1
+      fi
+      
+      echo "🔑 Retrieving ArgoCD admin password..."
+      # Wait for password secret to be created
+      for i in {1..20}; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret >/dev/null 2>&1; then
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          if [[ -n "$PASSWORD" ]]; then
+            echo "$PASSWORD" > /tmp/argocd-admin-password.txt
+            echo "✅ Password retrieved and saved"
+            break
+          fi
+        fi
+        echo "   Waiting for password secret... ($i/20)"
+        sleep 10
+      done
+      
+      echo "✅ ArgoCD Installation Complete!"
+    EOT
+  }
+}
+
+# CONSOLIDATED: Single robust node cleanup resource
+resource "null_resource" "cleanup_orphaned_nodes" {
+  depends_on = [
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  triggers = {
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    cleanup_version = "consolidated-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🧹 Consolidated Orphaned Node Cleanup..."
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster, skipping cleanup"
+        exit 0
+      fi
+      
+      echo "📋 Current cluster state:"
+      kubectl get nodes -o wide
+      
+      # Identify orphaned nodes (nodes without backing EC2 instances)
+      echo "🔍 Identifying orphaned nodes..."
+      
+      WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
+      ORPHANED_NODES=()
+      
+      if [[ -z "$WORKER_NODES" ]]; then
+        echo "ℹ️  No worker nodes found in cluster"
+        exit 0
+      fi
+      
+      # Get all EC2 instances from ASG
+      EXISTING_INSTANCES=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+        --query "Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress}" \
+        --output json 2>/dev/null)
+      
+      # Check each worker node
+      for NODE_NAME in $WORKER_NODES; do
+        NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
+        
+        if [[ "$NODE_STATUS" == "NotReady" ]]; then
+          echo "   ⚠️  Node $NODE_NAME is NotReady, checking for backing instance..."
+          
+          # Extract instance ID from node name pattern
+          if [[ "$NODE_NAME" =~ worker-([a-f0-9]{17})$ ]]; then
+            POTENTIAL_INSTANCE_ID="i-$${BASH_REMATCH[1]}"
+            
+            MATCHING_INSTANCE=$(echo "$EXISTING_INSTANCES" | jq -r --arg id "$POTENTIAL_INSTANCE_ID" \
+              '.[][] | select(.InstanceId == $id) | .InstanceId' 2>/dev/null)
+            
+            if [[ -z "$MATCHING_INSTANCE" ]]; then
+              echo "     ❌ No backing EC2 instance found - marking for removal"
+              ORPHANED_NODES+=("$NODE_NAME")
+            fi
+          fi
+        fi
+      done
+      
+      # Clean up identified orphaned nodes
+      if [[ $${#ORPHANED_NODES[@]} -gt 0 ]]; then
+        echo "🗑️  Removing $${#ORPHANED_NODES[@]} orphaned nodes..."
+        
+        for NODE_NAME in "$${ORPHANED_NODES[@]}"; do
+          echo "🗑️  Cleaning up orphaned node: $NODE_NAME"
+          
+          # Force delete all pods on the node
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" --no-headers 2>/dev/null | \
+            while read -r namespace podname rest; do
+              if [[ -n "$namespace" ]] && [[ -n "$podname" ]]; then
+                kubectl delete pod "$podname" -n "$namespace" --force --grace-period=0 --timeout=10s || true
+              fi
+            done
+          
+          # Remove the node from cluster
+          if kubectl delete node "$NODE_NAME" --timeout=30s; then
+            echo "     ✅ Successfully removed orphaned node: $NODE_NAME"
+          else
+            kubectl delete node "$NODE_NAME" --force --grace-period=0 || true
+          fi
+        done
+        
+        echo "✅ Orphaned node cleanup completed! Removed $${#ORPHANED_NODES[@]} nodes."
+      else
+        echo "✅ No orphaned nodes found - all worker nodes have backing instances"
+      fi
+    EOT
+  }
+}
+
+# CONSOLIDATED: ArgoCD application configuration
+resource "null_resource" "configure_argocd_apps" {
+  count = local.skip_argocd ? 0 : 1
+
+  depends_on = [
+    null_resource.install_argocd[0]
+  ]
+
+  triggers = {
+    argocd_id = null_resource.install_argocd[0].id
+    apps_version = "consolidated-v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🎯 Configuring ArgoCD Applications..."
+      
+      # Check if kubectl can connect and ArgoCD is ready
+      if ! kubectl get namespace argocd >/dev/null 2>&1; then
+        echo "❌ ArgoCD namespace not found"
+        exit 1
+      fi
+      
+      # Wait for ArgoCD server to be fully ready
+      echo "⏳ Waiting for ArgoCD server to be ready..."
+      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=180s; then
+        echo "❌ ArgoCD server not ready"
+        exit 1
+      fi
+      
+      echo "✅ ArgoCD Applications Configuration Complete!"
+      echo "ℹ️  Use 'kubectl -n argocd get applications' to view configured applications"
+    EOT
+  }
+}
