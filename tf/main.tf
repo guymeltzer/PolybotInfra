@@ -1252,11 +1252,11 @@ resource "null_resource" "cleanup_stale_nodes" {
           # Check node age - only remove nodes that have been NotReady for more than 10 minutes
           NODE_AGE_SECONDS=0
           if [[ "$NODE_AGE_RAW" =~ ^([0-9]+)m$ ]]; then
-            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 60))
+            NODE_AGE_SECONDS=$(($${BASH_REMATCH[1]} * 60))
           elif [[ "$NODE_AGE_RAW" =~ ^([0-9]+)h$ ]]; then
-            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 3600))
+            NODE_AGE_SECONDS=$(($${BASH_REMATCH[1]} * 3600))
           elif [[ "$NODE_AGE_RAW" =~ ^([0-9]+)d$ ]]; then
-            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 86400))
+            NODE_AGE_SECONDS=$(($${BASH_REMATCH[1]} * 86400))
           fi
           
           # If node is older than 10 minutes and still NotReady, check if EC2 instance exists
@@ -1268,7 +1268,7 @@ resource "null_resource" "cleanup_stale_nodes" {
             
             # Extract hash from worker node name (format: worker-<hash>)
             if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
-              NODE_HASH="${BASH_REMATCH[1]}"
+              NODE_HASH="$${BASH_REMATCH[1]}"
               echo "   Looking for EC2 instance with hash: $NODE_HASH"
               
               # Search for running instance with this hash in name or instance ID
@@ -1280,7 +1280,7 @@ resource "null_resource" "cleanup_stale_nodes" {
                 
             elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
               # Format: ip-<ip-with-dashes>
-              PRIVATE_IP="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+              PRIVATE_IP="$${BASH_REMATCH[1]}.$${BASH_REMATCH[2]}.$${BASH_REMATCH[3]}.$${BASH_REMATCH[4]}"
               echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
               
               # Search for running instance with this private IP
