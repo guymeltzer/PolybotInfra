@@ -1357,10 +1357,6 @@ resource "aws_iam_policy" "worker_s3_access" {
 }
 
 # Attach the S3 access policy to the worker role
-resource "aws_iam_role_policy_attachment" "worker_s3_access" {
-  role       = aws_iam_role.worker_role.name
-  policy_arn = aws_iam_policy.worker_s3_access.arn
-}
 
 # Alternative inline policy for S3 access to avoid policy limit
 resource "aws_iam_role_policy" "worker_s3_access_inline" {
@@ -1429,8 +1425,8 @@ resource "aws_launch_template" "worker_lt" {
     tags = {
       Name = "guy-worker-node-${random_id.suffix.hex}"
       "kubernetes-io-cluster-kubernetes" = "owned"
-      "k8s.io/cluster-autoscaler/enabled" = "true"
-      "k8s.io/role/node" = "true"
+      "k8s-io-cluster-autoscaler-enabled" = "true"
+      "k8s-io-role-node" = "true"  # Fixed: replaced invalid characters
       "ClusterIdentifier" = "${var.cluster_name}-${random_id.suffix.hex}"
     }
   }
@@ -1521,15 +1517,9 @@ resource "null_resource" "cleanup_existing_asg" {
   }
 }
 
-# Data source to check if ASG already exists
-data "aws_autoscaling_groups" "existing_worker_asg" {
-  names = ["guy-polybot-asg"]
-}
-
 # Terraform data resource to track ASG state
 resource "terraform_data" "asg_state_tracker" {
   input = {
-    asg_exists = length(data.aws_autoscaling_groups.existing_worker_asg.names) > 0
     cleanup_completed = null_resource.cleanup_existing_asg.id
   }
   
