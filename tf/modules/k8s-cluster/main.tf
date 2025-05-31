@@ -1547,13 +1547,13 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
 
   tag {
-    key                 = "k8s.io/cluster-autoscaler/enabled"
+    key                 = "k8s.io-cluster-autoscaler-enabled"
     value               = "true"
     propagate_at_launch = true
   }
 
   tag {
-    key                 = "k8s.io/cluster-autoscaler/guy-polybot-cluster"
+    key                 = "k8s.io-cluster-autoscaler-guy-polybot-cluster"
     value               = "owned"
     propagate_at_launch = true
   }
@@ -1571,7 +1571,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
   
   tag {
-    key                 = "k8s.io/role/node"
+    key                 = "k8s.io-role-node"
     value               = "true"
     propagate_at_launch = true
   }
