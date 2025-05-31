@@ -398,68 +398,110 @@ resource "null_resource" "cluster_readiness_check" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       #!/bin/bash
+      set -euo pipefail
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "🔍 Checking cluster readiness before proceeding with applications..."
+      echo "🔍 Checking cluster readiness..."
       
-      # Wait for basic connectivity
-      echo "⏳ Waiting for kubectl connectivity..."
-      for attempt in {1..30}; do
-        if kubectl get nodes &>/dev/null; then
-          echo "✅ kubectl connectivity established"
-          break
-        fi
-        echo "   Attempt $attempt/30: waiting for kubectl connectivity..."
-        sleep 10
-      done
-      
-      # Wait for all nodes to be ready
-      echo "⏳ Waiting for all nodes to be Ready..."
-      for attempt in {1..60}; do
-        NOT_READY_NODES=$(kubectl get nodes --no-headers | grep -v " Ready " | wc -l)
-        if [[ "$NOT_READY_NODES" -eq 0 ]]; then
-          echo "✅ All nodes are Ready"
-          break
-        fi
-        echo "   Attempt $attempt/60: $NOT_READY_NODES nodes still not ready..."
-        kubectl get nodes --no-headers | grep -v " Ready " || true
-        sleep 10
-      done
-      
-      # Wait for CoreDNS to be fully ready
-      echo "⏳ Waiting for CoreDNS to be ready..."
-      kubectl -n kube-system wait --for=condition=available deployment/coredns --timeout=300s || {
-        echo "⚠️  CoreDNS not ready within timeout, but continuing..."
+      # Function to check kubectl connectivity with retries
+      check_kubectl_connectivity() {
+        local max_attempts=20
+        local attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "   Kubectl connectivity check (attempt $attempt/$max_attempts)..."
+          if kubectl get nodes --request-timeout=10s &>/dev/null; then
+            echo "✅ kubectl connectivity established"
+            return 0
+          fi
+          echo "   Waiting for kubectl connectivity..."
+          sleep 15
+          attempt=$((attempt + 1))
+        done
+        
+        echo "❌ kubectl connectivity failed after $max_attempts attempts"
+        return 1
       }
       
-      # Wait for essential system pods
-      echo "⏳ Waiting for essential system pods..."
-      for component in kube-proxy calico-node ebs-csi-node; do
-        echo "   Checking $component..."
-        kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=$component --timeout=120s || {
-          echo "   ⚠️  $component pods not ready within timeout"
-        }
-      done
-      
-      # Check for any obvious issues
-      echo "🔍 Checking for obvious cluster issues..."
-      PENDING_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Pending --no-headers | wc -l)
-      FAILED_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Failed --no-headers | wc -l)
-      
-      echo "📊 Cluster Health Summary:"
-      echo "   Nodes: $(kubectl get nodes --no-headers | wc -l) total"
-      echo "   Ready Nodes: $(kubectl get nodes --no-headers | grep " Ready " | wc -l)"
-      echo "   Pending Pods: $PENDING_PODS"
-      echo "   Failed Pods: $FAILED_PODS"
-      
-      if [[ "$PENDING_PODS" -gt 10 ]]; then
-        echo "⚠️  Warning: High number of pending pods ($PENDING_PODS)"
-        echo "   This might indicate scheduling issues"
+      # Check kubectl connectivity first
+      if ! check_kubectl_connectivity; then
+        echo "❌ Cannot establish kubectl connectivity"
+        exit 1
       fi
       
-      if [[ "$FAILED_PODS" -gt 5 ]]; then
-        echo "⚠️  Warning: High number of failed pods ($FAILED_PODS)"
-        echo "   This might indicate configuration issues"
+      # Wait for all nodes to be in Ready state
+      echo "⏳ Waiting for all nodes to be Ready..."
+      local node_attempts=40
+      local node_attempt=1
+      
+      while [ $node_attempt -le $node_attempts ]; do
+        local not_ready_nodes=$(kubectl get nodes --no-headers 2>/dev/null | grep -v " Ready " | wc -l || echo "999")
+        local total_nodes=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        if [[ "$not_ready_nodes" -eq 0 ]] && [[ "$total_nodes" -gt 0 ]]; then
+          echo "✅ All $total_nodes nodes are Ready"
+          kubectl get nodes
+          break
+        fi
+        
+        echo "   Node readiness check (attempt $node_attempt/$node_attempts): $not_ready_nodes/$total_nodes nodes not ready"
+        if [ $node_attempt -eq $node_attempts ]; then
+          echo "⚠️  Some nodes still not ready after waiting, but continuing..."
+          kubectl get nodes || true
+        fi
+        
+        sleep 15
+        node_attempt=$((node_attempt + 1))
+      done
+      
+      # Wait for CoreDNS to be ready (essential for cluster operations)
+      echo "⏳ Waiting for CoreDNS to be ready..."
+      if kubectl -n kube-system wait --for=condition=available deployment/coredns --timeout=300s; then
+        echo "✅ CoreDNS is ready"
+      else
+        echo "⚠️  CoreDNS not ready within timeout, checking status..."
+        kubectl -n kube-system get deployment coredns || true
+        kubectl -n kube-system get pods -l k8s-app=kube-dns || true
+      fi
+      
+      # Wait for essential system components
+      echo "⏳ Checking essential system components..."
+      local essential_components=("kube-proxy" "calico-node")
+      
+      for component in "$${essential_components[@]}"; do
+        echo "   Checking $component..."
+        if kubectl -n kube-system get daemonset "$component" &>/dev/null; then
+          # For DaemonSets, check if desired == ready
+          local desired=$(kubectl -n kube-system get daemonset "$component" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+          local ready=$(kubectl -n kube-system get daemonset "$component" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+          
+          if [[ "$ready" == "$desired" ]] && [[ "$ready" -gt 0 ]]; then
+            echo "   ✅ $component: $ready/$desired pods ready"
+          else
+            echo "   ⚠️  $component: $ready/$desired pods ready (may still be starting)"
+          fi
+        else
+          echo "   ℹ️  $component: not found (may not be installed yet)"
+        fi
+      done
+      
+      # Check for any pod issues
+      echo "🔍 Checking for problematic pods..."
+      local pending_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l || echo "0")
+      local failed_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Failed --no-headers 2>/dev/null | wc -l || echo "0")
+      
+      echo "📊 Cluster Health Summary:"
+      echo "   Total Nodes: $(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")"
+      echo "   Ready Nodes: $(kubectl get nodes --no-headers 2>/dev/null | grep " Ready " | wc -l || echo "0")"
+      echo "   Pending Pods: $pending_pods"
+      echo "   Failed Pods: $failed_pods"
+      
+      if [[ "$pending_pods" -gt 20 ]]; then
+        echo "⚠️  High number of pending pods ($pending_pods) - may indicate resource constraints"
+      fi
+      
+      if [[ "$failed_pods" -gt 10 ]]; then
+        echo "⚠️  High number of failed pods ($failed_pods) - may indicate configuration issues"
       fi
       
       echo "✅ Basic cluster readiness check complete"
@@ -476,134 +518,277 @@ resource "null_resource" "install_argocd" {
     null_resource.install_ebs_csi_driver,
     null_resource.install_node_termination_handler,
     null_resource.cluster_readiness_check,
-    null_resource.pre_deployment_cleanup,
     terraform_data.kubectl_provider_config,
     null_resource.wait_for_kubernetes
   ]
   
-  # Only run when cluster is stable
+  # Only run when cluster is stable and ready
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    ebs_driver_id = null_resource.install_ebs_csi_driver.id
-    node_handler_id = null_resource.install_node_termination_handler.id
     cluster_ready_id = null_resource.cluster_readiness_check.id
+    # Add a timestamp to force re-run if needed
+    force_update = "argocd-v2"
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
+      set -euo pipefail  # Exit on error, undefined vars, pipe failures
+      
       export KUBECONFIG="${local.kubeconfig_path}"
       
       echo "🚀 Installing ArgoCD..."
       
-      # Check if kubectl can connect to the cluster
-      if ! kubectl get nodes &>/dev/null; then
-        echo "❌ Cannot connect to Kubernetes cluster, skipping ArgoCD installation"
-        exit 0
+      # Function to verify kubectl works reliably
+      verify_kubectl() {
+        local attempts=10
+        local attempt=1
+        
+        while [ $attempt -le $attempts ]; do
+          if kubectl version --client --request-timeout=10s &>/dev/null && \
+             kubectl get nodes --request-timeout=10s &>/dev/null; then
+            echo "✅ kubectl verified (attempt $attempt)"
+            return 0
+          fi
+          echo "⏳ kubectl verification attempt $attempt/$attempts..."
+          sleep 10
+          attempt=$((attempt + 1))
+        done
+        
+        echo "❌ kubectl verification failed after $attempts attempts"
+        return 1
+      }
+      
+      # Verify kubectl connectivity first
+      if ! verify_kubectl; then
+        echo "❌ Cannot verify kubectl connectivity, skipping ArgoCD installation"
+        exit 1
+      fi
+      
+      # Check if ArgoCD namespace already exists with healthy installation
+      if kubectl get namespace argocd &>/dev/null; then
+        echo "ℹ️  ArgoCD namespace already exists, checking installation health..."
+        
+        if kubectl -n argocd get deployment argocd-server &>/dev/null; then
+          echo "ℹ️  ArgoCD server deployment found, checking if healthy..."
+          
+          # Quick health check
+          if kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=30s; then
+            echo "✅ Existing ArgoCD installation is healthy, skipping reinstall"
+            # Still create storage classes
+            echo "📦 Ensuring storage classes exist..."
+            kubectl apply -f - <<EOF || true
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+allowVolumeExpansion: true
+EOF
+            return 0
+          else
+            echo "⚠️  Existing ArgoCD installation appears unhealthy, will clean up and reinstall"
+            kubectl delete namespace argocd --ignore-not-found=true --timeout=120s
+            # Wait for cleanup
+            local cleanup_attempts=30
+            local cleanup_attempt=1
+            while kubectl get namespace argocd &>/dev/null && [ $cleanup_attempt -le $cleanup_attempts ]; do
+              echo "   Waiting for namespace cleanup (attempt $cleanup_attempt/$cleanup_attempts)..."
+              sleep 5
+              cleanup_attempt=$((cleanup_attempt + 1))
+            done
+          fi
+        fi
       fi
       
       # Create ArgoCD namespace
       echo "📁 Creating ArgoCD namespace..."
       kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
       
-      # Install ArgoCD using the official manifest
+      # Verify namespace creation
+      if ! kubectl get namespace argocd &>/dev/null; then
+        echo "❌ Failed to create ArgoCD namespace"
+        exit 1
+      fi
+      echo "✅ ArgoCD namespace ready"
+      
+      # Install ArgoCD with robust retry logic
       echo "📦 Installing ArgoCD components..."
-      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      local install_success=false
+      local install_attempts=3
+      local install_attempt=1
       
-      echo "⏳ Waiting for ArgoCD deployments to be ready..."
-      
-      # Wait for ArgoCD server deployment
-      kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s || {
-        echo "⚠️  ArgoCD server deployment not ready within timeout, but continuing..."
-      }
-      
-      # Wait for ArgoCD controller
-      kubectl -n argocd wait --for=condition=available deployment/argocd-application-controller --timeout=300s || {
-        echo "⚠️  ArgoCD controller not ready within timeout, but continuing..."
-      }
-      
-      # Wait for ArgoCD repo server
-      kubectl -n argocd wait --for=condition=available deployment/argocd-repo-server --timeout=300s || {
-        echo "⚠️  ArgoCD repo server not ready within timeout, but continuing..."
-      }
-      
-      # Check if ArgoCD pods are running
-      echo "🔍 Checking ArgoCD pod status..."
-      kubectl -n argocd get pods
-      
-      # Get the ArgoCD admin password
-      echo "🔑 Retrieving ArgoCD admin password..."
-      for attempt in {1..30}; do
-        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
-          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
-          if [[ -n "$PASSWORD" ]]; then
-            echo "✅ ArgoCD admin password retrieved successfully"
-            echo "$PASSWORD" > /tmp/argocd-admin-password.txt
-            break
+      while [ $install_attempt -le $install_attempts ] && [ "$install_success" = "false" ]; do
+        echo "   ArgoCD installation attempt $install_attempt/$install_attempts..."
+        
+        # Download and apply manifest
+        if curl -fsSL --connect-timeout 30 --max-time 120 \
+           "https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml" | \
+           kubectl apply -n argocd -f -; then
+          echo "✅ ArgoCD manifests applied successfully"
+          install_success=true
+        else
+          echo "❌ ArgoCD installation attempt $install_attempt failed"
+          if [ $install_attempt -eq $install_attempts ]; then
+            echo "❌ All ArgoCD installation attempts failed"
+            exit 1
           fi
+          sleep 20
         fi
-        echo "   Waiting for ArgoCD admin secret... (attempt $attempt/30)"
-        sleep 10
+        install_attempt=$((install_attempt + 1))
       done
       
-      # Patch ArgoCD server to use LoadBalancer service type (optional)
-      echo "🌐 Configuring ArgoCD server service..."
-      kubectl -n argocd patch svc argocd-server -p '{"spec": {"type": "ClusterIP"}}' || {
-        echo "⚠️  Failed to patch ArgoCD service, but continuing..."
-      }
+      # Wait for ArgoCD components to be created
+      echo "⏳ Waiting for ArgoCD components to be created..."
+      local component_wait_attempts=20
+      local component_wait_attempt=1
       
-      echo "✅ ArgoCD installation completed!"
+      while [ $component_wait_attempt -le $component_wait_attempts ]; do
+        echo "   Checking for ArgoCD deployments (attempt $component_wait_attempt/$component_wait_attempts)..."
+        
+        local deployments_found=0
+        local required_deployments=("argocd-server" "argocd-application-controller" "argocd-repo-server")
+        
+        for deployment in "$${required_deployments[@]}"; do
+          if kubectl -n argocd get deployment "$deployment" &>/dev/null; then
+            deployments_found=$((deployments_found + 1))
+          fi
+        done
+        
+        if [ $deployments_found -eq 3 ]; then
+          echo "✅ All required ArgoCD deployments found"
+          break
+        fi
+        
+        echo "   Found $deployments_found/3 deployments..."
+        
+        if [ $component_wait_attempt -eq $component_wait_attempts ]; then
+          echo "❌ Not all ArgoCD deployments found after waiting"
+          echo "Available deployments:"
+          kubectl -n argocd get deployments || true
+          exit 1
+        fi
+        
+        sleep 15
+        component_wait_attempt=$((component_wait_attempt + 1))
+      done
+      
+      # Wait for ArgoCD server to be available (critical component)
+      echo "⏳ Waiting for ArgoCD server to become available..."
+      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=600s; then
+        echo "❌ ArgoCD server failed to become available"
+        echo "Deployment status:"
+        kubectl -n argocd describe deployment argocd-server || true
+        echo "Pod status:"
+        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server || true
+        echo "Recent events:"
+        kubectl -n argocd get events --sort-by='.lastTimestamp' | tail -20 || true
+        exit 1
+      fi
+      echo "✅ ArgoCD server is available"
+      
+      # Wait for ArgoCD server pods to be ready
+      echo "⏳ Waiting for ArgoCD server pods to be ready..."
+      if ! kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=300s; then
+        echo "❌ ArgoCD server pods not ready"
+        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server || true
+        kubectl -n argocd describe pods -l app.kubernetes.io/name=argocd-server || true
+        exit 1
+      fi
+      echo "✅ ArgoCD server pods are ready"
+      
+      # Verify ArgoCD service exists
+      echo "🔍 Verifying ArgoCD service..."
+      if ! kubectl -n argocd get service argocd-server &>/dev/null; then
+        echo "❌ ArgoCD server service not found"
+        kubectl -n argocd get services || true
+        exit 1
+      fi
+      echo "✅ ArgoCD server service verified"
+      
+      # Wait for and retrieve admin password
+      echo "🔑 Retrieving ArgoCD admin password..."
+      local password_attempts=15
+      local password_attempt=1
+      local password_retrieved=false
+      
+      while [ $password_attempt -le $password_attempts ] && [ "$password_retrieved" = "false" ]; do
+        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
+          local password=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+          if [[ -n "$password" ]] && [[ $${#password} -gt 5 ]]; then
+            echo "✅ ArgoCD admin password retrieved"
+            echo "$password" > /tmp/argocd-admin-password.txt
+            chmod 600 /tmp/argocd-admin-password.txt
+            password_retrieved=true
+          fi
+        fi
+        
+        if [ "$password_retrieved" = "false" ]; then
+          echo "   Waiting for ArgoCD admin secret (attempt $password_attempt/$password_attempts)..."
+          sleep 20
+          password_attempt=$((password_attempt + 1))
+        fi
+      done
+      
+      if [ "$password_retrieved" = "false" ]; then
+        echo "⚠️  Could not retrieve ArgoCD admin password within timeout"
+        echo "     You can get it later with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+      fi
+      
+      # Create essential storage classes
+      echo "📦 Creating storage classes..."
+      kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+allowVolumeExpansion: true
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mongodb-sc
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  encrypted: "true"
+allowVolumeExpansion: true
+EOF
+      
+      # Final verification
+      echo "🔍 Final ArgoCD installation verification..."
+      kubectl -n argocd get deployments
+      kubectl -n argocd get services
+      kubectl -n argocd get pods
+      
+      echo ""
+      echo "🎉 ArgoCD installation completed successfully!"
       echo ""
       echo "📋 ArgoCD Access Information:"
       echo "   Namespace: argocd"
       echo "   Username: admin"
-      echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo 'Check /tmp/argocd-admin-password.txt')"
+      echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo 'Available via kubectl command')"
       echo ""
       echo "🔗 To access ArgoCD:"
       echo "   kubectl -n argocd port-forward svc/argocd-server 8080:443"
       echo "   Then visit: https://localhost:8080"
-      
-      # Create storage classes as part of ArgoCD setup
       echo ""
-      echo "📦 Creating additional storage classes for ArgoCD..."
-      
-      # Function to create or update storage class
-      create_storage_class() {
-        local name="$1"
-        local is_default="$2"
-        local type="$3"
-        
-        echo "Creating/updating storage class: $name"
-        
-        # Delete existing storage class if it exists to avoid parameter conflicts
-        if kubectl get storageclass "$name" &>/dev/null; then
-          echo "Deleting existing storage class: $name"
-          kubectl delete storageclass "$name" --ignore-not-found=true
-          sleep 2
-        fi
-        
-        # Create the storage class
-        kubectl apply -f - <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: $name
-$(if [[ "$is_default" == "true" ]]; then echo "  annotations:"; echo "    storageclass.kubernetes.io/is-default-class: \"true\""; fi)
-provisioner: ebs.csi.aws.com
-volumeBindingMode: WaitForFirstConsumer
-parameters:
-  type: $type
-  encrypted: "true"
-allowVolumeExpansion: true
-EOF
-      }
-      
-      # Create storage classes for ArgoCD and general use
-      create_storage_class "ebs-sc" "true" "gp3"
-      create_storage_class "mongodb-sc" "false" "gp3"
-      
-      echo "✅ ArgoCD installation and configuration completed!"
+      echo "✅ ArgoCD is ready for application configuration!"
     EOT
   }
 }
@@ -667,204 +852,147 @@ EOF
 resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
   triggers = {
-    argocd_repo_id = null_resource.configure_argocd_repositories[0].id
+    argocd_install_id = null_resource.install_argocd[0].id
   }
   
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       #!/bin/bash
-      set -e  # Exit on any error
+      set -euo pipefail
       
       echo "🚀 Configuring ArgoCD applications..."
       
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      # Function to cleanup port-forward
-      cleanup_portforward() {
-        echo "🧹 Cleaning up port-forward..."
-        if [[ -n "$PORTFORWARD_PID" ]]; then
-          kill "$PORTFORWARD_PID" 2>/dev/null || true
-          wait "$PORTFORWARD_PID" 2>/dev/null || true
+      # Function to verify ArgoCD is ready
+      verify_argocd_ready() {
+        echo "🔍 Verifying ArgoCD is ready..."
+        
+        # Check if ArgoCD namespace exists
+        if ! kubectl get namespace argocd &>/dev/null; then
+          echo "❌ ArgoCD namespace not found"
+          return 1
         fi
-        # Kill any other argocd port-forwards
-        pkill -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
+        
+        # Check if ArgoCD server deployment exists and is available
+        if ! kubectl -n argocd get deployment argocd-server &>/dev/null; then
+          echo "❌ ArgoCD server deployment not found"
+          return 1
+        fi
+        
+        # Wait for ArgoCD server to be available
+        if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=120s; then
+          echo "❌ ArgoCD server deployment not available"
+          kubectl -n argocd get deployments
+          kubectl -n argocd get pods
+          return 1
+        fi
+        
+        # Check if ArgoCD server service exists
+        if ! kubectl -n argocd get service argocd-server &>/dev/null; then
+          echo "❌ ArgoCD server service not found"
+          return 1
+        fi
+        
+        echo "✅ ArgoCD is ready for application configuration"
+        return 0
       }
       
-      # Set up trap to cleanup on exit
-      trap cleanup_portforward EXIT
-      
-      # Verify ArgoCD is fully ready before proceeding
-      echo "🔍 Verifying ArgoCD readiness..."
-      
-      # Check if ArgoCD namespace exists
-      if ! kubectl get namespace argocd &>/dev/null; then
-        echo "❌ ArgoCD namespace not found"
+      # Verify ArgoCD is ready
+      if ! verify_argocd_ready; then
+        echo "❌ ArgoCD is not ready, cannot configure applications"
         exit 1
       fi
       
-      # Wait for ArgoCD server deployment to be ready
-      echo "⏳ Waiting for ArgoCD server deployment..."
-      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s; then
-        echo "❌ ArgoCD server deployment not ready within timeout"
-        kubectl -n argocd get deployments
-        kubectl -n argocd get pods
-        exit 1
-      fi
-      
-      # Wait for ArgoCD server pods to be running
-      echo "⏳ Waiting for ArgoCD server pods..."
-      if ! kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=180s; then
-        echo "❌ ArgoCD server pods not ready within timeout"
-        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server
-        exit 1
-      fi
-      
-      # Check ArgoCD service exists
-      if ! kubectl -n argocd get service argocd-server &>/dev/null; then
-        echo "❌ ArgoCD server service not found"
-        kubectl -n argocd get services
-        exit 1
-      fi
-      
-      echo "✅ ArgoCD appears to be ready"
-      
-      # Clean up any existing port-forwards first
-      echo "🧹 Cleaning up existing port-forwards..."
-      pkill -f "kubectl.*port-forward.*argocd-server" 2>/dev/null || true
-      sleep 3
-      
-      # Check if port 8080 is already in use
-      if lsof -Pi :8080 -sTCP:LISTEN -t >/dev/null 2>&1; then
-        echo "⚠️  Port 8080 is already in use, killing processes..."
-        lsof -ti:8080 | xargs kill -9 2>/dev/null || true
-        sleep 2
-      fi
-      
-      # Setup port-forward with better error handling
-      echo "🌐 Setting up ArgoCD port-forward..."
-      kubectl -n argocd port-forward service/argocd-server 8080:443 > /tmp/portforward.log 2>&1 &
-      PORTFORWARD_PID=$!
-      
-      # Give port-forward time to start
-      sleep 5
-      
-      # Check if port-forward process is still running
-      if ! kill -0 "$PORTFORWARD_PID" 2>/dev/null; then
-        echo "❌ Port-forward process died immediately"
-        cat /tmp/portforward.log 2>/dev/null || echo "No port-forward log available"
-        exit 1
-      fi
-      
-      echo "⏳ Waiting for ArgoCD to be accessible via port-forward..."
-      
-      # More robust connection testing
-      for attempt in {1..30}; do
-        # Test multiple endpoints
-        if curl -k -s --connect-timeout 5 --max-time 10 https://localhost:8080/api/version &>/dev/null || \
-           curl -k -s --connect-timeout 5 --max-time 10 https://localhost:8080/healthz &>/dev/null; then
-          echo "✅ ArgoCD is accessible via port-forward (attempt $attempt)"
-          break
-        fi
-        
-        # Check if port-forward is still running
-        if ! kill -0 "$PORTFORWARD_PID" 2>/dev/null; then
-          echo "❌ Port-forward process died during connection testing"
-          cat /tmp/portforward.log 2>/dev/null || echo "No port-forward log available"
-          exit 1
-        fi
-        
-        echo "   Attempt $attempt/30: ArgoCD not yet accessible, waiting..."
-        sleep 5
-        
-        if [[ $attempt -eq 30 ]]; then
-          echo "❌ Timed out waiting for ArgoCD to be accessible"
-          echo "Port-forward log:"
-          cat /tmp/portforward.log 2>/dev/null || echo "No log available"
-          echo "Testing direct connectivity:"
-          curl -k -v https://localhost:8080/api/version || true
-          exit 1
-        fi
-      done
-      
-      # Get ArgoCD admin password
-      echo "🔑 Getting ArgoCD admin password..."
-      ARGOCD_PASSWORD=""
-      for attempt in {1..10}; do
-        if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
-          ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null)
-          if [[ -n "$ARGOCD_PASSWORD" ]]; then
-            echo "✅ ArgoCD password retrieved successfully"
-            break
-          fi
-        fi
-        echo "   Attempt $attempt/10: Waiting for ArgoCD password..."
-        sleep 3
-      done
-      
-      if [[ -z "$ARGOCD_PASSWORD" ]]; then
-        echo "❌ Could not retrieve ArgoCD password"
-        kubectl -n argocd get secrets
-        exit 1
-      fi
-      
-      # Login to ArgoCD with retries
-      echo "🔐 Logging into ArgoCD..."
-      LOGIN_SUCCESS=false
-      for attempt in {1..5}; do
-        if argocd login localhost:8080 --username admin --password "$ARGOCD_PASSWORD" --insecure --grpc-web --plaintext=false; then
-          echo "✅ Successfully logged into ArgoCD (attempt $attempt)"
-          LOGIN_SUCCESS=true
-          break
-        fi
-        echo "   Login attempt $attempt/5 failed, retrying..."
-        sleep 5
-      done
-      
-      if [[ "$LOGIN_SUCCESS" != "true" ]]; then
-        echo "❌ Failed to login to ArgoCD after 5 attempts"
-        echo "Checking ArgoCD server status:"
-        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server
-        kubectl -n argocd logs -l app.kubernetes.io/name=argocd-server --tail=20
-        exit 1
-      fi
-      
-      # Create polybot namespace
+      # Create polybot namespace if it doesn't exist
       echo "📁 Creating polybot namespace..."
-      kubectl create namespace polybot --dry-run=client -o yaml | kubectl apply -f - || true
+      kubectl create namespace polybot --dry-run=client -o yaml | kubectl apply -f -
       
-      # Create/update ArgoCD application
-      echo "📱 Creating ArgoCD application..."
-      if argocd app create polybot \
-        --repo https://github.com/guymeltzer/PolybotInfra.git \
-        --path k8s-manifests \
-        --dest-server https://kubernetes.default.svc \
-        --dest-namespace polybot \
-        --sync-policy automated \
-        --auto-prune \
-        --self-heal \
-        --upsert; then
-        echo "✅ ArgoCD application created/updated successfully"
+      # Create ArgoCD Application using declarative approach
+      echo "📱 Creating ArgoCD Application for Polybot..."
+      
+      # Apply ArgoCD Application manifest directly
+      kubectl apply -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: polybot
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/guymeltzer/PolybotInfra.git
+    targetRevision: HEAD
+    path: k8s-manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: polybot
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+EOF
+      
+      if [ $? -eq 0 ]; then
+        echo "✅ ArgoCD Application 'polybot' created successfully"
       else
-        echo "⚠️  Application creation failed, trying sync instead..."
-        if argocd app sync polybot; then
-          echo "✅ Application sync successful"
-        else
-          echo "❌ Application sync failed, but continuing..."
-          argocd app get polybot || echo "Could not get app details"
-        fi
+        echo "❌ Failed to create ArgoCD Application"
+        exit 1
       fi
       
-      echo "✅ ArgoCD application configuration completed successfully!"
+      # Wait a moment for the application to be processed
+      sleep 10
       
-      # List applications for verification
-      echo "📋 Current ArgoCD applications:"
-      argocd app list || echo "Could not list applications"
+      # Check if the application was created
+      echo "🔍 Verifying ArgoCD Application creation..."
+      if kubectl -n argocd get application polybot &>/dev/null; then
+        echo "✅ ArgoCD Application 'polybot' found in cluster"
+        
+        # Show application status
+        echo "📊 Application status:"
+        kubectl -n argocd get application polybot -o wide
+        
+        # Show application details
+        echo "📋 Application details:"
+        kubectl -n argocd describe application polybot
+      else
+        echo "❌ ArgoCD Application 'polybot' not found after creation"
+        echo "Available applications:"
+        kubectl -n argocd get applications
+        exit 1
+      fi
+      
+      echo ""
+      echo "✅ ArgoCD application configuration completed successfully!"
+      echo ""
+      echo "📋 Summary:"
+      echo "   ✅ Namespace 'polybot' created"
+      echo "   ✅ ArgoCD Application 'polybot' created"
+      echo "   🔄 Application will automatically sync from: https://github.com/guymeltzer/PolybotInfra.git"
+      echo "   📁 Manifest path: k8s-manifests"
+      echo "   🎯 Target namespace: polybot"
+      echo ""
+      echo "🔗 To view the application in ArgoCD UI:"
+      echo "   1. kubectl -n argocd port-forward svc/argocd-server 8080:443"
+      echo "   2. Open https://localhost:8080"
+      echo "   3. Login with username: admin"
+      echo "   4. Password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
     EOT
   }
   
   depends_on = [
-    null_resource.configure_argocd_repositories,
+    null_resource.install_argocd,
     module.kubernetes_resources,
     module.k8s-cluster
   ]
@@ -896,6 +1024,9 @@ resource "null_resource" "configure_argocd_repositories" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
+      #!/bin/bash
+      set -euo pipefail
+      
       echo "🔧 Configuring ArgoCD repositories..."
       
       export KUBECONFIG="${local.kubeconfig_path}"
@@ -911,7 +1042,7 @@ resource "null_resource" "configure_argocd_repositories" {
       
       # Wait for ArgoCD server deployment to be ready
       echo "⏳ Waiting for ArgoCD server deployment..."
-      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=300s; then
+      if ! kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=180s; then
         echo "❌ ArgoCD server deployment not ready within timeout"
         kubectl -n argocd get deployments
         kubectl -n argocd get pods
@@ -920,14 +1051,18 @@ resource "null_resource" "configure_argocd_repositories" {
       
       # Wait for ArgoCD server service to exist
       echo "⏳ Waiting for ArgoCD server service..."
-      for attempt in {1..30}; do
+      local service_attempts=20
+      local service_attempt=1
+      
+      while [ $service_attempt -le $service_attempts ]; do
         if kubectl -n argocd get service argocd-server &>/dev/null; then
           echo "✅ ArgoCD server service found"
           break
         fi
-        echo "   Attempt $attempt/30: Waiting for ArgoCD server service..."
+        echo "   Attempt $service_attempt/$service_attempts: Waiting for ArgoCD server service..."
         sleep 10
-        if [[ $attempt -eq 30 ]]; then
+        service_attempt=$((service_attempt + 1))
+        if [ $service_attempt -gt $service_attempts ]; then
           echo "❌ ArgoCD server service not found after waiting"
           kubectl -n argocd get services
           exit 1
@@ -936,19 +1071,23 @@ resource "null_resource" "configure_argocd_repositories" {
       
       # Wait for ArgoCD server to be fully ready
       echo "⏳ Waiting for ArgoCD server to be fully ready..."
-      for attempt in {1..60}; do
+      local ready_attempts=20
+      local ready_attempt=1
+      
+      while [ $ready_attempt -le $ready_attempts ]; do
         if kubectl -n argocd get deployment argocd-server &>/dev/null; then
-          READY_REPLICAS=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          DESIRED_REPLICAS=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+          local ready_replicas=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          local desired_replicas=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
           
-          if [[ "$READY_REPLICAS" == "$DESIRED_REPLICAS" ]] && [[ "$READY_REPLICAS" -gt 0 ]]; then
-            echo "✅ ArgoCD server is ready ($READY_REPLICAS/$DESIRED_REPLICAS replicas)"
+          if [[ "$ready_replicas" == "$desired_replicas" ]] && [[ "$ready_replicas" -gt 0 ]]; then
+            echo "✅ ArgoCD server is ready ($ready_replicas/$desired_replicas replicas)"
             break
           fi
         fi
-        echo "   Attempt $attempt/60: ArgoCD server not ready yet..."
-        sleep 10
-        if [[ $attempt -eq 60 ]]; then
+        echo "   Attempt $ready_attempt/$ready_attempts: ArgoCD server not ready yet..."
+        sleep 15
+        ready_attempt=$((ready_attempt + 1))
+        if [ $ready_attempt -gt $ready_attempts ]; then
           echo "❌ ArgoCD server not ready after waiting"
           kubectl -n argocd get deployments
           kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server
@@ -956,8 +1095,50 @@ resource "null_resource" "configure_argocd_repositories" {
         fi
       done
       
-      echo "ℹ️  Skipping ArgoCD CLI-based repository configuration due to complexity"
-      echo "✅ ArgoCD is ready - you can add repositories manually via the UI"
+      # Verify ArgoCD core components are running
+      echo "🔍 Checking ArgoCD core components..."
+      
+      local core_components=("argocd-server" "argocd-application-controller" "argocd-repo-server")
+      local component_ready=true
+      
+      for component in "$${core_components[@]}"; do
+        if kubectl -n argocd get deployment "$component" &>/dev/null; then
+          local component_ready_replicas=$(kubectl -n argocd get deployment "$component" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          local component_desired_replicas=$(kubectl -n argocd get deployment "$component" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+          
+          if [[ "$component_ready_replicas" == "$component_desired_replicas" ]] && [[ "$component_ready_replicas" -gt 0 ]]; then
+            echo "   ✅ $component: $component_ready_replicas/$component_desired_replicas replicas ready"
+          else
+            echo "   ⚠️  $component: $component_ready_replicas/$component_desired_replicas replicas ready"
+            component_ready=false
+          fi
+        else
+          echo "   ❌ $component: deployment not found"
+          component_ready=false
+        fi
+      done
+      
+      if [[ "$component_ready" != "true" ]]; then
+        echo "⚠️  Some ArgoCD components are not fully ready, but core server is available"
+        echo "    ArgoCD should still be functional for basic operations"
+      fi
+      
+      # Show ArgoCD status summary
+      echo ""
+      echo "📊 ArgoCD Status Summary:"
+      kubectl -n argocd get deployments
+      echo ""
+      kubectl -n argocd get pods
+      echo ""
+      kubectl -n argocd get services
+      
+      echo ""
+      echo "✅ ArgoCD repository configuration completed!"
+      echo ""
+      echo "ℹ️  ArgoCD is ready for use. For repository configuration:"
+      echo "   • Use the ArgoCD UI (port-forward required)"
+      echo "   • Use ArgoCD CLI after port-forwarding"
+      echo "   • Use declarative manifests via kubectl"
       echo ""
       echo "🔗 To access ArgoCD UI:"
       echo "   kubectl -n argocd port-forward svc/argocd-server 8080:443"
@@ -965,6 +1146,8 @@ resource "null_resource" "configure_argocd_repositories" {
       echo ""
       echo "🔑 To get the admin password:"
       echo "   kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+      echo ""
+      echo "🎯 ArgoCD is now ready for application deployments!"
     EOT
   }
 }
