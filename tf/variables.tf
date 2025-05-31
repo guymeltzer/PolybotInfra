@@ -1,6 +1,7 @@
 variable "region" {
   description = "AWS region"
   type        = string
+  default     = "us-east-1"
 }
 
 variable "vpc_id" {
@@ -67,32 +68,76 @@ variable "telegram_token_prod" {
   default     = ""
 }
 
-variable "aws_access_key_id" {
-  description = "AWS Access Key ID to use in the Polybot application"
+variable "telegram_token" {
+  description = "Telegram bot token for Polybot"
   type        = string
   sensitive   = true
-  default     = ""
+}
+
+variable "sqs_queue_url" {
+  description = "SQS queue URL for Polybot"
+  type        = string
+  sensitive   = true
+}
+
+variable "s3_bucket_name" {
+  description = "S3 bucket name for Polybot"
+  type        = string
+  sensitive   = true
+}
+
+variable "telegram_app_url" {
+  description = "Telegram app URL for Polybot"
+  type        = string
+  sensitive   = true
+}
+
+variable "aws_access_key_id" {
+  description = "AWS access key ID for Polybot"
+  type        = string
+  sensitive   = true
 }
 
 variable "aws_secret_access_key" {
-  description = "AWS Secret Access Key to use in the Polybot application"
+  description = "AWS secret access key for Polybot"
   type        = string
   sensitive   = true
-  default     = ""
+}
+
+variable "mongo_collection" {
+  description = "MongoDB collection name for Polybot"
+  type        = string
+  default     = "polybot"
+}
+
+variable "mongo_db" {
+  description = "MongoDB database name for Polybot"
+  type        = string
+  default     = "polybot"
+}
+
+variable "mongo_uri" {
+  description = "MongoDB URI for Polybot"
+  type        = string
+  sensitive   = true
+}
+
+variable "polybot_url" {
+  description = "Polybot application URL"
+  type        = string
+  sensitive   = true
 }
 
 variable "docker_username" {
-  description = "Docker Hub username for pulling private images"
+  description = "Docker registry username"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "docker_password" {
-  description = "Docker Hub password for pulling private images"
+  description = "Docker registry password"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "control_plane_instance_type" {

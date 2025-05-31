@@ -27,6 +27,9 @@ locals {
     AWS_LOG_LEVEL        = "debug"
   }
   
+  # Debug log file path
+  debug_log = "${local.debug_config.log_path}tf_debug.log"
+  
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
   ssh_private_key_path = var.key_name != "" ? (
     fileexists("${path.module}/${var.key_name}.pem") ? 
@@ -1341,12 +1344,14 @@ resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
   
   depends_on = [
-    null_resource.install_argocd
+    null_resource.install_argocd,
+    null_resource.deploy_secrets
   ]
   
   triggers = {
     argocd_install_id = null_resource.install_argocd[0].id
-    app_config_version = "streamlined-v1"
+    secrets_ready_id = null_resource.deploy_secrets[0].id
+    app_config_version = "streamlined-v3"  # Updated version to include secrets dependency
   }
   
   provisioner "local-exec" {
@@ -1376,7 +1381,7 @@ spec:
   source:
     repoURL: https://github.com/guymeltzer/PolybotInfra.git
     targetRevision: HEAD
-    path: k8s-manifests
+    path: k8s
   destination:
     server: https://kubernetes.default.svc
     namespace: polybot
@@ -1633,6 +1638,7 @@ resource "null_resource" "cleanup_orphaned_nodes" {
               fi
             done
           
+          
           # Remove the node from cluster
           echo "     Removing node from cluster..."
           if kubectl delete node "$NODE_NAME" --timeout=30s; then
@@ -1707,5 +1713,162 @@ fi
 
 echo "Continuing with deployment..."
 EOF
+  }
+}
+
+# Install ArgoCD applications
+resource "null_resource" "install_argocd_apps" {
+  count = local.skip_argocd ? 0 : 1
+  triggers = {
+    argocd_ready = null_resource.install_argocd[0].id
+  }
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      if [ -f "${local.kubeconfig_path}" ]; then
+        echo "$(date): Installing ArgoCD applications..." | tee -a ${local.debug_log}
+        
+        # Apply the polybot application
+        KUBECONFIG="${local.kubeconfig_path}" kubectl apply -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: polybot
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/gmeltzer/PolybotService.git'
+    path: k8s
+    targetRevision: HEAD
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+EOF
+        
+        echo "$(date): ArgoCD applications installed successfully" | tee -a ${local.debug_log}
+        echo '{"timestamp":"'$(date -Iseconds)'","component":"argocd_apps","status":"success","message":"ArgoCD applications installed"}' >> ${local.debug_log}
+      else
+        echo "$(date): Error: Kubeconfig not found at ${local.kubeconfig_path}" | tee -a ${local.debug_log}
+        echo '{"timestamp":"'$(date -Iseconds)'","component":"argocd_apps","status":"error","message":"Kubeconfig not found"}' >> ${local.debug_log}
+      fi
+    EOT
+  }
+  depends_on = [null_resource.install_argocd]
+}
+
+# Process and deploy secrets before ArgoCD applications
+resource "null_resource" "deploy_secrets" {
+  count = local.skip_argocd ? 0 : 1
+  
+  depends_on = [
+    null_resource.install_argocd,
+    null_resource.cluster_readiness_check
+  ]
+  
+  triggers = {
+    argocd_install_id = null_resource.install_argocd[0].id
+    # Trigger when secret variables change
+    secrets_hash = md5(join("", [
+      var.telegram_token,
+      var.sqs_queue_url,
+      var.s3_bucket_name,
+      var.telegram_app_url,
+      var.mongo_uri,
+      var.polybot_url,
+      var.docker_username,
+      var.docker_password
+    ]))
+  }
+  
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔐 Processing and deploying secrets..."
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster"
+        exit 1
+      fi
+      
+      # Create prod namespace
+      kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Process polybot-secrets with actual values
+      echo "📝 Creating polybot-secrets..."
+      kubectl apply -f - <<'POLYBOT_EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: polybot-secrets
+  namespace: prod
+type: Opaque
+stringData:
+  telegram_token: "${var.telegram_token}"
+  sqs_queue_url: "${var.sqs_queue_url}"
+  s3_bucket_name: "${var.s3_bucket_name}"
+  telegram_app_url: "${var.telegram_app_url}"
+  aws_access_key_id: "${var.aws_access_key_id}"
+  aws_secret_access_key: "${var.aws_secret_access_key}"
+  mongo_collection: "${var.mongo_collection}"
+  mongo_db: "${var.mongo_db}"
+  mongo_uri: "${var.mongo_uri}"
+  polybot_url: "${var.polybot_url}"
+POLYBOT_EOF
+      
+      # Deploy TLS secret
+      echo "📝 Creating polybot-tls secret..."
+      kubectl apply -f ../k8s/shared/polybot-tls-secret.yaml
+      
+      # Deploy CA secret  
+      echo "📝 Creating polybot-ca secret..."
+      kubectl apply -f ../k8s/shared/polybot-ca-secret.yaml
+      
+      # Process docker registry secret with actual values
+      echo "📝 Creating docker-registry-credentials..."
+      DOCKER_AUTH=$(echo -n "${var.docker_username}:${var.docker_password}" | base64 -w 0)
+      kubectl apply -f - <<DOCKER_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: docker-registry-credentials
+  namespace: prod
+type: kubernetes.io/dockerconfigjson
+stringData:
+  .dockerconfigjson: |
+    {
+      "auths": {
+        "https://index.docker.io/v1/": {
+          "username": "${var.docker_username}",
+          "password": "${var.docker_password}",
+          "auth": "$DOCKER_AUTH"
+        }
+      }
+    }
+DOCKER_EOF
+      
+      echo "✅ All secrets deployed successfully!"
+      
+      # Verify secrets exist
+      echo "🔍 Verifying secrets..."
+      kubectl get secrets -n prod | grep -E "(polybot-secrets|polybot-tls|polybot-ca|docker-registry-credentials)" || {
+        echo "❌ Some secrets are missing!"
+        exit 1
+      }
+      
+      echo "✅ Secret verification complete!"
+    EOT
   }
 }
