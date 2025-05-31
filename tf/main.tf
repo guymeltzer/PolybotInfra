@@ -462,71 +462,53 @@ resource "null_resource" "cluster_readiness_check" {
         echo "   This might indicate configuration issues"
       fi
       
-      echo "✅ Basic cluster readiness check complete"
-      echo "🎯 Cluster is ready for application deployment"
+      echo "✅ Cluster readiness check completed"
     EOT
   }
 }
 
 # Install ArgoCD only if not already installed
-You're absolutely right, that was my mistake in the previous response. I provided the corrected bash script but didn't explicitly show how it should be placed within the resource "null_resource" "install_argocd" block in your main.tf file.
-
-The series of errors you're seeing (Invalid character, Invalid expression, Unsupported operator, Attribute redefined) all stem from the same root cause: the bash script content for installing ArgoCD is not correctly encapsulated as a string within the command argument of the provisioner "local-exec" block. Terraform is trying to parse lines of your bash script as if they were HCL (Terraform's language).
-
-Here's how to structure it correctly in your main.tf file. You need to ensure the entire bash script is within the command = <<-EOT ... EOT heredoc.
-
-Corrected resource "null_resource" "install_argocd" block for your root main.tf:
-
-Terraform
-
-# In your root main.tf (e.g., ~/PycharmProjects/PolybotInfra/tf/main.tf)
-
 resource "null_resource" "install_argocd" {
-  count = local.skip_argocd ? 0 : 1 # Assuming local.skip_argocd is defined elsewhere
-
-  # CONSOLIDATE ALL depends_on here.
-  # The error mentioned a depends_on at line 475 and another at 802.
-  # Ensure all necessary dependencies are listed ONCE.
+  count = local.skip_argocd ? 0 : 1
+  
   depends_on = [
     null_resource.install_ebs_csi_driver,
-    null_resource.install_node_termination_handler, // Assuming you have this resource
+    null_resource.install_node_termination_handler,
     null_resource.cluster_readiness_check,
-    terraform_data.kubectl_provider_config,      // Assuming this is your kubeconfig setup resource
-    null_resource.wait_for_kubernetes             // Ensures K8s API is up
+    terraform_data.kubectl_provider_config,
+    null_resource.wait_for_kubernetes
   ]
   
   triggers = {
-    kubeconfig_id    = terraform_data.kubectl_provider_config[0].id
-    cluster_ready_id = null_resource.cluster_readiness_check.id 
-    # Consider a more explicit trigger if the script content changes, 
-    # e.g., by embedding a hash or version, or just a timestamp for re-runs.
-    force_update     = "argocd-install-v3" # Change this string to force re-run if script logic changes
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    cluster_ready_id = null_resource.cluster_readiness_check.id
+    force_update = "argocd-v3"
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    command = <<-EOT
       #!/bin/bash
-      set -euo pipefail # Exit on error, undefined vars, pipe failures
+      set -euo pipefail
       
-      # KUBECONFIG will be interpolated by Terraform from local.kubeconfig_path
-      export KUBECONFIG="${local.kubeconfig_path}" 
+      export KUBECONFIG="${local.kubeconfig_path}"
       
       echo "🚀 Installing ArgoCD and Prerequisites..."
 
       # Function to verify kubectl works reliably
       verify_kubectl() {
-        local attempts=10 # 'local' is OK here as it's inside a function
-        local attempt=1   # 'local' is OK here
+        local attempts=10
+        local attempt=1
         echo "Verifying kubectl connectivity..."
         while [ $attempt -le $attempts ]; do
           if kubectl version --client --request-timeout=10s &>/dev/null && \
              kubectl get nodes --request-timeout=10s &>/dev/null; then
-            echo "✅ kubectl verified (attempt $attempt)"
+            echo "✅ kubectl connectivity verified"
             return 0
           fi
           echo "⏳ kubectl verification attempt $attempt/$attempts... waiting 10s"
-          sleep 10; attempt=$((attempt + 1))
+          sleep 10
+          attempt=$((attempt + 1))
         done
         echo "❌ kubectl verification failed after $attempts attempts"
         return 1
@@ -546,14 +528,11 @@ resource "null_resource" "install_argocd" {
           if kubectl -n argocd wait --for=condition=available deployment/argocd-server --timeout=30s; then
             echo "✅ Existing ArgoCD installation appears healthy and available."
             echo "📦 Ensuring storage classes exist (idempotent apply)..."
-            # Using different heredoc delimiters for nested heredocs
             kubectl apply -f - <<'EOFSC1' || echo "WARN: Failed to apply ebs-sc, but continuing as ArgoCD is healthy."
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
 provisioner: ebs.csi.aws.com
 volumeBindingMode: WaitForFirstConsumer
 parameters:
@@ -640,15 +619,10 @@ EOFSC2
         echo "  Checking ArgoCD deployments readiness (attempt $i/$wait_total_attempts)..."
         all_available_this_iteration=true
         found_count=0
-        # For bash array expansion `${array[@]}` and length `${#array[@]}`,
-        # if this script is processed by templatefile, escape with $$ if templatefile tries to interpret them.
-        # However, since 'required_deployments' is a bash array defined in this script, direct bash syntax should be fine
-        # *unless* the string containing it is processed by templatefile in a specific way that causes conflict.
-        # Given previous errors, being cautious and escaping these bash-specific ${} is safer:
-        for deployment_name in "$${required_deployments[@]}"; do 
+        
+        for deployment_name in $${required_deployments[@]}; do 
           if kubectl -n argocd get deployment "$deployment_name" -o name &>/dev/null; then
             found_count=$((found_count + 1))
-            # Check if rollout status is complete, implies available
             if ! kubectl -n argocd rollout status deployment/"$deployment_name" --timeout=5s &>/dev/null; then 
               echo "    Deployment $deployment_name found but not yet fully rolled out/available."
               all_available_this_iteration=false
@@ -663,7 +637,7 @@ EOFSC2
           fi
         done
 
-        if $all_available_this_iteration && [ "$found_count" -eq $${#required_deployments[@]} ]; then # Escape for bash array length
+        if $all_available_this_iteration && [ "$found_count" -eq $${#required_deployments[@]} ]; then
           echo "✅ All critical ArgoCD deployments are present and Available/rolled out."
           all_deployments_available_and_found=true
           break
@@ -699,11 +673,14 @@ EOFSC2
       echo "✅ ArgoCD server service verified."
       
       echo "🔑 Retrieving ArgoCD admin password..."
-      password_attempts=15; password_attempt=1; password_retrieved=false; password=""
+      password_attempts=15
+      password_attempt=1
+      password_retrieved=false
+      password=""
       while [ $password_attempt -le $password_attempts ] && [ "$password_retrieved" = "false" ]; do
         if kubectl -n argocd get secret argocd-initial-admin-secret &>/dev/null; then
           password=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
-          if [[ -n "$password" ]] && [[ $${#password} -gt 5 ]]; then # Escape for bash string length
+          if [[ -n "$password" ]] && [[ $${#password} -gt 5 ]]; then
             echo "✅ ArgoCD admin password retrieved."
             echo "$password" > /tmp/argocd-admin-password.txt
             chmod 600 /tmp/argocd-admin-password.txt
@@ -712,7 +689,8 @@ EOFSC2
         fi
         if [ "$password_retrieved" = "false" ]; then
           echo "    Waiting for ArgoCD admin secret (attempt $password_attempt/$password_attempts)..."
-          sleep 20; password_attempt=$((password_attempt + 1))
+          sleep 20
+          password_attempt=$((password_attempt + 1))
         fi
       done
       if [ "$password_retrieved" = "false" ]; then 
@@ -720,13 +698,11 @@ EOFSC2
       fi
       
       echo "📦 Creating/Ensuring storage classes (idempotent)..."
-      kubectl apply -f - <<'EOFSC1' || echo "WARN: Failed to apply ebs-sc, but continuing." # Quoted heredoc
+      kubectl apply -f - <<'EOFSC1' || echo "WARN: Failed to apply ebs-sc, but continuing."
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: ebs-sc
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
 provisioner: ebs.csi.aws.com
 volumeBindingMode: WaitForFirstConsumer
 parameters:
@@ -734,7 +710,7 @@ parameters:
   encrypted: "true"
 allowVolumeExpansion: true
 EOFSC1
-      kubectl apply -f - <<'EOFSC2' || echo "WARN: Failed to apply mongodb-sc, but continuing." # Quoted heredoc
+      kubectl apply -f - <<'EOFSC2' || echo "WARN: Failed to apply mongodb-sc, but continuing."
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -750,8 +726,8 @@ EOFSC2
       
       echo "🔍 Final ArgoCD installation verification..."
       kubectl -n argocd get deployments
-      kubectl -n argocd get services
       kubectl -n argocd get pods
+      kubectl -n argocd get services
 
       echo ""
       echo "🎉 ArgoCD installation and initial setup completed successfully!"
@@ -759,8 +735,6 @@ EOFSC2
       echo "📋 ArgoCD Access Information:"
       echo "   Namespace: argocd"
       echo "   Username: admin"
-      # For password, use $$ to escape ${#...} if it was an issue, but cat doesn't interpolate like that.
-      # This $(cat ...) is a bash command substitution.
       echo "   Password: $(cat /tmp/argocd-admin-password.txt 2>/dev/null || echo '(retrieve manually using kubectl)')"
       echo ""
       echo "🔗 To access ArgoCD:"
@@ -771,9 +745,8 @@ EOFSC2
     EOT
   }
 }
-        }
+
 # Simplified alternative: Create ArgoCD Application using direct kubectl apply
-resource "null_resource" "create_argocd_app_simple" {
 resource "null_resource" "create_argocd_app_simple" {
   count = 0  # Set to 1 to use this instead of the complex script above
 
