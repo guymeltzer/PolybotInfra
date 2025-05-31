@@ -144,7 +144,6 @@ resource "null_resource" "deployment_summary" {
   depends_on = [
     null_resource.cluster_readiness_check,
     null_resource.install_argocd,
-    null_resource.configure_argocd_apps,
     null_resource.cleanup_orphaned_nodes,
     null_resource.create_application_secrets
   ]
@@ -1477,12 +1476,14 @@ resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
 
   depends_on = [
-    null_resource.install_argocd[0]
+    null_resource.install_argocd[0],
+    terraform_data.kubectl_provider_config[0]  # EXPLICIT dependency to break cycles
   ]
 
   triggers = {
     argocd_id = null_resource.install_argocd[0].id
-    apps_version = "consolidated-v1"
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id  # Track kubeconfig changes
+    apps_version = "consolidated-v2-fixed"
   }
 
   provisioner "local-exec" {
@@ -1654,6 +1655,294 @@ resource "null_resource" "create_application_secrets" {
       echo ""
       echo "💡 Note: These are dummy/placeholder secrets for initial deployment."
       echo "   Replace with actual secrets from AWS Secrets Manager or your secret store."
+    EOT
+  }
+}
+
+# STATE MANAGEMENT AND VERIFICATION TOOLS
+# Resource to verify critical AWS resources exist and detect drift
+resource "null_resource" "state_verification" {
+  depends_on = [module.k8s-cluster]
+  
+  triggers = {
+    verification_version = "v1"
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      echo "🔍 Terraform State Verification and Drift Detection"
+      echo "=================================================="
+      
+      # Check critical IAM resources
+      echo "🔐 Verifying IAM Resources..."
+      MISSING_IAM=0
+      
+      if ! aws iam get-role --role-name "guy-cluster-control-plane-role" >/dev/null 2>&1; then
+        echo "   ❌ IAM Role 'guy-cluster-control-plane-role' NOT found"
+        MISSING_IAM=$((MISSING_IAM + 1))
+      else
+        echo "   ✅ IAM Role 'guy-cluster-control-plane-role' exists"
+      fi
+      
+      if ! aws iam get-instance-profile --instance-profile-name "guy-cluster-control-plane-profile" >/dev/null 2>&1; then
+        echo "   ❌ Instance Profile 'guy-cluster-control-plane-profile' NOT found"
+        MISSING_IAM=$((MISSING_IAM + 1))
+      else
+        echo "   ✅ Instance Profile 'guy-cluster-control-plane-profile' exists"
+      fi
+      
+      # Check EC2 resources
+      echo ""
+      echo "🖥️  Verifying EC2 Resources..."
+      MISSING_EC2=0
+      
+      CONTROL_PLANE_ID="${module.k8s-cluster.control_plane_instance_id}"
+      if [[ -n "$CONTROL_PLANE_ID" ]]; then
+        if ! aws ec2 describe-instances --instance-ids "$CONTROL_PLANE_ID" --region ${var.region} >/dev/null 2>&1; then
+          echo "   ❌ EC2 Instance '$CONTROL_PLANE_ID' NOT found"
+          MISSING_EC2=$((MISSING_EC2 + 1))
+        else
+          STATE=$(aws ec2 describe-instances --instance-ids "$CONTROL_PLANE_ID" --region ${var.region} --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "unknown")
+          echo "   ✅ EC2 Instance '$CONTROL_PLANE_ID' exists (state: $STATE)"
+        fi
+      else
+        echo "   ⚠️  Control plane instance ID not available"
+        MISSING_EC2=$((MISSING_EC2 + 1))
+      fi
+      
+      # Check ASG
+      echo ""
+      echo "📈 Verifying Auto Scaling Group..."
+      MISSING_ASG=0
+      
+      if ! aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "guy-polybot-asg" --region ${var.region} >/dev/null 2>&1; then
+        echo "   ❌ ASG 'guy-polybot-asg' NOT found"
+        MISSING_ASG=$((MISSING_ASG + 1))
+      else
+        DESIRED=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "guy-polybot-asg" --region ${var.region} --query "AutoScalingGroups[0].DesiredCapacity" --output text 2>/dev/null || echo "0")
+        ACTUAL=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "guy-polybot-asg" --region ${var.region} --query "AutoScalingGroups[0].Instances | length(@)" --output text 2>/dev/null || echo "0")
+        echo "   ✅ ASG 'guy-polybot-asg' exists (desired: $DESIRED, actual: $ACTUAL)"
+      fi
+      
+      # Check Terraform state
+      echo ""
+      echo "📋 Terraform State Analysis..."
+      terraform state list > /tmp/tf_state_resources.txt
+      RESOURCE_COUNT=$(wc -l < /tmp/tf_state_resources.txt)
+      echo "   Total resources in state: $RESOURCE_COUNT"
+      
+      # Check for problematic resources
+      PROBLEMATIC_FOUND=0
+      if grep -q "null_resource.improved_disk_cleanup" /tmp/tf_state_resources.txt; then
+        echo "   ⚠️  Found problematic resource: null_resource.improved_disk_cleanup"
+        echo "      Remove with: terraform state rm 'null_resource.improved_disk_cleanup'"
+        PROBLEMATIC_FOUND=$((PROBLEMATIC_FOUND + 1))
+      fi
+      
+      TOTAL_ISSUES=$((MISSING_IAM + MISSING_EC2 + MISSING_ASG + PROBLEMATIC_FOUND))
+      
+      echo ""
+      echo "📊 Summary: IAM($MISSING_IAM) EC2($MISSING_EC2) ASG($MISSING_ASG) Problematic($PROBLEMATIC_FOUND)"
+      
+      if [[ $TOTAL_ISSUES -gt 0 ]]; then
+        echo "⚠️  Found $TOTAL_ISSUES issues - check logs above for details"
+      else
+        echo "✅ All resources verified successfully"
+      fi
+    EOT
+  }
+}
+
+# SECURITY GROUP AUDIT
+# Resource to audit and report on security group rules
+resource "null_resource" "security_audit" {
+  depends_on = [module.k8s-cluster]
+  
+  triggers = {
+    audit_version = "v1"
+    cluster_id = module.k8s-cluster.control_plane_instance_id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      echo "🔒 Security Group Audit"
+      echo "======================"
+      
+      # Get all security groups for the cluster
+      echo "🔍 Auditing security group rules..."
+      
+      # Check control plane security group
+      CP_SG_ID=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --instance-ids "${module.k8s-cluster.control_plane_instance_id}" \
+        --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" \
+        --output text 2>/dev/null || echo "")
+      
+      if [[ -n "$CP_SG_ID" ]]; then
+        echo "🔍 Control Plane Security Group: $CP_SG_ID"
+        
+        # Check for 0.0.0.0/0 rules
+        WIDE_OPEN_RULES=$(aws ec2 describe-security-groups \
+          --region ${var.region} \
+          --group-ids "$CP_SG_ID" \
+          --query "SecurityGroups[0].IpPermissions[?IpRanges[?CidrIp=='0.0.0.0/0']]" \
+          --output json 2>/dev/null || echo "[]")
+        
+        RULE_COUNT=$(echo "$WIDE_OPEN_RULES" | jq 'length' 2>/dev/null || echo "0")
+        
+        if [[ "$RULE_COUNT" -gt 0 ]]; then
+          echo "   ⚠️  Found $RULE_COUNT rules with 0.0.0.0/0 access"
+          echo "$WIDE_OPEN_RULES" | jq -r '.[] | "   Port: " + (.FromPort|tostring) + "-" + (.ToPort|tostring) + " Protocol: " + .IpProtocol' 2>/dev/null || true
+        else
+          echo "   ✅ No overly permissive rules found"
+        fi
+      fi
+      
+      # Check worker node security groups
+      WORKER_INSTANCES=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+                  "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].InstanceId" \
+        --output text 2>/dev/null || echo "")
+      
+      if [[ -n "$WORKER_INSTANCES" ]]; then
+        WORKER_INSTANCE=$(echo "$WORKER_INSTANCES" | head -1)
+        WORKER_SG_ID=$(aws ec2 describe-instances \
+          --region ${var.region} \
+          --instance-ids "$WORKER_INSTANCE" \
+          --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" \
+          --output text 2>/dev/null || echo "")
+        
+        if [[ -n "$WORKER_SG_ID" ]]; then
+          echo ""
+          echo "🔍 Worker Node Security Group: $WORKER_SG_ID"
+          
+          WIDE_OPEN_RULES=$(aws ec2 describe-security-groups \
+            --region ${var.region} \
+            --group-ids "$WORKER_SG_ID" \
+            --query "SecurityGroups[0].IpPermissions[?IpRanges[?CidrIp=='0.0.0.0/0']]" \
+            --output json 2>/dev/null || echo "[]")
+          
+          RULE_COUNT=$(echo "$WIDE_OPEN_RULES" | jq 'length' 2>/dev/null || echo "0")
+          
+          if [[ "$RULE_COUNT" -gt 0 ]]; then
+            echo "   ⚠️  Found $RULE_COUNT rules with 0.0.0.0/0 access"
+            echo "$WIDE_OPEN_RULES" | jq -r '.[] | "   Port: " + (.FromPort|tostring) + "-" + (.ToPort|tostring) + " Protocol: " + .IpProtocol' 2>/dev/null || true
+          else
+            echo "   ✅ No overly permissive rules found"
+          fi
+        fi
+      fi
+      
+      echo ""
+      echo "🛡️  Security Recommendations:"
+      echo "   • Restrict SSH (22) access to specific IP ranges"
+      echo "   • Limit HTTP/HTTPS (80/443) to necessary sources"
+      echo "   • Use security groups for inter-service communication"
+      echo "   • Regularly audit and review security group rules"
+      
+      echo ""
+      echo "✅ Security audit completed"
+    EOT
+  }
+}
+
+# AWS NODE TERMINATION HANDLER VERIFICATION
+# Resource to verify aws-node-termination-handler is properly configured
+resource "null_resource" "node_termination_handler_check" {
+  depends_on = [
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    cluster_ready_id = null_resource.cluster_readiness_check.id
+    handler_check_version = "v1"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔧 AWS Node Termination Handler Verification"
+      echo "============================================"
+      
+      # Check if kubectl works
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster"
+        exit 0
+      fi
+      
+      # Check if node termination handler is installed
+      echo "🔍 Checking for aws-node-termination-handler..."
+      
+      if kubectl get daemonset aws-node-termination-handler -n kube-system >/dev/null 2>&1; then
+        echo "✅ aws-node-termination-handler DaemonSet found"
+        
+        # Check its status
+        DESIRED=$(kubectl get daemonset aws-node-termination-handler -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+        READY=$(kubectl get daemonset aws-node-termination-handler -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+        
+        echo "   Status: $READY/$DESIRED ready"
+        
+        if [[ "$READY" -eq "$DESIRED" ]] && [[ "$READY" -gt 0 ]]; then
+          echo "   ✅ Handler is healthy on all nodes"
+        else
+          echo "   ⚠️  Handler may have issues"
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-node-termination-handler || true
+        fi
+        
+        # Check IAM permissions
+        echo ""
+        echo "🔍 Checking IAM permissions..."
+        WORKER_ROLE_NAME=$(aws iam list-roles --query "Roles[?contains(RoleName, 'NodeInstanceRole') || contains(RoleName, 'worker')].RoleName" --output text 2>/dev/null | head -1 || echo "")
+        
+        if [[ -n "$WORKER_ROLE_NAME" ]]; then
+          echo "   Worker role: $WORKER_ROLE_NAME"
+          
+          # Check for required policies
+          POLICIES=$(aws iam list-attached-role-policies --role-name "$WORKER_ROLE_NAME" --query "AttachedPolicies[*].PolicyName" --output text 2>/dev/null || echo "")
+          
+          if echo "$POLICIES" | grep -q "AutoScaling"; then
+            echo "   ✅ AutoScaling permissions found"
+          else
+            echo "   ⚠️  AutoScaling permissions may be missing"
+          fi
+          
+          if echo "$POLICIES" | grep -q "EC2"; then
+            echo "   ✅ EC2 permissions found"
+          else
+            echo "   ⚠️  EC2 permissions may be missing"
+          fi
+        else
+          echo "   ⚠️  Could not identify worker node IAM role"
+        fi
+        
+      else
+        echo "❌ aws-node-termination-handler NOT found"
+        echo ""
+        echo "💡 To install aws-node-termination-handler:"
+        echo "   kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.22.0/all-resources.yaml"
+        echo ""
+        echo "   Or add to your cluster configuration"
+      fi
+      
+      echo ""
+      echo "✅ Node termination handler check completed"
     EOT
   }
 }
