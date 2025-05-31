@@ -145,13 +145,15 @@ resource "null_resource" "deployment_summary" {
     null_resource.cluster_readiness_check,
     null_resource.install_argocd,
     null_resource.configure_argocd_apps,
-    null_resource.cleanup_orphaned_nodes
+    null_resource.cleanup_orphaned_nodes,
+    null_resource.create_application_secrets
   ]
 
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id
     argocd_install_id = try(null_resource.install_argocd[0].id, "skipped")
     cleanup_id = null_resource.cleanup_orphaned_nodes.id
+    secrets_id = null_resource.create_application_secrets.id
   }
 
   provisioner "local-exec" {
@@ -817,7 +819,7 @@ resource "terraform_data" "kubectl_provider_config" {
   ]
 }
 
-# CONSOLIDATED: Enhanced cluster readiness check
+# CONSOLIDATED: Enhanced cluster readiness check - STRICT VERSION
 resource "null_resource" "cluster_readiness_check" {
   depends_on = [
     null_resource.wait_for_kubernetes[0],
@@ -828,7 +830,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     ebs_csi_id = null_resource.install_ebs_csi_driver.id
-    readiness_version = "consolidated-v3"
+    readiness_version = "strict-v4-enhanced"
   }
 
   provisioner "local-exec" {
@@ -839,36 +841,246 @@ resource "null_resource" "cluster_readiness_check" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "🔍 Consolidated Cluster Readiness Check..."
+      echo "🔍 STRICT Cluster Readiness Check - Will FAIL terraform if unhealthy"
+      echo "================================================================="
+      
+      # Function to force cleanup terminating pods
+      cleanup_terminating_pods() {
+        echo "🗑️  Cleaning up terminating pods..."
+        local terminating_pods
+        terminating_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null || echo "")
+        
+        if [[ -n "$terminating_pods" ]]; then
+          echo "⚠️ Found terminating pods - force deleting..."
+          echo "$terminating_pods" | while read -r namespace pod_name rest; do
+            if [[ -n "$namespace" ]] && [[ -n "$pod_name" ]]; then
+              echo "   Deleting: $namespace/$pod_name"
+              kubectl delete pod "$pod_name" -n "$namespace" --force --grace-period=0 --timeout=10s 2>/dev/null || {
+                kubectl patch pod "$pod_name" -n "$namespace" -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              }
+            fi
+          done
+          # Wait for cleanup
+          sleep 15
+        fi
+      }
+      
+      # Function to remove ghost nodes
+      remove_ghost_nodes() {
+        echo "👻 Checking for ghost nodes..."
+        
+        local notready_workers
+        notready_workers=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep "NotReady" | awk '{print $1}' || echo "")
+        
+        if [[ -n "$notready_workers" ]]; then
+          echo "🔍 Found NotReady workers: $notready_workers"
+          
+          # Get ASG instances
+          local existing_instances
+          existing_instances=$(aws ec2 describe-instances \
+            --region ${var.region} \
+            --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+                      "Name=instance-state-name,Values=running,pending" \
+            --query "Reservations[*].Instances[*].InstanceId" \
+            --output text 2>/dev/null || echo "")
+          
+          echo "Active ASG instances: $existing_instances"
+          
+          # Check each NotReady node
+          for node_name in $notready_workers; do
+            echo "🔍 Checking node: $node_name"
+            
+            local instance_id=""
+            
+            # Extract instance ID from node name patterns
+            if [[ "$node_name" =~ worker-([a-f0-9]{17})$ ]]; then
+              instance_id="i-$${BASH_REMATCH[1]}"
+            elif [[ "$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
+              instance_id="$${BASH_REMATCH[1]}"
+            else
+              # Check by IP
+              local node_ip
+              node_ip=$(kubectl get node "$node_name" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+              if [[ -n "$node_ip" ]]; then
+                instance_id=$(aws ec2 describe-instances \
+                  --region ${var.region} \
+                  --filters "Name=private-ip-address,Values=$node_ip" \
+                  --query "Reservations[*].Instances[*].InstanceId" \
+                  --output text 2>/dev/null || echo "")
+              fi
+            fi
+            
+            echo "   Instance ID: $instance_id"
+            
+            # Check if instance exists in ASG
+            if [[ -n "$instance_id" ]] && echo "$existing_instances" | grep -q "$instance_id"; then
+              echo "   ✅ Instance exists - keeping node"
+            else
+              echo "   ❌ Ghost node detected - removing $node_name"
+              
+              # Force delete pods on this node
+              kubectl get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null | \
+                while read -r ns pod_name rest; do
+                  if [[ -n "$ns" ]] && [[ -n "$pod_name" ]]; then
+                    kubectl delete pod "$pod_name" -n "$ns" --force --grace-period=0 --timeout=5s 2>/dev/null || true
+                  fi
+                done
+              
+              # Remove node
+              kubectl delete node "$node_name" --timeout=30s 2>/dev/null || \
+              kubectl delete node "$node_name" --force --grace-period=0 2>/dev/null || true
+            fi
+          done
+        fi
+      }
+      
+      # Step 1: Initial cleanup
+      cleanup_terminating_pods
+      remove_ghost_nodes
+      
+      # Wait for stabilization
+      echo "⏳ Waiting 30 seconds for cluster to stabilize..."
+      sleep 30
+      
+      # Step 2: STRICT validation with FAIL conditions
+      echo "🔍 Starting STRICT cluster validation..."
       
       # Check if kubectl can connect
       if ! kubectl get nodes >/dev/null 2>&1; then
-        echo "❌ Cannot connect to cluster"
+        echo "❌ FATAL: Cannot connect to cluster"
+        echo "💡 Check kubeconfig and API server status"
         exit 1
       fi
       
-      echo "📋 Cluster nodes:"
+      echo "📋 Current cluster nodes:"
       kubectl get nodes -o wide
+      echo ""
       
-      # Check that we have at least 1 node Ready
-      READY_NODES=$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
-      TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l || echo "0")
-      NOTREADY_NODES=$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
+      # Get ASG desired capacity for validation
+      local desired_workers
+      desired_workers=$(aws autoscaling describe-auto-scaling-groups \
+        --region ${var.region} \
+        --auto-scaling-group-names "guy-polybot-asg" \
+        --query "AutoScalingGroups[0].DesiredCapacity" \
+        --output text 2>/dev/null || echo "${var.desired_worker_nodes}")
       
-      echo "   Ready nodes: $READY_NODES/$TOTAL_NODES"
-      echo "   NotReady nodes: $NOTREADY_NODES"
+      echo "Expected workers from ASG: $desired_workers"
       
-      if [[ "$READY_NODES" -eq 0 ]]; then
-        echo "❌ No nodes are Ready"
+      # Check node counts and status
+      local ready_nodes notready_nodes total_nodes ready_workers
+      ready_nodes=$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
+      notready_nodes=$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
+      total_nodes=$(kubectl get nodes --no-headers | wc -l || echo "0")
+      ready_workers=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep -c " Ready " || echo "0")
+      
+      echo "📊 Node Status:"
+      echo "   Ready nodes: $ready_nodes/$total_nodes"
+      echo "   Ready workers: $ready_workers (expected: $desired_workers)"
+      echo "   NotReady nodes: $notready_nodes"
+      
+      # STRICT VALIDATION 1: No NotReady nodes allowed
+      if [[ "$notready_nodes" -gt 0 ]]; then
+        echo "❌ FATAL: Found $notready_nodes NotReady nodes - cluster is unhealthy"
+        echo "🔍 NotReady nodes:"
+        kubectl get nodes --no-headers | grep "NotReady" || true
         exit 1
       fi
       
-      if [[ "$NOTREADY_NODES" -gt 0 ]]; then
-        echo "❌ Found $NOTREADY_NODES NotReady nodes - cluster is not stable"
+      # STRICT VALIDATION 2: Minimum node requirements
+      if [[ "$ready_nodes" -lt 3 ]]; then
+        echo "❌ FATAL: Only $ready_nodes Ready nodes (minimum 3 required: 1 CP + 2 workers)"
         exit 1
       fi
       
-      echo "✅ Cluster Readiness Check PASSED!"
+      # STRICT VALIDATION 3: Worker count should match ASG desired capacity (with tolerance)
+      if [[ "$ready_workers" -lt 2 ]]; then
+        echo "❌ FATAL: Only $ready_workers Ready worker nodes (minimum 2 required)"
+        exit 1
+      fi
+      
+      # STRICT VALIDATION 4: Check for stuck terminating pods
+      local terminating_count
+      terminating_count=$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null | wc -l || echo "0")
+      if [[ "$terminating_count" -gt 0 ]]; then
+        echo "❌ FATAL: Found $terminating_count pods stuck in Terminating state"
+        kubectl get pods --all-namespaces --field-selector=status.phase=Terminating
+        exit 1
+      fi
+      
+      # STRICT VALIDATION 5: Core system components health
+      echo "🔍 Validating core system components..."
+      
+      # Check CoreDNS
+      local coredns_ready
+      coredns_ready=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+      local coredns_desired
+      coredns_desired=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "2")
+      
+      if [[ "$coredns_ready" -lt "$coredns_desired" ]]; then
+        echo "❌ FATAL: CoreDNS not ready ($coredns_ready/$coredns_desired replicas)"
+        kubectl describe deployment coredns -n kube-system
+        exit 1
+      fi
+      echo "   ✅ CoreDNS: $coredns_ready/$coredns_desired ready"
+      
+      # Check Calico controller
+      local calico_ready
+      calico_ready=$(kubectl get deployment calico-kube-controllers -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+      local calico_desired
+      calico_desired=$(kubectl get deployment calico-kube-controllers -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+      
+      if [[ "$calico_ready" -lt "$calico_desired" ]]; then
+        echo "❌ FATAL: Calico controller not ready ($calico_ready/$calico_desired replicas)"
+        kubectl describe deployment calico-kube-controllers -n kube-system
+        exit 1
+      fi
+      echo "   ✅ Calico Controller: $calico_ready/$calico_desired ready"
+      
+      # Check Calico DaemonSet (should run on all nodes)
+      local calico_ds_ready
+      calico_ds_ready=$(kubectl get daemonset calico-node -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+      local calico_ds_desired
+      calico_ds_desired=$(kubectl get daemonset calico-node -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "$ready_nodes")
+      
+      if [[ "$calico_ds_ready" -lt "$calico_ds_desired" ]]; then
+        echo "❌ FATAL: Calico DaemonSet not ready ($calico_ds_ready/$calico_ds_desired nodes)"
+        kubectl describe daemonset calico-node -n kube-system
+        exit 1
+      fi
+      echo "   ✅ Calico DaemonSet: $calico_ds_ready/$calico_ds_desired ready"
+      
+      # Check EBS CSI Controller
+      local ebs_ready
+      ebs_ready=$(kubectl get deployment ebs-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+      local ebs_desired
+      ebs_desired=$(kubectl get deployment ebs-csi-controller -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "2")
+      
+      if [[ "$ebs_ready" -lt "$ebs_desired" ]]; then
+        echo "❌ FATAL: EBS CSI Controller not ready ($ebs_ready/$ebs_desired replicas)"
+        kubectl describe deployment ebs-csi-controller -n kube-system
+        exit 1
+      fi
+      echo "   ✅ EBS CSI Controller: $ebs_ready/$ebs_desired ready"
+      
+      # STRICT VALIDATION 6: Check for excessive pending/creating pods
+      local problematic_pods
+      problematic_pods=$(kubectl get pods --all-namespaces | grep -E "(Pending|ContainerCreating|Error|CrashLoopBackOff)" | wc -l || echo "0")
+      
+      if [[ "$problematic_pods" -gt 5 ]]; then
+        echo "❌ FATAL: Too many problematic pods ($problematic_pods) - cluster unstable"
+        echo "🔍 Problematic pods:"
+        kubectl get pods --all-namespaces | grep -E "(Pending|ContainerCreating|Error|CrashLoopBackOff)" | head -10
+        exit 1
+      fi
+      
+      echo ""
+      echo "✅ STRICT Cluster Readiness Check PASSED!"
+      echo "🎉 Cluster is healthy with:"
+      echo "   • $ready_nodes Ready nodes ($ready_workers workers)"
+      echo "   • 0 NotReady nodes"
+      echo "   • All core services operational"
+      echo "   • No stuck terminating pods"
+      echo "   • $problematic_pods problematic pods (acceptable threshold: ≤5)"
     EOT
   }
 }
@@ -1020,7 +1232,7 @@ resource "null_resource" "install_argocd" {
   }
 }
 
-# CONSOLIDATED: Single robust node cleanup resource
+# CONSOLIDATED: Enhanced robust node cleanup resource - FIXED SYNTAX
 resource "null_resource" "cleanup_orphaned_nodes" {
   depends_on = [
     null_resource.cluster_readiness_check,
@@ -1030,7 +1242,7 @@ resource "null_resource" "cleanup_orphaned_nodes" {
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
-    cleanup_version = "consolidated-v1"
+    cleanup_version = "enhanced-v2-fixed"
   }
 
   provisioner "local-exec" {
@@ -1041,7 +1253,8 @@ resource "null_resource" "cleanup_orphaned_nodes" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "🧹 Consolidated Orphaned Node Cleanup..."
+      echo "🧹 Enhanced Orphaned Node Cleanup with Ghost Detection"
+      echo "====================================================="
       
       # Check if kubectl can connect
       if ! kubectl get nodes >/dev/null 2>&1; then
@@ -1049,76 +1262,212 @@ resource "null_resource" "cleanup_orphaned_nodes" {
         exit 0
       fi
       
-      echo "📋 Current cluster state:"
+      echo "📋 Initial cluster state:"
       kubectl get nodes -o wide
+      echo ""
       
-      # Identify orphaned nodes (nodes without backing EC2 instances)
-      echo "🔍 Identifying orphaned nodes..."
+      # Get current ASG instances for validation
+      echo "🔍 Fetching current ASG instances..."
+      local asg_instances
+      asg_instances=$(aws ec2 describe-instances \
+        --region ${var.region} \
+        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+                  "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+        --query "Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress}" \
+        --output json 2>/dev/null || echo "[]")
       
-      WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
-      ORPHANED_NODES=()
+      local active_instance_ids
+      active_instance_ids=$(echo "$asg_instances" | jq -r '.[][] | select(.State == "running" or .State == "pending") | .InstanceId' 2>/dev/null || echo "")
       
-      if [[ -z "$WORKER_NODES" ]]; then
+      echo "Active EC2 instances in ASG:"
+      echo "$active_instance_ids" | while read -r inst; do
+        if [[ -n "$inst" ]]; then
+          local state ip
+          state=$(echo "$asg_instances" | jq -r --arg id "$inst" '.[][] | select(.InstanceId == $id) | .State' 2>/dev/null || echo "unknown")
+          ip=$(echo "$asg_instances" | jq -r --arg id "$inst" '.[][] | select(.InstanceId == $id) | .PrivateIp' 2>/dev/null || echo "unknown")
+          echo "   $inst ($state) - $ip"
+        fi
+      done
+      echo ""
+      
+      # Identify all worker nodes
+      local all_worker_nodes
+      all_worker_nodes=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || echo "")
+      
+      if [[ -z "$all_worker_nodes" ]]; then
         echo "ℹ️  No worker nodes found in cluster"
         exit 0
       fi
       
-      # Get all EC2 instances from ASG
-      EXISTING_INSTANCES=$(aws ec2 describe-instances \
-        --region ${var.region} \
-        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
-        --query "Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,PrivateIp:PrivateIpAddress}" \
-        --output json 2>/dev/null)
+      echo "🔍 Analyzing worker nodes for orphaned/ghost status..."
+      
+      local orphaned_nodes=()
+      local healthy_nodes=()
       
       # Check each worker node
-      for NODE_NAME in $WORKER_NODES; do
-        NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
+      for node_name in $all_worker_nodes; do
+        echo "🔍 Analyzing node: $node_name"
         
-        if [[ "$NODE_STATUS" == "NotReady" ]]; then
-          echo "   ⚠️  Node $NODE_NAME is NotReady, checking for backing instance..."
-          
-          # Extract instance ID from node name pattern
-          if [[ "$NODE_NAME" =~ worker-([a-f0-9]{17})$ ]]; then
-            POTENTIAL_INSTANCE_ID="i-$${BASH_REMATCH[1]}"
-            
-            MATCHING_INSTANCE=$(echo "$EXISTING_INSTANCES" | jq -r --arg id "$POTENTIAL_INSTANCE_ID" \
-              '.[][] | select(.InstanceId == $id) | .InstanceId' 2>/dev/null)
-            
-            if [[ -z "$MATCHING_INSTANCE" ]]; then
-              echo "     ❌ No backing EC2 instance found - marking for removal"
-              ORPHANED_NODES+=("$NODE_NAME")
+        local node_status
+        node_status=$(kubectl get node "$node_name" --no-headers | awk '{print $2}' || echo "Unknown")
+        echo "   Status: $node_status"
+        
+        local instance_id=""
+        local is_orphaned=false
+        
+        # Try multiple methods to extract instance ID
+        if [[ "$node_name" =~ worker-([a-f0-9]{17})$ ]]; then
+          instance_id="i-$${BASH_REMATCH[1]}"
+          echo "   Extracted instance ID (pattern 1): $instance_id"
+        elif [[ "$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
+          instance_id="$${BASH_REMATCH[1]}"
+          echo "   Extracted instance ID (pattern 2): $instance_id"
+        else
+          # Try to get instance ID from node annotations or labels
+          instance_id=$(kubectl get node "$node_name" -o jsonpath='{.spec.providerID}' 2>/dev/null | sed 's|.*aws://.*[[:space:]]/||' || echo "")
+          if [[ -z "$instance_id" ]]; then
+            # Try to match by private IP
+            local node_ip
+            node_ip=$(kubectl get node "$node_name" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+            if [[ -n "$node_ip" ]]; then
+              instance_id=$(echo "$asg_instances" | jq -r --arg ip "$node_ip" '.[][] | select(.PrivateIp == $ip) | .InstanceId' 2>/dev/null || echo "")
+              echo "   Matched by IP ($node_ip): $instance_id"
             fi
+          else
+            echo "   Extracted instance ID (providerID): $instance_id"
           fi
         fi
+        
+        # Validate instance exists and is active
+        if [[ -n "$instance_id" ]]; then
+          if echo "$active_instance_ids" | grep -q "^$instance_id$"; then
+            local instance_state
+            instance_state=$(echo "$asg_instances" | jq -r --arg id "$instance_id" '.[][] | select(.InstanceId == $id) | .State' 2>/dev/null || echo "unknown")
+            echo "   ✅ Instance $instance_id exists in ASG (state: $instance_state)"
+            
+            # Additional check for NotReady nodes with valid instances
+            if [[ "$node_status" == "NotReady" ]]; then
+              echo "   ⚠️  Node is NotReady but has valid instance - checking heartbeat..."
+              local last_heartbeat
+              last_heartbeat=$(kubectl get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastHeartbeatTime}' 2>/dev/null || echo "")
+              if [[ -n "$last_heartbeat" ]]; then
+                echo "   Last heartbeat: $last_heartbeat"
+                local current_time heartbeat_time time_diff
+                current_time=$(date -u +%s)
+                heartbeat_time=$(date -d "$last_heartbeat" +%s 2>/dev/null || echo "0")
+                time_diff=$((current_time - heartbeat_time))
+                
+                if [[ $time_diff -gt 1800 ]]; then  # 30 minutes
+                  echo "   ❌ Last heartbeat > 30 minutes ago - treating as orphaned"
+                  is_orphaned=true
+                fi
+              fi
+            fi
+            
+            if [[ "$is_orphaned" == "false" ]]; then
+              healthy_nodes+=("$node_name")
+            fi
+          else
+            echo "   ❌ Instance $instance_id NOT found in active ASG instances - ORPHANED"
+            is_orphaned=true
+          fi
+        else
+          echo "   ⚠️  Could not determine instance ID - checking heartbeat..."
+          local last_heartbeat
+          last_heartbeat=$(kubectl get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastHeartbeatTime}' 2>/dev/null || echo "")
+          if [[ -n "$last_heartbeat" ]]; then
+            echo "   Last heartbeat: $last_heartbeat"
+            local current_time heartbeat_time time_diff
+            current_time=$(date -u +%s)
+            heartbeat_time=$(date -d "$last_heartbeat" +%s 2>/dev/null || echo "0")
+            time_diff=$((current_time - heartbeat_time))
+            
+            if [[ $time_diff -gt 1800 ]]; then  # 30 minutes
+              echo "   ❌ Last heartbeat > 30 minutes ago - treating as orphaned"
+              is_orphaned=true
+            fi
+          else
+            echo "   ❌ No heartbeat data - likely orphaned"
+            is_orphaned=true
+          fi
+        fi
+        
+        if [[ "$is_orphaned" == "true" ]]; then
+          orphaned_nodes+=("$node_name")
+          echo "   🗑️  Node marked for removal"
+        fi
+        
+        echo ""
       done
       
-      # Clean up identified orphaned nodes
-      if [[ $${#ORPHANED_NODES[@]} -gt 0 ]]; then
-        echo "🗑️  Removing $${#ORPHANED_NODES[@]} orphaned nodes..."
+      # Report findings
+      echo "📊 Analysis Results:"
+      echo "   Healthy nodes: $${#healthy_nodes[@]}"
+      echo "   Orphaned nodes: $${#orphaned_nodes[@]}"
+      echo ""
+      
+      # Clean up orphaned nodes
+      if [[ $${#orphaned_nodes[@]} -gt 0 ]]; then
+        echo "🗑️  Removing $${#orphaned_nodes[@]} orphaned nodes..."
         
-        for NODE_NAME in "$${ORPHANED_NODES[@]}"; do
-          echo "🗑️  Cleaning up orphaned node: $NODE_NAME"
+        for node_name in "$${orphaned_nodes[@]}"; do
+          echo "🗑️  Processing orphaned node: $node_name"
           
-          # Force delete all pods on the node
-          kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" --no-headers 2>/dev/null | \
-            while read -r namespace podname rest; do
-              if [[ -n "$namespace" ]] && [[ -n "$podname" ]]; then
-                kubectl delete pod "$podname" -n "$namespace" --force --grace-period=0 --timeout=10s || true
+          # Step 1: Cordon the node to prevent new pods
+          echo "   Cordoning node..."
+          kubectl cordon "$node_name" 2>/dev/null || echo "   (cordon failed - node likely unreachable)"
+          
+          # Step 2: Get all pods on this node and force delete them
+          echo "   Removing pods from node..."
+          local pods_on_node
+          pods_on_node=$(kubectl get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null || echo "")
+          
+          if [[ -n "$pods_on_node" ]]; then
+            echo "   Found pods on node:"
+            echo "$pods_on_node" | while read -r namespace pod_name rest; do
+              if [[ -n "$namespace" ]] && [[ -n "$pod_name" ]]; then
+                echo "     Deleting: $namespace/$pod_name"
+                # FIXED SYNTAX: Use proper kubectl delete pod syntax
+                kubectl delete pod "$pod_name" --namespace="$namespace" --force --grace-period=0 --timeout=10s 2>/dev/null || {
+                  echo "       Direct delete failed, trying patch..."
+                  kubectl patch pod "$pod_name" --namespace="$namespace" -p '{"metadata":{"finalizers":null}}' 2>/dev/null || echo "       Patch also failed"
+                }
               fi
             done
-          
-          # Remove the node from cluster
-          if kubectl delete node "$NODE_NAME" --timeout=30s; then
-            echo "     ✅ Successfully removed orphaned node: $NODE_NAME"
           else
-            kubectl delete node "$NODE_NAME" --force --grace-period=0 || true
+            echo "   No pods found on node"
           fi
+          
+          # Step 3: Remove the node object itself
+          echo "   Removing node object..."
+          if kubectl delete node "$node_name" --timeout=30s 2>/dev/null; then
+            echo "   ✅ Successfully removed orphaned node: $node_name"
+          else
+            echo "   ⚠️  Normal delete failed, trying force delete..."
+            if kubectl delete node "$node_name" --force --grace-period=0 2>/dev/null; then
+              echo "   ✅ Force delete succeeded for: $node_name"
+            else
+              echo "   ❌ Force delete also failed for: $node_name"
+              echo "   This may require manual intervention"
+            fi
+          fi
+          
+          echo ""
         done
         
-        echo "✅ Orphaned node cleanup completed! Removed $${#ORPHANED_NODES[@]} nodes."
+        echo "✅ Orphaned node cleanup completed! Removed $${#orphaned_nodes[@]} nodes."
+        
+        # Wait a bit and show final state
+        echo "⏳ Waiting 15 seconds for cluster to stabilize..."
+        sleep 15
+        
       else
-        echo "✅ No orphaned nodes found - all worker nodes have backing instances"
+        echo "✅ No orphaned nodes found - all worker nodes have valid backing instances"
       fi
+      
+      echo ""
+      echo "📊 Final cluster state:"
+      kubectl get nodes -o wide
     EOT
   }
 }
@@ -1161,6 +1510,150 @@ resource "null_resource" "configure_argocd_apps" {
       
       echo "✅ ArgoCD Applications Configuration Complete!"
       echo "ℹ️  Use 'kubectl -n argocd get applications' to view configured applications"
+    EOT
+  }
+}
+
+# ESSENTIAL: Create required Kubernetes secrets for applications
+resource "null_resource" "create_application_secrets" {
+  depends_on = [
+    null_resource.cluster_readiness_check,
+    terraform_data.kubectl_provider_config
+  ]
+
+  triggers = {
+    cluster_ready_id = null_resource.cluster_readiness_check.id
+    kubeconfig_id = terraform_data.kubectl_provider_config[0].id
+    secrets_version = "v1-essential"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set -e
+      
+      export KUBECONFIG="${local.kubeconfig_path}"
+      
+      echo "🔐 Creating Essential Application Secrets"
+      echo "======================================="
+      
+      # Check if kubectl can connect
+      if ! kubectl get nodes >/dev/null 2>&1; then
+        echo "❌ Cannot connect to cluster"
+        exit 1
+      fi
+      
+      # Create prod namespace if it doesn't exist
+      echo "📁 Ensuring prod namespace exists..."
+      kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Create dev namespace if it doesn't exist
+      echo "📁 Ensuring dev namespace exists..."
+      kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
+      
+      # Function to create or update a secret
+      create_or_update_secret() {
+        local namespace="$1"
+        local secret_name="$2"
+        local secret_type="$3"
+        shift 3
+        local data_args=("$@")
+        
+        echo "🔑 Processing secret: $namespace/$secret_name"
+        
+        # Check if secret exists
+        if kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
+          echo "   Secret exists, updating..."
+          kubectl delete secret "$secret_name" -n "$namespace" || true
+        else
+          echo "   Creating new secret..."
+        fi
+        
+        # Create the secret
+        kubectl create secret "$secret_type" "$secret_name" -n "$namespace" "$${data_args[@]}" || {
+          echo "   ❌ Failed to create secret $secret_name"
+          return 1
+        }
+        
+        echo "   ✅ Secret $secret_name created successfully"
+      }
+      
+      # Generate dummy certificates for TLS if they don't exist
+      echo "🔐 Generating dummy certificates for polybot-tls..."
+      
+      # Create temporary directory for certs
+      mkdir -p /tmp/polybot-certs
+      cd /tmp/polybot-certs
+      
+      # Generate private key
+      if [[ ! -f polybot.key ]]; then
+        openssl genrsa -out polybot.key 2048 2>/dev/null || {
+          echo "⚠️  OpenSSL not available, creating dummy certificate files"
+          echo "dummy-private-key" > polybot.key
+          echo "dummy-certificate" > polybot.crt
+          echo "dummy-ca-certificate" > ca.crt
+        }
+      fi
+      
+      # Generate certificate
+      if [[ ! -f polybot.crt ]] && command -v openssl >/dev/null 2>&1; then
+        openssl req -new -x509 -key polybot.key -out polybot.crt -days 365 -subj "/CN=polybot.local" 2>/dev/null || {
+          echo "dummy-certificate" > polybot.crt
+        }
+      elif [[ ! -f polybot.crt ]]; then
+        echo "dummy-certificate" > polybot.crt
+      fi
+      
+      # Generate CA certificate
+      if [[ ! -f ca.crt ]] && command -v openssl >/dev/null 2>&1; then
+        openssl req -new -x509 -key polybot.key -out ca.crt -days 365 -subj "/CN=polybot-ca.local" 2>/dev/null || {
+          echo "dummy-ca-certificate" > ca.crt
+        }
+      elif [[ ! -f ca.crt ]]; then
+        echo "dummy-ca-certificate" > ca.crt
+      fi
+      
+      # Create polybot-tls secret in both namespaces
+      for namespace in prod dev; do
+        echo "🔐 Creating TLS secrets in namespace: $namespace"
+        
+        # polybot-tls secret
+        create_or_update_secret "$namespace" "polybot-tls" "tls" \
+          "--cert=polybot.crt" \
+          "--key=polybot.key"
+        
+        # polybot-ca secret
+        create_or_update_secret "$namespace" "polybot-ca" "generic" \
+          "--from-file=ca.crt=ca.crt"
+        
+        # polybot-secrets (generic application secrets)
+        create_or_update_secret "$namespace" "polybot-secrets" "generic" \
+          "--from-literal=app-secret=default-secret-value" \
+          "--from-literal=database-url=postgresql://polybot:password@localhost:5432/polybot" \
+          "--from-literal=redis-url=redis://localhost:6379/0" \
+          "--from-literal=api-key=default-api-key-change-me"
+      done
+      
+      # Clean up temporary files
+      cd /
+      rm -rf /tmp/polybot-certs
+      
+      echo ""
+      echo "📊 Secrets Summary:"
+      echo "=================="
+      
+      for namespace in prod dev; do
+        echo ""
+        echo "📁 Namespace: $namespace"
+        kubectl get secrets -n "$namespace" | grep polybot || echo "   No polybot secrets found"
+      done
+      
+      echo ""
+      echo "✅ Application secrets creation completed!"
+      echo ""
+      echo "💡 Note: These are dummy/placeholder secrets for initial deployment."
+      echo "   Replace with actual secrets from AWS Secrets Manager or your secret store."
     EOT
   }
 }
