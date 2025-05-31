@@ -1215,10 +1215,10 @@ resource "null_resource" "cleanup_stale_nodes" {
     module.k8s-cluster
   ]
 
-  # Run this periodically or when cluster changes
+  # Run this on every terraform apply to ensure cluster is clean
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
-    timestamp = timestamp()
+    always_run = timestamp() # This ensures it runs every time
   }
 
   provisioner "local-exec" {
@@ -1231,51 +1231,55 @@ resource "null_resource" "cleanup_stale_nodes" {
       
       # Check if kubectl can connect to the cluster
       if ! kubectl get nodes &>/dev/null; then
-        echo "Cannot connect to Kubernetes cluster, skipping node cleanup"
+        echo "❌ Cannot connect to Kubernetes cluster, skipping node cleanup"
         exit 0
       fi
       
       # Get all worker nodes (excluding control plane)
-      echo "Getting all worker nodes..."
+      echo "📋 Getting all worker nodes..."
       WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
       
       if [[ -z "$WORKER_NODES" ]]; then
-        echo "No worker nodes found in cluster"
+        echo "ℹ️  No worker nodes found in cluster"
         exit 0
       fi
       
-      echo "Found worker nodes: $WORKER_NODES"
+      echo "📋 Found worker nodes: $WORKER_NODES"
       
       # Check each worker node
+      STALE_NODES_FOUND=0
       for NODE_NAME in $WORKER_NODES; do
-        echo "Checking node: $NODE_NAME"
+        echo ""
+        echo "🔍 Checking node: $NODE_NAME"
         
         # Get node status
         NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
-        echo "Node $NODE_NAME status: $NODE_STATUS"
+        NODE_READY=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        echo "   Status: $NODE_STATUS (Ready: $NODE_READY)"
         
         # If node is NotReady, check if corresponding EC2 instance exists
-        if [[ "$NODE_STATUS" == "NotReady" ]]; then
-          echo "Node $NODE_NAME is NotReady, checking if EC2 instance exists..."
+        if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" == "False" ]]; then
+          echo "⚠️  Node $NODE_NAME is NotReady, checking if EC2 instance exists..."
           
-          # Extract instance ID or IP from node name
-          # Node names are typically in format: worker-<hash> or ip-<ip-with-dashes>
+          # Initialize instance check flag
+          INSTANCE_EXISTS=""
+          
+          # Extract hash from worker node name (format: worker-<hash>)
           if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
-            # Format: worker-<hash>
             NODE_HASH="${BASH_REMATCH[1]}"
-            echo "Looking for EC2 instance with hash: $NODE_HASH"
+            echo "   Looking for EC2 instance with hash: $NODE_HASH"
             
-            # Search for running instance with this hash in name or tags
+            # Search for running instance with this hash in name or instance ID
             INSTANCE_EXISTS=$(aws ec2 describe-instances \
               --region ${var.region} \
               --filters "Name=instance-state-name,Values=running" \
-              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_HASH') || contains(PrivateIpAddress, '$NODE_HASH')]" \
-              --output text 2>/dev/null | head -1)
+              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_HASH') || contains(InstanceId, '$NODE_HASH')].[InstanceId]" \
+              --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' | head -1)
               
           elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
             # Format: ip-<ip-with-dashes>
             PRIVATE_IP="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
-            echo "Looking for EC2 instance with private IP: $PRIVATE_IP"
+            echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
             
             # Search for running instance with this private IP
             INSTANCE_EXISTS=$(aws ec2 describe-instances \
@@ -1286,61 +1290,108 @@ resource "null_resource" "cleanup_stale_nodes" {
               
           else
             # Generic search - look for any worker instance with similar name
-            echo "Generic search for node: $NODE_NAME"
+            echo "   Generic search for node: $NODE_NAME"
             INSTANCE_EXISTS=$(aws ec2 describe-instances \
               --region ${var.region} \
               --filters "Name=tag:Name,Values=*worker*" "Name=instance-state-name,Values=running" \
-              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_NAME')]" \
+              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_NAME')].[InstanceId]" \
               --output text 2>/dev/null | head -1)
           fi
           
+          echo "   Instance search result: '$INSTANCE_EXISTS'"
+          
           # If no running instance found, remove the node
-          if [[ -z "$INSTANCE_EXISTS" ]] || [[ "$INSTANCE_EXISTS" == "None" ]]; then
-            echo "⚠️  No running EC2 instance found for node $NODE_NAME, removing from cluster..."
+          if [[ -z "$INSTANCE_EXISTS" ]] || [[ "$INSTANCE_EXISTS" == "None" ]] || [[ "$INSTANCE_EXISTS" == "null" ]]; then
+            echo "🗑️  No running EC2 instance found for node $NODE_NAME, removing from cluster..."
+            STALE_NODES_FOUND=$((STALE_NODES_FOUND + 1))
             
-            # First drain the node to move pods safely
-            echo "Draining node $NODE_NAME..."
-            kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=60s || {
-              echo "Failed to drain node $NODE_NAME, but continuing with deletion"
-            }
+            # First, check if any pods are running on this node and try to gracefully drain
+            PODS_ON_NODE=$(kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" --no-headers 2>/dev/null | wc -l || echo "0")
+            echo "   Found $PODS_ON_NODE pods on node $NODE_NAME"
+            
+            if [[ "$PODS_ON_NODE" -gt 0 ]]; then
+              echo "   Draining node $NODE_NAME (60s timeout)..."
+              kubectl drain "$NODE_NAME" --ignore-daemonsets --delete-emptydir-data --force --timeout=60s --grace-period=30 || {
+                echo "   ⚠️  Failed to drain node $NODE_NAME gracefully, forcing deletion of pods..."
+                # Force delete pods on the node
+                kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o name | xargs -r kubectl delete --force --grace-period=0 || true
+              }
+            fi
             
             # Delete the node from the cluster
-            echo "Deleting node $NODE_NAME from cluster..."
-            kubectl delete node "$NODE_NAME" || {
-              echo "Failed to delete node $NODE_NAME"
-            }
+            echo "   Deleting node $NODE_NAME from cluster..."
+            if kubectl delete node "$NODE_NAME" --timeout=30s; then
+              echo "   ✅ Successfully removed stale node: $NODE_NAME"
+            else
+              echo "   ❌ Failed to delete node $NODE_NAME from cluster"
+            fi
             
-            echo "✅ Removed stale node: $NODE_NAME"
           else
-            echo "✅ Node $NODE_NAME has corresponding running EC2 instance"
+            echo "   ✅ Node $NODE_NAME has corresponding running EC2 instance: $INSTANCE_EXISTS"
           fi
         else
-          echo "✅ Node $NODE_NAME is in good state: $NODE_STATUS"
+          echo "   ✅ Node $NODE_NAME is healthy (Status: $NODE_STATUS)"
         fi
       done
       
-      # Clean up completed and failed pods on remaining nodes
-      echo "🧹 Cleaning up completed and failed pods..."
-      kubectl get pods --all-namespaces --field-selector=status.phase=Succeeded -o name | xargs -r kubectl delete || true
-      kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o name | xargs -r kubectl delete || true
+      echo ""
+      echo "🧹 Cleaning up problematic pods..."
       
-      # Clean up pending pods that have been stuck for more than 10 minutes
-      echo "🧹 Cleaning up stuck pending pods..."
-      kubectl get pods --all-namespaces --field-selector=status.phase=Pending -o json | \
-        jq -r '.items[] | select(.metadata.creationTimestamp | fromdateiso8601 < (now - 600)) | "\(.metadata.namespace)/\(.metadata.name)"' | \
-        while read pod; do
+      # Clean up completed and failed pods
+      echo "   Removing completed pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Succeeded -o name 2>/dev/null | xargs -r kubectl delete --timeout=30s || true
+      
+      echo "   Removing failed pods..."
+      kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o name 2>/dev/null | xargs -r kubectl delete --timeout=30s || true
+      
+      # Clean up pending pods that have been stuck for more than 5 minutes (reduced from 10)
+      echo "   Removing stuck pending pods (>5 mins)..."
+      STUCK_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Pending -o json 2>/dev/null | \
+        jq -r --argjson threshold "$(date -d '5 minutes ago' +%s)" \
+        '.items[] | select((.metadata.creationTimestamp | fromdateiso8601) < $threshold) | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || true)
+      
+      if [[ -n "$STUCK_PODS" ]]; then
+        echo "$STUCK_PODS" | while read -r pod; do
           if [[ -n "$pod" ]]; then
-            echo "Deleting stuck pending pod: $pod"
-            kubectl delete pod "$pod" --timeout=30s || true
+            echo "     Deleting stuck pending pod: $pod"
+            kubectl delete pod "$pod" --timeout=30s --force --grace-period=0 || true
           fi
-        done || true
+        done
+      fi
       
+      # Clean up pods stuck in Terminating state
+      echo "   Removing stuck terminating pods..."
+      TERMINATING_PODS=$(kubectl get pods --all-namespaces | grep Terminating | awk '{print $1"/"$2}' || true)
+      if [[ -n "$TERMINATING_PODS" ]]; then
+        echo "$TERMINATING_PODS" | while read -r pod; do
+          if [[ -n "$pod" ]]; then
+            echo "     Force deleting terminating pod: $pod"
+            kubectl delete pod "$pod" --force --grace-period=0 || true
+          fi
+        done
+      fi
+      
+      echo ""
       echo "🎉 Node cleanup completed!"
+      echo "📊 Summary:"
+      echo "   - Stale nodes removed: $STALE_NODES_FOUND"
+      echo ""
       
       # Show current cluster state
-      echo "Current cluster state:"
-      kubectl get nodes
-      kubectl get pods --all-namespaces | grep -E "(Pending|Failed|Unknown)" || echo "No problematic pods found"
+      echo "📋 Current cluster state:"
+      kubectl get nodes -o wide
+      echo ""
+      
+      echo "🔍 Problematic pods (if any):"
+      PROBLEM_PODS=$(kubectl get pods --all-namespaces | grep -E "(Pending|Failed|Unknown|Terminating|CrashLoopBackOff)" || true)
+      if [[ -n "$PROBLEM_PODS" ]]; then
+        echo "$PROBLEM_PODS"
+      else
+        echo "   ✅ No problematic pods found"
+      fi
+      
+      echo ""
+      echo "✅ Stale node cleanup process complete!"
     EOT
   }
 }
