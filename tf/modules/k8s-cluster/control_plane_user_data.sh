@@ -448,7 +448,7 @@ echo "Waiting for critical system pods to become ready..."
 wait_for_deployment() {
     local namespace=$1
     local deployment=$2
-    local timeout=${3:-300}  # 5 minutes default
+    local timeout=$${3$${":"}$${"-"}300}  # 5 minutes default
     
     echo "Waiting for deployment $deployment in namespace $namespace to be ready..."
     if kubectl wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment" -n "$namespace"; then
@@ -464,7 +464,7 @@ wait_for_deployment() {
 wait_for_daemonset() {
     local namespace=$1
     local daemonset=$2
-    local timeout=${3:-300}  # 5 minutes default
+    local timeout=$${3$${":"}$${"-"}300}  # 5 minutes default
     
     echo "Waiting for daemonset $daemonset in namespace $namespace to be ready..."
     local end_time=$(($(date +%s) + timeout))
