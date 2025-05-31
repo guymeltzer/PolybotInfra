@@ -56,7 +56,8 @@ if ! command -v aws &> /dev/null; then
     export PATH=$PATH:/usr/local/bin # May not persist for later commands if not in .bashrc
 else
     log "AWS CLI already installed."
-finame
+fi
+
 IMDS_TOKEN=$(retry 5 10 "curl -s -f -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600'")
 if [ -z "$IMDS_TOKEN" ]; then
     log "Warning: Failed to get IMDSv2 token. Attempting IMDSv1 for region."
@@ -290,5 +291,16 @@ aws ec2 create-tags --region "$EFFECTIVE_REGION" --resources "$INSTANCE_ID" \
          Key=k8s.io/role/node,Value= \
          Key=Role,Value=worker 2>/dev/null || log "Warning: Failed to set some EC2 tags. Check IAM permissions."
 # Note: ${cluster_name} must be passed by templatefile if used here.
+
+# Add kubectl alias to ubuntu user's bashrc
+log "Adding kubectl alias to ubuntu user's bashrc..."
+echo "# kubectl alias" >> /home/ubuntu/.bashrc
+echo "alias k='kubectl'" >> /home/ubuntu/.bashrc
+
+# Also add the alias to root's bashrc for completeness  
+echo "# kubectl alias" >> /root/.bashrc
+echo "alias k='kubectl'" >> /root/.bashrc
+
+log "kubectl alias 'k' added to both ubuntu and root user bashrc files"
 
 log "Worker node setup with CRI-O completed."

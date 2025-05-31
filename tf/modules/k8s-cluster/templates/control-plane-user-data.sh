@@ -589,3 +589,16 @@ fi
 # Create a log file if it doesn't exist
 touch /var/log/k8s-token-creator.log
 chmod 644 /var/log/k8s-token-creator.log
+
+# Add kubectl alias to ubuntu user's bashrc
+log "Adding kubectl alias to ubuntu user's bashrc..."
+echo "# kubectl alias" >> /home/ubuntu/.bashrc
+echo "alias k='kubectl'" >> /home/ubuntu/.bashrc
+echo "export KUBECONFIG=/home/ubuntu/.kube/config" >> /home/ubuntu/.bashrc
+
+# Also add the alias to root's bashrc for completeness
+echo "# kubectl alias" >> /root/.bashrc
+echo "alias k='kubectl'" >> /root/.bashrc
+echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> /root/.bashrc
+
+log "kubectl alias 'k' added to both ubuntu and root user bashrc files"
