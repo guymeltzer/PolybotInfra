@@ -1635,7 +1635,7 @@ resource "null_resource" "cleanup_orphaned_nodes" {
     null_resource.cluster_readiness_check,
     terraform_data.kubectl_provider_config
   ]
-
+  
   # Only run when there are actual issues - more selective triggering
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
