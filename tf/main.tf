@@ -479,15 +479,17 @@ resource "null_resource" "install_argocd" {
     null_resource.wait_for_kubernetes
   ]
   
+  # Only run when cluster is stable and ready
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     cluster_ready_id = null_resource.cluster_readiness_check.id
-    force_update = "argocd-v3"
+    # Add a timestamp to force re-run if needed
+    force_update = "argocd-v3-fixed"
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
       set -euo pipefail
       
@@ -609,54 +611,84 @@ EOFSC2
         install_attempt=$((install_attempt + 1))
       done
 
-      # 4. Wait for critical ArgoCD Deployments to be Available
-      echo "⏳ Waiting for critical ArgoCD deployments to become Available..."
-      required_deployments=("argocd-server" "argocd-application-controller" "argocd-repo-server" "argocd-dex-server" "argocd-redis")
+      # 4. Wait for critical ArgoCD components (both Deployments and StatefulSets)
+      echo "⏳ Waiting for critical ArgoCD components to become ready..."
       
-      all_deployments_available_and_found=false
-      wait_total_attempts=36 
+      # Define required components with their types
+      declare -A required_components
+      required_components["argocd-server"]="deployment"
+      required_components["argocd-repo-server"]="deployment"
+      required_components["argocd-dex-server"]="deployment"
+      required_components["argocd-redis"]="deployment"
+      required_components["argocd-applicationset-controller"]="deployment"
+      required_components["argocd-notifications-controller"]="deployment"
+      required_components["argocd-application-controller"]="statefulset"
+      
+      all_components_ready=false
+      wait_total_attempts=24  # 4 minutes total
       for ((i=1; i<=wait_total_attempts; i++)); do
-        echo "  Checking ArgoCD deployments readiness (attempt $i/$wait_total_attempts)..."
-        all_available_this_iteration=true
-        found_count=0
+        echo "  Checking ArgoCD components readiness (attempt $i/$wait_total_attempts)..."
+        all_ready_this_iteration=true
+        ready_count=0
         
-        for deployment_name in $${required_deployments[@]}; do 
-          if kubectl -n argocd get deployment "$deployment_name" -o name &>/dev/null; then
-            found_count=$((found_count + 1))
-            if ! kubectl -n argocd rollout status deployment/"$deployment_name" --timeout=5s &>/dev/null; then 
-              echo "    Deployment $deployment_name found but not yet fully rolled out/available."
-              all_available_this_iteration=false
-              break 
+        for component_name in "$${!required_components[@]}"; do
+          component_type="$${required_components[$component_name]}"
+          
+          if [ "$component_type" = "deployment" ]; then
+            if kubectl -n argocd get deployment "$component_name" -o name &>/dev/null; then
+              if kubectl -n argocd rollout status deployment/"$component_name" --timeout=5s &>/dev/null; then
+                echo "    ✅ Deployment $component_name is ready"
+                ready_count=$((ready_count + 1))
+              else
+                echo "    ⏳ Deployment $component_name found but not yet ready"
+                all_ready_this_iteration=false
+                break
+              fi
             else
-              echo "    Deployment $deployment_name is Available (rolled out)."
+              echo "    ⏳ Deployment $component_name not found yet..."
+              all_ready_this_iteration=false
+              break
             fi
-          else
-            echo "    Deployment $deployment_name not found yet..."
-            all_available_this_iteration=false
-            break
+          elif [ "$component_type" = "statefulset" ]; then
+            if kubectl -n argocd get statefulset "$component_name" -o name &>/dev/null; then
+              if kubectl -n argocd rollout status statefulset/"$component_name" --timeout=5s &>/dev/null; then
+                echo "    ✅ StatefulSet $component_name is ready"
+                ready_count=$((ready_count + 1))
+              else
+                echo "    ⏳ StatefulSet $component_name found but not yet ready"
+                all_ready_this_iteration=false
+                break
+              fi
+            else
+              echo "    ⏳ StatefulSet $component_name not found yet..."
+              all_ready_this_iteration=false
+              break
+            fi
           fi
         done
 
-        if $all_available_this_iteration && [ "$found_count" -eq $${#required_deployments[@]} ]; then
-          echo "✅ All critical ArgoCD deployments are present and Available/rolled out."
-          all_deployments_available_and_found=true
+        if $all_ready_this_iteration && [ "$ready_count" -eq "$${#required_components[@]}" ]; then
+          echo "✅ All critical ArgoCD components are ready!"
+          all_components_ready=true
           break
         fi
 
         if [ "$i" -eq "$wait_total_attempts" ]; then
-          echo "❌ Not all ArgoCD deployments became Available after $wait_total_attempts attempts."
+          echo "❌ Not all ArgoCD components became ready after $wait_total_attempts attempts."
           echo "Current deployment status in 'argocd' namespace:"
           kubectl -n argocd get deployments
+          echo "Current statefulset status in 'argocd' namespace:"
+          kubectl -n argocd get statefulsets
           echo "Current pod status in 'argocd' namespace:"
           kubectl -n argocd get pods
           exit 1
         fi
-        echo "   Waiting 10s before next check for deployments..."
+        echo "   Waiting 10s before next check..."
         sleep 10
       done
       
-      echo "⏳ Waiting for ArgoCD server pods to be ready..."
-      if ! kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=300s; then
+      echo "⏳ Final verification: waiting for ArgoCD server pods to be ready..."
+      if ! kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=180s; then
         echo "❌ ArgoCD server pods not ready within timeout."
         kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-server --show-labels || true
         kubectl -n argocd describe pods -l app.kubernetes.io/name=argocd-server || true
@@ -673,7 +705,7 @@ EOFSC2
       echo "✅ ArgoCD server service verified."
       
       echo "🔑 Retrieving ArgoCD admin password..."
-      password_attempts=15
+      password_attempts=10
       password_attempt=1
       password_retrieved=false
       password=""
@@ -689,7 +721,7 @@ EOFSC2
         fi
         if [ "$password_retrieved" = "false" ]; then
           echo "    Waiting for ArgoCD admin secret (attempt $password_attempt/$password_attempts)..."
-          sleep 20
+          sleep 15
           password_attempt=$((password_attempt + 1))
         fi
       done
@@ -726,6 +758,7 @@ EOFSC2
       
       echo "🔍 Final ArgoCD installation verification..."
       kubectl -n argocd get deployments
+      kubectl -n argocd get statefulsets
       kubectl -n argocd get pods
       kubectl -n argocd get services
 
@@ -1106,7 +1139,7 @@ resource "null_resource" "configure_argocd_repositories" {
   }
 }
 
-# Add this resource after the null_resource.fix_argocd_connectivity resource
+# Enhanced stale node cleanup with robust checking and terminating pod cleanup
 resource "null_resource" "cleanup_stale_nodes" {
   depends_on = [
     null_resource.wait_for_kubernetes,
@@ -1115,11 +1148,11 @@ resource "null_resource" "cleanup_stale_nodes" {
     module.k8s-cluster
   ]
 
-  # Run cleanup only when there are actual issues, not on every apply
+  # Run cleanup when there are actual issues or on explicit trigger
   triggers = {
     cluster_id = module.k8s-cluster.control_plane_instance_id
-    # Only run when explicitly needed, not on every timestamp
-    run_cleanup = "on-demand"
+    # Add a trigger for manual runs
+    run_cleanup = "enhanced-v3-aggressive"
   }
 
   provisioner "local-exec" {
@@ -1128,7 +1161,7 @@ resource "null_resource" "cleanup_stale_nodes" {
       #!/bin/bash
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "🧹 Checking for stale Kubernetes nodes..."
+      echo "🧹 Enhanced stale node and pod cleanup..."
       
       # Check if kubectl can connect to the cluster
       if ! kubectl get nodes &>/dev/null; then
@@ -1140,32 +1173,67 @@ resource "null_resource" "cleanup_stale_nodes" {
       echo "⏳ Waiting for cluster to stabilize..."
       sleep 30
       
-      # Check if CoreDNS is ready before doing any cleanup
-      echo "🔍 Checking CoreDNS readiness..."
-      COREDNS_READY=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-      COREDNS_DESIRED=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-      
-      if [[ "$COREDNS_READY" != "$COREDNS_DESIRED" ]] || [[ "$COREDNS_READY" == "0" ]]; then
-        echo "⚠️  CoreDNS not fully ready ($COREDNS_READY/$COREDNS_DESIRED), delaying cleanup to avoid disruption"
-        echo "    Will only remove obviously stale nodes"
-      fi
-      
-      # Get all worker nodes (excluding control plane)
       echo "📋 Getting all worker nodes..."
       WORKER_NODES=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || true)
       
       if [[ -z "$WORKER_NODES" ]]; then
         echo "ℹ️  No worker nodes found in cluster"
-        exit 0
+      else
+        echo "📋 Found worker nodes: $WORKER_NODES"
       fi
       
-      echo "📋 Found worker nodes: $WORKER_NODES"
+      # Phase 1: Clean up terminating pods from NotReady nodes
+      echo ""
+      echo "🧽 Phase 1: Cleaning up terminating pods from NotReady nodes..."
       
-      # Check each worker node
+      for NODE_NAME in $WORKER_NODES; do
+        NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
+        NODE_READY=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        
+        # Check if node is NotReady (either status="NotReady" or Ready condition is not "True")
+        if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" != "True" ]]; then
+          echo "🔍 Node $NODE_NAME is not ready (Status: $NODE_STATUS, Ready: $NODE_READY)"
+          
+          # Find terminating pods on this node
+          TERMINATING_PODS=$(kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" \
+            --output json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || true)
+          
+          if [[ -n "$TERMINATING_PODS" ]]; then
+            echo "   Found terminating pods on NotReady node $NODE_NAME:"
+            echo "$TERMINATING_PODS" | while read -r pod; do
+              if [[ -n "$pod" ]]; then
+                echo "     Force deleting terminating pod: $pod"
+                kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
+              fi
+            done
+          fi
+          
+          # Find stuck pending pods on this node that have been pending for >5 minutes
+          STUCK_PENDING_PODS=$(kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" \
+            --field-selector status.phase=Pending --output json | \
+            jq -r --argjson threshold "$(date -d '5 minutes ago' +%s)" \
+            '.items[] | select((.metadata.creationTimestamp | fromdateiso8601) < $threshold) | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || true)
+          
+          if [[ -n "$STUCK_PENDING_PODS" ]]; then
+            echo "   Found stuck pending pods on NotReady node $NODE_NAME:"
+            echo "$STUCK_PENDING_PODS" | while read -r pod; do
+              if [[ -n "$pod" ]]; then
+                echo "     Deleting stuck pending pod: $pod"
+                kubectl delete pod "$pod" --timeout=30s --grace-period=10 || true
+              fi
+            done
+          fi
+        fi
+      done
+      
+      # Phase 2: Check each worker node for staleness
+      echo ""
+      echo "🔍 Phase 2: Checking for truly stale nodes to remove..."
+      
       STALE_NODES_FOUND=0
       NODES_TO_CLEANUP=()
       
-      # First pass: identify truly stale nodes
+      # First pass: identify nodes that are NotReady for extended periods
       for NODE_NAME in $WORKER_NODES; do
         echo ""
         echo "🔍 Checking node: $NODE_NAME"
@@ -1173,70 +1241,88 @@ resource "null_resource" "cleanup_stale_nodes" {
         # Get detailed node status
         NODE_STATUS=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $2}' || echo "Unknown")
         NODE_READY=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
-        NODE_AGE=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $4}' || echo "Unknown")
+        NODE_AGE_RAW=$(kubectl get node "$NODE_NAME" --no-headers | awk '{print $4}' || echo "Unknown")
         
-        echo "   Status: $NODE_STATUS (Ready: $NODE_READY, Age: $NODE_AGE)"
+        echo "   Status: $NODE_STATUS (Ready: $NODE_READY, Age: $NODE_AGE_RAW)"
         
-        # Only check nodes that are definitively NotReady
-        if [[ "$NODE_STATUS" == "NotReady" ]] && [[ "$NODE_READY" == "False" ]]; then
-          echo "⚠️  Node $NODE_NAME is NotReady, checking if EC2 instance exists..."
+        # Consider a node stale if it's NotReady OR Ready condition is not "True"
+        if [[ "$NODE_STATUS" == "NotReady" ]] || [[ "$NODE_READY" != "True" ]]; then
+          echo "⚠️  Node $NODE_NAME is not ready, checking if it should be removed..."
           
-          # Initialize instance check flag
-          INSTANCE_EXISTS=""
-          
-          # Extract hash from worker node name (format: worker-<hash>)
-          if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
-            NODE_HASH="$${BASH_REMATCH[1]}"
-            echo "   Looking for EC2 instance with hash: $NODE_HASH"
-            
-            # Search for running instance with this hash in name or instance ID
-            INSTANCE_EXISTS=$(aws ec2 describe-instances \
-              --region ${var.region} \
-              --filters "Name=instance-state-name,Values=running" \
-              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_HASH') || contains(InstanceId, '$NODE_HASH')].[InstanceId]" \
-              --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' | head -1)
-              
-          elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
-            # Format: ip-<ip-with-dashes>
-            PRIVATE_IP="$${BASH_REMATCH[1]}.$${BASH_REMATCH[2]}.$${BASH_REMATCH[3]}.$${BASH_REMATCH[4]}"
-            echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
-            
-            # Search for running instance with this private IP
-            INSTANCE_EXISTS=$(aws ec2 describe-instances \
-              --region ${var.region} \
-              --filters "Name=private-ip-address,Values=$PRIVATE_IP" "Name=instance-state-name,Values=running" \
-              --query "Reservations[*].Instances[*].InstanceId" \
-              --output text 2>/dev/null | head -1)
-              
-          else
-            # Generic search - look for any worker instance with similar name
-            echo "   Generic search for node: $NODE_NAME"
-            INSTANCE_EXISTS=$(aws ec2 describe-instances \
-              --region ${var.region} \
-              --filters "Name=tag:Name,Values=*worker*" "Name=instance-state-name,Values=running" \
-              --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_NAME')].[InstanceId]" \
-              --output text 2>/dev/null | head -1)
+          # Check node age - only remove nodes that have been NotReady for more than 10 minutes
+          NODE_AGE_SECONDS=0
+          if [[ "$NODE_AGE_RAW" =~ ^([0-9]+)m$ ]]; then
+            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 60))
+          elif [[ "$NODE_AGE_RAW" =~ ^([0-9]+)h$ ]]; then
+            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 3600))
+          elif [[ "$NODE_AGE_RAW" =~ ^([0-9]+)d$ ]]; then
+            NODE_AGE_SECONDS=$((${BASH_REMATCH[1]} * 86400))
           fi
           
-          echo "   Instance search result: '$INSTANCE_EXISTS'"
-          
-          # If no running instance found, mark for cleanup
-          if [[ -z "$INSTANCE_EXISTS" ]] || [[ "$INSTANCE_EXISTS" == "None" ]] || [[ "$INSTANCE_EXISTS" == "null" ]]; then
-            echo "🗑️  No running EC2 instance found for node $NODE_NAME, marking for removal"
-            NODES_TO_CLEANUP+=("$NODE_NAME")
-            STALE_NODES_FOUND=$((STALE_NODES_FOUND + 1))
+          # If node is older than 10 minutes and still NotReady, check if EC2 instance exists
+          if [[ $NODE_AGE_SECONDS -gt 600 ]]; then
+            echo "   Node has been around for >10 minutes and is still NotReady, checking EC2 instance..."
+            
+            # Initialize instance check flag
+            INSTANCE_EXISTS=""
+            
+            # Extract hash from worker node name (format: worker-<hash>)
+            if [[ "$NODE_NAME" =~ ^worker-([a-f0-9]+)$ ]]; then
+              NODE_HASH="${BASH_REMATCH[1]}"
+              echo "   Looking for EC2 instance with hash: $NODE_HASH"
+              
+              # Search for running instance with this hash in name or instance ID
+              INSTANCE_EXISTS=$(aws ec2 describe-instances \
+                --region ${var.region} \
+                --filters "Name=instance-state-name,Values=running" \
+                --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_HASH') || contains(InstanceId, '$NODE_HASH')].[InstanceId]" \
+                --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' | head -1)
+                
+            elif [[ "$NODE_NAME" =~ ^ip-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+) ]]; then
+              # Format: ip-<ip-with-dashes>
+              PRIVATE_IP="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+              echo "   Looking for EC2 instance with private IP: $PRIVATE_IP"
+              
+              # Search for running instance with this private IP
+              INSTANCE_EXISTS=$(aws ec2 describe-instances \
+                --region ${var.region} \
+                --filters "Name=private-ip-address,Values=$PRIVATE_IP" "Name=instance-state-name,Values=running" \
+                --query "Reservations[*].Instances[*].InstanceId" \
+                --output text 2>/dev/null | head -1)
+                
+            else
+              # Generic search - look for any worker instance with similar name
+              echo "   Generic search for node: $NODE_NAME"
+              INSTANCE_EXISTS=$(aws ec2 describe-instances \
+                --region ${var.region} \
+                --filters "Name=tag:Name,Values=*worker*" "Name=instance-state-name,Values=running" \
+                --query "Reservations[*].Instances[?contains(Tags[?Key=='Name'].Value, '$NODE_NAME')].[InstanceId]" \
+                --output text 2>/dev/null | head -1)
+            fi
+            
+            echo "   Instance search result: '$INSTANCE_EXISTS'"
+            
+            # If no running instance found, mark for cleanup
+            if [[ -z "$INSTANCE_EXISTS" ]] || [[ "$INSTANCE_EXISTS" == "None" ]] || [[ "$INSTANCE_EXISTS" == "null" ]]; then
+              echo "🗑️  No running EC2 instance found for NotReady node $NODE_NAME, marking for removal"
+              NODES_TO_CLEANUP+=("$NODE_NAME")
+              STALE_NODES_FOUND=$((STALE_NODES_FOUND + 1))
+            else
+              echo "   ✅ Node $NODE_NAME has corresponding running EC2 instance: $INSTANCE_EXISTS"
+              echo "   📝 Will try to recover this node instead of removing it"
+            fi
           else
-            echo "   ✅ Node $NODE_NAME has corresponding running EC2 instance: $INSTANCE_EXISTS"
+            echo "   ⏰ Node is NotReady but still young (<10 min old), giving it more time to recover"
           fi
         else
-          echo "   ✅ Node $NODE_NAME is healthy (Status: $NODE_STATUS)"
+          echo "   ✅ Node $NODE_NAME is healthy (Status: $NODE_STATUS, Ready: $NODE_READY)"
         fi
       done
       
-      # Second pass: cleanup identified stale nodes
+      # Phase 3: Clean up identified stale nodes
       if [[ $${#NODES_TO_CLEANUP[@]} -gt 0 ]]; then
         echo ""
-        echo "🧹 Starting cleanup of $${#NODES_TO_CLEANUP[@]} stale nodes..."
+        echo "🧹 Phase 3: Cleaning up $${#NODES_TO_CLEANUP[@]} stale nodes..."
         
         for NODE_NAME in "$${NODES_TO_CLEANUP[@]}"; do
           echo ""
@@ -1247,7 +1333,7 @@ resource "null_resource" "cleanup_stale_nodes" {
           echo "   Found $PODS_ON_NODE pods on node $NODE_NAME"
           
           if [[ "$PODS_ON_NODE" -gt 0 ]]; then
-            echo "   Draining node $NODE_NAME with improved strategy..."
+            echo "   Draining node $NODE_NAME with aggressive strategy..."
             
             # First, try graceful drain with shorter timeout
             kubectl drain "$NODE_NAME" \
@@ -1267,28 +1353,15 @@ resource "null_resource" "cleanup_stale_nodes" {
                 --grace-period=5 \
                 --disable-eviction=true 2>/dev/null || {
                 
-                echo "   ⚠️  Standard drain failed, force deleting specific pod types..."
+                echo "   ⚠️  Standard drain failed, force deleting all pods on node..."
                 
-                # Force delete stuck pods by type
+                # Force delete all pods on this node
                 kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json | \
-                  jq -r '.items[] | select(.metadata.name | test("(debugger|test|temp)")) | "\(.metadata.namespace)/\(.metadata.name)"' | \
+                  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)"' | \
                   while read -r pod; do
                     if [[ -n "$pod" ]]; then
-                      echo "     Force deleting debug/test pod: $pod"
+                      echo "     Force deleting pod: $pod"
                       kubectl delete pod "$pod" --force --grace-period=0 --timeout=10s || true
-                    fi
-                  done
-                
-                # For system pods, be more careful
-                kubectl get pods --all-namespaces --field-selector spec.nodeName="$NODE_NAME" -o json | \
-                  jq -r '.items[] | select(.metadata.namespace == "kube-system") | "\(.metadata.namespace)/\(.metadata.name)"' | \
-                  while read -r pod; do
-                    if [[ -n "$pod" ]]; then
-                      echo "     Carefully deleting system pod: $pod"
-                      kubectl delete pod "$pod" --grace-period=30 --timeout=45s || {
-                        echo "       Force deleting stuck system pod: $pod"
-                        kubectl delete pod "$pod" --force --grace-period=0 || true
-                      }
                     fi
                   done
               }
@@ -1304,11 +1377,13 @@ resource "null_resource" "cleanup_stale_nodes" {
           fi
         done
       else
-        echo "✅ No stale nodes found"
+        echo ""
+        echo "✅ No stale nodes found that need removal"
       fi
       
+      # Phase 4: General pod cleanup
       echo ""
-      echo "🧹 Cleaning up problematic pods..."
+      echo "🧹 Phase 4: General problematic pod cleanup..."
       
       # Clean up completed and failed pods (with better error handling)
       echo "   Removing completed pods..."
@@ -1319,11 +1394,11 @@ resource "null_resource" "cleanup_stale_nodes" {
       kubectl get pods --all-namespaces --field-selector=status.phase=Failed -o name 2>/dev/null | \
         head -20 | xargs -r kubectl delete --timeout=30s 2>/dev/null || true
       
-      # Only clean up pending pods that are clearly stuck (more conservative)
-      echo "   Removing clearly stuck pending pods (>10 mins)..."
+      # Clean up old pending pods that are clearly stuck (>15 mins)
+      echo "   Removing clearly stuck pending pods (>15 mins)..."
       STUCK_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Pending -o json 2>/dev/null | \
-        jq -r --argjson threshold "$(date -d '10 minutes ago' +%s)" \
-        '.items[] | select((.metadata.creationTimestamp | fromdateiso8601) < $threshold and (.metadata.name | test("(debugger|test|temp)"))) | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || true)
+        jq -r --argjson threshold "$(date -d '15 minutes ago' +%s)" \
+        '.items[] | select((.metadata.creationTimestamp | fromdateiso8601) < $threshold and (.metadata.name | test("(debugger|test|temp|node-debugger)"))) | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null || true)
       
       if [[ -n "$STUCK_PODS" ]]; then
         echo "$STUCK_PODS" | while read -r pod; do
@@ -1335,7 +1410,7 @@ resource "null_resource" "cleanup_stale_nodes" {
       fi
       
       echo ""
-      echo "🎉 Node cleanup completed!"
+      echo "🎉 Enhanced node and pod cleanup completed!"
       echo "📊 Summary:"
       echo "   - Stale nodes removed: $STALE_NODES_FOUND"
       echo ""
@@ -1354,7 +1429,7 @@ resource "null_resource" "cleanup_stale_nodes" {
       fi
       
       echo ""
-      echo "✅ Stale node cleanup process complete!"
+      echo "✅ Enhanced stale node cleanup process complete!"
     EOT
   }
 }
@@ -2023,13 +2098,47 @@ spec:
         - name: IGNORE_DAEMON_SETS
           value: "true"
         - name: POD_TERMINATION_GRACE_PERIOD
-          value: "30"
+          value: "10"           # Reduced from 30 to 10 seconds
         - name: NODE_TERMINATION_GRACE_PERIOD
-          value: "120"
+          value: "60"           # Reduced from 120 to 60 seconds
         - name: METADATA_TRIES
           value: "3"
         - name: CORDON_ONLY
           value: "false"
+        - name: DRY_RUN
+          value: "false"
+        - name: ENABLE_PROMETHEUS_SERVER
+          value: "false"
+        - name: WEBHOOK_URL
+          value: ""
+        - name: WEBHOOK_HEADERS
+          value: ""
+        - name: WEBHOOK_TEMPLATE
+          value: ""
+        - name: ENABLE_SQS_TERMINATION_DRAINING
+          value: "false"
+        - name: QUEUE_URL
+          value: ""
+        - name: CHECK_ASG_TAG_BEFORE_DRAINING
+          value: "true"
+        - name: MANAGED_ASG_TAG
+          value: "aws-node-termination-handler/managed"
+        - name: USE_PROVIDER_ID
+          value: "false"
+        - name: JSON_LOGGING
+          value: "false"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: ENABLE_PROBES_SERVER
+          value: "false"
+        - name: PROBES_SERVER_PORT
+          value: "8080"
+        - name: PROBES_SERVER_ENDPOINT
+          value: "/healthz"
+        - name: NODE_DRAIN_TIMEOUT_SECONDS
+          value: "45"           # Reduced from default 120 to 45 seconds
+        - name: POD_TERMINATION_TIMEOUT_SECONDS
+          value: "15"           # Added explicit pod timeout of 15 seconds
         resources:
           requests:
             memory: "64Mi"
@@ -2068,6 +2177,44 @@ EOF
       }
       
       echo "AWS Node Termination Handler installation complete"
+      
+      # Create PodDisruptionBudgets for faster evictions
+      echo "Creating PodDisruptionBudgets for optimized pod evictions..."
+      kubectl apply -f - <<'EOF'
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-eviction-pdb-default
+  namespace: default
+spec:
+  maxUnavailable: 50%
+  selector: {}  # Applies to all pods in default namespace
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-eviction-pdb-kube-system
+  namespace: kube-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: not-critical  # Only applies to non-critical system pods
+---
+# Allow aggressive eviction for debugging pods
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: debug-pod-pdb
+  namespace: default
+spec:
+  maxUnavailable: 100%
+  selector:
+    matchLabels:
+      app: node-debugger
+EOF
+      
+      echo "PodDisruptionBudgets created for optimized evictions"
     EOT
   }
 }

@@ -1179,7 +1179,7 @@ resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
   name                   = "guy-scale-up-hook"
   autoscaling_group_name = aws_autoscaling_group.worker_asg.name
   default_result         = "CONTINUE"
-  heartbeat_timeout      = 600
+  heartbeat_timeout      = 120  # Reduced from 600 to 120 seconds
   lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
 
   notification_target_arn = aws_sns_topic.lifecycle_topic.arn
@@ -1190,7 +1190,7 @@ resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
   name                   = "guy-scale-down-hook"
   autoscaling_group_name = aws_autoscaling_group.worker_asg.name
   default_result         = "CONTINUE"
-  heartbeat_timeout      = 300
+  heartbeat_timeout      = 90   # Reduced from 300 to 90 seconds for faster termination
   lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
 
   notification_target_arn = aws_sns_topic.lifecycle_topic.arn
@@ -1538,8 +1538,23 @@ resource "aws_autoscaling_group" "worker_asg" {
   vpc_zone_identifier = module.vpc.public_subnets
   target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
   health_check_type   = "EC2"
-  health_check_grace_period = 300
-  default_cooldown    = 300
+  health_check_grace_period = 60   # Reduced from 300 to 60 seconds
+  default_cooldown    = 60         # Reduced from 300 to 60 seconds
+  
+  # Optimize termination policies for faster scale-down
+  termination_policies = ["NewestInstance", "Default"]
+  
+  # Enable faster instance refresh
+  enabled_metrics = [
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupTotalInstances",
+    "GroupPendingInstances",
+    "GroupStandbyInstances",
+    "GroupTerminatingInstances"
+  ]
   
   launch_template {
     id      = aws_launch_template.worker_lt.id
