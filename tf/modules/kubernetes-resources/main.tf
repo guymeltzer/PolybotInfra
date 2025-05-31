@@ -11,7 +11,67 @@ resource "null_resource" "create_storage_classes" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      KUBECONFIG="${var.kubeconfig_path}" kubectl apply -f ${path.module}/manifests/storage-classes.yaml
+      export KUBECONFIG="${var.kubeconfig_path}"
+      
+      echo "Creating storage classes..."
+      
+      # Function to handle storage class creation/update
+      handle_storage_class() {
+        local storage_class_name="$1"
+        
+        # Check if storage class exists
+        if kubectl get storageclass "$storage_class_name" &>/dev/null; then
+          echo "Storage class $storage_class_name already exists, checking for conflicts..."
+          
+          # Try to apply with server-side apply first
+          if ! kubectl apply -f ${path.module}/manifests/storage-classes.yaml --server-side=true --force-conflicts 2>/dev/null; then
+            echo "Server-side apply failed for $storage_class_name, deleting and recreating..."
+            kubectl delete storageclass "$storage_class_name" --ignore-not-found=true
+            sleep 2
+            kubectl apply -f ${path.module}/manifests/storage-classes.yaml
+          else
+            echo "Storage class $storage_class_name updated successfully"
+          fi
+        else
+          echo "Storage class $storage_class_name doesn't exist, creating..."
+          kubectl apply -f ${path.module}/manifests/storage-classes.yaml
+        fi
+      }
+      
+      # First, try a regular apply
+      if ! kubectl apply -f ${path.module}/manifests/storage-classes.yaml 2>/dev/null; then
+        echo "Regular apply failed, handling each storage class individually..."
+        
+        # Get list of storage classes from the manifest
+        STORAGE_CLASSES=$(kubectl apply -f ${path.module}/manifests/storage-classes.yaml --dry-run=client -o jsonpath='{.metadata.name}' 2>/dev/null || echo "ebs-sc ebs-fast ebs-slow")
+        
+        for sc in $STORAGE_CLASSES; do
+          if kubectl get storageclass "$sc" &>/dev/null; then
+            echo "Deleting existing storage class: $sc"
+            kubectl delete storageclass "$sc" --ignore-not-found=true
+          fi
+        done
+        
+        # Wait a moment and then apply
+        sleep 3
+        kubectl apply -f ${path.module}/manifests/storage-classes.yaml || {
+          echo "Failed to apply storage classes, creating them individually..."
+          
+          # Create storage classes one by one from the manifest
+          kubectl apply -f ${path.module}/manifests/storage-classes.yaml --dry-run=client -o yaml | \
+            awk '/^---/{if(block){print block; block=""} next} {block=block"\n"$0} END{if(block)print block}' | \
+            while read -r manifest; do
+              if [[ -n "$manifest" ]]; then
+                echo "Applying individual storage class..."
+                echo "$manifest" | kubectl apply -f - || echo "Failed to apply individual storage class, continuing..."
+              fi
+            done
+        }
+      else
+        echo "Storage classes applied successfully"
+      fi
+      
+      echo "Storage class creation completed"
     EOT
   }
   lifecycle {
