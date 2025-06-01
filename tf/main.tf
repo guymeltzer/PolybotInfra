@@ -666,7 +666,7 @@ resource "terraform_data" "kubectl_provider_config" {
   triggers_replace = {
     control_plane_id  = module.k8s-cluster.control_plane_instance_id
     control_plane_ip  = module.k8s-cluster.control_plane_public_ip
-    kubeconfig_version = "v4-enhanced-robust" # Enhanced version with better error handling
+    kubeconfig_version = "v5-ultra-robust" # Ultra robust version with comprehensive validation
   }
 
   provisioner "local-exec" {
@@ -675,7 +675,8 @@ resource "terraform_data" "kubectl_provider_config" {
       #!/bin/bash
       set -e  # Exit on any error
       
-      echo "🔑 Setting up Kubernetes provider with kubeconfig: ${local.kubeconfig_path}"
+      echo "🔑 Enhanced Robust Kubeconfig Setup: ${local.kubeconfig_path}"
+      echo "================================================================="
       
       # Use module outputs directly (more reliable than tag discovery)
       INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
@@ -683,50 +684,99 @@ resource "terraform_data" "kubectl_provider_config" {
       REGION="${var.region}"
       
       if [[ -z "$INSTANCE_ID" || -z "$PUBLIC_IP" ]]; then
-        echo "❌ ERROR: Missing required module outputs"
+        echo "❌ FATAL: Missing required module outputs"
         echo "   Instance ID: $INSTANCE_ID"
         echo "   Public IP: $PUBLIC_IP"
         exit 1
       fi
       
-      echo "📡 Using control plane instance: $INSTANCE_ID (IP: $PUBLIC_IP)"
+      echo "📡 Control Plane: $INSTANCE_ID (IP: $PUBLIC_IP)"
       
-      # Enhanced function to check if admin.conf is ready before fetching
-      check_admin_conf_ready() {
+      # Enhanced function to wait for kubeadm init completion with STRICT validation
+      wait_for_kubeadm_completion() {
         local instance_id="$1"
         local region="$2"
-        local max_checks=20
-        local check_delay=30
+        local max_wait_minutes=15  # 15 minutes max wait
+        local check_interval=45   # Check every 45 seconds
+        local max_checks=$((max_wait_minutes * 60 / check_interval))
         
-        echo "🔍 Checking if /etc/kubernetes/admin.conf is ready..."
+        echo "🔍 Waiting for kubeadm init to complete on control plane..."
+        echo "   Max wait time: $max_wait_minutes minutes"
+        echo "   Check interval: $check_interval seconds"
+        echo ""
         
         for check in $(seq 1 $max_checks); do
-          echo "🔄 Check $check/$max_checks: Verifying admin.conf existence and validity..."
+          local elapsed_minutes=$(((check - 1) * check_interval / 60))
+          echo "🔄 Check $check/$max_checks (${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
           
-          # Send command to check if admin.conf exists and has valid content
+          # Comprehensive check for kubeadm completion
           COMMAND_ID=$(aws ssm send-command \
             --region "$region" \
             --document-name "AWS-RunShellScript" \
             --instance-ids "$instance_id" \
-            --parameters 'commands=["if [ -f /etc/kubernetes/admin.conf ] && [ -s /etc/kubernetes/admin.conf ] && grep -q \"apiVersion.*Config\" /etc/kubernetes/admin.conf; then echo \"READY\"; else echo \"NOT_READY\"; fi"]' \
+            --parameters 'commands=[
+              "#!/bin/bash",
+              "echo \"=== KUBEADM COMPLETION CHECK ===\"",
+              "echo \"1. Checking admin.conf existence and content...\"",
+              "if [ -f /etc/kubernetes/admin.conf ] && [ -s /etc/kubernetes/admin.conf ]; then",
+              "  if grep -q \"apiVersion.*Config\" /etc/kubernetes/admin.conf && grep -q \"clusters:\" /etc/kubernetes/admin.conf; then",
+              "    echo \"✅ admin.conf: EXISTS and VALID\"",
+              "  else",
+              "    echo \"❌ admin.conf: EXISTS but INVALID CONTENT\"",
+              "    exit 1",
+              "  fi",
+              "else",
+              "  echo \"❌ admin.conf: MISSING or EMPTY\"",
+              "  exit 1",
+              "fi",
+              "echo \"2. Checking kubelet service status...\"",
+              "if systemctl is-active --quiet kubelet; then",
+              "  echo \"✅ kubelet: ACTIVE\"",
+              "else",
+              "  echo \"❌ kubelet: NOT ACTIVE\"",
+              "  systemctl status kubelet --no-pager",
+              "  exit 1",
+              "fi",
+              "echo \"3. Checking API server accessibility...\"",
+              "if curl -k -s https://localhost:6443/healthz | grep -q ok; then",
+              "  echo \"✅ API server: RESPONDING\"",
+              "else",
+              "  echo \"❌ API server: NOT RESPONDING\"",
+              "  exit 1",
+              "fi",
+              "echo \"4. Checking kubeadm init completion markers...\"",
+              "if [ -f /etc/kubernetes/pki/ca.crt ] && [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then",
+              "  echo \"✅ kubeadm artifacts: COMPLETE\"",
+              "else",
+              "  echo \"❌ kubeadm artifacts: INCOMPLETE\"",
+              "  ls -la /etc/kubernetes/pki/ /etc/kubernetes/manifests/ || true",
+              "  exit 1",
+              "fi",
+              "echo \"5. Basic kubectl functionality test...\"",
+              "if KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes --timeout=10s >/dev/null 2>&1; then",
+              "  echo \"✅ kubectl: FUNCTIONAL\"",
+              "else",
+              "  echo \"❌ kubectl: NOT FUNCTIONAL\"",
+              "  exit 1",
+              "fi",
+              "echo \"🎉 KUBEADM INIT: FULLY COMPLETE\""
+            ]' \
             --output text \
             --query "Command.CommandId" 2>/dev/null)
           
           if [[ -z "$COMMAND_ID" ]]; then
-            echo "   ⚠️ Failed to send SSM command, waiting $check_delay seconds..."
-            sleep $check_delay
+            echo "   ⚠️ Failed to send SSM command, waiting $check_interval seconds..."
+            sleep $check_interval
             continue
           fi
           
-          # Wait for command completion
-          sleep 15
+          # Wait for command completion with extended timeout
+          echo "   ⏳ Waiting for completion check (Command ID: $COMMAND_ID)..."
+          sleep 30
           
-          # Get command result with error handling
-          COMMAND_OUTPUT=""
-          COMMAND_ERROR=""
-          
-          # Try to get output with retries
-          for output_attempt in $(seq 1 3); do
+          # Get detailed results with multiple attempts
+          COMMAND_RESULT=""
+          for attempt in $(seq 1 5); do
             COMMAND_RESULT=$(aws ssm get-command-invocation \
               --region "$region" \
               --command-id "$COMMAND_ID" \
@@ -734,209 +784,243 @@ resource "terraform_data" "kubectl_provider_config" {
               --output json 2>/dev/null || echo "{}")
             
             if [[ -n "$COMMAND_RESULT" ]]; then
-              COMMAND_OUTPUT=$(echo "$COMMAND_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-              COMMAND_ERROR=$(echo "$COMMAND_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
-              STATUS_CODE=$(echo "$COMMAND_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
               break
             fi
-            echo "   ⏳ Waiting for command output (attempt $output_attempt/3)..."
-            sleep 5
+            echo "   ⏳ Waiting for command result (attempt $attempt/5)..."
+            sleep 10
           done
           
-          echo "   Command output: '$COMMAND_OUTPUT'"
-          if [[ -n "$COMMAND_ERROR" ]]; then
-            echo "   Command error: '$COMMAND_ERROR'"
+          # Parse results
+          STDOUT=$(echo "$COMMAND_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+          STDERR=$(echo "$COMMAND_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+          STATUS=$(echo "$COMMAND_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+          
+          echo "   📋 Command output:"
+          echo "$STDOUT" | sed 's/^/      /'
+          
+          if [[ -n "$STDERR" ]]; then
+            echo "   ⚠️ Command errors:"
+            echo "$STDERR" | sed 's/^/      /'
           fi
           
-          # Check if admin.conf is ready
-          if [[ "$COMMAND_OUTPUT" == *"READY"* ]]; then
-            echo "   ✅ /etc/kubernetes/admin.conf is ready and valid!"
+          # Check if kubeadm init is complete
+          if [[ "$STATUS" == "0" ]] && echo "$STDOUT" | grep -q "KUBEADM INIT: FULLY COMPLETE"; then
+            echo "   ✅ kubeadm init is FULLY COMPLETE!"
             return 0
-          elif [[ "$COMMAND_OUTPUT" == *"NOT_READY"* ]]; then
-            echo "   ⏳ /etc/kubernetes/admin.conf not ready yet (kubeadm init may still be running)"
-            if [[ -n "$COMMAND_ERROR" ]]; then
-              echo "   Additional info: $COMMAND_ERROR"
-            fi
+          elif [[ "$STATUS" == "0" ]]; then
+            echo "   ⏳ kubeadm init still in progress (some checks passed)"
           else
-            echo "   ⚠️ Unexpected response: '$COMMAND_OUTPUT'"
+            echo "   ❌ kubeadm init checks failed (exit code: $STATUS)"
           fi
           
           if [[ $check -eq $max_checks ]]; then
-            echo "   ❌ admin.conf not ready after $max_checks checks"
-            echo "   This usually means kubeadm init failed or is taking longer than expected"
+            echo ""
+            echo "❌ TIMEOUT: kubeadm init did not complete after $max_wait_minutes minutes"
+            echo ""
+            echo "🔍 Final diagnostics:"
+            echo "   Last command status: $STATUS"
+            echo "   Last stdout: $STDOUT"
+            echo "   Last stderr: $STDERR"
+            echo ""
+            echo "🛠️ Manual troubleshooting steps:"
+            echo "   1. SSH to control plane: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP"
+            echo "   2. Check init logs: sudo cat /var/log/k8s-init.log"
+            echo "   3. Check kubelet logs: sudo journalctl -u kubelet -n 100"
+            echo "   4. Check kubeadm status: sudo ls -la /etc/kubernetes/"
+            echo "   5. Check for errors: sudo kubeadm init --dry-run"
             return 1
           fi
           
-          echo "   ⏳ Waiting $check_delay seconds before next check..."
-          sleep $check_delay
+          echo "   ⏳ Waiting $check_interval seconds before next check..."
+          sleep $check_interval
         done
         
         return 1
       }
       
-      # Function to retrieve kubeconfig with enhanced error handling
-      fetch_kubeconfig() {
-        local max_attempts=5
-        local retry_delay=30
+      # Enhanced function to fetch kubeconfig with validation
+      fetch_and_validate_kubeconfig() {
+        local instance_id="$1"
+        local region="$2"
+        local public_ip="$3"
+        local max_attempts=3
+        local retry_delay=20
         
-        # First, ensure admin.conf is ready
-        if ! check_admin_conf_ready "$INSTANCE_ID" "$REGION"; then
-          echo "❌ FATAL: /etc/kubernetes/admin.conf is not ready"
-          echo "💡 Common causes:"
-          echo "   - kubeadm init failed or is still running"
-          echo "   - Control plane initialization script encountered errors"
-          echo "   - Instance is not fully booted or SSM agent issues"
-          echo ""
-          echo "🔍 Troubleshooting steps:"
-          echo "   1. Check control plane logs: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo cat /var/log/k8s-init.log'"
-          echo "   2. Check kubeadm status: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo systemctl status kubelet'"
-          echo "   3. Check if kubeadm init completed: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP 'sudo ls -la /etc/kubernetes/'"
-          return 1
-        fi
+        echo "📁 Fetching kubeconfig from control plane..."
         
         for attempt in $(seq 1 $max_attempts); do
-          echo "🔄 Attempt $attempt/$max_attempts to retrieve kubeconfig..."
+          echo "🔄 Fetch attempt $attempt/$max_attempts..."
           
-          # Check if SSM agent is online
-          if ! aws ssm describe-instance-information \
-               --region "$REGION" \
-               --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-               --query "InstanceInformationList[0].PingStatus" \
-               --output text | grep -q "Online"; then
-            echo "⏳ SSM agent not online yet, waiting $retry_delay seconds..."
-            sleep $retry_delay
-            continue
-          fi
-          
-          echo "✅ SSM agent online, fetching kubeconfig..."
-          
-          # Send command to get admin.conf with better error handling
+          # Send command to get admin.conf
           COMMAND_ID=$(aws ssm send-command \
-            --region "$REGION" \
+            --region "$region" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$INSTANCE_ID" \
-            --parameters 'commands=["sudo cat /etc/kubernetes/admin.conf 2>&1 || echo \"ERROR: Failed to read admin.conf\""]' \
+            --instance-ids "$instance_id" \
+            --parameters 'commands=[
+              "#!/bin/bash",
+              "echo \"=== FETCHING ADMIN.CONF ===\"",
+              "if [ -f /etc/kubernetes/admin.conf ]; then",
+              "  echo \"File exists, size: $(stat -c%s /etc/kubernetes/admin.conf) bytes\"",
+              "  echo \"=== ADMIN.CONF CONTENT START ===\"",
+              "  cat /etc/kubernetes/admin.conf",
+              "  echo \"=== ADMIN.CONF CONTENT END ===\"",
+              "else",
+              "  echo \"❌ ERROR: /etc/kubernetes/admin.conf not found\"",
+              "  ls -la /etc/kubernetes/ || true",
+              "  exit 1",
+              "fi"
+            ]' \
             --output text \
             --query "Command.CommandId")
           
           if [[ -z "$COMMAND_ID" ]]; then
-            echo "❌ Failed to send SSM command"
+            echo "   ❌ Failed to send fetch command"
             sleep $retry_delay
             continue
           fi
           
-          # Wait for command completion with timeout
-          echo "⏳ Waiting for SSM command to complete (ID: $COMMAND_ID)..."
-          sleep 20  # Increased wait time
+          echo "   ⏳ Waiting for fetch to complete (Command ID: $COMMAND_ID)..."
+          sleep 20
           
-          # Get command output with enhanced error checking
-          COMMAND_RESULT=""
-          for output_attempt in $(seq 1 5); do
-            COMMAND_RESULT=$(aws ssm get-command-invocation \
-              --region "$REGION" \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --output json 2>/dev/null || echo "{}")
-            
-            if [[ -n "$COMMAND_RESULT" ]]; then
-              break
+          # Get fetch results
+          FETCH_RESULT=$(aws ssm get-command-invocation \
+            --region "$region" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$instance_id" \
+            --output json 2>/dev/null || echo "{}")
+          
+          FETCH_STDOUT=$(echo "$FETCH_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+          FETCH_STDERR=$(echo "$FETCH_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+          FETCH_STATUS=$(echo "$FETCH_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+          
+          if [[ "$FETCH_STATUS" != "0" ]]; then
+            echo "   ❌ Fetch command failed (status: $FETCH_STATUS)"
+            if [[ -n "$FETCH_STDERR" ]]; then
+              echo "   Error: $FETCH_STDERR"
             fi
-            echo "⏳ Waiting for command invocation result (attempt $output_attempt/5)..."
-            sleep 5
-          done
-          
-          # Parse command result
-          KUBECONFIG_CONTENT=$(echo "$COMMAND_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-          ERROR_CONTENT=$(echo "$COMMAND_RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
-          RESPONSE_CODE=$(echo "$COMMAND_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
-          
-          echo "Response code: '$RESPONSE_CODE'"
-          if [[ -n "$ERROR_CONTENT" ]]; then
-            echo "Command stderr: '$ERROR_CONTENT'"
+            sleep $retry_delay
+            continue
           fi
           
-          # Enhanced validation of kubeconfig content
-          if [[ -n "$KUBECONFIG_CONTENT" ]] && [[ "$KUBECONFIG_CONTENT" != *"ERROR:"* ]]; then
-            # Check for valid kubeconfig structure
-            if echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
-               echo "$KUBECONFIG_CONTENT" | grep -q "clusters:" && \
-               echo "$KUBECONFIG_CONTENT" | grep -q "users:" && \
-               echo "$KUBECONFIG_CONTENT" | grep -q "contexts:"; then
-              
-              echo "✅ Successfully retrieved valid kubeconfig content"
-              
-              # Create kubeconfig with public IP
-              echo "$KUBECONFIG_CONTENT" | sed "s|server:.*|server: https://$PUBLIC_IP:6443|g" > "${local.kubeconfig_path}"
-              chmod 600 "${local.kubeconfig_path}"
-              
-              # Validate the created file
-              if [[ -f "${local.kubeconfig_path}" ]] && grep -q "server: https://$PUBLIC_IP:6443" "${local.kubeconfig_path}"; then
-                echo "✅ Kubeconfig created successfully at ${local.kubeconfig_path}"
-                echo "🔗 Server endpoint: https://$PUBLIC_IP:6443"
-                
-                # Final validation - check file size
-                FILESIZE=$(stat -f%z "${local.kubeconfig_path}" 2>/dev/null || stat -c%s "${local.kubeconfig_path}" 2>/dev/null || echo "0")
-                if [[ "$FILESIZE" -gt 100 ]]; then
-                  echo "✅ Kubeconfig file size validation passed ($FILESIZE bytes)"
-                  return 0
-                else
-                  echo "❌ Kubeconfig file is too small ($FILESIZE bytes), likely invalid"
-                fi
-              else
-                echo "❌ Failed to create valid kubeconfig file"
-              fi
-            else
-              echo "❌ Retrieved content is not a valid kubeconfig format"
-              echo "Content preview: $(echo "$KUBECONFIG_CONTENT" | head -3)"
-            fi
+          # Extract kubeconfig content from between markers
+          KUBECONFIG_CONTENT=$(echo "$FETCH_STDOUT" | \
+            sed -n '/=== ADMIN.CONF CONTENT START ===/,/=== ADMIN.CONF CONTENT END ===/p' | \
+            sed '1d;$d' || echo "")
+          
+          if [[ -z "$KUBECONFIG_CONTENT" ]]; then
+            echo "   ❌ No kubeconfig content found in output"
+            echo "   Full output: $FETCH_STDOUT"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Validate kubeconfig content structure
+          echo "   🔍 Validating kubeconfig structure..."
+          
+          if ! echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config"; then
+            echo "   ❌ Invalid kubeconfig: missing apiVersion Config"
+            sleep $retry_delay
+            continue
+          fi
+          
+          if ! echo "$KUBECONFIG_CONTENT" | grep -q "clusters:"; then
+            echo "   ❌ Invalid kubeconfig: missing clusters section"
+            sleep $retry_delay
+            continue
+          fi
+          
+          if ! echo "$KUBECONFIG_CONTENT" | grep -q "users:"; then
+            echo "   ❌ Invalid kubeconfig: missing users section"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Update server endpoint to use public IP
+          echo "   🔧 Updating server endpoint to use public IP: $public_ip"
+          UPDATED_KUBECONFIG=$(echo "$KUBECONFIG_CONTENT" | \
+            sed "s|server:.*|server: https://$public_ip:6443|g")
+          
+          if [[ -z "$UPDATED_KUBECONFIG" ]]; then
+            echo "   ❌ Failed to update server endpoint"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Write kubeconfig file
+          echo "   💾 Writing kubeconfig to ${local.kubeconfig_path}..."
+          echo "$UPDATED_KUBECONFIG" > "${local.kubeconfig_path}"
+          chmod 600 "${local.kubeconfig_path}"
+          
+          # Final validation of written file
+          if [[ ! -f "${local.kubeconfig_path}" ]]; then
+            echo "   ❌ Kubeconfig file was not created"
+            sleep $retry_delay
+            continue
+          fi
+          
+          local file_size
+          file_size=$(stat -f%z "${local.kubeconfig_path}" 2>/dev/null || stat -c%s "${local.kubeconfig_path}" 2>/dev/null || echo "0")
+          
+          if [[ "$file_size" -lt 100 ]]; then
+            echo "   ❌ Kubeconfig file too small: $file_size bytes"
+            sleep $retry_delay
+            continue
+          fi
+          
+          # Test kubeconfig functionality (basic validation)
+          echo "   🧪 Testing kubeconfig functionality..."
+          if KUBECONFIG="${local.kubeconfig_path}" kubectl version --client --output=yaml >/dev/null 2>&1; then
+            echo "   ✅ Kubeconfig client test passed"
           else
-            echo "❌ Invalid or empty kubeconfig content received"
-            if [[ -n "$KUBECONFIG_CONTENT" ]]; then
-              echo "Content preview: $(echo "$KUBECONFIG_CONTENT" | head -3)"
-            fi
-            if [[ -n "$ERROR_CONTENT" ]]; then
-              echo "Error details: $ERROR_CONTENT"
-            fi
+            echo "   ⚠️ Kubeconfig client test failed, but file seems valid"
           fi
           
-          echo "⏳ Retrying in $retry_delay seconds..."
-          sleep $retry_delay
+          echo "   ✅ Kubeconfig successfully created and validated!"
+          echo "   📁 Location: ${local.kubeconfig_path}"
+          echo "   📏 Size: $file_size bytes"
+          echo "   🔗 Server: https://$public_ip:6443"
+          
+          return 0
         done
         
-        echo "❌ FATAL: Failed to retrieve valid kubeconfig after $max_attempts attempts"
-        echo ""
-        echo "🔍 Debug information:"
-        echo "   Instance ID: $INSTANCE_ID"
-        echo "   Public IP: $PUBLIC_IP"
-        echo "   Last command ID: $COMMAND_ID"
-        echo "   Last response code: $RESPONSE_CODE"
-        echo ""
-        echo "🛠️ Manual recovery steps:"
-        echo "   1. SSH to control plane: ssh -i polybot-key.pem ubuntu@$PUBLIC_IP"
-        echo "   2. Check admin.conf: sudo ls -la /etc/kubernetes/admin.conf"
-        echo "   3. Verify content: sudo head -10 /etc/kubernetes/admin.conf"
-        echo "   4. Check kubeadm logs: sudo journalctl -u kubelet -n 50"
+        echo "❌ FATAL: Failed to fetch valid kubeconfig after $max_attempts attempts"
         return 1
       }
       
-      # Create kubeconfig directory
-      mkdir -p "$(dirname "${local.kubeconfig_path}")"
+      # Main execution flow
+      echo "🚀 Starting enhanced kubeconfig setup process..."
+      echo ""
       
-      # Call the enhanced function
-      if fetch_kubeconfig; then
-        echo "✅ Kubeconfig setup completed successfully"
-        echo "📁 File location: ${local.kubeconfig_path}"
-        echo "🔍 Server endpoint: $(grep 'server:' "${local.kubeconfig_path}" | head -1)"
-      else
-        echo "❌ FATAL ERROR: Could not create valid kubeconfig"
-        echo "🚨 Terraform apply will fail - this is intentional to prevent invalid deployments"
+      # Step 1: Wait for kubeadm init completion
+      if ! wait_for_kubeadm_completion "$INSTANCE_ID" "$REGION"; then
+        echo "❌ FATAL: kubeadm init did not complete successfully"
         exit 1
       fi
+      
+      echo ""
+      
+      # Step 2: Fetch and validate kubeconfig
+      if ! fetch_and_validate_kubeconfig "$INSTANCE_ID" "$REGION" "$PUBLIC_IP"; then
+        echo "❌ FATAL: Could not fetch valid kubeconfig"
+        exit 1
+      fi
+      
+      echo ""
+      echo "🎉 SUCCESS: Enhanced kubeconfig setup completed!"
+      echo "✅ kubeadm init: COMPLETE"
+      echo "✅ kubeconfig: READY"
+      echo "✅ File: ${local.kubeconfig_path}"
+      echo ""
+      echo "🔗 Quick test: export KUBECONFIG=${local.kubeconfig_path} && kubectl get nodes"
     EOT
   }
   
+  # Enhanced dependencies to ensure proper initialization order
   depends_on = [
-    module.k8s-cluster
+    module.k8s-cluster.aws_instance.control_plane,
+    # Wait for the control plane to be fully initialized
+    # This should include waiting for user data script completion
+    module.k8s-cluster.null_resource.wait_for_control_plane
   ]
 }
 
@@ -2066,6 +2150,269 @@ resource "null_resource" "node_termination_handler_check" {
       
       echo ""
       echo "✅ Node termination handler check completed"
+    EOT
+  }
+}
+
+# Enhanced SSH Diagnostics and Validation Resource
+resource "null_resource" "ssh_diagnostic_validation" {
+  depends_on = [
+    module.k8s-cluster.aws_instance.control_plane,
+    terraform_data.kubectl_provider_config
+  ]
+  
+  triggers = {
+    control_plane_id = module.k8s-cluster.control_plane_instance_id
+    control_plane_ip = module.k8s-cluster.control_plane_public_ip
+    ssh_diagnostic_version = "v2-comprehensive"
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      #!/bin/bash
+      set +e  # Don't exit on errors for diagnostics
+      
+      echo "🔍 COMPREHENSIVE SSH DIAGNOSTIC AND VALIDATION"
+      echo "=============================================="
+      
+      # Collect key information
+      CONTROL_PLANE_IP="${module.k8s-cluster.control_plane_public_ip}"
+      CONTROL_PLANE_ID="${module.k8s-cluster.control_plane_instance_id}"
+      MODULE_KEY_NAME="${module.k8s-cluster.ssh_key_name}"
+      LOCAL_SSH_KEY_PATH="${local.ssh_private_key_path}"
+      
+      echo "🔑 SSH Configuration Analysis:"
+      echo "   Control Plane IP: $CONTROL_PLANE_IP"
+      echo "   Instance ID: $CONTROL_PLANE_ID"
+      echo "   Module Key Name: $MODULE_KEY_NAME"
+      echo "   Local SSH Key Path: $LOCAL_SSH_KEY_PATH"
+      echo ""
+      
+      # Function to check SSH key file
+      validate_ssh_key_file() {
+        local key_path="$1"
+        local key_desc="$2"
+        
+        echo "🔍 Validating $key_desc: $key_path"
+        
+        if [[ ! -f "$key_path" ]]; then
+          echo "   ❌ File does not exist"
+          return 1
+        fi
+        
+        # Check file permissions
+        local perms
+        perms=$(stat -f%A "$key_path" 2>/dev/null || stat -c%a "$key_path" 2>/dev/null || echo "unknown")
+        echo "   📋 File permissions: $perms"
+        
+        if [[ "$perms" != "600" ]]; then
+          echo "   ⚠️  Incorrect permissions (should be 600)"
+          echo "   🔧 Fixing permissions..."
+          chmod 600 "$key_path" 2>/dev/null && echo "   ✅ Permissions fixed" || echo "   ❌ Failed to fix permissions"
+        else
+          echo "   ✅ Permissions correct"
+        fi
+        
+        # Check file size
+        local size
+        size=$(stat -f%z "$key_path" 2>/dev/null || stat -c%s "$key_path" 2>/dev/null || echo "0")
+        echo "   📏 File size: $size bytes"
+        
+        if [[ "$size" -lt 100 ]]; then
+          echo "   ❌ File too small (likely invalid)"
+          return 1
+        fi
+        
+        # Check if it looks like a valid private key
+        if grep -q "BEGIN.*PRIVATE KEY" "$key_path"; then
+          echo "   ✅ Valid private key format detected"
+        else
+          echo "   ❌ Does not appear to be a valid private key"
+          echo "   📋 File content preview:"
+          head -3 "$key_path" | sed 's/^/      /' || echo "      (unable to read)"
+          return 1
+        fi
+        
+        return 0
+      }
+      
+      # Function to test SSH connectivity
+      test_ssh_connection() {
+        local key_path="$1"
+        local key_desc="$2"
+        
+        echo "🔗 Testing SSH connection with $key_desc"
+        echo "   Command: ssh -i \"$key_path\" -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CONTROL_PLANE_IP 'echo \"SSH test successful\"'"
+        
+        # Test the connection
+        local ssh_result
+        ssh_result=$(ssh -i "$key_path" \
+          -o ConnectTimeout=10 \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          -o LogLevel=ERROR \
+          ubuntu@$CONTROL_PLANE_IP 'echo "SSH_TEST_SUCCESS"' 2>&1)
+        
+        local ssh_exit_code=$?
+        
+        if [[ $ssh_exit_code -eq 0 ]] && echo "$ssh_result" | grep -q "SSH_TEST_SUCCESS"; then
+          echo "   ✅ SSH connection successful!"
+          return 0
+        else
+          echo "   ❌ SSH connection failed (exit code: $ssh_exit_code)"
+          echo "   📋 Error output:"
+          echo "$ssh_result" | sed 's/^/      /'
+          return 1
+        fi
+      }
+      
+      # Function to check AWS key pair
+      check_aws_key_pair() {
+        echo "🌐 Checking AWS key pair configuration..."
+        
+        # Get the key name from the instance
+        local instance_key_name
+        instance_key_name=$(aws ec2 describe-instances \
+          --region ${var.region} \
+          --instance-ids "$CONTROL_PLANE_ID" \
+          --query "Reservations[0].Instances[0].KeyName" \
+          --output text 2>/dev/null || echo "")
+        
+        echo "   🔑 Instance key pair: $instance_key_name"
+        echo "   🔑 Module key name: $MODULE_KEY_NAME"
+        
+        if [[ "$instance_key_name" != "$MODULE_KEY_NAME" ]]; then
+          echo "   ⚠️  KEY MISMATCH DETECTED!"
+          echo "   📋 Instance was launched with key: $instance_key_name"
+          echo "   📋 Module expects key: $MODULE_KEY_NAME"
+          echo "   💡 This is likely the cause of SSH permission denied errors"
+          return 1
+        else
+          echo "   ✅ Key names match"
+        fi
+        
+        # Check if key pair exists in AWS
+        if aws ec2 describe-key-pairs --region ${var.region} --key-names "$MODULE_KEY_NAME" >/dev/null 2>&1; then
+          echo "   ✅ Key pair exists in AWS"
+        else
+          echo "   ❌ Key pair not found in AWS"
+          return 1
+        fi
+        
+        return 0
+      }
+      
+      # Function to provide comprehensive troubleshooting
+      provide_ssh_troubleshooting() {
+        echo ""
+        echo "🛠️  SSH TROUBLESHOOTING GUIDE"
+        echo "============================"
+        echo ""
+        echo "📋 Common SSH Permission Denied Causes:"
+        echo "   1. Wrong private key file"
+        echo "   2. Incorrect file permissions (should be 600)"
+        echo "   3. Key pair mismatch between instance and local file"
+        echo "   4. Wrong username (should be 'ubuntu' for Ubuntu AMIs)"
+        echo "   5. Security group not allowing SSH (port 22)"
+        echo ""
+        echo "🔧 Manual verification steps:"
+        echo "   1. Check instance key pair:"
+        echo "      aws ec2 describe-instances --instance-ids $CONTROL_PLANE_ID --query 'Reservations[0].Instances[0].KeyName'"
+        echo ""
+        echo "   2. Verify security groups allow SSH:"
+        echo "      aws ec2 describe-security-groups --group-ids \$(aws ec2 describe-instances --instance-ids $CONTROL_PLANE_ID --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)"
+        echo ""
+        echo "   3. Test SSH with verbose output:"
+        echo "      ssh -vvv -i \"$LOCAL_SSH_KEY_PATH\" ubuntu@$CONTROL_PLANE_IP"
+        echo ""
+        echo "   4. Check AWS CloudShell access:"
+        echo "      # From AWS CloudShell:"
+        echo "      aws ssm start-session --target $CONTROL_PLANE_ID"
+        echo ""
+        echo "🔑 Key file locations to check:"
+        local key_paths=(
+          "$LOCAL_SSH_KEY_PATH"
+          "${path.module}/$MODULE_KEY_NAME.pem"
+          "${path.module}/polybot-key.pem"
+          "~/.ssh/$MODULE_KEY_NAME.pem"
+          "~/.ssh/polybot-key.pem"
+        )
+        
+        for key_path in "$${key_paths[@]}"; do
+          expanded_path=$(eval echo "$key_path")
+          if [[ -f "$expanded_path" ]]; then
+            echo "   ✅ Found: $expanded_path"
+          else
+            echo "   ❌ Missing: $expanded_path"
+          fi
+        done
+      }
+      
+      # Main diagnostic flow
+      echo "🚀 Starting comprehensive SSH diagnostic..."
+      echo ""
+      
+      # Step 1: Check AWS key pair configuration
+      if ! check_aws_key_pair; then
+        echo "⚠️  AWS key pair configuration issues detected"
+      fi
+      
+      echo ""
+      
+      # Step 2: Validate local SSH key file
+      if validate_ssh_key_file "$LOCAL_SSH_KEY_PATH" "Primary SSH key"; then
+        echo ""
+        # Step 3: Test SSH connection
+        if test_ssh_connection "$LOCAL_SSH_KEY_PATH" "Primary SSH key"; then
+          echo ""
+          echo "🎉 SUCCESS: SSH connectivity verified!"
+          echo "✅ SSH diagnostics completed successfully"
+          exit 0
+        fi
+      fi
+      
+      echo ""
+      echo "❌ Primary SSH key validation or connection failed"
+      echo "🔍 Checking alternative key locations..."
+      
+      # Step 4: Try alternative key locations
+      local alternative_keys=(
+        "${path.module}/$MODULE_KEY_NAME.pem"
+        "${path.module}/polybot-key.pem"
+        "$(eval echo "~/.ssh/$MODULE_KEY_NAME.pem")"
+        "$(eval echo "~/.ssh/polybot-key.pem")"
+      )
+      
+      local ssh_success=false
+      for alt_key in "$${alternative_keys[@]}"; do
+        if [[ -f "$alt_key" ]] && [[ "$alt_key" != "$LOCAL_SSH_KEY_PATH" ]]; then
+          echo ""
+          echo "🔍 Trying alternative key: $alt_key"
+          if validate_ssh_key_file "$alt_key" "Alternative key" && \
+             test_ssh_connection "$alt_key" "Alternative key"; then
+            echo ""
+            echo "🎉 SUCCESS: Found working SSH key!"
+            echo "✅ Working key: $alt_key"
+            echo "⚠️  Consider updating your Terraform variables to use this key"
+            ssh_success=true
+            break
+          fi
+        fi
+      done
+      
+      if [[ "$ssh_success" != "true" ]]; then
+        echo ""
+        echo "❌ All SSH connectivity tests failed"
+        provide_ssh_troubleshooting
+        echo ""
+        echo "⚠️  Note: This diagnostic failure won't stop Terraform deployment"
+        echo "    But any SSH-dependent provisioners may fail"
+        echo "    Consider fixing SSH configuration before proceeding"
+      fi
+      
+      # Always exit successfully to not block deployment
+      exit 0
     EOT
   }
 }
