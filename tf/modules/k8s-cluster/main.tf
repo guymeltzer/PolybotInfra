@@ -59,11 +59,34 @@ locals {
   
   # Template variables for user data scripts
   template_vars = {
-    k8s_version_full = local.k8s_version_full
-    k8s_major_minor = local.k8s_major_minor
-    k8s_package_version = local.k8s_package_version
-    crio_k8s_major_minor = local.crio_k8s_major_minor
-    token_suffix = random_string.token_part1.result
+    # Kubernetes version variables (uppercase to match scripts)
+    K8S_VERSION_FULL = local.k8s_version_full
+    K8S_MAJOR_MINOR = local.k8s_major_minor
+    K8S_PACKAGE_VERSION = local.k8s_package_version
+    CRIO_K8S_MAJOR_MINOR = local.crio_k8s_major_minor
+    
+    # Worker-specific variable names
+    K8S_PACKAGE_VERSION_TO_INSTALL = local.k8s_package_version
+    K8S_MAJOR_MINOR_FOR_REPO = local.k8s_major_minor
+    CRIO_K8S_MAJOR_MINOR_FOR_REPO = local.crio_k8s_major_minor
+    
+    # Token variables
+    TOKEN_SUFFIX = random_string.token_part1.result
+    
+    # SSH public key
+    ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : (
+      length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""
+    )
+    SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (
+      length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""
+    )
+    
+    # Kubelet configuration
+    KUBELET_DROPIN_DIR = "/etc/systemd/system/kubelet.service.d"
+    
+    # Placeholder variables that get set dynamically in scripts
+    PRIVATE_IP_FROM_META = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT"
+    NODE_NAME = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT"
   }
 }
 
@@ -648,13 +671,16 @@ resource "aws_instance" "control_plane" {
   }
 
   user_data = base64encode(templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
-    cluster_name                    = local.cluster_name
-    region                         = var.region
-    pod_cidr                       = local.pod_cidr
-    kubeadm_token                  = local.kubeadm_token
-    token_formatted                = local.kubeadm_token
-    join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    cluster_name                   = local.cluster_name
+    region                        = var.region
+    pod_cidr                      = local.pod_cidr
+    POD_CIDR                      = local.pod_cidr
+    kubeadm_token                 = local.kubeadm_token
+    token_formatted               = local.kubeadm_token
+    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
+    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
   })))
 
   tags = merge(var.tags, {
@@ -703,11 +729,14 @@ resource "aws_launch_template" "worker_lt" {
   }
 
   user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", merge(local.template_vars, {
-    cluster_name              = local.cluster_name
-    region                   = var.region
-    join_command_secret_id   = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    control_plane_endpoint   = "https://${aws_instance.control_plane.private_ip}:6443"
-    s3_bucket               = aws_s3_bucket.worker_logs.bucket
+    cluster_name                = local.cluster_name
+    region                     = var.region
+    join_command_secret_id     = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    control_plane_endpoint     = "https://${aws_instance.control_plane.private_ip}:6443"
+    s3_bucket                  = aws_s3_bucket.worker_logs.bucket
+    worker_asg_name            = aws_autoscaling_group.worker_asg.name
+    K8S_VERSION_TO_INSTALL     = local.k8s_package_version
   })))
 
   tag_specifications {
