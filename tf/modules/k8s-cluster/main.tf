@@ -41,7 +41,7 @@ resource "random_string" "token_part2" {
 # Format the token for kubeadm (must be in format AAAAAA.BBBBBBBBBBBBBBBB)
 locals {
   kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
-  
+
   # Token suffix for hostname generation
   token_suffix_for_template = random_string.token_part1.result
 
@@ -1692,7 +1692,7 @@ resource "aws_launch_template" "worker_lt" {
   
   tag_specifications {
     resource_type = "instance"
-    tags = {
+  tags = {
       Name = "guy-worker-node-${random_id.suffix.hex}"
       "kubernetes-io-cluster-kubernetes" = "owned"
       "k8s-io-cluster-autoscaler-enabled" = "true"
@@ -1744,7 +1744,7 @@ resource "terraform_data" "cluster_health_assessment" {
       
       # Check if control plane is accessible
       CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
-      
+
       # Try to get kubeconfig and check cluster state
       if aws ssm describe-instance-information --region ${var.region} \
          --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" \

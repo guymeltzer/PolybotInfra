@@ -17,11 +17,11 @@ locals {
     log_path  = "logs/"
     timestamp = timestamp()
   }
-
+  
   # Structured logging for all components
   debug_environment = {
     TF_LOG                = "DEBUG"
-    TF_LOG_CORE          = "DEBUG"
+    TF_LOG_CORE          = "DEBUG" 
     TF_LOG_PATH          = "${local.debug_config.log_path}terraform-${local.debug_config.timestamp}.log"
     TF_LOG_PROVIDER      = "DEBUG"
     AWS_LOG_LEVEL        = "debug"
@@ -29,13 +29,13 @@ locals {
 
   # Debug log file path
   debug_log = "${local.debug_config.log_path}tf_debug.log"
-
+  
   kubeconfig_path = "${path.module}/kubeconfig.yaml"
   # Enhanced SSH key path resolution with comprehensive fallback logic
   ssh_private_key_path = var.key_name != "" ? (
     # Priority 1: Check if key exists in current module directory
-    fileexists("${path.module}/${var.key_name}.pem") ?
-    "${path.module}/${var.key_name}.pem" :
+    fileexists("${path.module}/${var.key_name}.pem") ? 
+    "${path.module}/${var.key_name}.pem" : 
     # Priority 2: Check if key exists in user's .ssh directory 
     (fileexists("${pathexpand("~/.ssh/${var.key_name}.pem")}") ?
       "${pathexpand("~/.ssh/${var.key_name}.pem")}" :
@@ -61,10 +61,10 @@ locals {
   kubeconfig_exists = fileexists("${path.module}/kubeconfig.yaml")
   # Only consider Kubernetes ready if we have a real kubeconfig (not the placeholder)
   k8s_ready = local.kubeconfig_exists && (
-  !strcontains(
-    try(file("${path.module}/kubeconfig.yaml"), ""),
-    "server: https://placeholder:6443"
-  )
+    !strcontains(
+      try(file("${path.module}/kubeconfig.yaml"), ""),
+      "server: https://placeholder:6443"
+    )
   )
   # Add the control_plane_ip from the second locals block
   control_plane_ip = try(
@@ -76,7 +76,7 @@ locals {
 # K8S-CLUSTER MODULE - Main Kubernetes cluster infrastructure
 module "k8s-cluster" {
   source = "./modules/k8s-cluster"
-
+  
   # Required parameters
   region                       = var.region
   cluster_name                 = "guy-cluster"  # Fixed cluster name
@@ -100,7 +100,7 @@ module "k8s-cluster" {
   # ASG Control Variables
   desired_worker_nodes         = var.desired_worker_nodes
   force_cleanup_asg           = var.force_cleanup_asg
-
+  
   # Optional parameters
   tags = {
     Environment = "production"
@@ -162,46 +162,168 @@ resource "null_resource" "deployment_summary" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
       
-      echo "📊 Creating comprehensive deployment summary..."
+      echo ""
+      echo "🎉======================================================🎉"
+      echo "       POLYBOT KUBERNETES CLUSTER DEPLOYMENT COMPLETE"
+      echo "🎉======================================================🎉"
+      echo ""
       
-      # Create summary directory
+      # Control Plane Information
+      echo "🖥️  CONTROL PLANE"
+      echo "=================="
+      PUBLIC_IP="${module.k8s-cluster.control_plane_public_ip}"
+      INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
+      echo "📍 Instance ID:  $INSTANCE_ID"
+      echo "🌐 Public IP:    $PUBLIC_IP"
+      echo "🔗 API Endpoint: https://$PUBLIC_IP:6443"
+      echo "🔑 SSH Command:  ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@$PUBLIC_IP"
+      echo ""
+      
+      # Worker Nodes Information
+      echo "🤖 WORKER NODES"
+      echo "==============="
+      if kubectl get nodes >/dev/null 2>&1; then
+        WORKER_COUNT=$(kubectl get nodes --no-headers | grep -v "control-plane" | wc -l | tr -d ' ')
+        READY_WORKERS=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep " Ready " | wc -l | tr -d ' ')
+        echo "📊 Worker Status: $READY_WORKERS/$WORKER_COUNT Ready"
+        
+        echo "📋 Worker Node Details:"
+        kubectl get nodes --no-headers | grep -v "control-plane" | while read -r node status rest; do
+          echo "   • $node ($status)"
+        done
+        
+        # Get actual worker IPs for SSH commands
+        echo ""
+        echo "🔑 Worker SSH Commands:"
+        WORKER_DATA=$(aws ec2 describe-instances --region ${var.region} \
+          --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
+                    "Name=instance-state-name,Values=running" \
+          --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,PublicIP:PublicIpAddress}" \
+          --output json 2>/dev/null || echo "[]")
+        
+        if [[ "$WORKER_DATA" != "[]" ]] && command -v jq >/dev/null 2>&1; then
+          echo "$WORKER_DATA" | jq -r '.[][] | select(.PublicIP != null) | "   ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@" + .PublicIP + " # " + .Name' 2>/dev/null || echo "   (Use AWS console to find worker IPs)"
+        else
+          echo "   (Use 'aws ec2 describe-instances' to find worker IPs)"
+        fi
+      else
+        echo "⚠️  Cannot connect to cluster to check worker status"
+        echo "   ASG Name: ${module.k8s-cluster.worker_asg_name}"
+      fi
+      echo ""
+      
+      # Kubernetes Access
+      echo "☸️  KUBERNETES ACCESS"
+      echo "====================="
+      echo "📁 Kubeconfig Path: ${local.kubeconfig_path}"
+      if [[ -f "${local.kubeconfig_path}" ]]; then
+        echo "✅ Kubeconfig Ready: YES"
+        echo "🚀 Quick Setup:"
+        echo "   export KUBECONFIG=${local.kubeconfig_path}"
+        echo "   kubectl get nodes"
+      else
+        echo "❌ Kubeconfig Ready: NO"
+        echo "📋 Manual Setup:"
+        echo "   ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@$PUBLIC_IP 'cat ~/.kube/config' > kubeconfig.yaml"
+        echo "   export KUBECONFIG=./kubeconfig.yaml"
+      fi
+      echo ""
+      
+      # ArgoCD Information
+      echo "🔐 ARGOCD ACCESS"
+      echo "================"
+      if kubectl get namespace argocd >/dev/null 2>&1; then
+        if kubectl -n argocd get deployment argocd-server >/dev/null 2>&1; then
+          ARGOCD_STATUS=$(kubectl -n argocd get deployment argocd-server -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || echo "unknown")
+          echo "📊 ArgoCD Status: $ARGOCD_STATUS ready"
+          
+          # Try to get password
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+          
+          echo "🌐 URL:      https://localhost:8081"
+          echo "👤 Username: admin"
+          if [[ -n "$PASSWORD" ]]; then
+            echo "🔑 Password: $PASSWORD"
+          else
+            echo "🔑 Password: Run 'kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d'"
+          fi
+          echo "🔗 Setup:    kubectl port-forward svc/argocd-server -n argocd 8081:443"
+        else
+          echo "⚠️  ArgoCD deployment not found"
+        fi
+      else
+        echo "❌ ArgoCD not installed"
+      fi
+      echo ""
+      
+      # AWS Resources Summary
+      echo "☁️  AWS RESOURCES"
+      echo "=================="
+      echo "🌐 VPC ID:           ${module.k8s-cluster.vpc_id}"
+      echo "⚖️  Load Balancer:    ${module.k8s-cluster.alb_dns_name}"
+      echo "🔄 Auto Scaling:     ${module.k8s-cluster.worker_asg_name}"
+      echo "🔑 SSH Key:          ${module.k8s-cluster.ssh_key_name}.pem"
+      echo ""
+      
+      # Troubleshooting Section
+      echo "🔧 TROUBLESHOOTING"
+      echo "=================="
+      echo "📋 Check Cluster:     kubectl get nodes"
+      echo "📋 Check Pods:        kubectl get pods --all-namespaces"
+      echo "📋 Control Plane Log: ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@$PUBLIC_IP 'sudo cat /var/log/k8s-init.log'"
+      echo "📋 Worker Logs:       aws s3 ls s3://guy-polybot-logs/ --recursive | grep worker-init"
+      echo "📋 ASG Status:        aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${module.k8s-cluster.worker_asg_name} --region ${var.region}"
+      echo ""
+      
+      # Quick Start Commands
+      echo "🚀 QUICK START"
+      echo "=============="
+      echo "1️⃣  Connect to cluster:"
+      echo "   export KUBECONFIG=${local.kubeconfig_path}"
+      echo ""
+      echo "2️⃣  Verify deployment:"
+      echo "   kubectl get nodes"
+      echo "   kubectl get pods --all-namespaces"
+      echo ""
+      echo "3️⃣  Access ArgoCD:"
+      echo "   kubectl port-forward svc/argocd-server -n argocd 8081:443"
+      echo "   # Visit https://localhost:8081"
+      echo ""
+      echo "4️⃣  Deploy test application:"
+      echo "   kubectl create deployment nginx --image=nginx"
+      echo "   kubectl expose deployment nginx --port=80 --type=NodePort"
+      echo ""
+      
+      # Final Status
+      echo "✅======================================================✅"
+      echo "   🎯 DEPLOYMENT SUCCESSFUL - CLUSTER READY FOR USE!"
+      echo "✅======================================================✅"
+      echo ""
+      
+      # Create summary log file (but don't reference it in outputs)
       mkdir -p logs/final_summary
       
-      # Capture final cluster state
-      if kubectl get nodes >/dev/null 2>&1; then
-        kubectl get nodes -o wide > logs/final_summary/nodes.txt 2>&1 || echo "Failed to get nodes" > logs/final_summary/nodes.txt
-        kubectl get pods --all-namespaces -o wide > logs/final_summary/all_pods.txt 2>&1 || echo "Failed to get pods" > logs/final_summary/all_pods.txt
-        kubectl get deployments --all-namespaces > logs/final_summary/deployments.txt 2>&1 || echo "Failed to get deployments" > logs/final_summary/deployments.txt
-        kubectl get services --all-namespaces > logs/final_summary/services.txt 2>&1 || echo "Failed to get services" > logs/final_summary/services.txt
-      else
-        echo "Kubectl connection failed" > logs/final_summary/connection_failed.txt
-      fi
-      
-      # Capture AWS resources
-      aws ec2 describe-instances --region ${var.region} \
-        --filters "Name=tag:aws:autoscaling:groupName,Values=guy-polybot-asg" \
-        --output json > logs/final_summary/worker_instances.json 2>&1 || echo "Failed to get worker instances" > logs/final_summary/worker_instances.json
-      
-      # Create deployment summary JSON
       cat > logs/final_summary/deployment_summary.json <<JSON
 {
-  "deployment_complete": "${timestamp()}",
+  "deployment_complete": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "region": "${var.region}",
-  "terraform_workspace": "${terraform.workspace}",
-  "control_plane_ip": "${module.k8s-cluster.control_plane_public_ip}",
-  "skip_argocd": ${local.skip_argocd},
+  "control_plane": {
+    "instance_id": "$INSTANCE_ID",
+    "public_ip": "$PUBLIC_IP",
+    "api_endpoint": "https://$PUBLIC_IP:6443"
+  },
+  "aws_resources": {
+    "vpc_id": "${module.k8s-cluster.vpc_id}",
+    "alb_dns": "${module.k8s-cluster.alb_dns_name}",
+    "worker_asg": "${module.k8s-cluster.worker_asg_name}",
+    "ssh_key": "${module.k8s-cluster.ssh_key_name}"
+  },
   "kubeconfig_path": "${local.kubeconfig_path}",
   "status": "deployment_completed"
 }
 JSON
 
-      echo "📦 Creating debug bundle..."
-      cd logs
-      tar -czf "debug-bundle-$(date +%Y%m%d-%H%M%S).tgz" . 2>/dev/null || echo "Failed to create debug bundle"
-      
-      echo "✅ Comprehensive deployment summary complete!"
-      echo "📋 Summary files created in logs/final_summary/"
-      echo "📦 Debug bundle created in logs/"
+      echo "📄 Deployment summary saved to logs/final_summary/deployment_summary.json"
     EOT
   }
 }
@@ -812,7 +934,7 @@ resource "terraform_data" "kubectl_provider_config" {
       fi
     EOT
   }
-
+  
   depends_on = [
     module.k8s-cluster
   ]
@@ -825,13 +947,13 @@ resource "null_resource" "cluster_readiness_check" {
     null_resource.install_ebs_csi_driver,
     terraform_data.kubectl_provider_config
   ]
-
+  
   triggers = {
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
     ebs_csi_id = null_resource.install_ebs_csi_driver.id
     readiness_version = "strict-v4-enhanced"
   }
-
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1476,16 +1598,17 @@ resource "null_resource" "configure_argocd_apps" {
   count = local.skip_argocd ? 0 : 1
 
   depends_on = [
-    null_resource.install_argocd[0],
-    terraform_data.kubectl_provider_config[0]  # EXPLICIT dependency to break cycles
+    null_resource.install_argocd[0]
+    # REMOVED: terraform_data.kubectl_provider_config[0] - this was causing cycles
+    # ArgoCD install already ensures kubeconfig is ready
   ]
-
+  
   triggers = {
     argocd_id = null_resource.install_argocd[0].id
-    kubeconfig_id = terraform_data.kubectl_provider_config[0].id  # Track kubeconfig changes
-    apps_version = "consolidated-v2-fixed"
+    # REMOVED: kubeconfig_id reference that caused cycles
+    apps_version = "consolidated-v2-cycle-free"
   }
-
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
@@ -1521,7 +1644,7 @@ resource "null_resource" "create_application_secrets" {
     null_resource.cluster_readiness_check,
     terraform_data.kubectl_provider_config
   ]
-
+  
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id
     kubeconfig_id = terraform_data.kubectl_provider_config[0].id
@@ -1745,7 +1868,7 @@ resource "null_resource" "state_verification" {
       fi
       
       TOTAL_ISSUES=$((MISSING_IAM + MISSING_EC2 + MISSING_ASG + PROBLEMATIC_FOUND))
-      
+
       echo ""
       echo "📊 Summary: IAM($MISSING_IAM) EC2($MISSING_EC2) ASG($MISSING_ASG) Problematic($PROBLEMATIC_FOUND)"
       
@@ -1771,9 +1894,9 @@ resource "null_resource" "security_audit" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
-      #!/bin/bash
-      set -e
-      
+#!/bin/bash
+set -e
+
       echo "🔒 Security Group Audit"
       echo "======================"
       
@@ -1864,12 +1987,12 @@ resource "null_resource" "node_termination_handler_check" {
     null_resource.cluster_readiness_check,
     terraform_data.kubectl_provider_config
   ]
-
+  
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id
     handler_check_version = "v1"
   }
-
+  
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
