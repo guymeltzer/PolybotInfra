@@ -114,15 +114,15 @@ echo "✅ Essential packages installed"
 # 2. SSH setup
 echo "🔑 Configuring SSH authorized_keys..."
 if [ -n "${ssh_public_key}" ]; then
-    mkdir -p /home/ubuntu/.ssh /root/.ssh
-    echo "${ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
-    echo "${ssh_public_key}" >> /root/.ssh/authorized_keys
-    sort -u /home/ubuntu/.ssh/authorized_keys -o /home/ubuntu/.ssh/authorized_keys
-    sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
-    chmod 700 /home/ubuntu/.ssh /root/.ssh
-    chmod 600 /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys
-    chown -R ubuntu:ubuntu /home/ubuntu/.ssh
-    chown -R root:root /root/.ssh
+  mkdir -p /home/ubuntu/.ssh /root/.ssh
+  echo "${ssh_public_key}" >> /home/ubuntu/.ssh/authorized_keys
+  echo "${ssh_public_key}" >> /root/.ssh/authorized_keys
+  sort -u /home/ubuntu/.ssh/authorized_keys -o /home/ubuntu/.ssh/authorized_keys
+  sort -u /root/.ssh/authorized_keys -o /root/.ssh/authorized_keys
+  chmod 700 /home/ubuntu/.ssh /root/.ssh
+  chmod 600 /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys
+  chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+  chown -R root:root /root/.ssh
     echo "✅ SSH public key added to authorized_keys"
 else
     echo "⚠️ No explicit SSH public key provided via template; relying on EC2 instance key pair"

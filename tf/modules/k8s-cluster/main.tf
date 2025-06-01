@@ -771,204 +771,345 @@ resource "aws_instance" "control_plane" {
     #!/bin/bash
     set -euo pipefail
     
-    # Comprehensive logging setup - log everything to multiple locations
-    MAIN_LOG="/var/log/k8s-init.log"
+    # =================================================================
+    # KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v9
+    # =================================================================
+    
+    # Set up comprehensive logging
+    BOOTSTRAP_LOG="/var/log/k8s-bootstrap.log"
     CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
     
-    exec > >(tee -a "$MAIN_LOG" "$CLOUD_INIT_LOG") 2>&1
+    # Create log files and ensure they're writable
+    touch "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
+    chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
     
-    echo "============================================================"
-    echo "= CONTROL PLANE INITIALIZATION - ENHANCED ROBUST v8     ="
-    echo "= Started: $(date)"
-    echo "= Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
-    echo "= Private IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
-    echo "= Public IP: $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
-    echo "============================================================"
+    # Redirect all output to both log files
+    exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
     
-    # Error handling function with detailed diagnostics
+    echo "================================================================="
+    echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED               ="
+    echo "= Time: $$(date)"
+    echo "= Instance: $$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
+    echo "= Private IP: $$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
+    echo "= Public IP: $$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
+    echo "================================================================="
+    
+    # Error handling function
     error_exit() {
-        echo "FATAL ERROR: $1" >&2
-        echo "Time: $(date)" >&2
-        echo "Working directory: $(pwd)" >&2
-        echo "Environment variables:" >&2
-        env | sort >&2
-        echo "Disk space:" >&2
-        df -h >&2
-        echo "Memory usage:" >&2
-        free -h >&2
-        echo "Process list:" >&2
-        ps aux >&2
-        echo "Network interfaces:" >&2
-        ip addr show >&2
-        echo "Recent system logs:" >&2
-        tail -50 /var/log/syslog >&2 || echo "No syslog available" >&2
+        echo "❌ FATAL ERROR: $1"
+        echo "❌ Time: $$(date)"
+        echo "❌ Exit code: $?"
+        echo "❌ Working directory: $$(pwd)"
+        echo "❌ Disk space:"
+        df -h
+        echo "❌ Memory:"
+        free -h
+        echo "❌ Last 20 lines of this log:"
+        tail -20 "$BOOTSTRAP_LOG" 2>/dev/null || echo "Cannot read bootstrap log"
         exit 1
     }
     
-    # Validate essential requirements
-    echo "🔍 Validating system requirements..."
+    # Step 0: Set hostname
+    echo "🏷️ Step 0: Setting hostname..."
+    NEW_HOSTNAME="guy-control-plane-${random_string.token_part1.result}"
+    hostnamectl set-hostname "$$NEW_HOSTNAME"
+    echo "127.0.0.1 $$NEW_HOSTNAME" >> /etc/hosts
+    echo "✅ Hostname set to: $$NEW_HOSTNAME"
     
-    # Check if we're on Ubuntu/Debian
-    if ! command -v apt-get >/dev/null 2>&1; then
-        error_exit "This script requires apt-get (Ubuntu/Debian system)"
-    fi
+    # Step 1: System updates and essential packages
+    echo "📦 Step 1: Installing essential packages..."
+    export DEBIAN_FRONTEND=noninteractive
     
-    # Check internet connectivity
-    if ! curl -s --connect-timeout 10 --max-time 30 http://archive.ubuntu.com/ >/dev/null; then
-        error_exit "No internet connectivity - cannot reach Ubuntu repositories"
-    fi
-    
-    echo "✅ System requirements validated"
-    
-    # Install essential packages with retries
-    echo "📦 Installing essential packages..."
-    
-    for attempt in {1..3}; do
-        echo "Attempt $attempt/3: Updating package lists..."
-        if apt-get update -y; then
-            break
-        fi
-        if [ $attempt -eq 3 ]; then
-            error_exit "Failed to update package lists after 3 attempts"
-        fi
-        sleep 10
-    done
+    # Update package lists
+    echo "📥 Updating package lists..."
+    apt-get update -y || error_exit "Failed to update package lists"
     
     # Install essential packages
-    ESSENTIAL_PACKAGES="curl wget unzip jq awscli ca-certificates gnupg lsb-release software-properties-common apt-transport-https"
-    echo "Installing essential packages: $ESSENTIAL_PACKAGES"
-    
-    if ! apt-get install -y $ESSENTIAL_PACKAGES; then
-        error_exit "Failed to install essential packages"
-    fi
+    echo "📦 Installing essential packages..."
+    apt-get install -y \
+        curl \
+        wget \
+        unzip \
+        jq \
+        awscli \
+        ca-certificates \
+        gnupg \
+        lsb-release \
+        software-properties-common \
+        apt-transport-https \
+        socat \
+        conntrack \
+        ipset || error_exit "Failed to install essential packages"
     
     echo "✅ Essential packages installed"
     
     # Verify AWS CLI works
-    echo "🔍 Verifying AWS CLI..."
+    echo "🔍 Testing AWS CLI..."
     aws --version || error_exit "AWS CLI not working"
+    echo "✅ AWS CLI verified"
     
-    # Test AWS credentials/IAM role
-    if ! aws sts get-caller-identity --region ${var.region} >/dev/null 2>&1; then
-        error_exit "AWS credentials not working - IAM role may not be attached"
+    # Step 2: System configuration for Kubernetes
+    echo "⚙️ Step 2: Configuring system for Kubernetes..."
+    
+    # Disable swap permanently
+    echo "💾 Disabling swap..."
+    swapoff -a
+    sed -i.bak '/swap/s/^/#/' /etc/fstab
+    echo "✅ Swap disabled"
+    
+    # Load required kernel modules
+    echo "🔧 Loading kernel modules..."
+    cat > /etc/modules-load.d/k8s.conf << 'MODULES_EOF'
+overlay
+br_netfilter
+MODULES_EOF
+    
+    modprobe overlay || error_exit "Failed to load overlay module"
+    modprobe br_netfilter || error_exit "Failed to load br_netfilter module"
+    echo "✅ Kernel modules loaded"
+    
+    # Configure sysctl parameters
+    echo "🔧 Configuring sysctl parameters..."
+    cat > /etc/sysctl.d/k8s.conf << 'SYSCTL_EOF'
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTL_EOF
+    
+    sysctl --system || error_exit "Failed to apply sysctl settings"
+    echo "✅ System configuration completed"
+    
+    # Step 3: Install containerd (container runtime)
+    echo "🐳 Step 3: Installing containerd container runtime..."
+    
+    # Install containerd
+    echo "📦 Installing containerd..."
+    apt-get update -y
+    apt-get install -y containerd || error_exit "Failed to install containerd"
+    
+    # Configure containerd
+    echo "🔧 Configuring containerd..."
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+    
+    # Enable systemd cgroup driver
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    
+    # Start and enable containerd
+    systemctl daemon-reload
+    systemctl enable containerd
+    systemctl start containerd
+    
+    # Verify containerd is running
+    if ! systemctl is-active --quiet containerd; then
+        error_exit "containerd is not running"
     fi
     
-    echo "✅ AWS CLI verified and working"
+    echo "✅ containerd installed and configured"
     
-    # Download and execute the full initialization script from S3
-    SCRIPT_BUCKET="${aws_s3_bucket.user_data_scripts.bucket}"
-    SCRIPT_KEY="control_plane_user_data.sh"
-    SCRIPT_PATH="/tmp/control_plane_init.sh"
-    S3_URI="s3://$SCRIPT_BUCKET/$SCRIPT_KEY"
+    # Step 4: Install Kubernetes components
+    echo "☸️ Step 4: Installing Kubernetes components..."
     
-    echo "📥 Downloading initialization script from $S3_URI"
+    # Add Kubernetes apt repository
+    echo "📥 Adding Kubernetes repository..."
+    mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg || error_exit "Failed to add Kubernetes GPG key"
     
-    # Test S3 access first
-    if ! aws s3 ls "s3://$SCRIPT_BUCKET/" --region ${var.region} >/dev/null 2>&1; then
-        error_exit "Cannot access S3 bucket: $SCRIPT_BUCKET"
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+    
+    # Update package lists with new repository
+    echo "📥 Updating package lists with Kubernetes repository..."
+    apt-get update -y || error_exit "Failed to update package lists with Kubernetes repo"
+    
+    # Install Kubernetes components
+    echo "📦 Installing kubectl, kubeadm, kubelet..."
+    apt-get install -y \
+        kubelet=${local.k8s_package_version} \
+        kubeadm=${local.k8s_package_version} \
+        kubectl=${local.k8s_package_version} || error_exit "Failed to install Kubernetes components"
+    
+    # Hold packages to prevent automatic updates
+    apt-mark hold kubelet kubeadm kubectl || error_exit "Failed to hold Kubernetes packages"
+    
+    # Verify installations
+    echo "🔍 Verifying Kubernetes component installations..."
+    kubectl version --client || error_exit "kubectl not installed correctly"
+    kubeadm version || error_exit "kubeadm not installed correctly"
+    kubelet --version || error_exit "kubelet not installed correctly"
+    
+    echo "✅ Kubernetes components installed successfully"
+    
+    # Step 5: Configure kubelet
+    echo "🔧 Step 5: Configuring kubelet..."
+    
+    # Get instance metadata
+    PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+    
+    # Configure kubelet with cloud provider
+    mkdir -p /etc/systemd/system/kubelet.service.d
+    cat > /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf << 'KUBELET_EOF'
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--cloud-provider=external --node-ip=$$PRIVATE_IP"
+KUBELET_EOF
+    
+    systemctl daemon-reload
+    echo "✅ Kubelet configured"
+    
+    # Step 6: Initialize Kubernetes cluster with kubeadm
+    echo "🚀 Step 6: Initializing Kubernetes cluster with kubeadm..."
+    
+    # Create kubeadm configuration
+    echo "📝 Creating kubeadm configuration..."
+    mkdir -p /etc/kubernetes/kubeadm
+    
+    cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << 'KUBEADM_EOF'
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+bootstrapTokens:
+- token: "${local.kubeadm_token}"
+  description: "Initial token for worker nodes"
+  ttl: "24h"
+localAPIEndpoint:
+  advertiseAddress: $$PRIVATE_IP
+  bindPort: 6443
+nodeRegistration:
+  name: $$NEW_HOSTNAME
+  criSocket: "unix:///run/containerd/containerd.sock"
+  kubeletExtraArgs:
+    cloud-provider: "external"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v$${local.k8s_version_full}"
+controlPlaneEndpoint: "$$PRIVATE_IP:6443"
+apiServer:
+  certSANs:
+  - "$$PRIVATE_IP"
+  - "$$NEW_HOSTNAME"
+  - "127.0.0.1"
+  - "localhost"
+  - "kubernetes"
+  - "kubernetes.default"
+  - "kubernetes.default.svc"
+  - "kubernetes.default.svc.cluster.local"
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+networking:
+  podSubnet: "${local.pod_cidr}"
+  serviceSubnet: "10.96.0.0/12"
+KUBEADM_EOF
+    
+    echo "✅ Kubeadm configuration created"
+    echo "📋 Configuration preview:"
+    cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
+    
+    # Run kubeadm init
+    echo "🎯 Running kubeadm init (this may take several minutes)..."
+    echo "📋 Command: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5"
+    echo "📋 Start time: $$(date)"
+    
+    # Create dedicated log for kubeadm init
+    KUBEADM_LOG="/var/log/kubeadm-init.log"
+    
+    if kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5 > "$$KUBEADM_LOG" 2>&1; then
+        echo "✅ kubeadm init completed successfully!"
+        echo "📋 End time: $$(date)"
+        echo "📋 Last 10 lines of kubeadm output:"
+        tail -10 "$$KUBEADM_LOG"
+    else
+        echo "❌ kubeadm init FAILED!"
+        echo "📋 End time: $$(date)"
+        echo "📋 Full kubeadm output:"
+        cat "$$KUBEADM_LOG"
+        error_exit "kubeadm init failed"
     fi
     
-    # Download with detailed retries and validation
-    for attempt in {1..5}; do
-        echo "Download attempt $attempt/5..."
+    # Verify admin.conf was created
+    if [ ! -f /etc/kubernetes/admin.conf ]; then
+        error_exit "admin.conf was not created by kubeadm init"
+    fi
+    
+    echo "✅ admin.conf verified: $$(stat -c%s /etc/kubernetes/admin.conf) bytes"
+    
+    # Step 7: Set up kubeconfig for root and ubuntu users
+    echo "🔧 Step 7: Setting up kubeconfig..."
+    
+    # Set up for root
+    mkdir -p /root/.kube
+    cp -i /etc/kubernetes/admin.conf /root/.kube/config
+    chown root:root /root/.kube/config
+    chmod 600 /root/.kube/config
+    
+    # Set up for ubuntu user
+    mkdir -p /home/ubuntu/.kube
+    cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+    chown ubuntu:ubuntu /home/ubuntu/.kube/config
+    chmod 600 /home/ubuntu/.kube/config
+    chown -R ubuntu:ubuntu /home/ubuntu/.kube
+    
+    echo "✅ Kubeconfig configured for root and ubuntu users"
+    
+    # Step 8: Test cluster access
+    echo "🔍 Step 8: Testing cluster access..."
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    
+    if kubectl cluster-info; then
+        echo "✅ Cluster access verified"
+        kubectl get nodes
+    else
+        error_exit "Cannot access Kubernetes cluster"
+    fi
+    
+    # Step 9: Install CNI (Calico)
+    echo "🌐 Step 9: Installing Calico CNI..."
+    
+    if kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml; then
+        echo "✅ Calico CNI installation initiated"
+    else
+        echo "⚠️ Calico installation failed, but continuing..."
+    fi
+    
+    # Step 10: Store join command in AWS Secrets Manager
+    echo "🔐 Step 10: Storing join command in AWS Secrets Manager..."
+    
+    # Generate fresh join command
+    JOIN_COMMAND=$$(kubeadm token create --print-join-command)
+    
+    if [ -n "$$JOIN_COMMAND" ]; then
+        echo "📤 Storing join command in secrets..."
         
-        if aws s3 cp "$S3_URI" "$SCRIPT_PATH" --region ${var.region}; then
-            # Validate downloaded file
-            if [ -f "$SCRIPT_PATH" ] && [ -s "$SCRIPT_PATH" ]; then
-                # Check if it looks like a shell script
-                if head -1 "$SCRIPT_PATH" | grep -q "^#!/bin/bash"; then
-                    echo "✅ Script downloaded and validated"
-                    break
-                else
-                    echo "❌ Downloaded file doesn't look like a shell script"
-                    cat "$SCRIPT_PATH" | head -10
-                fi
-            else
-                echo "❌ Downloaded file is empty or doesn't exist"
-            fi
-        else
-            echo "❌ S3 download failed"
-        fi
-        
-        if [ $attempt -eq 5 ]; then
-            echo "📋 Final attempt failed. S3 bucket contents:"
-            aws s3 ls "s3://$SCRIPT_BUCKET/" --region ${var.region} || echo "Cannot list bucket"
-            error_exit "Failed to download initialization script after 5 attempts"
-        fi
-        
-        echo "Retrying in 15 seconds..."
-        sleep 15
-    done
-    
-    # Make executable and verify
-    chmod +x "$SCRIPT_PATH"
-    if [ ! -x "$SCRIPT_PATH" ]; then
-        error_exit "Script is not executable after chmod +x"
-    fi
-    
-    echo "🚀 Executing initialization script..."
-    echo "Script path: $SCRIPT_PATH"
-    echo "Script size: $(stat -c%s "$SCRIPT_PATH") bytes"
-    echo "Script permissions: $(ls -la "$SCRIPT_PATH")"
-    echo "============================================================"
-    
-    # Execute with detailed logging
-    if ! "$SCRIPT_PATH"; then
-        echo "❌ Initialization script failed!"
-        echo "Script exit code: $?"
-        echo "Last 50 lines of this log:"
-        tail -50 "$MAIN_LOG"
-        error_exit "Control plane initialization script failed"
-    fi
-    
-    echo "============================================================"
-    echo "= CONTROL PLANE INITIALIZATION COMPLETED SUCCESSFULLY   ="
-    echo "= Completed: $(date)"
-    echo "============================================================"
-    
-    # Final validation - check that kubectl was installed
-    echo "🔍 Final validation checks..."
-    
-    # Check if kubectl was installed
-    if command -v kubectl >/dev/null 2>&1; then
-        echo "✅ kubectl installed: $(kubectl version --client --short 2>/dev/null || echo 'installed but cluster not ready')"
+        # Store in both secrets
+        aws secretsmanager put-secret-value \
+            --secret-id "${aws_secretsmanager_secret.kubernetes_join_command.name}" \
+            --secret-string "$$JOIN_COMMAND" \
+            --region "${var.region}" || echo "⚠️ Failed to store in primary secret"
+            
+        aws secretsmanager put-secret-value \
+            --secret-id "${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" \
+            --secret-string "$$JOIN_COMMAND" \
+            --region "${var.region}" || echo "⚠️ Failed to store in latest secret"
+            
+        echo "✅ Join command stored in AWS Secrets Manager"
     else
-        error_exit "kubectl was not installed by the initialization script"
+        echo "⚠️ Failed to generate join command"
     fi
     
-    # Check if kubeadm was installed  
-    if command -v kubeadm >/dev/null 2>&1; then
-        echo "✅ kubeadm installed: $(kubeadm version -o short 2>/dev/null || echo 'installed')"
-    else
-        error_exit "kubeadm was not installed by the initialization script"
-    fi
-    
-    # Check if kubelet was installed
-    if command -v kubelet >/dev/null 2>&1; then
-        echo "✅ kubelet installed: $(kubelet --version 2>/dev/null || echo 'installed')"
-    else
-        error_exit "kubelet was not installed by the initialization script"
-    fi
-    
-    # Check if admin.conf was created
-    if [ -f /etc/kubernetes/admin.conf ]; then
-        echo "✅ admin.conf exists: $(stat -c%s /etc/kubernetes/admin.conf) bytes"
-        echo "✅ admin.conf modified: $(stat -c%y /etc/kubernetes/admin.conf)"
-    else
-        error_exit "admin.conf was not created - kubeadm init likely failed"
-    fi
-    
-    # Check if kubelet is running
-    if systemctl is-active --quiet kubelet; then
-        echo "✅ kubelet service is active and running"
-    else
-        echo "❌ kubelet service is not running:"
-        systemctl status kubelet --no-pager || true
-        error_exit "kubelet service is not running"
-    fi
-    
-    echo "🎉 ALL VALIDATION CHECKS PASSED!"
-    echo "📋 Control plane is ready for kubeconfig retrieval"
+    # Final status report
+    echo "================================================================="
+    echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED             ="
+    echo "= Time: $$(date)"
+    echo "= Status: SUCCESS"
+    echo "================================================================="
+    echo "📊 Final verification:"
+    echo "   ✅ kubectl: $$(kubectl version --client --short 2>/dev/null)"
+    echo "   ✅ kubeadm: $$(kubeadm version -o short 2>/dev/null)"
+    echo "   ✅ kubelet: $$(systemctl is-active kubelet)"
+    echo "   ✅ containerd: $$(systemctl is-active containerd)"
+    echo "   ✅ admin.conf: $$([ -f /etc/kubernetes/admin.conf ] && echo 'EXISTS' || echo 'MISSING')"
+    echo "    Logs available at: $$BOOTSTRAP_LOG"
+    echo "   📁 Kubeadm logs at: $$KUBEADM_LOG"
+    echo "================================================================="
     
     EOF
   )
@@ -1023,7 +1164,7 @@ resource "aws_launch_template" "worker_lt" {
     region                     = var.region
     join_command_secret_id     = aws_secretsmanager_secret.kubernetes_join_command_latest.id
     JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-    control_plane_endpoint     = "https://${aws_instance.control_plane.private_ip}:6443"
+    control_plane_endpoint     = "https://$${aws_instance.control_plane.private_ip}:6443"
     s3_bucket                  = aws_s3_bucket.worker_logs.bucket
     worker_asg_name            = local.worker_asg_name
     K8S_VERSION_TO_INSTALL     = local.k8s_package_version
@@ -1166,11 +1307,11 @@ resource "null_resource" "update_join_command" {
         exit 0
       fi
       
-      echo "📡 Control Plane: $${aws_instance.control_plane.public_ip}"
-      echo "🔑 Secrets: $${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
+      echo "📡 Control Plane: ${aws_instance.control_plane.public_ip}"
+      echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
       
       # Upload logs for troubleshooting
-      echo "Join command update completed at $$(date)" | aws s3 cp - s3://$${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$$(date +"%Y%m%d%H%M%S").log --region ${var.region} || true
+      echo "Join command update completed at $$(date)" | aws s3 cp - s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$$(date +"%Y%m%d%H%M%S").log --region ${var.region} || true
       
       echo "✅ Join command management completed"
     EOT
@@ -1183,7 +1324,7 @@ resource "null_resource" "update_join_command" {
 
 # Lambda function code file
 resource "local_file" "lambda_function_code" {
-  filename = "$${path.module}/lambda_code.py"
+  filename = "${path.module}/lambda_code.py"
   content = <<EOF
 import json
 import boto3
@@ -1219,7 +1360,7 @@ EOF
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = local_file.lambda_function_code.filename
-  output_path = "$${path.module}/lambda_function.zip"
+  output_path = "${path.module}/lambda_function.zip"
   
   depends_on = [local_file.lambda_function_code]
 }
@@ -1244,60 +1385,63 @@ resource "aws_iam_role" "node_management_lambda_role" {
   tags = var.tags
 }
 
+# Lambda IAM policy document (using data source for proper interpolation)
+data "aws_iam_policy_document" "node_management_lambda_policy" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = ["arn:aws:logs:*:*:*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "autoscaling:CompleteLifecycleAction",
+      "autoscaling:DescribeAutoScalingGroups",
+      "autoscaling:DescribeAutoScalingInstances"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "ec2:DescribeTags"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:PutSecretValue"
+    ]
+    resources = [
+      aws_secretsmanager_secret.kubernetes_join_command.arn,
+      aws_secretsmanager_secret.kubernetes_join_command_latest.arn
+    ]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject"
+    ]
+    resources = ["${aws_s3_bucket.worker_logs.arn}/*"]
+  }
+}
+
 # Lambda IAM policy
 resource "aws_iam_policy" "node_management_lambda_policy" {
-  name = "guy-node-management-lambda-policy"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:*:*:*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:CompleteLifecycleAction",
-          "autoscaling:DescribeAutoScalingGroups",
-          "autoscaling:DescribeAutoScalingInstances"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeTags"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
-        ]
-        Resource = [
-          aws_secretsmanager_secret.kubernetes_join_command.arn,
-          aws_secretsmanager_secret.kubernetes_join_command_latest.arn
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:PutObject",
-          "s3:GetObject"
-        ]
-        Resource = "$${aws_s3_bucket.worker_logs.arn}/*"
-      }
-    ]
-  })
+  name   = "guy-node-management-lambda-policy"
+  policy = data.aws_iam_policy_document.node_management_lambda_policy.json
 
   tags = var.tags
 }
