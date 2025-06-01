@@ -771,43 +771,205 @@ resource "aws_instance" "control_plane" {
     #!/bin/bash
     set -euo pipefail
     
-    # Basic logging setup
-    exec > >(tee -a /var/log/k8s-init.log) 2>&1
-    echo "=== Control Plane Initialization Started at $(date) ==="
+    # Comprehensive logging setup - log everything to multiple locations
+    MAIN_LOG="/var/log/k8s-init.log"
+    CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
     
-    # Install AWS CLI if not present
-    if ! command -v aws >/dev/null 2>&1; then
-        apt-get update -y
-        apt-get install -y awscli curl
+    exec > >(tee -a "$MAIN_LOG" "$CLOUD_INIT_LOG") 2>&1
+    
+    echo "============================================================"
+    echo "= CONTROL PLANE INITIALIZATION - ENHANCED ROBUST v8     ="
+    echo "= Started: $(date)"
+    echo "= Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+    echo "= Private IP: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
+    echo "= Public IP: $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+    echo "============================================================"
+    
+    # Error handling function with detailed diagnostics
+    error_exit() {
+        echo "FATAL ERROR: $1" >&2
+        echo "Time: $(date)" >&2
+        echo "Working directory: $(pwd)" >&2
+        echo "Environment variables:" >&2
+        env | sort >&2
+        echo "Disk space:" >&2
+        df -h >&2
+        echo "Memory usage:" >&2
+        free -h >&2
+        echo "Process list:" >&2
+        ps aux >&2
+        echo "Network interfaces:" >&2
+        ip addr show >&2
+        echo "Recent system logs:" >&2
+        tail -50 /var/log/syslog >&2 || echo "No syslog available" >&2
+        exit 1
+    }
+    
+    # Validate essential requirements
+    echo "🔍 Validating system requirements..."
+    
+    # Check if we're on Ubuntu/Debian
+    if ! command -v apt-get >/dev/null 2>&1; then
+        error_exit "This script requires apt-get (Ubuntu/Debian system)"
     fi
+    
+    # Check internet connectivity
+    if ! curl -s --connect-timeout 10 --max-time 30 http://archive.ubuntu.com/ >/dev/null; then
+        error_exit "No internet connectivity - cannot reach Ubuntu repositories"
+    fi
+    
+    echo "✅ System requirements validated"
+    
+    # Install essential packages with retries
+    echo "📦 Installing essential packages..."
+    
+    for attempt in {1..3}; do
+        echo "Attempt $attempt/3: Updating package lists..."
+        if apt-get update -y; then
+            break
+        fi
+        if [ $attempt -eq 3 ]; then
+            error_exit "Failed to update package lists after 3 attempts"
+        fi
+        sleep 10
+    done
+    
+    # Install essential packages
+    ESSENTIAL_PACKAGES="curl wget unzip jq awscli ca-certificates gnupg lsb-release software-properties-common apt-transport-https"
+    echo "Installing essential packages: $ESSENTIAL_PACKAGES"
+    
+    if ! apt-get install -y $ESSENTIAL_PACKAGES; then
+        error_exit "Failed to install essential packages"
+    fi
+    
+    echo "✅ Essential packages installed"
+    
+    # Verify AWS CLI works
+    echo "🔍 Verifying AWS CLI..."
+    aws --version || error_exit "AWS CLI not working"
+    
+    # Test AWS credentials/IAM role
+    if ! aws sts get-caller-identity --region ${var.region} >/dev/null 2>&1; then
+        error_exit "AWS credentials not working - IAM role may not be attached"
+    fi
+    
+    echo "✅ AWS CLI verified and working"
     
     # Download and execute the full initialization script from S3
     SCRIPT_BUCKET="${aws_s3_bucket.user_data_scripts.bucket}"
     SCRIPT_KEY="control_plane_user_data.sh"
     SCRIPT_PATH="/tmp/control_plane_init.sh"
+    S3_URI="s3://$SCRIPT_BUCKET/$SCRIPT_KEY"
     
-    echo "Downloading initialization script from s3://$SCRIPT_BUCKET/$SCRIPT_KEY"
+    echo "📥 Downloading initialization script from $S3_URI"
     
-    # Download with retries
-    for i in {1..5}; do
-        if aws s3 cp "s3://$SCRIPT_BUCKET/$SCRIPT_KEY" "$SCRIPT_PATH" --region ${var.region}; then
-            break
-        fi
-        echo "Download attempt $i failed, retrying in 10 seconds..."
-        sleep 10
-    done
-    
-    if [ ! -f "$SCRIPT_PATH" ]; then
-        echo "FATAL: Failed to download initialization script after 5 attempts"
-        exit 1
+    # Test S3 access first
+    if ! aws s3 ls "s3://$SCRIPT_BUCKET/" --region ${var.region} >/dev/null 2>&1; then
+        error_exit "Cannot access S3 bucket: $SCRIPT_BUCKET"
     fi
     
-    # Make executable and run
-    chmod +x "$SCRIPT_PATH"
-    echo "Executing initialization script..."
-    "$SCRIPT_PATH"
+    # Download with detailed retries and validation
+    for attempt in {1..5}; do
+        echo "Download attempt $attempt/5..."
+        
+        if aws s3 cp "$S3_URI" "$SCRIPT_PATH" --region ${var.region}; then
+            # Validate downloaded file
+            if [ -f "$SCRIPT_PATH" ] && [ -s "$SCRIPT_PATH" ]; then
+                # Check if it looks like a shell script
+                if head -1 "$SCRIPT_PATH" | grep -q "^#!/bin/bash"; then
+                    echo "✅ Script downloaded and validated"
+                    break
+                else
+                    echo "❌ Downloaded file doesn't look like a shell script"
+                    cat "$SCRIPT_PATH" | head -10
+                fi
+            else
+                echo "❌ Downloaded file is empty or doesn't exist"
+            fi
+        else
+            echo "❌ S3 download failed"
+        fi
+        
+        if [ $attempt -eq 5 ]; then
+            echo "📋 Final attempt failed. S3 bucket contents:"
+            aws s3 ls "s3://$SCRIPT_BUCKET/" --region ${var.region} || echo "Cannot list bucket"
+            error_exit "Failed to download initialization script after 5 attempts"
+        fi
+        
+        echo "Retrying in 15 seconds..."
+        sleep 15
+    done
     
-    echo "=== Control Plane Initialization Completed at $(date) ==="
+    # Make executable and verify
+    chmod +x "$SCRIPT_PATH"
+    if [ ! -x "$SCRIPT_PATH" ]; then
+        error_exit "Script is not executable after chmod +x"
+    fi
+    
+    echo "🚀 Executing initialization script..."
+    echo "Script path: $SCRIPT_PATH"
+    echo "Script size: $(stat -c%s "$SCRIPT_PATH") bytes"
+    echo "Script permissions: $(ls -la "$SCRIPT_PATH")"
+    echo "============================================================"
+    
+    # Execute with detailed logging
+    if ! "$SCRIPT_PATH"; then
+        echo "❌ Initialization script failed!"
+        echo "Script exit code: $?"
+        echo "Last 50 lines of this log:"
+        tail -50 "$MAIN_LOG"
+        error_exit "Control plane initialization script failed"
+    fi
+    
+    echo "============================================================"
+    echo "= CONTROL PLANE INITIALIZATION COMPLETED SUCCESSFULLY   ="
+    echo "= Completed: $(date)"
+    echo "============================================================"
+    
+    # Final validation - check that kubectl was installed
+    echo "🔍 Final validation checks..."
+    
+    # Check if kubectl was installed
+    if command -v kubectl >/dev/null 2>&1; then
+        echo "✅ kubectl installed: $(kubectl version --client --short 2>/dev/null || echo 'installed but cluster not ready')"
+    else
+        error_exit "kubectl was not installed by the initialization script"
+    fi
+    
+    # Check if kubeadm was installed  
+    if command -v kubeadm >/dev/null 2>&1; then
+        echo "✅ kubeadm installed: $(kubeadm version -o short 2>/dev/null || echo 'installed')"
+    else
+        error_exit "kubeadm was not installed by the initialization script"
+    fi
+    
+    # Check if kubelet was installed
+    if command -v kubelet >/dev/null 2>&1; then
+        echo "✅ kubelet installed: $(kubelet --version 2>/dev/null || echo 'installed')"
+    else
+        error_exit "kubelet was not installed by the initialization script"
+    fi
+    
+    # Check if admin.conf was created
+    if [ -f /etc/kubernetes/admin.conf ]; then
+        echo "✅ admin.conf exists: $(stat -c%s /etc/kubernetes/admin.conf) bytes"
+        echo "✅ admin.conf modified: $(stat -c%y /etc/kubernetes/admin.conf)"
+    else
+        error_exit "admin.conf was not created - kubeadm init likely failed"
+    fi
+    
+    # Check if kubelet is running
+    if systemctl is-active --quiet kubelet; then
+        echo "✅ kubelet service is active and running"
+    else
+        echo "❌ kubelet service is not running:"
+        systemctl status kubelet --no-pager || true
+        error_exit "kubelet service is not running"
+    fi
+    
+    echo "🎉 ALL VALIDATION CHECKS PASSED!"
+    echo "📋 Control plane is ready for kubeconfig retrieval"
+    
     EOF
   )
 
@@ -1008,8 +1170,7 @@ resource "null_resource" "update_join_command" {
       echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
       
       # Upload logs for troubleshooting
-      aws s3 cp /dev/stdin s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$(date +"%Y%m%d%H%M%S").log \
-        --region ${var.region} <<< "Join command update completed at $(date)" || true
+      echo "Join command update completed at $$(date)" | aws s3 cp - s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$$(date +"%Y%m%d%H%M%S").log --region ${var.region} || true
       
       echo "✅ Join command management completed"
     EOT

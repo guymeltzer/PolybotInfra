@@ -120,7 +120,7 @@ resource "terraform_data" "kubectl_provider_config" {
   triggers_replace = {
     control_plane_id  = module.k8s-cluster.control_plane_instance_id
     control_plane_ip  = module.k8s-cluster.control_plane_public_ip
-    kubeconfig_version = "v7-enhanced-robust"
+    kubeconfig_version = "v8-syntax-fixed"
   }
 
   provisioner "local-exec" {
@@ -130,8 +130,8 @@ resource "terraform_data" "kubectl_provider_config" {
       set -e
       
       echo "========================================================="
-      echo "= ROBUST KUBECONFIG SETUP v7 - ENHANCED              ="
-      echo "= Date: $$(date)                                        ="
+      echo "= ROBUST KUBECONFIG SETUP v8 - SYNTAX FIXED          ="
+      echo "= Date: \$(date)                                        ="
       echo "========================================================="
       
       INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
@@ -139,9 +139,9 @@ resource "terraform_data" "kubectl_provider_config" {
       REGION="${var.region}"
       KUBECONFIG_PATH="${local.kubeconfig_path}"
       
-      echo "📡 Control Plane: $$INSTANCE_ID (IP: $$PUBLIC_IP)"
-      echo "📁 Kubeconfig Path: $$KUBECONFIG_PATH"
-      echo "🌍 Region: $$REGION"
+      echo "📡 Control Plane: \$INSTANCE_ID (IP: \$PUBLIC_IP)"
+      echo "📁 Kubeconfig Path: \$KUBECONFIG_PATH"
+      echo "🌍 Region: \$REGION"
       
       # Enhanced function to check instance readiness
       wait_for_instance_ready() {
@@ -149,7 +149,7 @@ resource "terraform_data" "kubectl_provider_config" {
         
         # Wait for instance running state
         echo "⏳ Waiting for instance to be in running state..."
-        aws ec2 wait instance-running --instance-ids "$$INSTANCE_ID" --region "$$REGION" || {
+        aws ec2 wait instance-running --instance-ids "\$INSTANCE_ID" --region "\$REGION" || {
           echo "❌ Instance failed to reach running state"
           return 1
         }
@@ -160,22 +160,22 @@ resource "terraform_data" "kubectl_provider_config" {
         local ssm_waited=0
         local ssm_interval=15
         
-        echo "⏳ Waiting for SSM agent to be online (timeout: $$ssm_timeout seconds)..."
-        while [ $$ssm_waited -lt $$ssm_timeout ]; do
+        echo "⏳ Waiting for SSM agent to be online (timeout: \$ssm_timeout seconds)..."
+        while [ \$ssm_waited -lt \$ssm_timeout ]; do
           if aws ssm describe-instance-information \
-             --region "$$REGION" \
-             --filters "Key=InstanceIds,Values=$$INSTANCE_ID" \
+             --region "\$REGION" \
+             --filters "Key=InstanceIds,Values=\$INSTANCE_ID" \
              --query "InstanceInformationList[0].PingStatus" \
              --output text 2>/dev/null | grep -q "Online"; then
             echo "✅ SSM agent is online"
             return 0
           fi
-          echo "⏳ SSM agent not ready yet... ($$ssm_waited/$$ssm_timeout seconds)"
-          sleep $$ssm_interval
-          ssm_waited=$$((ssm_waited + ssm_interval))
+          echo "⏳ SSM agent not ready yet... (\$ssm_waited/\$ssm_timeout seconds)"
+          sleep \$ssm_interval
+          ssm_waited=\$((ssm_waited + ssm_interval))
         done
         
-        echo "❌ SSM agent failed to come online within $$ssm_timeout seconds"
+        echo "❌ SSM agent failed to come online within \$ssm_timeout seconds"
         return 1
       }
       
@@ -183,28 +183,28 @@ resource "terraform_data" "kubectl_provider_config" {
       wait_for_kubeadm() {
         local max_wait=1200  # 20 minutes (increased from 15)
         local check_interval=45
-        local max_checks=$$((max_wait / check_interval))
+        local max_checks=\$((max_wait / check_interval))
         
-        echo "🔍 Waiting for kubeadm init completion (max: $$((max_wait / 60)) minutes)..."
-        echo "   Check interval: $$check_interval seconds"
-        echo "   Max checks: $$max_checks"
+        echo "🔍 Waiting for kubeadm init completion (max: \$((max_wait / 60)) minutes)..."
+        echo "   Check interval: \$check_interval seconds"
+        echo "   Max checks: \$max_checks"
         
-        for check in $$(seq 1 $$max_checks); do
-          local elapsed=$$((check * check_interval))
-          local elapsed_minutes=$$((elapsed / 60))
+        for check in \$(seq 1 \$max_checks); do
+          local elapsed=\$((check * check_interval))
+          local elapsed_minutes=\$((elapsed / 60))
           echo ""
-          echo "🔄 Check $$check/$$max_checks ($${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
+          echo "🔄 Check \$check/\$max_checks (\${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
           
           # Enhanced verification command with better logging
-          COMMAND_ID=$$(aws ssm send-command \
-            --region "$$REGION" \
+          COMMAND_ID=\$(aws ssm send-command \
+            --region "\$REGION" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$$INSTANCE_ID" \
+            --instance-ids "\$INSTANCE_ID" \
             --parameters 'commands=[
               "#!/bin/bash",
-              "echo \"=== KUBEADM COMPLETION CHECK v7 ===\"",
-              "echo \"Timestamp: $$(date)\"",
-              "echo \"Hostname: $$(hostname)\"",
+              "echo \"=== KUBEADM COMPLETION CHECK v8 ===\"",
+              "echo \"Timestamp: \$(date)\"",
+              "echo \"Hostname: \$(hostname)\"",
               "echo \"\"",
               "# Check if initialization is still running",
               "if pgrep -f \"kubeadm init\" >/dev/null; then",
@@ -219,8 +219,8 @@ resource "terraform_data" "kubectl_provider_config" {
               "  if [ -s /etc/kubernetes/admin.conf ]; then",
               "    if grep -q \"apiVersion.*Config\" /etc/kubernetes/admin.conf; then",
               "      echo \"✅ admin.conf: EXISTS and VALID\"",
-              "      echo \"   Size: $$(stat -c%s /etc/kubernetes/admin.conf) bytes\"",
-              "      echo \"   Modified: $$(stat -c%y /etc/kubernetes/admin.conf)\"",
+              "      echo \"   Size: \$(stat -c%s /etc/kubernetes/admin.conf) bytes\"",
+              "      echo \"   Modified: \$(stat -c%y /etc/kubernetes/admin.conf)\"",
               "    else",
               "      echo \"❌ admin.conf: EXISTS but INVALID CONTENT\"",
               "      echo \"   First few lines:\"",
@@ -270,64 +270,64 @@ resource "terraform_data" "kubectl_provider_config" {
             --output text \
             --query "Command.CommandId" 2>/dev/null)
           
-          if [[ -z "$$COMMAND_ID" ]]; then
+          if [[ -z "\$COMMAND_ID" ]]; then
             echo "   ⚠️ Failed to send SSM command, retrying..."
-            sleep $$check_interval
+            sleep \$check_interval
             continue
           fi
           
-          echo "   📋 Waiting for check completion (Command ID: $$COMMAND_ID)..."
+          echo "   📋 Waiting for check completion (Command ID: \$COMMAND_ID)..."
           sleep 30  # Give command time to execute
           
           # Get command result with retries
           local result_attempts=0
           local max_result_attempts=3
-          while [ $$result_attempts -lt $$max_result_attempts ]; do
-            RESULT=$$(aws ssm get-command-invocation \
-              --region "$$REGION" \
-              --command-id "$$COMMAND_ID" \
-              --instance-id "$$INSTANCE_ID" \
+          while [ \$result_attempts -lt \$max_result_attempts ]; do
+            RESULT=\$(aws ssm get-command-invocation \
+              --region "\$REGION" \
+              --command-id "\$COMMAND_ID" \
+              --instance-id "\$INSTANCE_ID" \
               --output json 2>/dev/null || echo "{}")
             
-            STATUS=$$(echo "$$RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
-            STDOUT=$$(echo "$$RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-            STDERR=$$(echo "$$RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+            STATUS=\$(echo "\$RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+            STDOUT=\$(echo "\$RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+            STDERR=\$(echo "\$RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
             
-            if [[ -n "$$STATUS" ]]; then
+            if [[ -n "\$STATUS" ]]; then
               break
             fi
             
-            result_attempts=$$((result_attempts + 1))
-            echo "   ⏳ Waiting for command result... (attempt $$result_attempts/$$max_result_attempts)"
+            result_attempts=\$((result_attempts + 1))
+            echo "   ⏳ Waiting for command result... (attempt \$result_attempts/\$max_result_attempts)"
             sleep 10
           done
           
-          echo "   📋 Command Status: $$STATUS"
-          if [[ -n "$$STDOUT" ]]; then
+          echo "   📋 Command Status: \$STATUS"
+          if [[ -n "\$STDOUT" ]]; then
             echo "   📄 Output:"
-            echo "$$STDOUT" | sed 's/^/      /'
+            echo "\$STDOUT" | sed 's/^/      /'
           fi
-          if [[ -n "$$STDERR" && "$$STDERR" != "null" ]]; then
+          if [[ -n "\$STDERR" && "\$STDERR" != "null" ]]; then
             echo "   ⚠️ Errors:"
-            echo "$$STDERR" | sed 's/^/      /'
+            echo "\$STDERR" | sed 's/^/      /'
           fi
           
           # Check results
-          if [[ "$$STATUS" == "0" ]] && echo "$$STDOUT" | grep -q "KUBEADM INIT: COMPLETE AND VERIFIED"; then
+          if [[ "\$STATUS" == "0" ]] && echo "\$STDOUT" | grep -q "KUBEADM INIT: COMPLETE AND VERIFIED"; then
             echo "   ✅ kubeadm init completed successfully!"
             return 0
-          elif [[ "$$STATUS" == "2" ]]; then
+          elif [[ "\$STATUS" == "2" ]]; then
             echo "   🔄 kubeadm init still in progress..."
           else
-            echo "   ❌ kubeadm init verification failed (status: $$STATUS)"
+            echo "   ❌ kubeadm init verification failed (status: \$STATUS)"
           fi
           
-          if [[ $$check -eq $$max_checks ]]; then
+          if [[ \$check -eq \$max_checks ]]; then
             echo ""
-            echo "❌ TIMEOUT: kubeadm init did not complete after $$max_wait seconds ($$((max_wait / 60)) minutes)"
+            echo "❌ TIMEOUT: kubeadm init did not complete after \$max_wait seconds (\$((max_wait / 60)) minutes)"
             echo "   This suggests the control plane initialization failed."
             echo "   Check the logs on the control plane instance:"
-            echo "   - ssh -i YOUR_KEY.pem ubuntu@$$PUBLIC_IP"
+            echo "   - ssh -i YOUR_KEY.pem ubuntu@\$PUBLIC_IP"
             echo "   - sudo cat /var/log/k8s-init.log"
             echo "   - sudo cat /var/log/kubeadm-init.log"
             echo "   - sudo systemctl status kubelet"
@@ -335,8 +335,8 @@ resource "terraform_data" "kubectl_provider_config" {
             return 1
           fi
           
-          echo "   ⏳ Waiting $$check_interval seconds before next check..."
-          sleep $$check_interval
+          echo "   ⏳ Waiting \$check_interval seconds before next check..."
+          sleep \$check_interval
         done
         
         return 1
@@ -346,17 +346,17 @@ resource "terraform_data" "kubectl_provider_config" {
       fetch_kubeconfig() {
         echo "📁 Fetching kubeconfig from control plane..."
         
-        for attempt in $$(seq 1 5); do
-          echo "🔄 Fetch attempt $$attempt/5..."
+        for attempt in \$(seq 1 5); do
+          echo "🔄 Fetch attempt \$attempt/5..."
           
-          COMMAND_ID=$$(aws ssm send-command \
-            --region "$$REGION" \
+          COMMAND_ID=\$(aws ssm send-command \
+            --region "\$REGION" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "$$INSTANCE_ID" \
+            --instance-ids "\$INSTANCE_ID" \
             --parameters 'commands=[
               "#!/bin/bash",
-              "echo \"=== KUBECONFIG FETCH v7 ===\"",
-              "echo \"Timestamp: $$(date)\"",
+              "echo \"=== KUBECONFIG FETCH v8 ===\"",
+              "echo \"Timestamp: \$(date)\"",
               "echo \"File info:\"",
               "ls -la /etc/kubernetes/admin.conf",
               "echo \"\"",
@@ -369,32 +369,34 @@ resource "terraform_data" "kubectl_provider_config" {
           
           sleep 20
           
-          FETCH_RESULT=$$(aws ssm get-command-invocation \
-            --region "$$REGION" \
-            --command-id "$$COMMAND_ID" \
-            --instance-id "$$INSTANCE_ID" \
+          FETCH_RESULT=\$(aws ssm get-command-invocation \
+            --region "\$REGION" \
+            --command-id "\$COMMAND_ID" \
+            --instance-id "\$INSTANCE_ID" \
             --output json 2>/dev/null || echo "{}")
           
-          FETCH_STDOUT=$$(echo "$$FETCH_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-          FETCH_STATUS=$$(echo "$$FETCH_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+          FETCH_STDOUT=\$(echo "\$FETCH_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+          FETCH_STATUS=\$(echo "\$FETCH_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
           
-          if [[ "$$FETCH_STATUS" != "0" ]]; then
-            echo "   ❌ Fetch command failed (status: $$FETCH_STATUS), retrying..."
+          if [[ "\$FETCH_STATUS" != "0" ]]; then
+            echo "   ❌ Fetch command failed (status: \$FETCH_STATUS), retrying..."
             sleep 20
             continue
           fi
           
-          KUBECONFIG_CONTENT=$$(echo "$$FETCH_STDOUT" | \
+          KUBECONFIG_CONTENT=\$(echo "\$FETCH_STDOUT" | \
             sed -n '/=== ADMIN.CONF CONTENT START ===/,/=== ADMIN.CONF CONTENT END ===/p' | \
-            sed '1d;$$d')
+            sed '1d;\$d')
           
-          if [[ -z "$$KUBECONFIG_CONTENT" ]]; then
+          if [[ -z "\$KUBECONFIG_CONTENT" ]]; then
             echo "   ❌ No kubeconfig content found, retrying..."
             sleep 20
             continue
           fi
           
           # Enhanced validation
+          if echo "\$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
+             echo "\$KUBECONFIG_CONTENT" | grep -q "kind.*Config" && \
           if echo "$$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
              echo "$$KUBECONFIG_CONTENT" | grep -q "kind.*Config" && \
              echo "$$KUBECONFIG_CONTENT" | grep -q "clusters:" && \
