@@ -1208,6 +1208,118 @@ resource "aws_lambda_permission" "eventbridge_permission" {
   source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
 }
 
+# =============================================================================
+# 🔄 ASG LIFECYCLE HOOKS - GRACEFUL NODE MANAGEMENT
+# =============================================================================
+
+# ASG lifecycle hook IAM role
+resource "aws_iam_role" "asg_lifecycle_hook_role" {
+  name = "guy-asg-lifecycle-hook-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "autoscaling.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "asg_sns_publish_policy" {
+  name = "asg-sns-publish-policy"
+  role = aws_iam_role.asg_lifecycle_hook_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.lifecycle_topic.arn
+      }
+    ]
+  })
+}
+
+# Scale up lifecycle hook
+resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
+  name                 = "guy-scale-up-hook"
+  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
+  default_result       = "CONTINUE"
+  heartbeat_timeout    = 300
+  lifecycle_transition = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
+  role_arn            = aws_iam_role.asg_lifecycle_hook_role.arn
+}
+
+# Scale down lifecycle hook
+resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
+  name                 = "guy-scale-down-hook"
+  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
+  default_result       = "CONTINUE"
+  heartbeat_timeout    = 300
+  lifecycle_transition = "autoscaling:EC2_INSTANCE_TERMINATING"
+  notification_target_arn = aws_sns_topic.lifecycle_topic.arn
+  role_arn            = aws_iam_role.asg_lifecycle_hook_role.arn
+}
+
+# =============================================================================
+# 📡 MONITORING AND AUTOMATION - SNS AND CLOUDWATCH
+# =============================================================================
+
+# SNS topic for lifecycle events
+resource "aws_sns_topic" "lifecycle_topic" {
+  name = "guy-asg-lifecycle-topic"
+  
+  tags = var.tags
+}
+
+resource "aws_sns_topic_subscription" "lambda_subscription" {
+  topic_arn = aws_sns_topic.lifecycle_topic.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.node_management_lambda.arn
+}
+
+resource "aws_lambda_permission" "sns_permission" {
+  statement_id  = "AllowExecutionFromSNS"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.lifecycle_topic.arn
+}
+
+# CloudWatch event for token refresh
+resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
+  name                = "guy-token-refresh-rule"
+  description         = "Trigger token refresh every 6 hours"
+  schedule_expression = "rate(6 hours)"
+  
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "token_refresh_target" {
+  rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
+  target_id = "TokenRefreshTarget"
+  arn       = aws_lambda_function.node_management_lambda.arn
+}
+
+resource "aws_lambda_permission" "eventbridge_permission" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
+}
+
 # ASG Lifecycle Hooks
 resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
   name                   = "guy-scale-up-hook"
