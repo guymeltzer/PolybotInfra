@@ -62,7 +62,7 @@ output "cluster_readiness" {
   value = {
     kubeconfig_exists = fileexists(local.kubeconfig_path)
     # SAFE: Only reference resource ID, not complex chains
-    ebs_csi_ready     = try(null_resource.install_ebs_csi_driver.id != "", false)
+    # ebs_csi_ready     = try(null_resource.install_ebs_csi_driver.id != "", false)
   }
 }
 

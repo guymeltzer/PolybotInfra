@@ -305,10 +305,11 @@ output "kubernetes_join_command_secrets" {
 # 📋 SCRIPT HASHES AND VERSIONING
 # =============================================================================
 
-output "control_plane_script_hash" {
-  description = "Hash of the control plane user data script" #OUTPUT
-  value       = terraform_data.control_plane_script_hash.id
-}
+# Remove the problematic output for non-existent resource
+# output "control_plane_script_hash" {
+#   description = "Control plane script hash for change tracking"
+#   value       = terraform_data.control_plane_script_hash.id
+# }
 
 # =============================================================================
 # 🎯 DEPLOYMENT SUMMARY OUTPUT

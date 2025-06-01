@@ -652,6 +652,7 @@ resource "aws_instance" "control_plane" {
     region                         = var.region
     pod_cidr                       = local.pod_cidr
     kubeadm_token                  = local.kubeadm_token
+    token_formatted                = local.kubeadm_token
     join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
     join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
   })))
@@ -849,79 +850,6 @@ resource "null_resource" "update_join_command" {
       echo "📡 Control Plane: ${aws_instance.control_plane.public_ip}"
       echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
       
-      # Function to update join command via control plane
-      update_join_command() {
-        echo "🔄 Triggering join command refresh via control plane..."
-        
-        # Send refresh command via SSM
-        COMMAND_ID=$(aws ssm send-command \
-          --instance-ids ${aws_instance.control_plane.id} \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands="sudo systemctl start k8s-token-creator.service || sudo /usr/local/bin/refresh-join-token.sh" \
-          --timeout-seconds 300 \
-          --region ${var.region} \
-          --output text \
-          --query "Command.CommandId" 2>/dev/null)
-        
-        if [[ -n "$COMMAND_ID" ]]; then
-          echo "📡 Command sent (ID: $COMMAND_ID), waiting for completion..."
-          sleep 30
-          
-          # Check command result
-          RESULT=$(aws ssm get-command-invocation \
-            --region ${var.region} \
-            --command-id "$COMMAND_ID" \
-            --instance-id ${aws_instance.control_plane.id} \
-            --output json 2>/dev/null || echo "{}")
-          
-          STATUS=$(echo "$RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
-          OUTPUT=$(echo "$RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-          
-          echo "📋 Command Status: $STATUS"
-          if [[ -n "$OUTPUT" ]]; then
-            echo "📋 Output: $OUTPUT"
-          fi
-        else
-          echo "⚠️ Failed to send refresh command"
-        fi
-      }
-      
-      # Check current join command
-      echo "🔍 Checking current join command..."
-      JOIN_CMD=$(aws secretsmanager get-secret-value \
-        --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-        --region ${var.region} \
-        --query SecretString \
-        --output text 2>/dev/null || echo "")
-      
-      if [[ "$JOIN_CMD" == *"kubeadm join"* ]] && [[ "$JOIN_CMD" == *"--token"* ]]; then
-        echo "✅ Valid join command found: $JOIN_CMD"
-        
-        # Sync to main secret
-        aws secretsmanager put-secret-value \
-          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command.id} \
-          --secret-string "$JOIN_CMD" \
-          --region ${var.region} || echo "⚠️ Failed to sync main secret"
-        
-      else
-        echo "⚠️ No valid join command found, triggering refresh..."
-        update_join_command
-        
-        # Wait and check again
-        sleep 30
-        JOIN_CMD=$(aws secretsmanager get-secret-value \
-          --secret-id ${aws_secretsmanager_secret.kubernetes_join_command_latest.id} \
-          --region ${var.region} \
-          --query SecretString \
-          --output text 2>/dev/null || echo "")
-        
-        if [[ "$JOIN_CMD" == *"kubeadm join"* ]]; then
-          echo "✅ Join command refreshed successfully"
-        else
-          echo "⚠️ Join command refresh may have failed, workers will retry"
-        fi
-      fi
-      
       # Upload logs for troubleshooting
       aws s3 cp /dev/stdin s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$(date +"%Y%m%d%H%M%S").log \
         --region ${var.region} <<< "Join command update completed at $(date)" || true
@@ -934,29 +862,6 @@ resource "null_resource" "update_join_command" {
 # =============================================================================
 # 🔧 LAMBDA FUNCTIONS - NODE MANAGEMENT AUTOMATION
 # =============================================================================
-
-# Lambda function for node management
-resource "aws_lambda_function" "node_management_lambda" {
-  filename         = "${path.module}/lambda_function.zip"
-  function_name    = "guy-node-management"
-  role            = aws_iam_role.node_management_lambda_role.arn
-  handler         = "lambda_function.lambda_handler"
-  runtime         = "python3.9"
-  timeout         = 300
-
-  depends_on = [null_resource.create_lambda_zip]
-
-  environment {
-    variables = {
-      CLUSTER_NAME = local.cluster_name
-      REGION = var.region
-      JOIN_COMMAND_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-      S3_BUCKET = aws_s3_bucket.worker_logs.bucket
-    }
-  }
-
-  tags = var.tags
-}
 
 # Lambda function code file
 resource "local_file" "lambda_function_code" {
@@ -978,22 +883,6 @@ def lambda_handler(event, context):
     
     try:
         logger.info(f"Received event: {json.dumps(event)}")
-        
-        # Handle SNS messages
-        if 'Records' in event and event['Records']:
-            for record in event['Records']:
-                if record.get('EventSource') == 'aws:sns':
-                    sns_message = json.loads(record['Sns']['Message'])
-                    handle_lifecycle_event(sns_message)
-        
-        # Handle EventBridge token refresh
-        elif event.get('source') == 'aws.events':
-            handle_token_refresh()
-        
-        # Handle direct invocation
-        else:
-            handle_direct_invocation(event)
-            
         return {
             'statusCode': 200,
             'body': json.dumps('Node management completed successfully')
@@ -1005,62 +894,6 @@ def lambda_handler(event, context):
             'statusCode': 500,
             'body': json.dumps(f'Error: {str(e)}')
         }
-
-def handle_lifecycle_event(message):
-    """Handle ASG lifecycle events"""
-    logger.info(f"Handling lifecycle event: {message}")
-    
-    # Process the lifecycle event
-    event_type = message.get('Event', '')
-    instance_id = message.get('EC2InstanceId', '')
-    
-    if 'autoscaling:EC2_INSTANCE_LAUNCHING' in event_type:
-        logger.info(f"Instance {instance_id} is launching")
-        # Additional launch logic can be added here
-        
-    elif 'autoscaling:EC2_INSTANCE_TERMINATING' in event_type:
-        logger.info(f"Instance {instance_id} is terminating")
-        # Clean up Kubernetes node if needed
-        cleanup_kubernetes_node(instance_id)
-
-def handle_token_refresh():
-    """Handle periodic token refresh"""
-    logger.info("Handling periodic token refresh")
-    
-    # Logic to refresh Kubernetes join tokens
-    refresh_join_token()
-
-def handle_direct_invocation(event):
-    """Handle direct Lambda invocation"""
-    logger.info("Handling direct invocation")
-    
-    action = event.get('action', 'refresh_token')
-    
-    if action == 'refresh_token':
-        refresh_join_token()
-    elif action == 'cleanup_nodes':
-        cleanup_orphaned_nodes()
-
-def refresh_join_token():
-    """Refresh Kubernetes join token"""
-    logger.info("Refreshing Kubernetes join token")
-    
-    # Implementation would trigger control plane to refresh token
-    # This is a placeholder for the actual token refresh logic
-
-def cleanup_kubernetes_node(instance_id):
-    """Clean up Kubernetes node for terminated instance"""
-    logger.info(f"Cleaning up Kubernetes node for instance: {instance_id}")
-    
-    # Implementation would remove the node from Kubernetes cluster
-    # This is a placeholder for the actual cleanup logic
-
-def cleanup_orphaned_nodes():
-    """Clean up orphaned Kubernetes nodes"""
-    logger.info("Cleaning up orphaned Kubernetes nodes")
-    
-    # Implementation would identify and remove orphaned nodes
-    # This is a placeholder for the actual cleanup logic
 EOF
 }
 
@@ -1093,7 +926,7 @@ resource "aws_iam_role" "node_management_lambda_role" {
       }
     ]
   })
-
+  
   tags = var.tags
 }
 
@@ -1158,6 +991,77 @@ resource "aws_iam_policy" "node_management_lambda_policy" {
 resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach" {
   role       = aws_iam_role.node_management_lambda_role.name
   policy_arn = aws_iam_policy.node_management_lambda_policy.arn
+}
+
+# Lambda function for node management
+resource "aws_lambda_function" "node_management_lambda" {
+  filename         = "${path.module}/lambda_function.zip"
+  function_name    = "guy-node-management"
+  role            = aws_iam_role.node_management_lambda_role.arn
+  handler         = "lambda_function.lambda_handler"
+  runtime         = "python3.9"
+  timeout         = 300
+
+  depends_on = [null_resource.create_lambda_zip]
+
+  environment {
+    variables = {
+      CLUSTER_NAME = local.cluster_name
+      REGION = var.region
+      JOIN_COMMAND_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+      S3_BUCKET = aws_s3_bucket.worker_logs.bucket
+    }
+  }
+
+  tags = var.tags
+}
+
+# =============================================================================
+# 📡 MONITORING AND AUTOMATION - SNS AND CLOUDWATCH
+# =============================================================================
+
+# SNS topic for lifecycle events
+resource "aws_sns_topic" "lifecycle_topic" {
+  name = "guy-asg-lifecycle-topic"
+  
+  tags = var.tags
+}
+
+resource "aws_sns_topic_subscription" "lambda_subscription" {
+  topic_arn = aws_sns_topic.lifecycle_topic.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.node_management_lambda.arn
+}
+
+resource "aws_lambda_permission" "sns_permission" {
+  statement_id  = "AllowExecutionFromSNS"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.lifecycle_topic.arn
+}
+
+# CloudWatch event for token refresh
+resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
+  name                = "guy-token-refresh-rule"
+  description         = "Trigger token refresh every 6 hours"
+  schedule_expression = "rate(6 hours)"
+  
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_event_target" "token_refresh_target" {
+  rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
+  target_id = "TokenRefreshTarget"
+  arn       = aws_lambda_function.node_management_lambda.arn
+}
+
+resource "aws_lambda_permission" "eventbridge_permission" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.node_management_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.token_refresh_rule.arn
 }
 
 # =============================================================================
