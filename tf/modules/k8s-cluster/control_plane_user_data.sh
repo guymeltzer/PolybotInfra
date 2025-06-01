@@ -7,25 +7,25 @@ export DEBIAN_FRONTEND=noninteractive
 
 # Enhanced logging setup - log to both file and stdout/stderr
 LOGFILE="/var/log/k8s-init.log"
-exec > >(tee -a $LOGFILE) 2>&1
+exec > >(tee -a $$LOGFILE) 2>&1
 
 echo "========================================================="
 echo "= STARTING CONTROL PLANE INITIALIZATION v2.0         ="
-echo "= Date: $(date)                                        ="
-echo "= PID: $$                                              ="
+echo "= Date: $$(date)                                        ="
+echo "= PID: $$$$                                              ="
 echo "========================================================="
 
 # Function for enhanced error handling
 error_exit() {
-    echo "FATAL ERROR: $1" >&2
-    echo "FATAL ERROR: $1" >> $LOGFILE
-    echo "Current working directory: $(pwd)" >> $LOGFILE
-    echo "Environment variables:" >> $LOGFILE
-    env | sort >> $LOGFILE
-    echo "Disk space:" >> $LOGFILE
-    df -h >> $LOGFILE
-    echo "Memory usage:" >> $LOGFILE
-    free -h >> $LOGFILE
+    echo "FATAL ERROR: $$1" >&2
+    echo "FATAL ERROR: $$1" >> $$LOGFILE
+    echo "Current working directory: $$(pwd)" >> $$LOGFILE
+    echo "Environment variables:" >> $$LOGFILE
+    env | sort >> $$LOGFILE
+    echo "Disk space:" >> $$LOGFILE
+    df -h >> $$LOGFILE
+    echo "Memory usage:" >> $$LOGFILE
+    free -h >> $$LOGFILE
     exit 1
 }
 
@@ -58,7 +58,7 @@ validate_variables() {
     fi
     
     echo "✅ All critical template variables validated"
-    echo "   - kubeadm_token: $(echo "${kubeadm_token}" | cut -d. -f1).****"
+    echo "   - kubeadm_token: $$(echo "${kubeadm_token}" | cut -d. -f1).****"
     echo "   - pod_cidr: ${pod_cidr}"
     echo "   - region: ${region}"
     echo "   - K8S version: ${K8S_VERSION_FULL}"
@@ -66,24 +66,24 @@ validate_variables() {
 
 # Function to check service status
 check_service() {
-    local service_name=$1
-    local max_wait=${2:-60}
+    local service_name=$$1
+    local max_wait=$${2:-60}
     local wait_time=0
     
-    echo "🔍 Checking service: $service_name"
+    echo "🔍 Checking service: $$service_name"
     
-    while [ $wait_time -lt $max_wait ]; do
-        if systemctl is-active --quiet $service_name; then
-            echo "✅ Service $service_name is active"
+    while [ $$wait_time -lt $$max_wait ]; do
+        if systemctl is-active --quiet $$service_name; then
+            echo "✅ Service $$service_name is active"
             return 0
         fi
-        echo "⏳ Waiting for $service_name to be active... ($wait_time/$max_wait)"
+        echo "⏳ Waiting for $$service_name to be active... ($$wait_time/$$max_wait)"
         sleep 5
-        wait_time=$((wait_time + 5))
+        wait_time=$$((wait_time + 5))
     done
     
-    echo "❌ Service $service_name failed to become active within $max_wait seconds"
-    systemctl status $service_name || true
+    echo "❌ Service $$service_name failed to become active within $$max_wait seconds"
+    systemctl status $$service_name || true
     return 1
 }
 
@@ -93,17 +93,17 @@ validate_variables
 # 0. Set Hostname (Good Practice)
 echo "🏷️ Setting hostname..."
 NEW_HOSTNAME="guy-control-plane-${TOKEN_SUFFIX}"
-hostnamectl set-hostname "$NEW_HOSTNAME"
-if grep -q "127.0.0.1 $NEW_HOSTNAME" /etc/hosts; then
-    echo "Hostname $NEW_HOSTNAME already in /etc/hosts for 127.0.0.1"
+hostnamectl set-hostname "$$NEW_HOSTNAME"
+if grep -q "127.0.0.1 $$NEW_HOSTNAME" /etc/hosts; then
+    echo "Hostname $$NEW_HOSTNAME already in /etc/hosts for 127.0.0.1"
 else
     if grep -q "127.0.0.1 localhost" /etc/hosts; then
-        sed -i "/^127.0.0.1 localhost/ s/$/ $NEW_HOSTNAME/" /etc/hosts
+        sed -i "/^127.0.0.1 localhost/ s/$$/ $$NEW_HOSTNAME/" /etc/hosts
     else
-        echo "127.0.0.1 localhost $NEW_HOSTNAME" >> /etc/hosts
+        echo "127.0.0.1 localhost $$NEW_HOSTNAME" >> /etc/hosts
     fi
 fi
-echo "✅ Hostname set to $NEW_HOSTNAME"
+echo "✅ Hostname set to $$NEW_HOSTNAME"
 
 # 1. Install essential packages
 echo "📦 Installing essential packages..."
@@ -166,14 +166,14 @@ echo "✅ CRI-O packages installed"
 
 # Configure CRI-O to use systemd cgroup driver
 CRIO_CONF="/etc/crio/crio.conf"
-if [ -f "$CRIO_CONF" ]; then
-    if grep -q "cgroup_manager" "$CRIO_CONF"; then
-        sed -i 's/cgroup_manager = "cgroupfs"/cgroup_manager = "systemd"/' "$CRIO_CONF"
+if [ -f "$$CRIO_CONF" ]; then
+    if grep -q "cgroup_manager" "$$CRIO_CONF"; then
+        sed -i 's/cgroup_manager = "cgroupfs"/cgroup_manager = "systemd"/' "$$CRIO_CONF"
     else
-        if grep -q "\[crio.runtime\]" "$CRIO_CONF"; then
-            sed -i '/\[crio.runtime\]/a \cgroup_manager = "systemd"' "$CRIO_CONF"
+        if grep -q "\[crio.runtime\]" "$$CRIO_CONF"; then
+            sed -i '/\[crio.runtime\]/a \cgroup_manager = "systemd"' "$$CRIO_CONF"
         else
-            echo -e "\n[crio.runtime]\ncgroup_manager = \"systemd\"" >> "$CRIO_CONF"
+            echo -e "\n[crio.runtime]\ncgroup_manager = \"systemd\"" >> "$$CRIO_CONF"
         fi
     fi
 else
@@ -211,24 +211,24 @@ systemctl enable kubelet
 
 # 6. Get instance metadata and prepare kubeadm config values
 echo "📡 Fetching instance metadata..."
-IMDS_TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s -f)
-if [ -n "$IMDS_TOKEN" ]; then
+IMDS_TOKEN=$$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s -f)
+if [ -n "$$IMDS_TOKEN" ]; then
     echo "✅ Acquired IMDSv2 token"
-    PRIVATE_IP=$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
-    PUBLIC_IP=$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
+    PRIVATE_IP=$$(curl -H "X-aws-ec2-metadata-token: $$IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
+    PUBLIC_IP=$$(curl -H "X-aws-ec2-metadata-token: $$IMDS_TOKEN" -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
 else
     echo "⚠️ Failed to get IMDSv2 token, attempting IMDSv1"
-    PRIVATE_IP=$(curl -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
-    PUBLIC_IP=$(curl -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
+    PRIVATE_IP=$$(curl -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
+    PUBLIC_IP=$$(curl -s -f http://169.254.169.254/latest/meta-data/public-ipv4)
 fi
 
-if [ -z "$PRIVATE_IP" ]; then
+if [ -z "$$PRIVATE_IP" ]; then
     error_exit "Could not determine Private IP from instance metadata"
 fi
 
 echo "✅ Instance metadata retrieved"
-echo "   - Private IP: $PRIVATE_IP"
-echo "   - Public IP: ${PUBLIC_IP:-Not assigned}"
+echo "   - Private IP: $$PRIVATE_IP"
+echo "   - Public IP: $${PUBLIC_IP:-Not assigned}"
 echo "   - Pod CIDR: ${pod_cidr}"
 
 # 7. Construct and Initialize Kubernetes with Kubeadm
@@ -243,10 +243,10 @@ bootstrapTokens:
   description: "Initial token for worker nodes to join"
   ttl: "24h"
 localAPIEndpoint:
-  advertiseAddress: $PRIVATE_IP
+  advertiseAddress: $$PRIVATE_IP
   bindPort: 6443
 nodeRegistration:
-  name: $NEW_HOSTNAME
+  name: $$NEW_HOSTNAME
   criSocket: "unix:///run/crio/crio.sock"
   kubeletExtraArgs:
     cloud-provider: "external"
@@ -254,19 +254,19 @@ nodeRegistration:
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
 kubernetesVersion: "v${K8S_VERSION_FULL}"
-controlPlaneEndpoint: "$PRIVATE_IP:6443"
+controlPlaneEndpoint: "$$PRIVATE_IP:6443"
 apiServer:
   certSANs:
-  - "$PRIVATE_IP"
+  - "$$PRIVATE_IP"
 EOF
 
 # Add public IP to certSANs if available
-if [ -n "$PUBLIC_IP" ]; then
-    echo "  - \"$PUBLIC_IP\"" >> /etc/kubernetes/kubeadm/kubeadm-config.yaml
+if [ -n "$$PUBLIC_IP" ]; then
+    echo "  - \"$$PUBLIC_IP\"" >> /etc/kubernetes/kubeadm/kubeadm-config.yaml
 fi
 
 cat >> /etc/kubernetes/kubeadm/kubeadm-config.yaml << EOF
-  - "$NEW_HOSTNAME"
+  - "$$NEW_HOSTNAME"
   - "127.0.0.1"
   - "localhost"
   - "kubernetes"
@@ -295,23 +295,23 @@ echo "✅ Pre-flight checks passed"
 echo "========================================="
 echo "🚀 STARTING KUBEADM INIT - CRITICAL STEP"
 echo "========================================="
-echo "Time: $(date)"
+echo "Time: $$(date)"
 echo "Config file: /etc/kubernetes/kubeadm/kubeadm-config.yaml"
-echo "Log location: $LOGFILE"
+echo "Log location: $$LOGFILE"
 
 # Run kubeadm init with timeout and detailed error handling
 timeout 600 kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5 2>&1 | tee -a /var/log/kubeadm-init.log
-KUBEADM_EXIT_CODE=${PIPESTATUS[0]}
+KUBEADM_EXIT_CODE=$${PIPESTATUS[0]}
 
-if [ $KUBEADM_EXIT_CODE -ne 0 ]; then
+if [ $$KUBEADM_EXIT_CODE -ne 0 ]; then
     echo "❌ KUBEADM INIT FAILED!"
-    echo "Exit code: $KUBEADM_EXIT_CODE"
+    echo "Exit code: $$KUBEADM_EXIT_CODE"
     echo "Detailed kubeadm init log:"
     cat /var/log/kubeadm-init.log
     echo "Current system status:"
     systemctl status kubelet || true
     systemctl status crio || true
-    error_exit "kubeadm init failed with exit code $KUBEADM_EXIT_CODE"
+    error_exit "kubeadm init failed with exit code $$KUBEADM_EXIT_CODE"
 fi
 
 echo "✅ KUBEADM INIT COMPLETED SUCCESSFULLY!"
@@ -442,23 +442,23 @@ cat > /usr/local/bin/manage-cloud-provider-taint.sh << 'TAINT_SCRIPT_EOF'
 # Script to manage cloud provider uninitialized taint
 
 LOGFILE="/var/log/cloud-provider-taint-manager.log"
-exec > >(tee -a "$LOGFILE") 2>&1
+exec > >(tee -a "$$LOGFILE") 2>&1
 
-echo "$(date): Starting cloud provider taint management"
+echo "$$(date): Starting cloud provider taint management"
 
 export KUBECONFIG=/etc/kubernetes/admin.conf
-NODE_NAME=$(hostname)
+NODE_NAME=$$(hostname)
 
 # Function to check if cloud controller manager is running
 check_ccm_running() {
     kubectl get pods -A -l app=aws-cloud-controller-manager 2>/dev/null | grep -q Running
-    return $?
+    return $$?
 }
 
 # Function to check if node has provider ID set
 check_provider_id() {
-    kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}' | grep -q "aws://"
-    return $?
+    kubectl get node "$$NODE_NAME" -o jsonpath='{.spec.providerID}' | grep -q "aws://"
+    return $$?
 }
 
 # Wait up to 10 minutes for CCM to initialize the node
@@ -466,59 +466,59 @@ CCM_TIMEOUT=600  # 10 minutes
 WAITED=0
 SLEEP_INTERVAL=30
 
-echo "$(date): Waiting up to $CCM_TIMEOUT seconds for cloud controller manager to initialize node..."
+echo "$$(date): Waiting up to $$CCM_TIMEOUT seconds for cloud controller manager to initialize node..."
 
-while [ $WAITED -lt $CCM_TIMEOUT ]; do
+while [ $$WAITED -lt $$CCM_TIMEOUT ]; do
     # Check if CCM is running and has set provider ID
     if check_ccm_running && check_provider_id; then
-        echo "$(date): Cloud controller manager has initialized the node successfully"
-        echo "$(date): Provider ID: $(kubectl get node "$NODE_NAME" -o jsonpath='{.spec.providerID}')"
+        echo "$$(date): Cloud controller manager has initialized the node successfully"
+        echo "$$(date): Provider ID: $$(kubectl get node "$$NODE_NAME" -o jsonpath='{.spec.providerID}')"
         exit 0
     fi
     
     # Check if the taint is already gone (CCM removed it)
-    if ! kubectl get node "$NODE_NAME" -o json | jq -r '.spec.taints[]? | select(.key == "node.cloudprovider.kubernetes.io/uninitialized") | .key' | grep -q uninitialized; then
-        echo "$(date): Cloud provider uninitialized taint has been removed by cloud controller manager"
+    if ! kubectl get node "$$NODE_NAME" -o json | jq -r '.spec.taints[]? | select(.key == "node.cloudprovider.kubernetes.io/uninitialized") | .key' | grep -q uninitialized; then
+        echo "$$(date): Cloud provider uninitialized taint has been removed by cloud controller manager"
         exit 0
     fi
     
-    sleep $SLEEP_INTERVAL
-    WAITED=$((WAITED + SLEEP_INTERVAL))
-    echo "$(date): Still waiting for CCM initialization... ($WAITED/$CCM_TIMEOUT seconds)"
+    sleep $$SLEEP_INTERVAL
+    WAITED=$$((WAITED + SLEEP_INTERVAL))
+    echo "$$(date): Still waiting for CCM initialization... ($$WAITED/$$CCM_TIMEOUT seconds)"
 done
 
 # If we reach here, CCM didn't initialize the node in time
-echo "$(date): WARNING: Cloud controller manager did not initialize the node within $CCM_TIMEOUT seconds"
-echo "$(date): Attempting to remove the uninitialized taint to unblock system pods"
+echo "$$(date): WARNING: Cloud controller manager did not initialize the node within $$CCM_TIMEOUT seconds"
+echo "$$(date): Attempting to remove the uninitialized taint to unblock system pods"
 
 # Remove the uninitialized taint to allow system pods to schedule
-if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null; then
-    echo "$(date): Successfully removed NoSchedule taint"
+if kubectl taint node "$$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoSchedule- 2>/dev/null; then
+    echo "$$(date): Successfully removed NoSchedule taint"
 else
-    echo "$(date): NoSchedule taint was not present or already removed"
+    echo "$$(date): NoSchedule taint was not present or already removed"
 fi
 
-if kubectl taint node "$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoExecute- 2>/dev/null; then
-    echo "$(date): Successfully removed NoExecute taint"
+if kubectl taint node "$$NODE_NAME" node.cloudprovider.kubernetes.io/uninitialized:NoExecute- 2>/dev/null; then
+    echo "$$(date): Successfully removed NoExecute taint"
 else
-    echo "$(date): NoExecute taint was not present or already removed"
+    echo "$$(date): NoExecute taint was not present or already removed"
 fi
 
 # Set a basic provider ID if none exists (fallback mechanism)
 if ! check_provider_id; then
-    echo "$(date): Setting fallback provider ID for node"
-    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-    AVAILABILITY_ZONE=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+    echo "$$(date): Setting fallback provider ID for node"
+    INSTANCE_ID=$$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    REGION=$$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+    AVAILABILITY_ZONE=$$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
     
-    if [ -n "$INSTANCE_ID" ] && [ -n "$AVAILABILITY_ZONE" ]; then
-        PROVIDER_ID="aws://$AVAILABILITY_ZONE/$INSTANCE_ID"
-        echo "$(date): Setting provider ID to: $PROVIDER_ID"
-        kubectl patch node "$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$PROVIDER_ID\"}}" || echo "$(date): Failed to set provider ID"
+    if [ -n "$$INSTANCE_ID" ] && [ -n "$$AVAILABILITY_ZONE" ]; then
+        PROVIDER_ID="aws://$$AVAILABILITY_ZONE/$$INSTANCE_ID"
+        echo "$$(date): Setting provider ID to: $$PROVIDER_ID"
+        kubectl patch node "$$NODE_NAME" -p "{\"spec\":{\"providerID\":\"$$PROVIDER_ID\"}}" || echo "$$(date): Failed to set provider ID"
     fi
 fi
 
-echo "$(date): Cloud provider taint management completed"
+echo "$$(date): Cloud provider taint management completed"
 TAINT_SCRIPT_EOF
 
 chmod +x /usr/local/bin/manage-cloud-provider-taint.sh
@@ -555,43 +555,43 @@ echo "⏳ Waiting for critical system pods to become ready..."
 
 # Function to wait for deployment readiness
 wait_for_deployment() {
-    local namespace=$1
-    local deployment=$2
-    local timeout=${3:-300}
+    local namespace=$$1
+    local deployment=$$2
+    local timeout=$${3:-300}
     
-    echo "⏳ Waiting for deployment $deployment in namespace $namespace to be ready..."
-    if kubectl wait --for=condition=available --timeout="${timeout}s" deployment/"$deployment" -n "$namespace"; then
-        echo "✅ Deployment $deployment is ready"
+    echo "⏳ Waiting for deployment $$deployment in namespace $$namespace to be ready..."
+    if kubectl wait --for=condition=available --timeout="$${timeout}s" deployment/"$$deployment" -n "$$namespace"; then
+        echo "✅ Deployment $$deployment is ready"
         return 0
     else
-        echo "❌ Timeout waiting for deployment $deployment"
+        echo "❌ Timeout waiting for deployment $$deployment"
         return 1
     fi
 }
 
 # Function to wait for daemonset readiness
 wait_for_daemonset() {
-    local namespace=$1
-    local daemonset=$2
-    local timeout=${3:-300}
+    local namespace=$$1
+    local daemonset=$$2
+    local timeout=$${3:-300}
     
-    echo "⏳ Waiting for daemonset $daemonset in namespace $namespace to be ready..."
-    local end_time=$(($(date +%s) + timeout))
+    echo "⏳ Waiting for daemonset $$daemonset in namespace $$namespace to be ready..."
+    local end_time=$$(($$$(date +%s) + timeout))
     
-    while [ $(date +%s) -lt $end_time ]; do
-        local desired=$(kubectl get daemonset "$daemonset" -n "$namespace" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
-        local ready=$(kubectl get daemonset "$daemonset" -n "$namespace" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+    while [ $$$(date +%s) -lt $$end_time ]; do
+        local desired=$$(kubectl get daemonset "$$daemonset" -n "$$namespace" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+        local ready=$$(kubectl get daemonset "$$daemonset" -n "$$namespace" -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
         
-        if [ "$desired" -gt 0 ] && [ "$ready" -eq "$desired" ]; then
-            echo "✅ DaemonSet $daemonset is ready ($ready/$desired)"
+        if [ "$$desired" -gt 0 ] && [ "$$ready" -eq "$$desired" ]; then
+            echo "✅ DaemonSet $$daemonset is ready ($$ready/$$desired)"
             return 0
         fi
         
-        echo "⏳ Still waiting for daemonset $daemonset: $ready/$desired ready"
+        echo "⏳ Still waiting for daemonset $$daemonset: $$ready/$$desired ready"
         sleep 10
     done
     
-    echo "❌ Timeout waiting for daemonset $daemonset"
+    echo "❌ Timeout waiting for daemonset $$daemonset"
     return 1
 }
 
@@ -611,13 +611,13 @@ echo ""
 
 # Check for any pods that are still pending and show their events
 echo "🔍 Checking for any pending pods and their events..."
-PENDING_PODS=$(kubectl get pods -A --field-selector=status.phase=Pending -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | head -5)
+PENDING_PODS=$$(kubectl get pods -A --field-selector=status.phase=Pending -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | head -5)
 
-if [ -n "$PENDING_PODS" ]; then
+if [ -n "$$PENDING_PODS" ]; then
     echo "⚠️ Found pending pods, showing events:"
-    for pod in $PENDING_PODS; do
-        echo "Events for pod $pod:"
-        kubectl describe pod "$pod" -A | grep -A 10 "Events:" || echo "No events found"
+    for pod in $$PENDING_PODS; do
+        echo "Events for pod $$pod:"
+        kubectl describe pod "$$pod" -A | grep -A 10 "Events:" || echo "No events found"
         echo "---"
     done
 else
@@ -626,19 +626,19 @@ fi
 
 # 10. Store a fresh join command in AWS Secrets Manager
 echo "🔐 Creating and storing new Kubeadm join command in AWS Secrets Manager..."
-JOIN_COMMAND=$(kubeadm token create --print-join-command)
-if [ -z "$JOIN_COMMAND" ]; then
+JOIN_COMMAND=$$(kubeadm token create --print-join-command)
+if [ -z "$$JOIN_COMMAND" ]; then
     error_exit "Failed to create a new join command with kubeadm"
 fi
 
 echo "📤 Storing join command in secrets..."
-if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}"; then
+if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_SECRET}" --secret-string "$$JOIN_COMMAND" --region "${region}"; then
     echo "✅ Successfully stored join command in ${JOIN_COMMAND_SECRET}"
 else
     echo "❌ ERROR: Failed to store join command in ${JOIN_COMMAND_SECRET}"
 fi
 
-if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_LATEST_SECRET}" --secret-string "$JOIN_COMMAND" --region "${region}"; then
+if aws secretsmanager put-secret-value --secret-id "${JOIN_COMMAND_LATEST_SECRET}" --secret-string "$$JOIN_COMMAND" --region "${region}"; then
     echo "✅ Successfully stored join command in ${JOIN_COMMAND_LATEST_SECRET}"
 else
     echo "❌ ERROR: Failed to store join command in ${JOIN_COMMAND_LATEST_SECRET}"
@@ -647,8 +647,8 @@ fi
 # Final success verification
 echo "========================================================="
 echo "= CONTROL PLANE INITIALIZATION COMPLETED SUCCESSFULLY ="
-echo "= Date: $(date)                                        ="
-echo "= Duration: $SECONDS seconds                           ="
+echo "= Date: $$(date)                                        ="
+echo "= Duration: $$SECONDS seconds                           ="
 echo "========================================================="
 
 # Final cluster verification
@@ -657,7 +657,7 @@ kubectl get nodes -o wide
 kubectl get pods --all-namespaces | head -20
 echo ""
 echo "✅ admin.conf location: /etc/kubernetes/admin.conf"
-echo "✅ Log location: $LOGFILE"
+echo "✅ Log location: $$LOGFILE"
 echo "✅ Kubeadm init log: /var/log/kubeadm-init.log"
 echo ""
 echo "🎯 Control plane initialization completed successfully!"

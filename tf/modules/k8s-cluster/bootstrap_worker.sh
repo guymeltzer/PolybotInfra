@@ -9,15 +9,15 @@ export DEBIAN_FRONTEND=noninteractive
 LOGFILE="/var/log/k8s-worker-bootstrap.log"
 CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
 mkdir -p /var/log
-touch "$LOGFILE"
-chmod 644 "$LOGFILE"
+touch "$$LOGFILE"
+chmod 644 "$$LOGFILE"
 
-exec > >(tee -a "$LOGFILE" "$CLOUD_INIT_LOG") 2>&1
+exec > >(tee -a "$$LOGFILE" "$$CLOUD_INIT_LOG") 2>&1
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootstrap (CRI-O)"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootstrap (CRI-O)"
 
 # Error handling with clear error messages
-# trap 'echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $LINENO: Command \"$BASH_COMMAND\" failed with exit code $?" >&2' ERR
+# trap 'echo "$$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Error at line $$LINENO: Command \"$$BASH_COMMAND\" failed with exit code $$?" >&2' ERR
 
 # These variables are NOW expected to be substituted by Terraform's templatefile function:
 # ${SSH_PUBLIC_KEY}, ${region}, ${JOIN_COMMAND_SECRET}, ${JOIN_COMMAND_LATEST_SECRET},
@@ -31,9 +31,9 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Starting Kubernetes worker node bootst
 
 # Initialize progress tracking
 mark_progress() {
-  local stage="$1"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $stage"
-  echo "$stage" > /var/log/worker-bootstrap-progress
+  local stage="$$1"
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] $$stage"
+  echo "$$stage" > /var/log/worker-bootstrap-progress
 }
 
 # 1. Configure SSH first for emergency access
@@ -53,9 +53,9 @@ EOF
   chmod 700 /root/.ssh
   chmod 600 /root/.ssh/authorized_keys
   chown -R root:root /root/.ssh
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH public key configured via template."
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] SSH public key configured via template."
 else
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] No explicit SSH_PUBLIC_KEY provided by template; relying on EC2 instance key pair."
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] No explicit SSH_PUBLIC_KEY provided by template; relying on EC2 instance key pair."
 fi
 
 # 2. Install essential packages
@@ -70,57 +70,57 @@ if ! command -v aws &> /dev/null; then
   unzip -q awscliv2.zip
   ./aws/install --update
   rm -rf awscliv2.zip aws/
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] AWS CLI installed."
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] AWS CLI installed."
 else
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] AWS CLI already present."
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] AWS CLI already present."
 fi
 aws --version
 
 # 4. Get instance metadata with robust retry
 mark_progress "Retrieving instance metadata"
 get_metadata() {
-  local max_attempts=5; local attempt=1; local wait_time=5; local key="$1"; local value=""
+  local max_attempts=5; local attempt=1; local wait_time=5; local key="$$1"; local value=""
   local imds_token
-  imds_token=$(curl -s -f -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+  imds_token=$$(curl -s -f -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
   
-  while [ "$attempt" -le "$max_attempts" ]; do
-    if [ -n "$imds_token" ]; then
-      value=$(curl -s -f -H "X-aws-ec2-metadata-token: $imds_token" "http://169.254.169.254/latest/meta-data/$key" 2>/dev/null || echo "")
+  while [ "$$attempt" -le "$$max_attempts" ]; do
+    if [ -n "$$imds_token" ]; then
+      value=$$(curl -s -f -H "X-aws-ec2-metadata-token: $$imds_token" "http://169.254.169.254/latest/meta-data/$$key" 2>/dev/null || echo "")
     else
-      value=$(curl -s -f "http://169.254.169.254/latest/meta-data/$key" 2>/dev/null || echo "")
+      value=$$(curl -s -f "http://169.254.169.254/latest/meta-data/$$key" 2>/dev/null || echo "")
     fi
-    if [ -n "$value" ] && [ "$value" != "404 - Not Found" ]; then echo "$value"; return 0; fi
+    if [ -n "$$value" ] && [ "$$value" != "404 - Not Found" ]; then echo "$$value"; return 0; fi
     # Avoid bash substring syntax that conflicts with templatefile parsing
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get metadata: $key (attempt $attempt/$max_attempts). Token: [token truncated...]. Value: [$value]"
-    sleep "$wait_time"; attempt=$((attempt + 1)); wait_time=$((wait_time * 2))
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get metadata: $$key (attempt $$attempt/$$max_attempts). Token: [token truncated...]. Value: [$$value]"
+    sleep "$$wait_time"; attempt=$$((attempt + 1)); wait_time=$$((wait_time * 2))
   done
   echo ""; return 1
 }
 
 # Use ${region} passed from Terraform template as the primary source for EFFECTIVE_REGION
 EFFECTIVE_REGION="${region}" # ${region} is from templatefile
-INSTANCE_ID_FROM_META=$(get_metadata "instance-id")
+INSTANCE_ID_FROM_META=$$(get_metadata "instance-id")
 # Override the placeholder values from templatefile with actual instance metadata
-PRIVATE_IP_FROM_META=$(get_metadata "local-ipv4")
-AZ_FROM_META=$(get_metadata "placement/availability-zone")
+PRIVATE_IP_FROM_META=$$(get_metadata "local-ipv4")
+AZ_FROM_META=$$(get_metadata "placement/availability-zone")
 
-if [ -z "$EFFECTIVE_REGION" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] AWS Region not provided via template."; exit 1; fi
-if [ -z "$INSTANCE_ID_FROM_META" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Could not retrieve Instance ID."; exit 1; fi
-if [ -z "$PRIVATE_IP_FROM_META" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Could not retrieve Private IP."; exit 1; fi
-if [ -z "$AZ_FROM_META" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not retrieve Availability Zone. Using fallback."; AZ_FROM_META="$${EFFECTIVE_REGION}a"; fi # Escape for templatefile
+if [ -z "$$EFFECTIVE_REGION" ]; then echo "$$(date '+%Y-%m-%d %H:%M:%S') [FATAL] AWS Region not provided via template."; exit 1; fi
+if [ -z "$$INSTANCE_ID_FROM_META" ]; then echo "$$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Could not retrieve Instance ID."; exit 1; fi
+if [ -z "$$PRIVATE_IP_FROM_META" ]; then echo "$$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Could not retrieve Private IP."; exit 1; fi
+if [ -z "$$AZ_FROM_META" ]; then echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not retrieve Availability Zone. Using fallback."; AZ_FROM_META="$${EFFECTIVE_REGION}a"; fi # Escape for templatefile
 
-NODE_NAME_SUFFIX=$(echo "$INSTANCE_ID_FROM_META" | cut -d'-' -f2)
+NODE_NAME_SUFFIX=$$(echo "$$INSTANCE_ID_FROM_META" | cut -d'-' -f2)
 # Override the placeholder value from templatefile with actual node name
-NODE_NAME="worker-$NODE_NAME_SUFFIX"
-hostnamectl set-hostname "$NODE_NAME"
-echo "127.0.0.1 $NODE_NAME" >> /etc/hosts
+NODE_NAME="worker-$$NODE_NAME_SUFFIX"
+hostnamectl set-hostname "$$NODE_NAME"
+echo "127.0.0.1 $$NODE_NAME" >> /etc/hosts
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
-echo "  Instance ID: $INSTANCE_ID_FROM_META"
-echo "  Private IP: $PRIVATE_IP_FROM_META"
-echo "  Region: $EFFECTIVE_REGION" # This is the bash variable EFFECTIVE_REGION
-echo "  AZ: $AZ_FROM_META"
-echo "  Node name: $NODE_NAME"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Instance metadata:"
+echo "  Instance ID: $$INSTANCE_ID_FROM_META"
+echo "  Private IP: $$PRIVATE_IP_FROM_META"
+echo "  Region: $$EFFECTIVE_REGION" # This is the bash variable EFFECTIVE_REGION
+echo "  AZ: $$AZ_FROM_META"
+echo "  Node name: $$NODE_NAME"
 
 # 6. Configure basic Kubernetes prerequisites
 mark_progress "Configuring Kubernetes prerequisites"
@@ -150,20 +150,20 @@ echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.i
 
 apt-get update -y
 apt-get install -y cri-o 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] CRI-O packages installed."
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] CRI-O packages installed."
 
 CRIO_CONF_DIR="/etc/crio/crio.conf.d"
-mkdir -p "$CRIO_CONF_DIR"
+mkdir -p "$$CRIO_CONF_DIR"
 cat > "$${CRIO_CONF_DIR}/01-cgroup-manager.conf" << EOF
 [crio.runtime]
 cgroup_manager = "systemd"
 EOF
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configured CRI-O for systemd cgroup manager."
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Configured CRI-O for systemd cgroup manager."
 
 systemctl daemon-reload
 systemctl enable --now crio
 systemctl restart crio
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] CRI-O started and enabled."
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] CRI-O started and enabled."
 
 # 8. Install Kubernetes components
 # Use ${K8S_MAJOR_MINOR_FOR_REPO} and ${K8S_PACKAGE_VERSION_TO_INSTALL} from templatefile
@@ -174,7 +174,7 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 apt-get update -y
 apt-get install -y kubelet="${K8S_PACKAGE_VERSION_TO_INSTALL}" kubeadm="${K8S_PACKAGE_VERSION_TO_INSTALL}" kubectl="${K8S_PACKAGE_VERSION_TO_INSTALL}"
 apt-mark hold kubelet kubeadm kubectl cri-o
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubernetes components installed and held."
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubernetes components installed and held."
 
 # 9. Configure Kubelet to use CRI-O
 mark_progress "Configuring Kubelet for CRI-O"
@@ -184,14 +184,14 @@ mkdir -p "${KUBELET_DROPIN_DIR}"
 # Use a filename like 20-crio-override.conf to ensure it's applied appropriately
 cat > "${KUBELET_DROPIN_DIR}/20-crio-override.conf" << EOF
 [Service]
-Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=${PRIVATE_IP_FROM_META} --hostname-override=${NODE_NAME} --cloud-provider=external"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/crio/crio.sock --node-ip=$$PRIVATE_IP_FROM_META --hostname-override=$$NODE_NAME --cloud-provider=external"
 EOF
 # Note: Now using actual bash variables set from instance metadata
 
 systemctl daemon-reload
 systemctl restart kubelet # Restart to ensure it picks up the drop-in *before* kubeadm join
 systemctl enable --now kubelet 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet configured for CRI-O, (re)started and enabled."
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Kubelet configured for CRI-O, (re)started and enabled."
 
 # 10. Retrieve and execute join command
 mark_progress "Retrieving join command"
@@ -200,66 +200,66 @@ JOIN_SECRETS_TO_TRY=("${JOIN_COMMAND_LATEST_SECRET}" "${JOIN_COMMAND_SECRET}")
 RAW_JOIN_COMMAND=""
 
 MAX_SECRET_FETCH_ATTEMPTS=10
-for attempt in $(seq 1 $MAX_SECRET_FETCH_ATTEMPTS); do
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $attempt/$MAX_SECRET_FETCH_ATTEMPTS to retrieve join command secret"
+for attempt in $$(seq 1 $$MAX_SECRET_FETCH_ATTEMPTS); do
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$MAX_SECRET_FETCH_ATTEMPTS to retrieve join command secret"
   # Correctly escaped for templatefile, iterate through array elements differently
   for secret_id_to_try in $${JOIN_SECRETS_TO_TRY[*]}; do
-    if [ -z "$secret_id_to_try" ]; then continue; fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying to retrieve secret: $secret_id_to_try"
+    if [ -z "$$secret_id_to_try" ]; then continue; fi
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Trying to retrieve secret: $$secret_id_to_try"
     
-    RAW_JOIN_COMMAND=$(aws secretsmanager get-secret-value \
-      --secret-id "$secret_id_to_try" \
-      --region "$EFFECTIVE_REGION" \
+    RAW_JOIN_COMMAND=$$(aws secretsmanager get-secret-value \
+      --secret-id "$$secret_id_to_try" \
+      --region "$$EFFECTIVE_REGION" \
       --query 'SecretString' \
       --output text 2>/dev/null || echo "")
     
-    if [ -n "$RAW_JOIN_COMMAND" ] && [[ "$RAW_JOIN_COMMAND" == *"kubeadm join"* ]]; then
-      echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Successfully retrieved join command from $secret_id_to_try"
+    if [ -n "$$RAW_JOIN_COMMAND" ] && [[ "$$RAW_JOIN_COMMAND" == *"kubeadm join"* ]]; then
+      echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Successfully retrieved join command from $$secret_id_to_try"
       break 2
     else
       RAW_JOIN_COMMAND=""
     fi
   done
-  if [ -n "$RAW_JOIN_COMMAND" ]; then break; fi
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get valid join command on attempt $attempt, waiting 30s..."
+  if [ -n "$$RAW_JOIN_COMMAND" ]; then break; fi
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to get valid join command on attempt $$attempt, waiting 30s..."
   sleep 30
 done
 
-if [ -z "$RAW_JOIN_COMMAND" ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Failed to retrieve a valid join command after $MAX_SECRET_FETCH_ATTEMPTS attempts."
+if [ -z "$$RAW_JOIN_COMMAND" ]; then
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Failed to retrieve a valid join command after $$MAX_SECRET_FETCH_ATTEMPTS attempts."
   exit 1
 fi
 
 CRIO_SOCKET_PATH="unix:///run/crio/crio.sock"
-MODIFIED_JOIN_COMMAND="$RAW_JOIN_COMMAND --cri-socket $CRIO_SOCKET_PATH --node-name $NODE_NAME"
+MODIFIED_JOIN_COMMAND="$$RAW_JOIN_COMMAND --cri-socket $$CRIO_SOCKET_PATH --node-name $$NODE_NAME"
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Using join command: $MODIFIED_JOIN_COMMAND"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Using join command: $$MODIFIED_JOIN_COMMAND"
 
 mark_progress "Joining cluster"
-kubeadm reset -f || echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] kubeadm reset failed, proceeding with join anyway..."
+kubeadm reset -f || echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] kubeadm reset failed, proceeding with join anyway..."
 
 MAX_JOIN_ATTEMPTS=10
 JOIN_RETRY_DELAY=30
-for attempt in $(seq 1 $MAX_JOIN_ATTEMPTS); do
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $attempt/$MAX_JOIN_ATTEMPTS to join Kubernetes cluster"
-  if eval "$MODIFIED_JOIN_COMMAND --v=5"; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the cluster!"
+for attempt in $$(seq 1 $$MAX_JOIN_ATTEMPTS); do
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [INFO] Attempt $$attempt/$$MAX_JOIN_ATTEMPTS to join Kubernetes cluster"
+  if eval "$$MODIFIED_JOIN_COMMAND --v=5"; then
+    echo "$$(date '+%Y-%m-%d %H:%M:%S') [SUCCESS] Successfully joined the cluster!"
     touch /var/log/worker-join-success
     mark_progress "Joined successfully"
     
     # Optional: Tag instance. Ensure ${cluster_name} is passed if used.
     # aws ec2 create-tags \
-    #   --resources "$INSTANCE_ID_FROM_META" \
-    #   --tags Key=Name,Value="$NODE_NAME" Key=kubernetes.io/cluster/"${cluster_name}",Value=owned \
-    #   --region "$EFFECTIVE_REGION" || echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to create some EC2 tags."
+    #   --resources "$$INSTANCE_ID_FROM_META" \
+    #   --tags Key=Name,Value="$$NODE_NAME" Key=kubernetes.io/cluster/"${cluster_name}",Value=owned \
+    #   --region "$$EFFECTIVE_REGION" || echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to create some EC2 tags."
     
     exit 0
   fi
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to join cluster on attempt $attempt. Retrying in $JOIN_RETRY_DELAY seconds..."
-  sleep $JOIN_RETRY_DELAY
+  echo "$$(date '+%Y-%m-%d %H:%M:%S') [WARN] Failed to join cluster on attempt $$attempt. Retrying in $$JOIN_RETRY_DELAY seconds..."
+  sleep $$JOIN_RETRY_DELAY
 done
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Failed to join cluster after $MAX_JOIN_ATTEMPTS attempts"
+echo "$$(date '+%Y-%m-%d %H:%M:%S') [FATAL] Failed to join cluster after $$MAX_JOIN_ATTEMPTS attempts"
 journalctl -u kubelet --no-pager -n 100
 mark_progress "Failed to join cluster"
 exit 1
