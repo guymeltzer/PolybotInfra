@@ -678,32 +678,354 @@ resource "aws_s3_bucket_acl" "user_data_scripts_acl" {
   acl    = "private"
 }
 
-# Upload control plane script to S3
+# Upload control plane script to S3 - Updated with comprehensive v9 script
 resource "aws_s3_object" "control_plane_script" {
   bucket = aws_s3_bucket.user_data_scripts.bucket
-  key    = "control_plane_user_data.sh"
-  content = templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
-    cluster_name                   = local.cluster_name
-    region                        = var.region
-    pod_cidr                       = local.pod_cidr
-    kubeadm_token                  = local.kubeadm_token
-    join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_SECRET            = aws_secretsmanager_secret.kubernetes_join_command.name
-    JOIN_COMMAND_LATEST_SECRET     = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-  }))
-  
-  # Force update when script changes
-  etag = md5(templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
-    cluster_name                   = local.cluster_name
-    region                        = var.region
-    pod_cidr                       = local.pod_cidr
-    kubeadm_token                  = local.kubeadm_token
-    join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_SECRET            = aws_secretsmanager_secret.kubernetes_join_command.name
-    JOIN_COMMAND_LATEST_SECRET     = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-  })))
+  key    = "control_plane_bootstrap_v9.sh"
+  content = <<-EOF
+#!/bin/bash
+set -euo pipefail
+
+# =================================================================
+# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v9
+# =================================================================
+
+# Set up comprehensive logging
+BOOTSTRAP_LOG="/var/log/k8s-bootstrap.log"
+CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
+
+# Create log files and ensure they're writable
+touch "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
+chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
+
+# Redirect all output to both log files
+exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
+
+echo "================================================================="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED               ="
+echo "= Time: $$(date)"
+echo "= Instance: $$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
+echo "= Private IP: $$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
+echo "= Public IP: $$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
+echo "================================================================="
+
+# Error handling function
+error_exit() {
+    echo "❌ FATAL ERROR: $1"
+    echo "❌ Time: $$(date)"
+    echo "❌ Exit code: $?"
+    echo "❌ Working directory: $$(pwd)"
+    echo "❌ Disk space:"
+    df -h
+    echo "❌ Memory:"
+    free -h
+    echo "❌ Last 20 lines of this log:"
+    tail -20 "$BOOTSTRAP_LOG" 2>/dev/null || echo "Cannot read bootstrap log"
+    exit 1
+}
+
+# Step 0: Set hostname
+echo "🏷️ Step 0: Setting hostname..."
+NEW_HOSTNAME="guy-control-plane-${random_string.token_part1.result}"
+hostnamectl set-hostname "$$NEW_HOSTNAME"
+echo "127.0.0.1 $$NEW_HOSTNAME" >> /etc/hosts
+echo "✅ Hostname set to: $$NEW_HOSTNAME"
+
+# Step 1: System updates and essential packages
+echo "📦 Step 1: Installing essential packages..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Update package lists
+echo "📥 Updating package lists..."
+apt-get update -y || error_exit "Failed to update package lists"
+
+# Install essential packages
+echo "📦 Installing essential packages..."
+apt-get install -y \
+    curl \
+    wget \
+    unzip \
+    jq \
+    awscli \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    apt-transport-https \
+    socat \
+    conntrack \
+    ipset || error_exit "Failed to install essential packages"
+
+echo "✅ Essential packages installed"
+
+# Verify AWS CLI works
+echo "🔍 Testing AWS CLI..."
+aws --version || error_exit "AWS CLI not working"
+echo "✅ AWS CLI verified"
+
+# Step 2: System configuration for Kubernetes
+echo "⚙️ Step 2: Configuring system for Kubernetes..."
+
+# Disable swap permanently
+echo "💾 Disabling swap..."
+swapoff -a
+sed -i.bak '/swap/s/^/#/' /etc/fstab
+echo "✅ Swap disabled"
+
+# Load required kernel modules
+echo "🔧 Loading kernel modules..."
+cat > /etc/modules-load.d/k8s.conf << 'MODULES_EOF'
+overlay
+br_netfilter
+MODULES_EOF
+
+modprobe overlay || error_exit "Failed to load overlay module"
+modprobe br_netfilter || error_exit "Failed to load br_netfilter module"
+echo "✅ Kernel modules loaded"
+
+# Configure sysctl parameters
+echo "🔧 Configuring sysctl parameters..."
+cat > /etc/sysctl.d/k8s.conf << 'SYSCTL_EOF'
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTL_EOF
+
+sysctl --system || error_exit "Failed to apply sysctl settings"
+echo "✅ System configuration completed"
+
+# Step 3: Install containerd (container runtime)
+echo "🐳 Step 3: Installing containerd container runtime..."
+
+# Install containerd
+echo "📦 Installing containerd..."
+apt-get update -y
+apt-get install -y containerd || error_exit "Failed to install containerd"
+
+# Configure containerd
+echo "🔧 Configuring containerd..."
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+
+# Enable systemd cgroup driver
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Start and enable containerd
+systemctl daemon-reload
+systemctl enable containerd
+systemctl start containerd
+
+# Verify containerd is running
+if ! systemctl is-active --quiet containerd; then
+    error_exit "containerd is not running"
+fi
+
+echo "✅ containerd installed and configured"
+
+# Step 4: Install Kubernetes components
+echo "☸️ Step 4: Installing Kubernetes components..."
+
+# Add Kubernetes apt repository
+echo "📥 Adding Kubernetes repository..."
+mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg || error_exit "Failed to add Kubernetes GPG key"
+
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+
+# Update package lists with new repository
+echo "📥 Updating package lists with Kubernetes repository..."
+apt-get update -y || error_exit "Failed to update package lists with Kubernetes repo"
+
+# Install Kubernetes components
+echo "📦 Installing kubectl, kubeadm, kubelet..."
+apt-get install -y \
+    kubelet=${local.k8s_package_version} \
+    kubeadm=${local.k8s_package_version} \
+    kubectl=${local.k8s_package_version} || error_exit "Failed to install Kubernetes components"
+
+# Hold packages to prevent automatic updates
+apt-mark hold kubelet kubeadm kubectl || error_exit "Failed to hold Kubernetes packages"
+
+# Verify installations
+echo "🔍 Verifying Kubernetes component installations..."
+kubectl version --client || error_exit "kubectl not installed correctly"
+kubeadm version || error_exit "kubeadm not installed correctly"
+kubelet --version || error_exit "kubelet not installed correctly"
+
+echo "✅ Kubernetes components installed successfully"
+
+# Step 5: Configure kubelet
+echo "🔧 Step 5: Configuring kubelet..."
+
+# Get instance metadata
+PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+# Configure kubelet with cloud provider
+mkdir -p /etc/systemd/system/kubelet.service.d
+cat > /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf << 'KUBELET_EOF'
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--cloud-provider=external --node-ip=$$PRIVATE_IP"
+KUBELET_EOF
+
+systemctl daemon-reload
+echo "✅ Kubelet configured"
+
+# Step 6: Initialize Kubernetes cluster with kubeadm
+echo "🚀 Step 6: Initializing Kubernetes cluster with kubeadm..."
+
+# Create kubeadm configuration
+echo "📝 Creating kubeadm configuration..."
+mkdir -p /etc/kubernetes/kubeadm
+
+cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << 'KUBEADM_EOF'
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+bootstrapTokens:
+- token: "${local.kubeadm_token}"
+  description: "Initial token for worker nodes"
+  ttl: "24h"
+localAPIEndpoint:
+  advertiseAddress: $$PRIVATE_IP
+  bindPort: 6443
+nodeRegistration:
+  name: $$NEW_HOSTNAME
+  criSocket: "unix:///run/containerd/containerd.sock"
+  kubeletExtraArgs:
+    cloud-provider: "external"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v${local.k8s_version_full}"
+controlPlaneEndpoint: "$$PRIVATE_IP:6443"
+apiServer:
+  certSANs:
+  - "$$PRIVATE_IP"
+  - "$$NEW_HOSTNAME"
+  - "127.0.0.1"
+  - "localhost"
+  - "kubernetes"
+  - "kubernetes.default"
+  - "kubernetes.default.svc"
+  - "kubernetes.default.svc.cluster.local"
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+networking:
+  podSubnet: "${local.pod_cidr}"
+  serviceSubnet: "10.96.0.0/12"
+KUBEADM_EOF
+
+echo "✅ Kubeadm configuration created"
+echo "📋 Configuration preview:"
+cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
+
+# Run kubeadm init
+echo "🎯 Running kubeadm init (this may take several minutes)..."
+echo "📋 Command: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5"
+echo "📋 Start time: $$(date)"
+
+# Create dedicated log for kubeadm init
+KUBEADM_LOG="/var/log/kubeadm-init.log"
+
+if kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5 > "$$KUBEADM_LOG" 2>&1; then
+    echo "✅ kubeadm init completed successfully!"
+    echo "📋 End time: $$(date)"
+    echo "📋 Last 10 lines of kubeadm output:"
+    tail -10 "$$KUBEADM_LOG"
+else
+    echo "❌ kubeadm init FAILED!"
+    echo "📋 End time: $$(date)"
+    echo "📋 Full kubeadm output:"
+    cat "$$KUBEADM_LOG"
+    error_exit "kubeadm init failed"
+fi
+
+# Verify admin.conf was created
+if [ ! -f /etc/kubernetes/admin.conf ]; then
+    error_exit "admin.conf was not created by kubeadm init"
+fi
+
+echo "✅ admin.conf verified: $$(stat -c%s /etc/kubernetes/admin.conf) bytes"
+
+# Step 7: Set up kubeconfig for root and ubuntu users
+echo "🔧 Step 7: Setting up kubeconfig..."
+
+# Set up for root
+mkdir -p /root/.kube
+cp -i /etc/kubernetes/admin.conf /root/.kube/config
+chown root:root /root/.kube/config
+chmod 600 /root/.kube/config
+
+# Set up for ubuntu user
+mkdir -p /home/ubuntu/.kube
+cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+chown ubuntu:ubuntu /home/ubuntu/.kube/config
+chmod 600 /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
+
+echo "✅ Kubeconfig configured for root and ubuntu users"
+
+# Step 8: Test cluster access
+echo "🔍 Step 8: Testing cluster access..."
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+if kubectl cluster-info; then
+    echo "✅ Cluster access verified"
+    kubectl get nodes
+else
+    error_exit "Cannot access Kubernetes cluster"
+fi
+
+# Step 9: Install CNI (Calico)
+echo "🌐 Step 9: Installing Calico CNI..."
+
+if kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml; then
+    echo "✅ Calico CNI installation initiated"
+else
+    echo "⚠️ Calico installation failed, but continuing..."
+fi
+
+# Step 10: Store join command in AWS Secrets Manager
+echo "🔐 Step 10: Storing join command in AWS Secrets Manager..."
+
+# Generate fresh join command
+JOIN_COMMAND=$$(kubeadm token create --print-join-command)
+
+if [ -n "$$JOIN_COMMAND" ]; then
+    echo "📤 Storing join command in secrets..."
+    
+    # Store in both secrets
+    aws secretsmanager put-secret-value \
+        --secret-id "${aws_secretsmanager_secret.kubernetes_join_command.name}" \
+        --secret-string "$$JOIN_COMMAND" \
+        --region "${var.region}" || echo "⚠️ Failed to store in primary secret"
+        
+    aws secretsmanager put-secret-value \
+        --secret-id "${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" \
+        --secret-string "$$JOIN_COMMAND" \
+        --region "${var.region}" || echo "⚠️ Failed to store in latest secret"
+        
+    echo "✅ Join command stored in AWS Secrets Manager"
+else
+    echo "⚠️ Failed to generate join command"
+fi
+
+# Final status report
+echo "================================================================="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED             ="
+echo "= Time: $$(date)"
+echo "= Status: SUCCESS"
+echo "================================================================="
+echo "📊 Final verification:"
+echo "   ✅ kubectl: $$(kubectl version --client --short 2>/dev/null)"
+echo "   ✅ kubeadm: $$(kubeadm version -o short 2>/dev/null)"
+echo "   ✅ kubelet: $$(systemctl is-active kubelet)"
+echo "   ✅ containerd: $$(systemctl is-active containerd)"
+echo "   ✅ admin.conf: $$([ -f /etc/kubernetes/admin.conf ] && echo 'EXISTS' || echo 'MISSING')"
+echo "    Logs available at: $$BOOTSTRAP_LOG"
+echo "   📁 Kubeadm logs at: $$KUBEADM_LOG"
+echo "================================================================="
+EOF
 
   tags = var.tags
 }
@@ -772,345 +1094,92 @@ resource "aws_instance" "control_plane" {
     set -euo pipefail
     
     # =================================================================
-    # KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v9
+    # S3 BOOTSTRAP SCRIPT FETCHER - CONTROL PLANE v1
     # =================================================================
     
-    # Set up comprehensive logging
-    BOOTSTRAP_LOG="/var/log/k8s-bootstrap.log"
-    CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
+    echo "========================================================="
+    echo "= S3 BOOTSTRAP SCRIPT FETCHER - STARTING              ="
+    echo "= Time: $(date)                                         ="
+    echo "= Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
+    echo "========================================================="
     
-    # Create log files and ensure they're writable
-    touch "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
-    chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
+    # Set up basic logging
+    FETCHER_LOG="/var/log/s3-bootstrap-fetcher.log"
+    exec > >(tee -a "$FETCHER_LOG") 2>&1
     
-    # Redirect all output to both log files
-    exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
-    
-    echo "================================================================="
-    echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED               ="
-    echo "= Time: $$(date)"
-    echo "= Instance: $$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-    echo "= Private IP: $$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
-    echo "= Public IP: $$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
-    echo "================================================================="
-    
-    # Error handling function
+    # Error handling
     error_exit() {
-        echo "❌ FATAL ERROR: $1"
-        echo "❌ Time: $$(date)"
-        echo "❌ Exit code: $?"
-        echo "❌ Working directory: $$(pwd)"
-        echo "❌ Disk space:"
-        df -h
-        echo "❌ Memory:"
-        free -h
-        echo "❌ Last 20 lines of this log:"
-        tail -20 "$BOOTSTRAP_LOG" 2>/dev/null || echo "Cannot read bootstrap log"
+        echo "❌ FETCHER ERROR: $1"
+        echo "❌ Time: $(date)"
         exit 1
     }
     
-    # Step 0: Set hostname
-    echo "🏷️ Step 0: Setting hostname..."
-    NEW_HOSTNAME="guy-control-plane-${random_string.token_part1.result}"
-    hostnamectl set-hostname "$$NEW_HOSTNAME"
-    echo "127.0.0.1 $$NEW_HOSTNAME" >> /etc/hosts
-    echo "✅ Hostname set to: $$NEW_HOSTNAME"
-    
-    # Step 1: System updates and essential packages
-    echo "📦 Step 1: Installing essential packages..."
+    # Install minimal required packages
+    echo "📦 Installing minimal required packages..."
     export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || error_exit "Failed to update package list"
+    apt-get install -y curl awscli || error_exit "Failed to install curl and awscli"
     
-    # Update package lists
-    echo "📥 Updating package lists..."
-    apt-get update -y || error_exit "Failed to update package lists"
-    
-    # Install essential packages
-    echo "📦 Installing essential packages..."
-    apt-get install -y \
-        curl \
-        wget \
-        unzip \
-        jq \
-        awscli \
-        ca-certificates \
-        gnupg \
-        lsb-release \
-        software-properties-common \
-        apt-transport-https \
-        socat \
-        conntrack \
-        ipset || error_exit "Failed to install essential packages"
-    
-    echo "✅ Essential packages installed"
-    
-    # Verify AWS CLI works
-    echo "🔍 Testing AWS CLI..."
+    # Verify AWS CLI
     aws --version || error_exit "AWS CLI not working"
-    echo "✅ AWS CLI verified"
     
-    # Step 2: System configuration for Kubernetes
-    echo "⚙️ Step 2: Configuring system for Kubernetes..."
+    # Download bootstrap script from S3
+    echo "📥 Downloading bootstrap script from S3..."
+    SCRIPT_PATH="/tmp/control_plane_bootstrap.sh"
+    S3_BUCKET="${aws_s3_bucket.user_data_scripts.bucket}"
+    S3_KEY="${aws_s3_object.control_plane_script.key}"
+    REGION="${var.region}"
     
-    # Disable swap permanently
-    echo "💾 Disabling swap..."
-    swapoff -a
-    sed -i.bak '/swap/s/^/#/' /etc/fstab
-    echo "✅ Swap disabled"
+    echo "📍 S3 Location: s3://$S3_BUCKET/$S3_KEY"
+    echo "🌍 Region: $REGION"
     
-    # Load required kernel modules
-    echo "🔧 Loading kernel modules..."
-    cat > /etc/modules-load.d/k8s.conf << 'MODULES_EOF'
-overlay
-br_netfilter
-MODULES_EOF
+    # Download with retries
+    for attempt in {1..5}; do
+        echo "📥 Download attempt $attempt/5..."
+        if aws s3 cp "s3://$S3_BUCKET/$S3_KEY" "$SCRIPT_PATH" --region "$REGION"; then
+            echo "✅ Script downloaded successfully"
+            break
+        else
+            echo "⚠️ Download attempt $attempt failed"
+            if [ $attempt -eq 5 ]; then
+                error_exit "Failed to download bootstrap script after 5 attempts"
+            fi
+            sleep 10
+        fi
+    done
     
-    modprobe overlay || error_exit "Failed to load overlay module"
-    modprobe br_netfilter || error_exit "Failed to load br_netfilter module"
-    echo "✅ Kernel modules loaded"
-    
-    # Configure sysctl parameters
-    echo "🔧 Configuring sysctl parameters..."
-    cat > /etc/sysctl.d/k8s.conf << 'SYSCTL_EOF'
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-SYSCTL_EOF
-    
-    sysctl --system || error_exit "Failed to apply sysctl settings"
-    echo "✅ System configuration completed"
-    
-    # Step 3: Install containerd (container runtime)
-    echo "🐳 Step 3: Installing containerd container runtime..."
-    
-    # Install containerd
-    echo "📦 Installing containerd..."
-    apt-get update -y
-    apt-get install -y containerd || error_exit "Failed to install containerd"
-    
-    # Configure containerd
-    echo "🔧 Configuring containerd..."
-    mkdir -p /etc/containerd
-    containerd config default > /etc/containerd/config.toml
-    
-    # Enable systemd cgroup driver
-    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-    
-    # Start and enable containerd
-    systemctl daemon-reload
-    systemctl enable containerd
-    systemctl start containerd
-    
-    # Verify containerd is running
-    if ! systemctl is-active --quiet containerd; then
-        error_exit "containerd is not running"
+    # Verify script was downloaded
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        error_exit "Bootstrap script not found at $SCRIPT_PATH"
     fi
     
-    echo "✅ containerd installed and configured"
+    # Check script size
+    SCRIPT_SIZE=$(stat -c%s "$SCRIPT_PATH")
+    echo "📊 Script size: $SCRIPT_SIZE bytes"
     
-    # Step 4: Install Kubernetes components
-    echo "☸️ Step 4: Installing Kubernetes components..."
+    if [ $SCRIPT_SIZE -lt 1000 ]; then
+        error_exit "Downloaded script too small ($SCRIPT_SIZE bytes), likely corrupted"
+    fi
     
-    # Add Kubernetes apt repository
-    echo "📥 Adding Kubernetes repository..."
-    mkdir -p -m 755 /etc/apt/keyrings
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg || error_exit "Failed to add Kubernetes GPG key"
+    # Make script executable
+    chmod +x "$SCRIPT_PATH" || error_exit "Failed to make script executable"
     
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+    # Execute the bootstrap script
+    echo "🚀 Executing bootstrap script..."
+    echo "📋 Command: $SCRIPT_PATH"
+    echo "📋 Start time: $(date)"
     
-    # Update package lists with new repository
-    echo "📥 Updating package lists with Kubernetes repository..."
-    apt-get update -y || error_exit "Failed to update package lists with Kubernetes repo"
-    
-    # Install Kubernetes components
-    echo "📦 Installing kubectl, kubeadm, kubelet..."
-    apt-get install -y \
-        kubelet=${local.k8s_package_version} \
-        kubeadm=${local.k8s_package_version} \
-        kubectl=${local.k8s_package_version} || error_exit "Failed to install Kubernetes components"
-    
-    # Hold packages to prevent automatic updates
-    apt-mark hold kubelet kubeadm kubectl || error_exit "Failed to hold Kubernetes packages"
-    
-    # Verify installations
-    echo "🔍 Verifying Kubernetes component installations..."
-    kubectl version --client || error_exit "kubectl not installed correctly"
-    kubeadm version || error_exit "kubeadm not installed correctly"
-    kubelet --version || error_exit "kubelet not installed correctly"
-    
-    echo "✅ Kubernetes components installed successfully"
-    
-    # Step 5: Configure kubelet
-    echo "🔧 Step 5: Configuring kubelet..."
-    
-    # Get instance metadata
-    PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-    
-    # Configure kubelet with cloud provider
-    mkdir -p /etc/systemd/system/kubelet.service.d
-    cat > /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf << 'KUBELET_EOF'
-[Service]
-Environment="KUBELET_EXTRA_ARGS=--cloud-provider=external --node-ip=$$PRIVATE_IP"
-KUBELET_EOF
-    
-    systemctl daemon-reload
-    echo "✅ Kubelet configured"
-    
-    # Step 6: Initialize Kubernetes cluster with kubeadm
-    echo "🚀 Step 6: Initializing Kubernetes cluster with kubeadm..."
-    
-    # Create kubeadm configuration
-    echo "📝 Creating kubeadm configuration..."
-    mkdir -p /etc/kubernetes/kubeadm
-    
-    cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << 'KUBEADM_EOF'
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
-bootstrapTokens:
-- token: "${local.kubeadm_token}"
-  description: "Initial token for worker nodes"
-  ttl: "24h"
-localAPIEndpoint:
-  advertiseAddress: $$PRIVATE_IP
-  bindPort: 6443
-nodeRegistration:
-  name: $$NEW_HOSTNAME
-  criSocket: "unix:///run/containerd/containerd.sock"
-  kubeletExtraArgs:
-    cloud-provider: "external"
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-kubernetesVersion: "v$${local.k8s_version_full}"
-controlPlaneEndpoint: "$$PRIVATE_IP:6443"
-apiServer:
-  certSANs:
-  - "$$PRIVATE_IP"
-  - "$$NEW_HOSTNAME"
-  - "127.0.0.1"
-  - "localhost"
-  - "kubernetes"
-  - "kubernetes.default"
-  - "kubernetes.default.svc"
-  - "kubernetes.default.svc.cluster.local"
-controllerManager:
-  extraArgs:
-    cloud-provider: "external"
-networking:
-  podSubnet: "${local.pod_cidr}"
-  serviceSubnet: "10.96.0.0/12"
-KUBEADM_EOF
-    
-    echo "✅ Kubeadm configuration created"
-    echo "📋 Configuration preview:"
-    cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
-    
-    # Run kubeadm init
-    echo "🎯 Running kubeadm init (this may take several minutes)..."
-    echo "📋 Command: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5"
-    echo "📋 Start time: $$(date)"
-    
-    # Create dedicated log for kubeadm init
-    KUBEADM_LOG="/var/log/kubeadm-init.log"
-    
-    if kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5 > "$$KUBEADM_LOG" 2>&1; then
-        echo "✅ kubeadm init completed successfully!"
-        echo "📋 End time: $$(date)"
-        echo "📋 Last 10 lines of kubeadm output:"
-        tail -10 "$$KUBEADM_LOG"
+    if "$SCRIPT_PATH"; then
+        echo "✅ Bootstrap script completed successfully!"
+        echo "📋 End time: $(date)"
     else
-        echo "❌ kubeadm init FAILED!"
-        echo "📋 End time: $$(date)"
-        echo "📋 Full kubeadm output:"
-        cat "$$KUBEADM_LOG"
-        error_exit "kubeadm init failed"
+        error_exit "Bootstrap script execution failed"
     fi
     
-    # Verify admin.conf was created
-    if [ ! -f /etc/kubernetes/admin.conf ]; then
-        error_exit "admin.conf was not created by kubeadm init"
-    fi
-    
-    echo "✅ admin.conf verified: $$(stat -c%s /etc/kubernetes/admin.conf) bytes"
-    
-    # Step 7: Set up kubeconfig for root and ubuntu users
-    echo "🔧 Step 7: Setting up kubeconfig..."
-    
-    # Set up for root
-    mkdir -p /root/.kube
-    cp -i /etc/kubernetes/admin.conf /root/.kube/config
-    chown root:root /root/.kube/config
-    chmod 600 /root/.kube/config
-    
-    # Set up for ubuntu user
-    mkdir -p /home/ubuntu/.kube
-    cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-    chown ubuntu:ubuntu /home/ubuntu/.kube/config
-    chmod 600 /home/ubuntu/.kube/config
-    chown -R ubuntu:ubuntu /home/ubuntu/.kube
-    
-    echo "✅ Kubeconfig configured for root and ubuntu users"
-    
-    # Step 8: Test cluster access
-    echo "🔍 Step 8: Testing cluster access..."
-    export KUBECONFIG=/etc/kubernetes/admin.conf
-    
-    if kubectl cluster-info; then
-        echo "✅ Cluster access verified"
-        kubectl get nodes
-    else
-        error_exit "Cannot access Kubernetes cluster"
-    fi
-    
-    # Step 9: Install CNI (Calico)
-    echo "🌐 Step 9: Installing Calico CNI..."
-    
-    if kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml; then
-        echo "✅ Calico CNI installation initiated"
-    else
-        echo "⚠️ Calico installation failed, but continuing..."
-    fi
-    
-    # Step 10: Store join command in AWS Secrets Manager
-    echo "🔐 Step 10: Storing join command in AWS Secrets Manager..."
-    
-    # Generate fresh join command
-    JOIN_COMMAND=$$(kubeadm token create --print-join-command)
-    
-    if [ -n "$$JOIN_COMMAND" ]; then
-        echo "📤 Storing join command in secrets..."
-        
-        # Store in both secrets
-        aws secretsmanager put-secret-value \
-            --secret-id "${aws_secretsmanager_secret.kubernetes_join_command.name}" \
-            --secret-string "$$JOIN_COMMAND" \
-            --region "${var.region}" || echo "⚠️ Failed to store in primary secret"
-            
-        aws secretsmanager put-secret-value \
-            --secret-id "${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" \
-            --secret-string "$$JOIN_COMMAND" \
-            --region "${var.region}" || echo "⚠️ Failed to store in latest secret"
-            
-        echo "✅ Join command stored in AWS Secrets Manager"
-    else
-        echo "⚠️ Failed to generate join command"
-    fi
-    
-    # Final status report
-    echo "================================================================="
-    echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED             ="
-    echo "= Time: $$(date)"
-    echo "= Status: SUCCESS"
-    echo "================================================================="
-    echo "📊 Final verification:"
-    echo "   ✅ kubectl: $$(kubectl version --client --short 2>/dev/null)"
-    echo "   ✅ kubeadm: $$(kubeadm version -o short 2>/dev/null)"
-    echo "   ✅ kubelet: $$(systemctl is-active kubelet)"
-    echo "   ✅ containerd: $$(systemctl is-active containerd)"
-    echo "   ✅ admin.conf: $$([ -f /etc/kubernetes/admin.conf ] && echo 'EXISTS' || echo 'MISSING')"
-    echo "    Logs available at: $$BOOTSTRAP_LOG"
-    echo "   📁 Kubeadm logs at: $$KUBEADM_LOG"
-    echo "================================================================="
-    
+    echo "========================================================="
+    echo "= S3 BOOTSTRAP SCRIPT FETCHER - COMPLETED             ="
+    echo "= Time: $(date)                                         ="
+    echo "========================================================="
     EOF
   )
 
