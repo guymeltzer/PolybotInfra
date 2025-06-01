@@ -68,6 +68,7 @@ module "k8s-cluster" {
   vpc_id                       = var.vpc_id
   subnet_ids                   = var.subnet_ids
   route53_zone_id              = var.route53_zone_id
+  domain_name                  = var.domain_name
   
   # Instance configuration
   control_plane_ami            = var.control_plane_ami

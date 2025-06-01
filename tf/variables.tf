@@ -21,6 +21,11 @@ variable "route53_zone_id" {
   type        = string
 }
 
+variable "domain_name" {
+  description = "Domain name for SSL certificate (e.g., guy-polybot-lg.devops-int-college.com)"
+  type        = string
+}
+
 variable "key_name" {
   description = "SSH key name for EC2 instances"
   type        = string

@@ -19,6 +19,9 @@ pod_cidr = "10.244.0.0/16"  # Flannel default
 # Route53 zone ID (replace with your actual zone ID)
 route53_zone_id = "Z02842682SGSPDJQMJGFT"
 
+# SSL domain configuration  
+domain_name = "guy-polybot.devops-int-college.com"
+
 key_name                   = "polybot-key"           # SSH key for instance access
 ssh_private_key_file_path  = "~/.ssh/polybot-key.pem" 
 vpc_id                     = ""                      # Leave empty to create a new VPC
