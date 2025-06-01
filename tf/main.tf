@@ -707,7 +707,7 @@ resource "terraform_data" "kubectl_provider_config" {
         
         for check in $(seq 1 $max_checks); do
           local elapsed_minutes=$(((check - 1) * check_interval / 60))
-          echo "🔄 Check $check/$max_checks (${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
+          echo "🔄 Check $check/$max_checks ($${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
           
           # Comprehensive check for kubeadm completion
           COMMAND_ID=$(aws ssm send-command \
@@ -1017,10 +1017,9 @@ resource "terraform_data" "kubectl_provider_config" {
   
   # Enhanced dependencies to ensure proper initialization order
   depends_on = [
-    module.k8s-cluster.aws_instance.control_plane,
-    # Wait for the control plane to be fully initialized
-    # This should include waiting for user data script completion
-    module.k8s-cluster.null_resource.wait_for_control_plane
+    module.k8s-cluster
+    # Wait for the module to complete - removed specific resource references
+    # since they don't exist in the module outputs
   ]
 }
 
@@ -2157,7 +2156,7 @@ resource "null_resource" "node_termination_handler_check" {
 # Enhanced SSH Diagnostics and Validation Resource
 resource "null_resource" "ssh_diagnostic_validation" {
   depends_on = [
-    module.k8s-cluster.aws_instance.control_plane,
+    module.k8s-cluster,
     terraform_data.kubectl_provider_config
   ]
   
