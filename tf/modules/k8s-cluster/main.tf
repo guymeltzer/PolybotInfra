@@ -52,6 +52,9 @@ locals {
   cluster_name = var.cluster_name
   pod_cidr = var.pod_cidr
   
+  # ASG names (defined here to avoid circular dependencies)
+  worker_asg_name = "guy-polybot-asg"
+  
   # SSH key management
   actual_key_name = var.key_name != "" ? var.key_name : (
     length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : "polybot-key"
@@ -735,7 +738,7 @@ resource "aws_launch_template" "worker_lt" {
     JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
     control_plane_endpoint     = "https://${aws_instance.control_plane.private_ip}:6443"
     s3_bucket                  = aws_s3_bucket.worker_logs.bucket
-    worker_asg_name            = aws_autoscaling_group.worker_asg.name
+    worker_asg_name            = local.worker_asg_name
     K8S_VERSION_TO_INSTALL     = local.k8s_package_version
   })))
 
@@ -755,7 +758,7 @@ resource "aws_launch_template" "worker_lt" {
 
 # Worker auto scaling group
 resource "aws_autoscaling_group" "worker_asg" {
-  name                = "guy-polybot-asg"
+  name                = local.worker_asg_name
   vpc_zone_identifier = module.vpc.public_subnets
   target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
   health_check_type   = "ELB"
@@ -772,7 +775,7 @@ resource "aws_autoscaling_group" "worker_asg" {
 
   tag {
     key                 = "Name"
-    value               = "guy-polybot-asg"
+    value               = local.worker_asg_name
     propagate_at_launch = false
   }
 
@@ -1198,7 +1201,7 @@ resource "terraform_data" "cluster_health_assessment" {
   triggers_replace = {
     # Check cluster health whenever these change
     control_plane_id = aws_instance.control_plane.id
-    asg_name = "guy-polybot-asg"
+    asg_name = local.worker_asg_name
     assessment_version = "v1"
   }
 
@@ -1262,7 +1265,7 @@ resource "terraform_data" "cluster_health_assessment" {
             # Get current ASG desired capacity
             ASG_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
               --region ${var.region} \
-              --auto-scaling-group-names "guy-polybot-asg" \
+              --auto-scaling-group-names "${local.worker_asg_name}" \
               --query "AutoScalingGroups[0].DesiredCapacity" \
               --output text 2>/dev/null || echo "0")
             
