@@ -25,13 +25,13 @@ module "vpc" {
   enable_dns_support   = true
 
   tags = merge(var.tags, {
-    Name                               = "guy-vpc"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    Name                                      = "guy-vpc"
+    "kubernetes-io-cluster-kubernetes"        = "owned"
   })
 
   public_subnet_tags = {
-    "kubernetes.io/role/elb"          = "1"
-    "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes-io-role-elb"          = "1"
+    "kubernetes-io-role-internal-elb" = "1"
   }
 }
 
@@ -200,7 +200,7 @@ resource "aws_security_group" "control_plane_sg" {
 
   tags = merge(var.tags, {
     Name = "Guy-Control-Plane-SG"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   })
 }
 
@@ -248,7 +248,7 @@ resource "aws_security_group" "worker_sg" {
 
   tags = merge(var.tags, {
     Name = "Guy-Worker-SG"
-    "kubernetes.io/cluster/kubernetes" = "owned"
+    "kubernetes-io-cluster-kubernetes" = "owned"
   })
 }
 
@@ -485,8 +485,7 @@ resource "aws_iam_role_policy_attachment" "worker_policies" {
     "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
     "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
     "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-    "arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicy"
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
   ])
   
   role       = aws_iam_role.worker_role.name
@@ -686,24 +685,24 @@ resource "aws_s3_object" "control_plane_script" {
   content = templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
     cluster_name                   = local.cluster_name
     region                        = var.region
-    pod_cidr                      = local.pod_cidr
-    kubeadm_token                 = local.kubeadm_token
-    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
-    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    pod_cidr                       = local.pod_cidr
+    kubeadm_token                  = local.kubeadm_token
+    join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
+    join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_SECRET            = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET     = aws_secretsmanager_secret.kubernetes_join_command_latest.name
   }))
   
   # Force update when script changes
   etag = md5(templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
     cluster_name                   = local.cluster_name
     region                        = var.region
-    pod_cidr                      = local.pod_cidr
-    kubeadm_token                 = local.kubeadm_token
-    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
-    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    pod_cidr                       = local.pod_cidr
+    kubeadm_token                  = local.kubeadm_token
+    join_command_secret_id         = aws_secretsmanager_secret.kubernetes_join_command.id
+    join_command_secret_latest_id  = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_SECRET            = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET     = aws_secretsmanager_secret.kubernetes_join_command_latest.name
   })))
 
   tags = var.tags
@@ -815,7 +814,7 @@ resource "aws_instance" "control_plane" {
   tags = merge(var.tags, {
     Name = "guy-control-plane"
     Role = "control-plane"
-    "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+    "kubernetes-io-cluster-${local.cluster_name}" = "owned"
   })
 
   lifecycle {
@@ -873,7 +872,7 @@ resource "aws_launch_template" "worker_lt" {
     tags = merge(var.tags, {
       Name = "guy-worker-node"
       Role = "worker"
-      "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+      "kubernetes-io-cluster-${local.cluster_name}" = "owned"
     })
   }
 
@@ -906,7 +905,7 @@ resource "aws_autoscaling_group" "worker_asg" {
   }
 
   tag {
-    key                 = "kubernetes.io/cluster/${local.cluster_name}"
+    key                 = "kubernetes-io-cluster-${local.cluster_name}"
     value               = "owned"
     propagate_at_launch = true
   }

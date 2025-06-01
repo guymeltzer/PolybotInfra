@@ -285,7 +285,7 @@ output "check_asg" {
 
 output "list_instances" {
   description = "Command to list all cluster instances" #OUTPUT
-  value = "aws ec2 describe-instances --filters Name=tag:kubernetes.io/cluster/${var.cluster_name},Values=owned"
+  value = "aws ec2 describe-instances --filters Name=tag:kubernetes-io-cluster-${var.cluster_name},Values=owned"
 }
 
 # =============================================================================
