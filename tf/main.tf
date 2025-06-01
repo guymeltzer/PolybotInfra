@@ -193,7 +193,7 @@ resource "terraform_data" "kubectl_provider_config" {
           local elapsed=\$((check * check_interval))
           local elapsed_minutes=\$((elapsed / 60))
           echo ""
-          echo "🔄 Check \$check/\$max_checks (\${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
+          echo "🔄 Check \$check/\$max_checks (\$${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
           
           # Enhanced verification command with better logging
           COMMAND_ID=\$(aws ssm send-command \

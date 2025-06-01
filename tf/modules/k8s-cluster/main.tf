@@ -1166,11 +1166,11 @@ resource "null_resource" "update_join_command" {
         exit 0
       fi
       
-      echo "📡 Control Plane: ${aws_instance.control_plane.public_ip}"
-      echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
+      echo "📡 Control Plane: $${aws_instance.control_plane.public_ip}"
+      echo "🔑 Secrets: $${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
       
       # Upload logs for troubleshooting
-      echo "Join command update completed at $$(date)" | aws s3 cp - s3://${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$$(date +"%Y%m%d%H%M%S").log --region ${var.region} || true
+      echo "Join command update completed at $$(date)" | aws s3 cp - s3://$${aws_s3_bucket.worker_logs.bucket}/logs/join-command-$$(date +"%Y%m%d%H%M%S").log --region ${var.region} || true
       
       echo "✅ Join command management completed"
     EOT
@@ -1183,7 +1183,7 @@ resource "null_resource" "update_join_command" {
 
 # Lambda function code file
 resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/lambda_code.py"
+  filename = "$${path.module}/lambda_code.py"
   content = <<EOF
 import json
 import boto3
@@ -1219,7 +1219,7 @@ EOF
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = local_file.lambda_function_code.filename
-  output_path = "${path.module}/lambda_function.zip"
+  output_path = "$${path.module}/lambda_function.zip"
   
   depends_on = [local_file.lambda_function_code]
 }
@@ -1294,7 +1294,7 @@ resource "aws_iam_policy" "node_management_lambda_policy" {
           "s3:PutObject",
           "s3:GetObject"
         ]
-        Resource = "${aws_s3_bucket.worker_logs.arn}/*"
+        Resource = "$${aws_s3_bucket.worker_logs.arn}/*"
       }
     ]
   })
