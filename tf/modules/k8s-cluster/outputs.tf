@@ -423,3 +423,37 @@ output "kubeconfig_path" {
   description = "Local kubeconfig file path (legacy compatibility)" #OUTPUT
   value = "${path.module}/../../kubeconfig.yaml"
 }
+
+# =============================================================================
+# 🔧 DEBUGGING AND TROUBLESHOOTING OUTPUTS
+# =============================================================================
+
+#OUTPUT - Enhanced debugging commands with log access
+output "debug_control_plane_initialization" {
+  description = "Commands to debug control plane initialization" #OUTPUT
+  value = <<EOT
+🔍 Debug Control Plane Initialization:
+
+1️⃣ Check initialization logs:
+   aws ssm start-session --target ${aws_instance.control_plane.id} --region ${var.region}
+   sudo cat /var/log/k8s-init.log
+   sudo cat /var/log/kubeadm-init.log
+
+2️⃣ Check system services:
+   sudo systemctl status kubelet --no-pager
+   sudo systemctl status crio --no-pager
+   sudo journalctl -u kubelet --no-pager -l
+
+3️⃣ Check kubeadm status:
+   sudo kubeadm version
+   ls -la /etc/kubernetes/
+   sudo cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
+
+4️⃣ Direct SSH access:
+   ssh -i ${local.actual_key_name}.pem ubuntu@${aws_instance.control_plane.public_ip}
+
+5️⃣ Check cloud-init logs:
+   sudo cat /var/log/cloud-init-output.log
+   sudo tail -100 /var/log/cloud-init.log
+EOT
+}
