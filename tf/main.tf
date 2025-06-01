@@ -627,10 +627,10 @@ resource "null_resource" "cluster_maintenance" {
         instance_id=""
         
         # Extract instance ID from node name
-        if [[ "\$\$node_name" =~ worker-([a-f0-9]{17})\$\$ ]]; then
-          instance_id="i-\$\${BASH_REMATCH[1]}"
-        elif [[ "\$\$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
-          instance_id="\$\${BASH_REMATCH[1]}"
+        if [[ "$${node_name}" =~ worker-([a-f0-9]{17})$$ ]]; then
+          instance_id="i-$${BASH_REMATCH[1]}"
+        elif [[ "$${node_name}" =~ (i-[a-f0-9]{8,17}) ]]; then
+          instance_id="$${BASH_REMATCH[1]}"
         fi
         
         # Check if instance exists in ASG
