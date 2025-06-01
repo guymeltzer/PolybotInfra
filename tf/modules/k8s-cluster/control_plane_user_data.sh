@@ -11,14 +11,14 @@ exec > >(tee -a /var/log/k8s-init.log) 2>&1
 echo "--- Starting control plane initialization at $(date) ---"
 
 # These variables are expected to be substituted by Terraform's templatefile function:
-# ${token_formatted}, ${TOKEN_SUFFIX}, ${ssh_public_key}, ${POD_CIDR},
+# ${kubeadm_token}, ${TOKEN_SUFFIX}, ${ssh_public_key}, ${pod_cidr},
 # ${JOIN_COMMAND_SECRET}, ${JOIN_COMMAND_LATEST_SECRET}, ${region},
 # ${K8S_VERSION_FULL}, ${K8S_PACKAGE_VERSION}, ${K8S_MAJOR_MINOR}
 
 # 0. Set Hostname (Good Practice)
 echo "Setting hostname..."
-if [ -z "${token_formatted}" ]; then # This is substituted by templatefile
-  echo "FATAL: token_formatted variable not set in template. Exiting."
+if [ -z "${kubeadm_token}" ]; then # This is substituted by templatefile
+  echo "FATAL: kubeadm_token variable not set in template. Exiting."
   exit 1
 fi
 # TOKEN_SUFFIX is substituted by templatefile
@@ -161,24 +161,24 @@ else
   echo "Public IP not found or not assigned to this instance."
 fi
 
-if [ -z "${POD_CIDR}" ]; then # POD_CIDR is substituted by templatefile
-  echo "FATAL: POD_CIDR variable not set in template. Exiting."
+if [ -z "${pod_cidr}" ]; then # pod_cidr is substituted by templatefile
+  echo "FATAL: pod_cidr variable not set in template. Exiting."
   exit 1
 fi
-echo "Using POD_CIDR: ${POD_CIDR}"
-echo "Using bootstrap token prefix: $(echo "${token_formatted}" | cut -d. -f1).*****" # token_formatted is from templatefile
+echo "Using pod_cidr: ${pod_cidr}"
+echo "Using bootstrap token prefix: $(echo "${kubeadm_token}" | cut -d. -f1).*****" # kubeadm_token is from templatefile
 
 # 7. Construct and Initialize Kubernetes with Kubeadm
 echo "Constructing kubeadm configuration..."
 mkdir -p /etc/kubernetes/kubeadm
 # NEW_HOSTNAME is a bash variable, derived from template variable ${TOKEN_SUFFIX}
 # PRIVATE_IP is a bash variable
-# Variables like ${token_formatted}, ${K8S_VERSION_FULL}, ${POD_CIDR} are substituted by templatefile
+# Variables like ${kubeadm_token}, ${K8S_VERSION_FULL}, ${pod_cidr} are substituted by templatefile
 cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 bootstrapTokens:
-- token: "${token_formatted}"
+- token: "${kubeadm_token}"
   description: "Initial token for worker nodes to join"
   ttl: "24h"
 localAPIEndpoint:
@@ -209,7 +209,7 @@ controllerManager:
   extraArgs:
     cloud-provider: "external"
 networking:
-  podSubnet: "${POD_CIDR}"
+  podSubnet: "${pod_cidr}"
   serviceSubnet: "10.96.0.0/12"
 EOF
 

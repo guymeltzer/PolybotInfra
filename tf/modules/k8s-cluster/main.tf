@@ -421,7 +421,9 @@ resource "aws_iam_role_policy" "control_plane_comprehensive_policy" {
         ]
         Resource = [
           aws_s3_bucket.worker_logs.arn,
-          "${aws_s3_bucket.worker_logs.arn}/*"
+          "${aws_s3_bucket.worker_logs.arn}/*",
+          aws_s3_bucket.user_data_scripts.arn,
+          "${aws_s3_bucket.user_data_scripts.arn}/*"
         ]
       },
       # Lambda permissions
@@ -651,6 +653,63 @@ resource "aws_lb_listener" "https_listener" {
 }
 
 # =============================================================================
+# 📦 S3 BUCKET - USER DATA SCRIPTS STORAGE
+# =============================================================================
+
+# S3 bucket for storing large user data scripts
+resource "aws_s3_bucket" "user_data_scripts" {
+  bucket        = "guy-k8s-userdata-${random_id.suffix.hex}"
+  force_destroy = true
+
+  tags = var.tags
+}
+
+resource "aws_s3_bucket_ownership_controls" "user_data_scripts_ownership" {
+  bucket = aws_s3_bucket.user_data_scripts.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "user_data_scripts_acl" {
+  depends_on = [aws_s3_bucket_ownership_controls.user_data_scripts_ownership]
+  
+  bucket = aws_s3_bucket.user_data_scripts.id
+  acl    = "private"
+}
+
+# Upload control plane script to S3
+resource "aws_s3_object" "control_plane_script" {
+  bucket = aws_s3_bucket.user_data_scripts.bucket
+  key    = "control_plane_user_data.sh"
+  content = templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
+    cluster_name                   = local.cluster_name
+    region                        = var.region
+    pod_cidr                      = local.pod_cidr
+    kubeadm_token                 = local.kubeadm_token
+    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
+    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  }))
+  
+  # Force update when script changes
+  etag = md5(templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
+    cluster_name                   = local.cluster_name
+    region                        = var.region
+    pod_cidr                      = local.pod_cidr
+    kubeadm_token                 = local.kubeadm_token
+    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
+    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+  })))
+
+  tags = var.tags
+}
+
+# =============================================================================
 # 📦 S3 BUCKET - WORKER LOGS STORAGE
 # =============================================================================
 
@@ -709,18 +768,49 @@ resource "aws_instance" "control_plane" {
     })
   }
 
-  user_data = base64encode(templatefile("${path.module}/control_plane_user_data.sh", merge(local.template_vars, {
-    cluster_name                   = local.cluster_name
-    region                        = var.region
-    pod_cidr                      = local.pod_cidr
-    POD_CIDR                      = local.pod_cidr
-    kubeadm_token                 = local.kubeadm_token
-    token_formatted               = local.kubeadm_token
-    join_command_secret_id        = aws_secretsmanager_secret.kubernetes_join_command.id
-    join_command_secret_latest_id = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_SECRET           = aws_secretsmanager_secret.kubernetes_join_command.name
-    JOIN_COMMAND_LATEST_SECRET    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-  })))
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    set -euo pipefail
+    
+    # Basic logging setup
+    exec > >(tee -a /var/log/k8s-init.log) 2>&1
+    echo "=== Control Plane Initialization Started at $(date) ==="
+    
+    # Install AWS CLI if not present
+    if ! command -v aws >/dev/null 2>&1; then
+        apt-get update -y
+        apt-get install -y awscli curl
+    fi
+    
+    # Download and execute the full initialization script from S3
+    SCRIPT_BUCKET="${aws_s3_bucket.user_data_scripts.bucket}"
+    SCRIPT_KEY="control_plane_user_data.sh"
+    SCRIPT_PATH="/tmp/control_plane_init.sh"
+    
+    echo "Downloading initialization script from s3://$SCRIPT_BUCKET/$SCRIPT_KEY"
+    
+    # Download with retries
+    for i in {1..5}; do
+        if aws s3 cp "s3://$SCRIPT_BUCKET/$SCRIPT_KEY" "$SCRIPT_PATH" --region ${var.region}; then
+            break
+        fi
+        echo "Download attempt $i failed, retrying in 10 seconds..."
+        sleep 10
+    done
+    
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "FATAL: Failed to download initialization script after 5 attempts"
+        exit 1
+    fi
+    
+    # Make executable and run
+    chmod +x "$SCRIPT_PATH"
+    echo "Executing initialization script..."
+    "$SCRIPT_PATH"
+    
+    echo "=== Control Plane Initialization Completed at $(date) ==="
+    EOF
+  )
 
   tags = merge(var.tags, {
     Name = "guy-control-plane"
