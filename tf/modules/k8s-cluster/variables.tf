@@ -54,6 +54,23 @@ variable "route53_zone_id" {
   type        = string
 }
 
+variable "domain_name" {
+  description = "Domain name for the SSL certificate (e.g., guy-polybot-lg.devops-int-college.com)"
+  type        = string
+  # Required - no default value
+}
+
+variable "enable_https" {
+  description = "Whether to enable HTTPS listener with SSL certificate"
+  type        = bool
+  default     = true
+}
+
+variable "redirect_http_to_https" {
+  description = "Whether to redirect HTTP traffic to HTTPS"
+  type        = bool
+  default     = false
+}
 
 variable "addons" {
   description = "List of URLs to Kubernetes add-on manifests to apply"

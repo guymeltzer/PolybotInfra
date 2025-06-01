@@ -526,6 +526,52 @@ resource "local_file" "ssh_private_key" {
 }
 
 # =============================================================================
+# 🔐 SSL CERTIFICATE - ACM WITH DNS VALIDATION
+# =============================================================================
+
+# ACM certificate for the domain
+resource "aws_acm_certificate" "polybot_cert" {
+  domain_name       = var.domain_name  # e.g., "guy-polybot-lg.devops-int-college.com"
+  validation_method = "DNS"
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+  
+  tags = merge(var.tags, {
+    Name = "polybot-ssl-certificate"
+  })
+}
+
+# DNS validation record
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.polybot_cert.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = var.route53_zone_id
+}
+
+# Certificate validation
+resource "aws_acm_certificate_validation" "polybot_cert_validation" {
+  certificate_arn         = aws_acm_certificate.polybot_cert.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+  
+  timeouts {
+    create = "5m"
+  }
+}
+
+# =============================================================================
 # ⚖️ LOAD BALANCER - APPLICATION LOAD BALANCER
 # =============================================================================
 
@@ -544,10 +590,10 @@ resource "aws_lb" "polybot_alb" {
   })
 }
 
-# HTTP target group
-resource "aws_lb_target_group" "http_tg" {
-  name     = "guy-polybot-http-tg"
-  port     = 80
+# Main target group (backend for both HTTP and HTTPS listeners)
+resource "aws_lb_target_group" "main_tg" {
+  name     = "guy-polybot-main-tg"
+  port     = 30080  # NodePort for Kubernetes services
   protocol = "HTTP"
   vpc_id   = module.vpc.vpc_id
 
@@ -555,63 +601,53 @@ resource "aws_lb_target_group" "http_tg" {
     enabled             = true
     healthy_threshold   = 2
     interval            = 30
-    matcher             = "200"
+    matcher             = "200,404"  # 404 is acceptable for health check
     path                = "/"
     port                = "traffic-port"
     protocol            = "HTTP"
     timeout             = 5
-    unhealthy_threshold = 2
+    unhealthy_threshold = 3
   }
 
   tags = var.tags
 }
 
-# HTTPS target group
-resource "aws_lb_target_group" "https_tg" {
-  name     = "guy-polybot-https-tg"
-  port     = 443
-  protocol = "HTTPS"
-  vpc_id   = module.vpc.vpc_id
-
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    interval            = 30
-    matcher             = "200"
-    path                = "/"
-    port                = "traffic-port"
-    protocol            = "HTTPS"
-    timeout             = 5
-    unhealthy_threshold = 2
-  }
-
-  tags = var.tags
-}
-
-# HTTP listener
+# HTTP listener (with optional redirect to HTTPS)
 resource "aws_lb_listener" "http_listener" {
   load_balancer_arn = aws_lb.polybot_alb.arn
   port              = "80"
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.http_tg.arn
+    type = var.redirect_http_to_https ? "redirect" : "forward"
+    
+    dynamic "redirect" {
+      for_each = var.redirect_http_to_https ? [1] : []
+      content {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
+    
+    target_group_arn = var.redirect_http_to_https ? null : aws_lb_target_group.main_tg.arn
   }
 }
 
-# HTTPS listener
+# HTTPS listener (using validated ACM certificate)
 resource "aws_lb_listener" "https_listener" {
   load_balancer_arn = aws_lb.polybot_alb.arn
   port              = "443"
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01"
-  certificate_arn   = "arn:aws:acm:${var.region}:123456789012:certificate/example"
+  certificate_arn   = aws_acm_certificate_validation.polybot_cert_validation.certificate_arn
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.https_tg.arn
+    target_group_arn = aws_lb_target_group.main_tg.arn  # SSL termination: HTTPS->HTTP
   }
+
+  depends_on = [aws_acm_certificate_validation.polybot_cert_validation]
 }
 
 # =============================================================================
@@ -760,7 +796,7 @@ resource "aws_launch_template" "worker_lt" {
 resource "aws_autoscaling_group" "worker_asg" {
   name                = local.worker_asg_name
   vpc_zone_identifier = module.vpc.public_subnets
-  target_group_arns   = [aws_lb_target_group.http_tg.arn, aws_lb_target_group.https_tg.arn]
+  target_group_arns   = [aws_lb_target_group.main_tg.arn]
   health_check_type   = "ELB"
   health_check_grace_period = 300
 
