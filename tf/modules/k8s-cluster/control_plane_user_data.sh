@@ -186,7 +186,7 @@ localAPIEndpoint:
   bindPort: 6443
 nodeRegistration:
   name: $NEW_HOSTNAME
-  criSocket: "unix$${":"///run/crio/crio.sock" # Specify CRI-O socket
+  criSocket: "unix$${":"///run/crio/crio.sock" # Specify CRI-O socket"
   kubeletExtraArgs:
     cloud-provider: "external"
 ---
