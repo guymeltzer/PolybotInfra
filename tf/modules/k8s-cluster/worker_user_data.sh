@@ -2,7 +2,7 @@
 
 # Log file for debugging
 LOGFILE="/var/log/k8s-node-init.log"
-exec > >(tee -a ${LOGFILE}) 2>&1
+exec > >(tee -a $${LOGFILE}) 2>&1
 echo "$(date) - Starting Kubernetes worker node initialization (CRI-O)"
 
 # These variables are expected to be substituted by Terraform's templatefile function:
@@ -53,7 +53,7 @@ if ! command -v aws &> /dev/null; then
     unzip -q awscliv2.zip
     ./aws/install --update
     rm -rf awscliv2.zip aws/
-    export PATH=$PATH:/usr/local/bin # May not persist for later commands if not in .bashrc
+    export PATH=$$PATH:/usr/local/bin # May not persist for later commands if not in .bashrc
 else
     log "AWS CLI already installed."
 fi
@@ -66,9 +66,9 @@ else
     REGION=$(retry 5 10 "curl -s -f -H 'X-aws-ec2-metadata-token: $IMDS_TOKEN' http://169.254.169.254/latest/meta-data/placement/region")
 fi
 [ -z "$REGION" ] && { log "Failed to retrieve region"; exit 1; }
-log "Retrieved region: $REGION. Terraform should pass this as '${region}'."
+log "Retrieved region: $REGION. Terraform should pass this as '\${region}'."
 # Use region passed from Terraform for consistency if available, otherwise use discovered.
-EFFECTIVE_REGION="${region:-$REGION}" # ${region} is from templatefile
+EFFECTIVE_REGION="$${region:-$REGION}" # ${region} is from templatefile
 
 # Verify AWS CLI access
 log "Verifying AWS CLI access..."
@@ -77,16 +77,16 @@ aws sts get-caller-identity --region "$EFFECTIVE_REGION" || { log "AWS CLI acces
 # Get instance metadata
 log "Retrieving instance metadata..."
 if [ -n "$IMDS_TOKEN" ]; then
-    PRIVATE_IP=$(curl -s -f -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
-    INSTANCE_ID=$(curl -s -f -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+    PRIVATE_IP=$$(curl -s -f -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+    INSTANCE_ID=$$(curl -s -f -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
     AZ=$(curl -s -f -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 else # Fallback to IMDSv1
-    PRIVATE_IP=$(curl -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
-    INSTANCE_ID=$(curl -s -f http://169.254.169.254/latest/meta-data/instance-id)
-    AZ=$(curl -s -f http://169.254.169.254/latest/meta-data/placement/availability-zone)
+    PRIVATE_IP=$$(curl -s -f http://169.254.169.254/latest/meta-data/local-ipv4)
+    INSTANCE_ID=$$(curl -s -f http://169.254.169.254/latest/meta-data/instance-id)
+    AZ=$$(curl -s -f http://169.254.169.254/latest/meta-data/placement/availability-zone)
 fi
 [ -z "$INSTANCE_ID" ] && { log "Failed to retrieve instance ID"; exit 1; }
-PROVIDER_ID="aws:///${AZ}/${INSTANCE_ID}"
+PROVIDER_ID="aws:///$${AZ}/$${INSTANCE_ID}"
 
 # Set sequential hostname using SSM Parameter Store
 SSM_PARAM_NAME="/k8s/worker-node-counter"
