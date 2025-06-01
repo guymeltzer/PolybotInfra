@@ -39,6 +39,7 @@ output "vpc_id" {
 output "ssh_key_name" {
   description = "SSH key name for cluster access"
   value       = module.k8s-cluster.ssh_key_name
+  sensitive   = true
 }
 
 # ------------------------------------------------------------------------
@@ -71,6 +72,7 @@ output "cluster_readiness" {
 
 output "ssh_commands" {
   description = "SSH commands for cluster access"
+  sensitive   = true
   value = {
     control_plane = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip}"
     # Template for workers - user needs to replace IP
@@ -80,6 +82,7 @@ output "ssh_commands" {
 
 output "kubectl_setup" {
   description = "Commands to set up kubectl access"
+  sensitive   = true
   value = {
     copy_kubeconfig = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat ~/.kube/config' > kubeconfig.yaml"
     set_kubeconfig  = "export KUBECONFIG=./kubeconfig.yaml"
@@ -107,6 +110,7 @@ output "argocd_access" {
 
 output "aws_resources" {
   description = "AWS resources created"
+  sensitive   = true
   value = {
     vpc_id         = module.k8s-cluster.vpc_id
     public_subnets = module.k8s-cluster.public_subnet_ids
@@ -121,6 +125,7 @@ output "aws_resources" {
 
 output "troubleshooting" {
   description = "Commands for troubleshooting"
+  sensitive   = true
   value = {
     check_control_plane = "ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'kubectl get nodes'"
     check_worker_logs   = "aws s3 ls s3://guy-polybot-logs/ --recursive | grep worker-init"
@@ -135,6 +140,7 @@ output "troubleshooting" {
 
 output "quick_start" {
   description = "Quick start commands"
+  sensitive   = true
   value = <<-EOT
     1. Copy kubeconfig:
        ssh -i ${module.k8s-cluster.ssh_key_name}.pem ubuntu@${module.k8s-cluster.control_plane_public_ip} 'cat ~/.kube/config' > kubeconfig.yaml
