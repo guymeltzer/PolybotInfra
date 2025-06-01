@@ -1055,17 +1055,13 @@ def lambda_handler(event, context):
 EOF
 }
 
-# Create Lambda ZIP file
-resource "null_resource" "create_lambda_zip" {
-  depends_on = [local_file.lambda_function_code]
+# Create Lambda ZIP file using archive_file data source
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = local_file.lambda_function_code.filename
+  output_path = "${path.module}/lambda_function.zip"
   
-  triggers = {
-    code_hash = filemd5("${path.module}/lambda_code.py")
-  }
-
-  provisioner "local-exec" {
-    command = "cd ${path.module} && zip -j lambda_function.zip lambda_code.py"
-  }
+  depends_on = [local_file.lambda_function_code]
 }
 
 # Lambda IAM role
@@ -1153,14 +1149,13 @@ resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach"
 
 # Lambda function for node management
 resource "aws_lambda_function" "node_management_lambda" {
-  filename         = "${path.module}/lambda_function.zip"
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   function_name    = "guy-node-management"
   role            = aws_iam_role.node_management_lambda_role.arn
-  handler         = "lambda_function.lambda_handler"
+  handler         = "lambda_code.lambda_handler"
   runtime         = "python3.9"
   timeout         = 300
-
-  depends_on = [null_resource.create_lambda_zip]
 
   environment {
     variables = {
