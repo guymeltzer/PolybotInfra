@@ -56,14 +56,10 @@ locals {
 
 module "k8s-cluster" {
   source = "./modules/k8s-cluster"
-
+  
   # Core configuration
   region                       = var.region
   cluster_name                 = local.cluster_name
-  # Pass VPC and Subnet details if not created within the module
-  # If module "vpc" is defined inside k8s-cluster module, these are not needed here.
-  # vpc_id                       = var.vpc_id
-  # subnet_ids                   = var.subnet_ids
   route53_zone_id              = var.route53_zone_id
   domain_name                  = var.domain_name
 
@@ -72,15 +68,12 @@ module "k8s-cluster" {
   worker_ami                   = var.worker_ami
   control_plane_instance_type  = var.control_plane_instance_type
   worker_instance_type         = var.worker_instance_type
-  # instance_type                = var.instance_type # This seems redundant if control_plane and worker types are specific
 
   # SSH configuration
   key_name                     = var.key_name
   ssh_public_key               = var.ssh_public_key
-  # ssh_private_key_file_path   = local.ssh_private_key_path # Module likely handles its own key generation/path
 
   # Worker node configuration
-  # worker_count                 = var.desired_worker_nodes # Redundant with desired_worker_nodes
   desired_worker_nodes         = var.desired_worker_nodes
 
   # Network configuration
@@ -89,20 +82,20 @@ module "k8s-cluster" {
   # ASG control
   force_cleanup_asg            = var.force_cleanup_asg
 
-  # Verification settings (these might be for local-exec scripts within the module)
+  # Verification settings
   skip_api_verification        = var.skip_api_verification
   skip_token_verification      = var.skip_token_verification
   verification_max_attempts    = var.verification_max_attempts
   verification_wait_seconds    = var.verification_wait_seconds
 
   # Deployment environment
-  deployment_environment       = "prod" # This could be a var
-  root_kubeconfig_path = local.kubeconfig_path # Pass the path here
+  deployment_environment       = "prod"
+  
   tags = {
     Environment       = "production"
     Project           = "polybot"
     ManagedBy         = "terraform"
-    KubernetesVersion = local.k8s_version # Pass k8s_version from root local to module var if needed
+    KubernetesVersion = local.k8s_version
   }
 }
 

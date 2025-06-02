@@ -457,3 +457,47 @@ output "debug_control_plane_initialization" {
    sudo tail -100 /var/log/cloud-init.log
 EOT
 }
+
+# =============================================================================
+# 📤 ADDITIONAL MODULE OUTPUTS (Moved from main.tf)
+# =============================================================================
+
+output "vpc_id_output" {
+  description = "The ID of the VPC"
+  value       = module.vpc.vpc_id
+}
+
+output "control_plane_instance_id_output" {
+  description = "The ID of the control plane instance"
+  value       = aws_instance.control_plane.id
+}
+
+output "control_plane_public_ip_output" {
+  description = "The public IP of the control plane instance"
+  value       = aws_instance.control_plane.public_ip
+}
+
+output "worker_asg_name_output" {
+  description = "The name of the worker Auto Scaling Group"
+  value       = aws_autoscaling_group.worker_asg.name
+}
+
+output "alb_dns_name_output" {
+  description = "The DNS name of the Application Load Balancer"
+  value       = aws_lb.polybot_alb.dns_name
+}
+
+output "ssh_key_name_output" {
+  description = "The name of the SSH key pair to use for instances"
+  value       = local.actual_key_name
+}
+
+output "kubeconfig_secret_name_output" {
+  description = "The name of the AWS Secrets Manager secret storing the kubeconfig."
+  value       = aws_secretsmanager_secret.cluster_kubeconfig.name
+}
+
+output "kubeconfig_secret_arn_output" {
+  description = "The ARN of the AWS Secrets Manager secret storing the kubeconfig."
+  value       = aws_secretsmanager_secret.cluster_kubeconfig.arn
+}

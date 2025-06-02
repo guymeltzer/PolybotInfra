@@ -909,53 +909,24 @@ resource "null_resource" "update_join_command" {
       echo "📡 Control Plane ID: $CONTROL_PLANE_INSTANCE_ID"
       echo "🔑 Latest Secret ID: $LATEST_SECRET_ID"
 
-      # Generate a new join command by running kubeadm token create on the control plane via SSM
-      echo "🔄 Generating new join command from control plane..."
-      NEW_JOIN_COMMAND=$(aws ssm send-command \
-        --instance-ids "$CONTROL_PLANE_INSTANCE_ID" \
-        --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["kubeadm token create --print-join-command"]' \
+      echo "Attempting to retrieve kubeconfig via AWS Secrets Manager..."
+      
+      # Try to get kubeconfig from Secrets Manager as the primary method
+      KUBECONFIG_SECRET_NAME="${aws_secretsmanager_secret.cluster_kubeconfig.name}"
+      KUBECONFIG_CONTENT=$(aws secretsmanager get-secret-value \
+        --secret-id "$KUBECONFIG_SECRET_NAME" \
         --region "$REGION_NAME" \
-        --query "CommandInvocations[0].CommandPlugins[0].Output" \
-        --output text 2>/dev/null || echo "")
-
-      if [[ -z "$NEW_JOIN_COMMAND" ]]; then
-        echo "❌ Failed to generate new join command from control plane via SSM."
-        # Optionally, try to get the one stored by user_data as a fallback
-        # NEW_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$LATEST_SECRET_ID" --region "$REGION_NAME" --query SecretString --output text 2>/dev/null || echo "")
-        # if [[ -z "$NEW_JOIN_COMMAND" ]]; then
-        #  echo "❌ Also failed to retrieve existing join command from Secrets Manager."
-        #  exit 1
-        # fi
-        # echo "⚠️ Using existing join command from Secrets Manager as fallback."
-        exit 1 # Make it fail if new command cannot be generated
+        --query SecretString --output text 2>/dev/null || echo "")
+      
+      if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+        echo "✅ Got valid kubeconfig from Secrets Manager. Creating temporary kubeconfig for health check."
+        echo "$KUBECONFIG_CONTENT" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+        chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+        export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+      else
+        echo "❌ Failed to get valid kubeconfig from Secrets Manager."
+        exit 1 # Exit with error if kubeconfig cannot be retrieved
       fi
-
-      echo "✅ New join command generated."
-
-      echo "🔐 Updating Secrets Manager with new join command..."
-      aws secretsmanager put-secret-value \
-        --secret-id "$LATEST_SECRET_ID" \
-        --secret-string "$NEW_JOIN_COMMAND" \
-        --region "$REGION_NAME" --no-cli-pager || {
-          echo "❌ Failed to update latest join command secret."
-          exit 1
-        }
-
-      # Optionally update the non-latest one too, or handle its lifecycle differently
-      aws secretsmanager put-secret-value \
-        --secret-id "$PRIMARY_SECRET_ID" \
-        --secret-string "$NEW_JOIN_COMMAND" \
-        --region "$REGION_NAME" --no-cli-pager || echo "⚠️ Failed to update primary join command secret."
-
-      echo "✅ Join command stored/updated in AWS Secrets Manager."
-
-      # Log this operation to S3
-      CURRENT_DATETIME=$(date +"%Y-%m-%dT%H:%M:%S%Z")
-      LOG_MESSAGE="Join command successfully updated in Secrets Manager at $CURRENT_DATETIME for instance $CONTROL_PLANE_INSTANCE_ID."
-      S3_LOG_KEY="cluster_operations/join_command_update/$(date +%Y/%m/%d)/$CONTROL_PLANE_INSTANCE_ID-$(date +%H%M%S).log"
-
-      echo "$LOG_MESSAGE" | aws s3 cp - "s3://$S3_LOG_BUCKET/$S3_LOG_KEY" --region "$REGION_NAME" || echo "⚠️ Failed to upload log to S3."
 
       echo "✅ Join command management completed successfully."
     EOT
@@ -1280,51 +1251,23 @@ resource "terraform_data" "cluster_health_assessment" {
         exit 0 # Exit gracefully as we can't perform kubectl checks
       fi
 
-      echo "Attempting to use KUBECONFIG from local path: ${var.root_kubeconfig_path}" # Assuming this var is passed from root
-      export KUBECONFIG="${var.root_kubeconfig_path}" # Pass kubeconfig path from root module as a variable
-
-      if ! kubectl cluster-info > /dev/null 2>&1; then
-          echo "❌ Initial kubectl cluster-info failed. Attempting to fetch admin.conf via SSM as fallback..."
-          if aws ssm describe-instance-information --region "$AWS_CLI_REGION" \
-             --filters "Key=InstanceIds,Values=$CONTROL_PLANE_INSTANCE_ID" \
-             --query "InstanceInformationList[*].PingStatus" --output text 2>/dev/null | grep -q "Online"; then
-
-            echo "📡 Control plane accessible via SSM, trying to get admin.conf..."
-            SSM_COMMAND_ID=$(aws ssm send-command --region "$AWS_CLI_REGION" \
-              --document-name "AWS-RunShellScript" \
-              --instance-ids "$CONTROL_PLANE_INSTANCE_ID" \
-              --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
-              --output text --query "Command.CommandId" 2>/dev/null || echo "")
-
-            if [[ -z "$SSM_COMMAND_ID" ]]; then
-                echo "❌ Failed to send SSM command to get admin.conf"
-                echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
-                echo "ssm_command_failed" > "$TMP_HEALTH_STATUS_FILE"
-                exit 1 # Or handle more gracefully
-            fi
-            sleep 10 # Allow time for command execution
-
-            KUBECONFIG_CONTENT_FROM_SSM=$(aws ssm get-command-invocation --region "$AWS_CLI_REGION" \
-              --command-id "$SSM_COMMAND_ID" --instance-id "$CONTROL_PLANE_INSTANCE_ID" \
-              --query "StandardOutputContent" --output text 2>/dev/null || echo "")
-
-            if [[ -n "$KUBECONFIG_CONTENT_FROM_SSM" ]] && echo "$KUBECONFIG_CONTENT_FROM_SSM" | grep -q "apiVersion"; then
-              echo "✅ Got valid admin.conf from SSM. Creating temporary kubeconfig for health check."
-              echo "$KUBECONFIG_CONTENT_FROM_SSM" | sed "s|server:.*|server: https://$CONTROL_PLANE_PUBLIC_IP_ADDR:6443|" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
-              chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
-              export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml" # Use this for checks
-            else
-              echo "❌ Could not get valid admin.conf via SSM."
-              echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
-              echo "kubeconfig_unavailable_via_ssm" > "$TMP_HEALTH_STATUS_FILE"
-              exit 1 # Or handle more gracefully
-            fi
-          else
-            echo "ℹ️ Control plane not accessible via SSM. Cannot fetch admin.conf."
-            echo "true" > "$TMP_CLEANUP_NEEDED_FILE" # Mark as needing cleanup if we can't verify
-            echo "control_plane_ssm_offline" > "$TMP_HEALTH_STATUS_FILE"
-            exit 1 # Or handle more gracefully
-          fi
+      echo "Attempting to retrieve kubeconfig via AWS Secrets Manager..."
+      
+      # Try to get kubeconfig from Secrets Manager as the primary method
+      KUBECONFIG_SECRET_NAME="${aws_secretsmanager_secret.cluster_kubeconfig.name}"
+      KUBECONFIG_CONTENT=$(aws secretsmanager get-secret-value \
+        --secret-id "$KUBECONFIG_SECRET_NAME" \
+        --region "$AWS_CLI_REGION" \
+        --query SecretString --output text 2>/dev/null || echo "")
+      
+      if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+        echo "✅ Got valid kubeconfig from Secrets Manager. Creating temporary kubeconfig for health check."
+        echo "$KUBECONFIG_CONTENT" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+        chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+        export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+      else
+        echo "❌ Failed to get valid kubeconfig from Secrets Manager."
+        exit 1 # Exit with error if kubeconfig cannot be retrieved
       fi
 
       # Proceed with kubectl checks if KUBECONFIG is now set and working
@@ -1420,57 +1363,7 @@ resource "terraform_data" "worker_progress_reporter" {
 }
 
 # =============================================================================
-# 📤 MODULE OUTPUTS
+# 📤 MODULE OUTPUTS - MOVED TO outputs.tf
 # =============================================================================
 
-output "vpc_id_output" {
-  description = "The ID of the VPC"
-  value       = module.vpc.vpc_id
-}
-
-output "control_plane_instance_id_output" {
-  description = "The ID of the control plane instance"
-  value       = aws_instance.control_plane.id
-}
-
-output "control_plane_public_ip_output" {
-  description = "The public IP of the control plane instance"
-  value       = aws_instance.control_plane.public_ip
-}
-
-output "worker_asg_name_output" {
-  description = "The name of the worker Auto Scaling Group"
-  value       = aws_autoscaling_group.worker_asg.name
-}
-
-output "alb_dns_name_output" {
-  description = "The DNS name of the Application Load Balancer"
-  value       = aws_lb.polybot_alb.dns_name
-}
-
-output "ssh_key_name_output" {
-  description = "The name of the SSH key pair to use for instances"
-  value       = local.actual_key_name
-}
-
-output "kubeconfig_secret_name_output" {
-  description = "The name of the AWS Secrets Manager secret storing the kubeconfig."
-  value       = aws_secretsmanager_secret.cluster_kubeconfig.name
-}
-
-output "kubeconfig_secret_arn_output" {
-  description = "The ARN of the AWS Secrets Manager secret storing the kubeconfig."
-  value       = aws_secretsmanager_secret.cluster_kubeconfig.arn
-}
-
-variable "asg_scale_up_heartbeat_timeout" {
-  description = "The heartbeat timeout in seconds for the ASG scale-up lifecycle hook."
-  type        = number
-  default     = 300 # Example: 5 minutes
-}
-
-variable "asg_scale_down_heartbeat_timeout" {
-  description = "The heartbeat timeout in seconds for the ASG scale-down lifecycle hook."
-  type        = number
-  default     = 300 # Example: 5 minutes
-}
+# Note: All outputs have been moved to outputs.tf for better organization

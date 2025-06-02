@@ -33,12 +33,6 @@ variable "worker_instance_type" {
   default     = "t3.medium"
 }
 
-variable "worker_count" {
-  description = "Number of worker nodes to create"
-  type        = number
-  default     = 2
-}
-
 variable "control_plane_ami" {
   description = "AMI ID for control plane node"
   type        = string
@@ -88,12 +82,6 @@ variable "rebuild_control_plane" {
   description = "Flag to trigger rebuild of the control plane instance"
   type        = bool
   default     = false
-}
-
-variable "instance_type" {
-  description = "EC2 instance type for the cluster nodes"
-  type        = string
-  default     = "t3.medium"
 }
 
 variable "tags" {
@@ -214,4 +202,16 @@ variable "root_kubeconfig_path" {
   type        = string
   # No default is fine if it's always expected to be passed from the root module.
   # Add a default if the module might be used standalone or has a fallback.
+}
+
+variable "asg_scale_up_heartbeat_timeout" {
+  description = "The heartbeat timeout in seconds for the ASG scale-up lifecycle hook."
+  type        = number
+  default     = 300 # Example: 5 minutes
+}
+
+variable "asg_scale_down_heartbeat_timeout" {
+  description = "The heartbeat timeout in seconds for the ASG scale-down lifecycle hook."
+  type        = number
+  default     = 300 # Example: 5 minutes
 }
