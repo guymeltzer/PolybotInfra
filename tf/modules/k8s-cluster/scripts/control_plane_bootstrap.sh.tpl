@@ -2,12 +2,12 @@
 set -euo pipefail # Exit on error, unset variable, or pipe failure
 
 # =================================================================
-# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v10.1 (Templated & Shell Corrected)
+# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v10.3 (Templated & Shell Corrected)
 # =================================================================
 
 # Set up comprehensive logging
 BOOTSTRAP_LOG="/var/log/k8s-bootstrap-control-plane.log"
-CLOUD_INIT_LOG="/var/log/cloud-init-output.log" # Standard cloud-init log location
+CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
 
 # Create log files and ensure they're writable
 touch "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
@@ -17,7 +17,7 @@ chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
 exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
 
 echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED (TEMPLATE v10.1) ="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED (TEMPLATE v10.3) ="
 echo "= Template Variables Received & Used:                           ="
 echo "=   K8S Version Full:    ${K8S_VERSION_FULL}"
 echo "=   K8S Major.Minor:     ${K8S_MAJOR_MINOR}"
@@ -33,9 +33,9 @@ echo "=   Latest Join Secret:  ${JOIN_COMMAND_LATEST_SECRET_NAME}"
 echo "=   Calico Version:      ${CALICO_VERSION}"
 echo "================================================================="
 echo "= Current Time (UTC):    $(date -u)"
-echo "= Instance ID:         $(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-echo "= Private IP (metadata): $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
-echo "= Public IP (metadata):  $(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
+echo "= Instance ID:         $(curl -fsSL http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
+echo "= Private IP (metadata): $(curl -fsSL http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
+echo "= Public IP (metadata):  $(curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
 echo "================================================================="
 
 # Error handling function
@@ -56,7 +56,7 @@ error_exit() {
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     if command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
         S3_DEBUG_BUCKET_NAME="${CLUSTER_NAME}-bootstrap-debug-logs"
-        INSTANCE_ID_DEBUG="$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown-instance')"
+        INSTANCE_ID_DEBUG="$(curl -fsSL http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown-instance')"
         LOG_S3_KEY="control-plane-failures/$INSTANCE_ID_DEBUG-bootstrap-$(date +%Y%m%d%H%M%S).log"
         echo "Attempting to upload full log to s3://$S3_DEBUG_BUCKET_NAME/$LOG_S3_KEY"
         aws s3 cp "$BOOTSTRAP_LOG" "s3://$S3_DEBUG_BUCKET_NAME/$LOG_S3_KEY" --region "${REGION}" || echo "Warning: Failed to upload full debug log to S3."
@@ -224,41 +224,41 @@ cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 bootstrapTokens:
-- token: "${KUBEADM_TOKEN}" # Template variable
+- token: "${KUBEADM_TOKEN}"
   description: "kubeadm bootstrap token for joining nodes"
   ttl: "24h0m0s"
   usages:
   - signing
   - authentication
 localAPIEndpoint:
-  advertiseAddress: "$PRIVATE_IP" # Shell variable
+  advertiseAddress: "$PRIVATE_IP"
   bindPort: 6443
 nodeRegistration:
-  name: "$NEW_HOSTNAME" # Shell variable
+  name: "$NEW_HOSTNAME"
   criSocket: "unix:///run/containerd/containerd.sock"
   kubeletExtraArgs:
     cloud-provider: "external"
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-kubernetesVersion: "v${K8S_VERSION_FULL}" # Template variable
-controlPlaneEndpoint: "$PRIVATE_IP:6443" # Shell variable
+kubernetesVersion: "v${K8S_VERSION_FULL}"
+controlPlaneEndpoint: "$PRIVATE_IP:6443"
 apiServer:
   certSANs:
-  - "$PRIVATE_IP"   # Shell variable
-  - "$NEW_HOSTNAME" # Shell variable
+  - "$PRIVATE_IP"
+  - "$NEW_HOSTNAME"
   - "127.0.0.1"
   - "localhost"
   - "kubernetes"
   - "kubernetes.default"
   - "kubernetes.default.svc"
   - "kubernetes.default.svc.cluster.local"
-  # - "$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)" # If API needs to be exposed on public IP via cert
+  # - "$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
 controllerManager:
   extraArgs:
     cloud-provider: "external"
 networking:
-  podSubnet: "${POD_CIDR_BLOCK}" # Template variable
+  podSubnet: "${POD_CIDR_BLOCK}"
   serviceSubnet: "10.96.0.0/12"
 EOF
 echo "   Kubeadm configuration file created."
@@ -408,7 +408,7 @@ fi
 # Final status report
 echo ""
 echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED (TEMPLATE v10.1)="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED (TEMPLATE v10.2)="
 echo "= Current Time (UTC): $(date -u)"
 echo "= Overall Status: SUCCESS"
 echo "================================================================="
