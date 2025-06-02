@@ -971,17 +971,18 @@ resource "null_resource" "update_join_command" {
 # The IAM policy data.aws_iam_policy_document.node_management_lambda_policy looks reasonable.
 # Ensure the lambda_code.py is correctly packaged by data.archive_file.lambda_zip.
 
+# This was identified as problematic, assuming lambda_code.py is a source file you provide
 resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/scripts/lambda_code.py" # Store scripts in a sub-directory
-  content  = file("${path.module}/scripts/lambda_code.py") # Assuming lambda_code.py exists
+  filename = "${path.module}/scripts/lambda_code.py"
+  content  = file("${path.module}/scripts/lambda_code.py")
 }
 
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_file = local_file.lambda_function_code.filename
-  output_path = "${path.module}/lambda_function.zip" # Temporary local zip
-  depends_on  = [local_file.lambda_function_code]
-}
+# data "archive_file" "lambda_zip" {
+#   type        = "zip"
+#   source_file = local_file.lambda_function_code.filename
+#   output_path = "${path.module}/lambda_function.zip"
+#   depends_on  = [local_file.lambda_function_code]
+# }
 
 resource "aws_iam_role" "node_management_lambda_role" {
   name = "${var.cluster_name}-node-mgmt-lambda-role"
