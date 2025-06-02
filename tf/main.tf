@@ -614,7 +614,7 @@ resource "null_resource" "cluster_maintenance" {
       echo "👻 Checking for orphaned nodes..."
       
       # Get active ASG instances
-      active_instances=$(aws ec2 describe-instances \
+      active_instances=$$(aws ec2 describe-instances \
         --region ${var.region} \
         --filters "Name=tag:aws:autoscaling:groupName,Values=${local.worker_asg_name}" \
                   "Name=instance-state-name,Values=running,pending" \
@@ -622,40 +622,40 @@ resource "null_resource" "cluster_maintenance" {
         --output text 2>/dev/null || echo "")
       
       # Check worker nodes
-      worker_nodes=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || echo "")
+      worker_nodes=$$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $$1}' || echo "")
       
-      for node_name in $worker_nodes; do
+      for node_name in $$worker_nodes; do
         instance_id=""
         
         # Extract instance ID from node name
-        if [[ "$node_name" =~ worker-([a-f0-9]{17})$ ]]; then
-          instance_id="i-${BASH_REMATCH[1]}"
-        elif [[ "$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
-          instance_id="${BASH_REMATCH[1]}"
+        if [[ "$$node_name" =~ worker-([a-f0-9]{17})$$ ]]; then
+          instance_id="i-$${BASH_REMATCH[1]}"
+        elif [[ "$$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
+          instance_id="$${BASH_REMATCH[1]}"
         fi
         
         # Check if instance exists in ASG
-        if [[ -n "$instance_id" ]] && ! echo "$active_instances" | grep -q "$instance_id"; then
-          echo "🗑️ Removing orphaned node: $node_name (instance: $instance_id)"
+        if [[ -n "$$instance_id" ]] && ! echo "$$active_instances" | grep -q "$$instance_id"; then
+          echo "🗑️ Removing orphaned node: $$node_name (instance: $$instance_id)"
           
           # Force delete pods on this node
-          kubectl get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null | \
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$$node_name" --no-headers 2>/dev/null | \
             while read -r ns pod rest; do
-              kubectl delete pod $pod -n $ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
+              kubectl delete pod $$pod -n $$ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
             done
           
           # Remove the node
-          kubectl delete node $node_name --force --grace-period=0 2>/dev/null || true
+          kubectl delete node $$node_name --force --grace-period=0 2>/dev/null || true
         fi
       done
       
       # 2. Clean up terminating pods
       echo "🗑️ Cleaning up stuck terminating pods..."
-      terminating_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null || echo "")
+      terminating_pods=$$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null || echo "")
       
-      if [[ -n "$terminating_pods" ]]; then
-        echo "$terminating_pods" | while read -r ns pod rest; do
-          kubectl delete pod $pod -n $ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
+      if [[ -n "$$terminating_pods" ]]; then
+        echo "$$terminating_pods" | while read -r ns pod rest; do
+          kubectl delete pod $$pod -n $$ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
         done
       fi
       
