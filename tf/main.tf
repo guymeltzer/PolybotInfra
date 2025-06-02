@@ -166,7 +166,7 @@ resource "null_resource" "cluster_readiness_check" {
 
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
-    readiness_version     = "v5-with-proper-wait"
+    readiness_version     = "v6-enhanced"
   }
 
   provisioner "local-exec" {
