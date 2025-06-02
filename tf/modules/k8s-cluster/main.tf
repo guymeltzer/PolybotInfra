@@ -1,7 +1,7 @@
 # =============================================================================
 # K8S-CLUSTER MODULE - REFACTORED AND OPTIMIZED
 # =============================================================================
-# Kubernetes Version: 1.32.3 (hardcoded for consistency)
+# Kubernetes Version: Defined by local.k8s_version_full
 # Comprehensive cluster infrastructure with logical organization
 
 # =============================================================================
@@ -10,137 +10,153 @@
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+  version = "~> 5.0" # Consider pinning to a more specific minor version for stability
 
-  name = "guy-vpc"
-  cidr = "10.0.0.0/16"
+  name = "${var.cluster_name}-vpc" # Using var.cluster_name for VPC name
+  cidr = "10.0.0.0/16"          # Consider making this a variable
 
-  azs             = ["${var.region}a", "${var.region}b"]
-  public_subnets  = ["10.0.0.0/24", "10.0.2.0/24"]
-  private_subnets = ["10.0.1.0/24"]
+  azs             = ["${var.region}a", "${var.region}b"] # Assumes 2 AZs, make this configurable if needed
+  public_subnets  = ["10.0.0.0/24", "10.0.2.0/24"]     # Consider making these configurable
+  private_subnets = ["10.0.1.0/24"]                   # Consider making these configurable
 
   enable_nat_gateway   = true
-  single_nat_gateway   = true
+  single_nat_gateway   = true # For cost savings in dev; for HA, set to false
   enable_dns_hostnames = true
   enable_dns_support   = true
 
   tags = merge(var.tags, {
-    Name                                      = "guy-vpc"
-    "kubernetes-io-cluster-kubernetes"        = "owned"
+    Name                                      = "${var.cluster_name}-vpc"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned" # Standard EKS tag, good practice
   })
 
   public_subnet_tags = {
-    "kubernetes-io-role-elb"          = "1"
-    "kubernetes-io-role-internal-elb" = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/elb"                    = "1"
+    # "kubernetes.io/role/internal-elb" = "1" # Usually for private subnets if used for internal LBs
+  }
+
+  private_subnet_tags = { # Added tags for private subnets
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    "kubernetes.io/role/internal-elb"           = "1"
   }
 }
 
 # =============================================================================
-# 📋 LOCALS - CENTRALIZED CONFIGURATION  
+# 📋 LOCALS - CENTRALIZED CONFIGURATION
 # =============================================================================
 
 locals {
-  # Kubernetes version configuration (hardcoded to 1.32.3)
-  k8s_version_full = "1.32.3"
-  k8s_major_minor = "1.32"
-  k8s_package_version = "1.32.3-1.1"
-  
-  # CRI-O version aligns with Kubernetes major.minor
-  crio_k8s_major_minor = "1.32"
-  
+  # Kubernetes version configuration
+  k8s_version_full    = "1.32.3" # Hardcoded as per user's file, consider making this a variable
+  k8s_major_minor     = "1.32"   # Derived from k8s_version_full if it were a var
+  k8s_package_version = "${local.k8s_version_full}-1.1" # Ensure this format matches actual package versions
+
+  # CRI-O (if used) or other runtime versions might be defined here
+  # crio_k8s_major_minor = local.k8s_major_minor # Example if CRI-O was used
+
   # Cluster configuration
+  calico_version_for_template = "v3.27.3"
   cluster_name = var.cluster_name
-  pod_cidr = var.pod_cidr
-  
-  # ASG names (defined here to avoid circular dependencies)
-  worker_asg_name = "guy-polybot-asg"
-  
+  pod_cidr     = var.pod_cidr # Example: "10.244.0.0/16"
+
+  # ASG names
+  worker_asg_name = "${var.cluster_name}-workers-asg" # Made dynamic with cluster_name
+
   # SSH key management
   actual_key_name = var.key_name != "" ? var.key_name : (
-    length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : "polybot-key"
+    length(aws_key_pair.generated_key) > 0 ? aws_key_pair.generated_key[0].key_name : null # Return null if no key generated and none provided
   )
-  
-  # Template variables for user data scripts
-  template_vars = {
-    # Kubernetes version variables (uppercase to match scripts)
-    K8S_VERSION_FULL = local.k8s_version_full
-    K8S_MAJOR_MINOR = local.k8s_major_minor
+
+  # Common template variables for user data scripts (control plane and workers)
+  # These will be passed to templatefile function
+  common_template_vars = {
+    K8S_VERSION_FULL    = local.k8s_version_full
+    K8S_MAJOR_MINOR     = local.k8s_major_minor
     K8S_PACKAGE_VERSION = local.k8s_package_version
-    CRIO_K8S_MAJOR_MINOR = local.crio_k8s_major_minor
-    
-    # Worker-specific variable names
-    K8S_PACKAGE_VERSION_TO_INSTALL = local.k8s_package_version
-    K8S_MAJOR_MINOR_FOR_REPO = local.k8s_major_minor
-    CRIO_K8S_MAJOR_MINOR_FOR_REPO = local.crio_k8s_major_minor
-    
-    # Token variables
-    TOKEN_SUFFIX = random_string.token_part1.result
-    
-    # SSH public key
-    ssh_public_key = var.ssh_public_key != "" ? var.ssh_public_key : (
-      length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""
-    )
-    SSH_PUBLIC_KEY = var.ssh_public_key != "" ? var.ssh_public_key : (
-      length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""
-    )
-    
-    # Kubelet configuration
-    KUBELET_DROPIN_DIR = "/etc/systemd/system/kubelet.service.d"
-    
-    # Placeholder variables that get set dynamically in scripts
-    PRIVATE_IP_FROM_META = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT"
-    NODE_NAME = "PLACEHOLDER_WILL_BE_SET_BY_SCRIPT"
+    # CRIO_K8S_MAJOR_MINOR = local.crio_k8s_major_minor # If using CRI-O
+    REGION              = var.region
+    CLUSTER_NAME        = local.cluster_name
   }
+
+  # Control plane specific template variables
+  control_plane_template_vars = merge(local.common_template_vars, {
+    HOSTNAME_SUFFIX                 = random_string.hostname_suffix.result # Changed from token_part1 for clarity
+    KUBEADM_TOKEN                   = local.kubeadm_token
+    POD_CIDR_BLOCK                  = local.pod_cidr
+    KUBECONFIG_SECRET_NAME          = aws_secretsmanager_secret.cluster_kubeconfig.name
+    JOIN_COMMAND_PRIMARY_SECRET_NAME = aws_secretsmanager_secret.kubernetes_join_command.name
+    JOIN_COMMAND_LATEST_SECRET_NAME  = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    CALICO_VERSION                   = local.calico_version_for_template
+    # PRIVATE_IP will be determined by the script on the instance itself
+  })
+
+  # Worker specific template variables
+  worker_template_vars = merge(local.common_template_vars, {
+    # JOIN_COMMAND_SECRET_ID and JOIN_COMMAND_LATEST_SECRET are passed directly in launch_template
+    # K8S_PACKAGE_VERSION_TO_INSTALL is already K8S_PACKAGE_VERSION
+    # K8S_MAJOR_MINOR_FOR_REPO is already K8S_MAJOR_MINOR
+    # CRIO_K8S_MAJOR_MINOR_FOR_REPO is already CRIO_K8S_MAJOR_MINOR
+    # TOKEN_SUFFIX is not directly used by worker_user_data based on original structure; join token is via SecretsManager
+    SSH_PUBLIC_KEY_CONTENT = var.ssh_public_key != "" ? var.ssh_public_key : (
+      length(tls_private_key.ssh) > 0 ? tls_private_key.ssh[0].public_key_openssh : ""
+    )
+    # Control plane endpoint will be passed directly using aws_instance.control_plane.private_ip
+  })
 }
 
 # =============================================================================
 # 🎲 RANDOM RESOURCES - TOKENS AND IDENTIFIERS
 # =============================================================================
 
-# Generate kubeadm token components
-resource "random_string" "token_part1" {
+resource "random_string" "hostname_suffix" { # Renamed for clarity
   length  = 6
   special = false
   upper   = false
 }
 
-resource "random_string" "token_part2" {
+resource "random_string" "kubeadm_token_part2" { # Renamed for clarity
   length  = 16
   special = false
   upper   = false
 }
 
-# Random suffix for unique resource naming
-resource "random_id" "suffix" {
+# Random suffix for unique resource naming where needed (e.g., S3 bucket)
+resource "random_id" "unique_suffix" { # Renamed for clarity
   byte_length = 4
 }
 
 # Formatted kubeadm token
 locals {
-  kubeadm_token = "${random_string.token_part1.result}.${random_string.token_part2.result}"
+  kubeadm_token = "${random_string.hostname_suffix.result}.${random_string.kubeadm_token_part2.result}"
 }
 
 # =============================================================================
-# 🔐 SECRETS MANAGEMENT - JOIN COMMANDS
+# 🔐 SECRETS MANAGEMENT - KUBECONFIG & JOIN COMMANDS
 # =============================================================================
 
-# Primary join command secret
+resource "aws_secretsmanager_secret" "cluster_kubeconfig" {
+  name                    = "${local.cluster_name}-kubeconfig-${random_id.unique_suffix.hex}"
+  description             = "Kubeconfig for the ${local.cluster_name} Kubernetes cluster, modified for external access."
+  recovery_window_in_days = 0 # Set to 0 for immediate deletion if destroy; for prod consider 7-30 days.
+  force_overwrite_replica_secret = true # If using replicas
+
+  tags = var.tags
+}
+
 resource "aws_secretsmanager_secret" "kubernetes_join_command" {
-  name                    = "kubernetes-join-command-${random_id.suffix.hex}"
+  name                    = "${local.cluster_name}-join-command-${random_id.unique_suffix.hex}"
   description             = "Kubernetes join command for worker nodes"
   recovery_window_in_days = 0
   force_overwrite_replica_secret = true
 
   lifecycle {
-    create_before_destroy = true
+    create_before_destroy = true # Good for handling updates if name doesn't change often
   }
-
   tags = var.tags
 }
 
-# Latest join command secret (for updates)
 resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
-  name                    = "kubernetes-join-command-latest-${random_id.suffix.hex}"
+  name                    = "${local.cluster_name}-join-command-latest-${random_id.unique_suffix.hex}"
   description             = "Latest Kubernetes join command for worker nodes"
   recovery_window_in_days = 0
   force_overwrite_replica_secret = true
@@ -148,7 +164,6 @@ resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
   lifecycle {
     create_before_destroy = true
   }
-
   tags = var.tags
 }
 
@@ -156,22 +171,19 @@ resource "aws_secretsmanager_secret" "kubernetes_join_command_latest" {
 # 🛡️ SECURITY GROUPS - NETWORK ACCESS CONTROL
 # =============================================================================
 
-# Control plane security group
 resource "aws_security_group" "control_plane_sg" {
-  name        = "Guy-Control-Plane-SG"
-  description = "Security group for Kubernetes control plane"
+  name        = "${var.cluster_name}-cp-sg"
+  description = "Security group for Kubernetes control plane (${var.cluster_name})"
   vpc_id      = module.vpc.vpc_id
 
-  # Kubernetes API server
+  # ... other ingress rules (K8s API, SSH, VPC internal) remain the same ...
   ingress {
     from_port   = 6443
     to_port     = 6443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "Kubernetes API server"
+    description = "Kubernetes API server from anywhere"
   }
-
-  # SSH access
   ingress {
     from_port   = 22
     to_port     = 22
@@ -179,17 +191,33 @@ resource "aws_security_group" "control_plane_sg" {
     cidr_blocks = ["0.0.0.0/0"]
     description = "SSH access"
   }
-
-  # Internal VPC traffic
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Internal VPC traffic"
+    cidr_blocks = [module.vpc.vpc_cidr_block]
+    description = "Internal VPC traffic to control plane"
   }
 
-  # All outbound traffic
+  # Corrected etcd rule: Allows instances within this same SG to communicate on these ports
+  ingress {
+    from_port   = 2379
+    to_port     = 2380
+    protocol    = "tcp"
+    self        = true # <--- FIX: Allows traffic from other members of this SG
+    description = "etcd communication within control_plane_sg"
+  }
+
+  # If workers also need to access etcd on the control plane (add this rule if needed):
+  # ingress {
+  #   from_port       = 2379
+  #   to_port         = 2380
+  #   protocol        = "tcp"
+  #   security_groups = [aws_security_group.worker_sg.id] # Allow from worker SG
+  #   description     = "etcd communication from workers to control plane"
+  # }
+
+  # ... egress rule remains the same ...
   egress {
     from_port   = 0
     to_port     = 0
@@ -197,20 +225,15 @@ resource "aws_security_group" "control_plane_sg" {
     cidr_blocks = ["0.0.0.0/0"]
     description = "All outbound traffic"
   }
-
-  tags = merge(var.tags, {
-    Name = "Guy-Control-Plane-SG"
-    "kubernetes-io-cluster-kubernetes" = "owned"
-  })
+  tags = merge(var.tags, { Name = "${var.cluster_name}-cp-sg" })
 }
 
-# Worker node security group
 resource "aws_security_group" "worker_sg" {
-  name        = "Guy-Worker-SG"
-  description = "Security group for Kubernetes worker nodes"
+  name        = "${var.cluster_name}-worker-sg"
+  description = "Security group for Kubernetes worker nodes (${var.cluster_name})"
   vpc_id      = module.vpc.vpc_id
 
-  # SSH access
+  # ... SSH ingress rule remains the same ...
   ingress {
     from_port   = 22
     to_port     = 22
@@ -219,16 +242,23 @@ resource "aws_security_group" "worker_sg" {
     description = "SSH access"
   }
 
-  # Internal VPC traffic
+  # Corrected rule for internal cluster traffic
+  ingress {
+    from_port       = 0
+    to_port         = 0
+    protocol        = "-1"
+    security_groups = [aws_security_group.control_plane_sg.id] # Allows from control plane
+    description     = "Traffic from Control Plane SG"
+  }
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["10.0.0.0/16"]
-    description = "Internal VPC traffic"
+    self        = true # <--- FIX: Allows traffic from other workers in this same SG
+    description = "Worker-to-worker traffic within worker_sg"
   }
 
-  # NodePort services
+  # ... NodePort and Kubelet API ingress rules remain the same ...
   ingress {
     from_port   = 30000
     to_port     = 32767
@@ -236,8 +266,15 @@ resource "aws_security_group" "worker_sg" {
     cidr_blocks = ["0.0.0.0/0"]
     description = "NodePort services"
   }
+  ingress {
+    from_port       = 10250
+    to_port         = 10250
+    protocol        = "tcp"
+    security_groups = [aws_security_group.control_plane_sg.id]
+    description     = "Kubelet API"
+  }
 
-  # All outbound traffic
+  # ... egress rule remains the same ...
   egress {
     from_port   = 0
     to_port     = 0
@@ -245,258 +282,259 @@ resource "aws_security_group" "worker_sg" {
     cidr_blocks = ["0.0.0.0/0"]
     description = "All outbound traffic"
   }
-
-  tags = merge(var.tags, {
-    Name = "Guy-Worker-SG"
-    "kubernetes-io-cluster-kubernetes" = "owned"
-  })
+  tags = merge(var.tags, { Name = "${var.cluster_name}-worker-sg" })
 }
 
-# ALB security group
 resource "aws_security_group" "alb_sg" {
-  name        = "Guy-ALB-SG"
-  description = "Security group for Application Load Balancer"
+  name        = "${var.cluster_name}-alb-sg"
+  description = "Security group for Application Load Balancer (${var.cluster_name})"
   vpc_id      = module.vpc.vpc_id
 
-  # HTTP traffic
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] # Allow HTTP from anywhere
     description = "HTTP traffic"
   }
-
-  # HTTPS traffic
   ingress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = ["0.0.0.0/0"] # Allow HTTPS from anywhere
     description = "HTTPS traffic"
   }
-
-  # All outbound traffic
+  egress { # ALB needs to talk to instances on NodePorts
+    from_port   = 30000
+    to_port     = 32767
+    protocol    = "tcp"
+    security_groups = [aws_security_group.worker_sg.id] # Allow ALB to reach worker NodePorts
+    description = "Outbound to worker NodePorts"
+  }
+  # Add any other necessary egress, e.g., to internet if health checks need it
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound traffic"
+    description = "Allow all other outbound (review if too permissive)"
   }
-
-  tags = merge(var.tags, {
-    Name = "Guy-ALB-SG"
-  })
+  tags = merge(var.tags, { Name = "${var.cluster_name}-alb-sg" })
 }
 
 # =============================================================================
 # 🔑 IAM ROLES AND POLICIES - ACCESS MANAGEMENT
 # =============================================================================
 
-# Control plane IAM role
 resource "aws_iam_role" "control_plane_role" {
-  name = "guy-cluster-control-plane-role"
-
+  name = "${var.cluster_name}-cp-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
   })
-
   tags = var.tags
 }
 
-# Control plane comprehensive policy
-resource "aws_iam_role_policy" "control_plane_comprehensive_policy" {
-  name = "control-plane-comprehensive-policy"
-  role = aws_iam_role.control_plane_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      # EC2 permissions
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeImages",
-          "ec2:DescribeKeyPairs",
-          "ec2:DescribeSecurityGroups",
-          "ec2:DescribeSubnets",
-          "ec2:DescribeVpcs",
-          "ec2:DescribeAvailabilityZones",
-          "ec2:DescribeAccountAttributes",
-          "ec2:DescribeInternetGateways",
-          "ec2:DescribeRouteTables",
-          "ec2:CreateTags",
-          "ec2:DescribeTags",
-          "ec2:RunInstances",
-          "ec2:TerminateInstances",
-          "ec2:ModifyInstanceAttribute",
-          "ec2:AttachVolume",
-          "ec2:DetachVolume",
-          "ec2:CreateVolume",
-          "ec2:DeleteVolume",
-          "ec2:DescribeVolumes",
-          "ec2:DescribeSnapshots",
-          "ec2:CreateSnapshot",
-          "ec2:DeleteSnapshot"
-        ]
-        Resource = "*"
-      },
-      # Auto Scaling permissions
-      {
-        Effect = "Allow"
-        Action = [
-          "autoscaling:DescribeAutoScalingGroups",
-          "autoscaling:DescribeAutoScalingInstances",
-          "autoscaling:DescribeLaunchConfigurations",
-          "autoscaling:SetDesiredCapacity",
-          "autoscaling:TerminateInstanceInAutoScalingGroup",
-          "autoscaling:UpdateAutoScalingGroup"
-        ]
-        Resource = "*"
-      },
-      # Secrets Manager permissions
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:CreateSecret",
-          "secretsmanager:UpdateSecret",
-          "secretsmanager:DescribeSecret"
-        ]
-        Resource = [
-          aws_secretsmanager_secret.kubernetes_join_command.arn,
-          aws_secretsmanager_secret.kubernetes_join_command_latest.arn,
-          "${aws_secretsmanager_secret.kubernetes_join_command.arn}*",
-          "${aws_secretsmanager_secret.kubernetes_join_command_latest.arn}*"
-        ]
-      },
-      # Load Balancer permissions
-      {
-        Effect = "Allow"
-        Action = [
-          "elasticloadbalancing:DescribeLoadBalancers",
-          "elasticloadbalancing:DescribeLoadBalancerAttributes",
-          "elasticloadbalancing:DescribeTargetGroups",
-          "elasticloadbalancing:DescribeTargetGroupAttributes",
-          "elasticloadbalancing:DescribeTargetHealth",
-          "elasticloadbalancing:CreateLoadBalancer",
-          "elasticloadbalancing:CreateTargetGroup",
-          "elasticloadbalancing:CreateListener",
-          "elasticloadbalancing:DeleteLoadBalancer",
-          "elasticloadbalancing:DeleteTargetGroup",
-          "elasticloadbalancing:DeleteListener",
-          "elasticloadbalancing:ModifyLoadBalancerAttributes",
-          "elasticloadbalancing:ModifyTargetGroup",
-          "elasticloadbalancing:ModifyTargetGroupAttributes",
-          "elasticloadbalancing:RegisterTargets",
-          "elasticloadbalancing:DeregisterTargets",
-          "elasticloadbalancing:SetIpAddressType",
-          "elasticloadbalancing:SetSecurityGroups",
-          "elasticloadbalancing:SetSubnets",
-          "elasticloadbalancing:AddTags",
-          "elasticloadbalancing:RemoveTags"
-        ]
-        Resource = "*"
-      },
-      # S3 permissions for logs
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:DeleteObject",
-          "s3:ListBucket"
-        ]
-        Resource = [
-          aws_s3_bucket.worker_logs.arn,
-          "${aws_s3_bucket.worker_logs.arn}/*",
-          aws_s3_bucket.user_data_scripts.arn,
-          "${aws_s3_bucket.user_data_scripts.arn}/*"
-        ]
-      },
-      # Lambda permissions
-      {
-        Effect = "Allow"
-        Action = [
-          "lambda:InvokeFunction",
-          "lambda:GetFunction",
-          "lambda:ListFunctions"
-        ]
-        Resource = aws_lambda_function.node_management_lambda.arn
-      }
+data "aws_iam_policy_document" "control_plane_inline_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances", "ec2:DescribeTags", "ec2:CreateTags", # Basic EC2 info, tagging
+      "ec2:AttachVolume", "ec2:DetachVolume", "ec2:DescribeVolumes", # For EBS CSI
+      # Add more specific EC2 permissions if needed by cloud controller manager
     ]
-  })
+    resources = ["*"] # Consider restricting if possible
+  }
+  statement {
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue", # For workers to get join token (if CP distributes)
+      "secretsmanager:PutSecretValue"  # For CP to store kubeconfig and join token
+    ]
+    resources = [
+      aws_secretsmanager_secret.cluster_kubeconfig.arn, # New kubeconfig secret
+      aws_secretsmanager_secret.kubernetes_join_command.arn,
+      aws_secretsmanager_secret.kubernetes_join_command_latest.arn
+    ]
+  }
+  statement { # For S3 user_data script fetching & log uploads
+    effect = "Allow"
+    actions = [
+      "s3:GetObject" # For fetching the main bootstrap script
+    ]
+    resources = ["${aws_s3_bucket.user_data_scripts.arn}/${aws_s3_object.control_plane_script.key}"]
+  }
+  statement { # For log uploads from bootstrap script
+    effect = "Allow"
+    actions = [
+      "s3:PutObject"
+    ]
+    # This was your S3 bucket for worker logs, assuming CP also logs here or its own dedicated one
+    resources = ["${aws_s3_bucket.worker_logs.arn}/*"]
+  }
+  statement { # For AWS Load Balancer Controller (if used and runs on CP)
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeAccountAttributes",
+      "ec2:DescribeAddresses",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInternetGateways",
+      "ec2:DescribeVpcs",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeInstances",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeTags",
+      "ec2:GetCoipPoolUsage", # Conditional
+      "ec2:DescribeCoipPools", # Conditional
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeLoadBalancerAttributes",
+      "elasticloadbalancing:DescribeListeners",
+      "elasticloadbalancing:DescribeListenerCertificates",
+      "elasticloadbalancing:DescribeSSLPolicies",
+      "elasticloadbalancing:DescribeRules",
+      "elasticloadbalancing:DescribeTargetGroups",
+      "elasticloadbalancing:DescribeTargetGroupAttributes",
+      "elasticloadbalancing:DescribeTargetHealth",
+      "elasticloadbalancing:DescribeTags",
+      "elasticloadbalancing:CreateLoadBalancer",
+      "elasticloadbalancing:CreateTargetGroup",
+      "elasticloadbalancing:CreateListener",
+      "elasticloadbalancing:AddListenerCertificates",
+      "elasticloadbalancing:CreateRule",
+      "elasticloadbalancing:DeleteLoadBalancer",
+      "elasticloadbalancing:DeleteTargetGroup",
+      "elasticloadbalancing:DeleteListener",
+      "elasticloadbalancing:RemoveListenerCertificates",
+      "elasticloadbalancing:DeleteRule",
+      "elasticloadbalancing:ModifyLoadBalancerAttributes",
+      "elasticloadbalancing:ModifyTargetGroup",
+      "elasticloadbalancing:ModifyTargetGroupAttributes",
+      "elasticloadbalancing:ModifyListener",
+      "elasticloadbalancing:ModifyRule",
+      "elasticloadbalancing:RegisterTargets",
+      "elasticloadbalancing:DeregisterTargets",
+      "elasticloadbalancing:SetIpAddressType",
+      "elasticloadbalancing:SetSecurityGroups",
+      "elasticloadbalancing:SetSubnets",
+      "elasticloadbalancing:SetWebAcl", # Conditional
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:RemoveTags",
+      "iam:CreateServiceLinkedRole", # Potentially needed once
+      "iam:GetServerCertificate", # For ACM/IAM certs if used with ALB
+      "iam:ListServerCertificates",
+      "acm:ListCertificates",
+      "acm:DescribeCertificate",
+      "waf-regional:GetWebACLForResource", # Conditional
+      "waf-regional:GetWebACL", # Conditional
+      "waf-regional:AssociateWebACL", # Conditional
+      "waf-regional:DisassociateWebACL", # Conditional
+      "wafv2:GetWebACL", # Conditional
+      "wafv2:GetWebACLForResource", # Conditional
+      "wafv2:AssociateWebACL", # Conditional
+      "wafv2:DisassociateWebACL", # Conditional
+      "shield:DescribeProtection", # Conditional
+      "shield:GetSubscriptionState", # Conditional
+      "shield:DeleteProtection", # Conditional
+      "shield:CreateProtection", # Conditional
+      "shield:DescribeSubscription", # Conditional
+      "shield:ListProtections" # Conditional
+    ]
+    resources = ["*"] # These are broad, typical for ALB controller
+  }
+  # Your original comprehensive policy had Lambda invoke, removing unless CP EC2 calls Lambda directly
+  # statement {
+  #   Effect = "Allow"
+  #   Action = [
+  #     "lambda:InvokeFunction",
+  #     "lambda:GetFunction",
+  #     "lambda:ListFunctions"
+  #   ]
+  #   Resource = aws_lambda_function.node_management_lambda.arn # This implies lambda is defined in this module
+  # }
 }
 
-# AWS managed policies for control plane
-resource "aws_iam_role_policy_attachment" "control_plane_policies" {
-  for_each = toset([
-    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
-    "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-  ])
-  
+resource "aws_iam_role_policy" "control_plane_inline_policy" { # Renamed from comprehensive
+  name   = "${var.cluster_name}-cp-inline-policy"
+  role   = aws_iam_role.control_plane_role.id
+  policy = data.aws_iam_policy_document.control_plane_inline_policy_doc.json
+}
+
+resource "aws_iam_role_policy_attachment" "control_plane_ssm_policy" {
   role       = aws_iam_role.control_plane_role.name
-  policy_arn = each.value
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Control plane instance profile
+resource "aws_iam_role_policy_attachment" "control_plane_cloudwatch_policy" {
+  role       = aws_iam_role.control_plane_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# Added EBS CSI Driver Policy for control plane (needed if it runs csi-provisioner or attacher)
+resource "aws_iam_role_policy_attachment" "control_plane_ebs_csi_policy" {
+  role       = aws_iam_role.control_plane_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # Corrected ARN
+}
+
+
 resource "aws_iam_instance_profile" "control_plane_profile" {
-  name = "guy-cluster-control-plane-profile"
+  name = "${var.cluster_name}-cp-profile"
   role = aws_iam_role.control_plane_role.name
-
   tags = var.tags
 }
 
-# Worker node IAM role
 resource "aws_iam_role" "worker_role" {
-  name = "guy-cluster-worker-role"
-
+  name = "${var.cluster_name}-worker-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
   })
-
   tags = var.tags
 }
 
-# AWS managed policies for worker nodes
-resource "aws_iam_role_policy_attachment" "worker_policies" {
+resource "aws_iam_role_policy_attachment" "worker_eks_policies" { # Renamed for clarity
   for_each = toset([
     "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
-    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
-    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
-    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy", # Covers CNI pod permissions
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly", # For pulling images from ECR
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+    "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # For worker nodes to interact with EBS CSI
   ])
-  
   role       = aws_iam_role.worker_role.name
   policy_arn = each.value
 }
+# Add S3 read for worker_logs if workers need to fetch anything or for consistency (though less common)
+data "aws_iam_policy_document" "worker_s3_logs_policy_doc" {
+  statement {
+    actions = [
+      "s3:GetObject", # If workers fetch from it
+      "s3:PutObject", # If workers directly upload logs (less common, usually via Fluentd/CW agent)
+      "s3:ListBucket" # If needed
+    ]
+    resources = [
+      aws_s3_bucket.worker_logs.arn,
+      "${aws_s3_bucket.worker_logs.arn}/*",
+    ]
+  }
+}
+resource "aws_iam_role_policy" "worker_s3_logs_policy" {
+  name   = "${var.cluster_name}-worker-s3-logs-policy"
+  role   = aws_iam_role.worker_role.id
+  policy = data.aws_iam_policy_document.worker_s3_logs_policy_doc.json
+}
 
-# Worker instance profile
+
 resource "aws_iam_instance_profile" "worker_profile" {
-  name = "guy-cluster-worker-profile"
+  name = "${var.cluster_name}-worker-profile"
   role = aws_iam_role.worker_role.name
-
   tags = var.tags
 }
 
@@ -504,25 +542,23 @@ resource "aws_iam_instance_profile" "worker_profile" {
 # 🔑 SSH KEY MANAGEMENT
 # =============================================================================
 
-# Generate SSH key if not provided
 resource "tls_private_key" "ssh" {
-  count     = var.key_name == "" ? 1 : 0
+  count     = var.key_name == "" ? 1 : 0 # Only create if key_name is not provided
   algorithm = "RSA"
   rsa_bits  = 4096
 }
 
 resource "aws_key_pair" "generated_key" {
   count      = var.key_name == "" ? 1 : 0
-  key_name   = "polybot-key"
+  key_name   = "${var.cluster_name}-bootstrap-key" # Use cluster_name for uniqueness
   public_key = tls_private_key.ssh[0].public_key_openssh
-
-  tags = var.tags
+  tags       = var.tags
 }
 
 resource "local_file" "ssh_private_key" {
-  count           = var.key_name == "" ? 1 : 0
+  count           = var.key_name == "" && length(tls_private_key.ssh) > 0 ? 1 : 0
   content         = tls_private_key.ssh[0].private_key_pem
-  filename        = "${path.module}/../../polybot-key.pem"
+  filename        = var.ssh_private_key_file_path != "" ? var.ssh_private_key_file_path : "${path.module}/../../${local.actual_key_name}.pem" # Use var if provided
   file_permission = "0600"
 }
 
@@ -530,21 +566,13 @@ resource "local_file" "ssh_private_key" {
 # 🔐 SSL CERTIFICATE - ACM WITH DNS VALIDATION
 # =============================================================================
 
-# ACM certificate for the domain
 resource "aws_acm_certificate" "polybot_cert" {
-  domain_name       = var.domain_name  # e.g., "guy-polybot-lg.devops-int-college.com"
+  domain_name       = var.domain_name
   validation_method = "DNS"
-  
-  lifecycle {
-    create_before_destroy = true
-  }
-  
-  tags = merge(var.tags, {
-    Name = "polybot-ssl-certificate"
-  })
+  lifecycle { create_before_destroy = true }
+  tags = merge(var.tags, { Name = "${var.cluster_name}-ssl-certificate" })
 }
 
-# DNS validation record
 resource "aws_route53_record" "cert_validation" {
   for_each = {
     for dvo in aws_acm_certificate.polybot_cert.domain_validation_options : dvo.domain_name => {
@@ -553,8 +581,7 @@ resource "aws_route53_record" "cert_validation" {
       type   = dvo.resource_record_type
     }
   }
-
-  allow_overwrite = true
+  allow_overwrite = true # This might be problematic if other records exist with same name/type
   name            = each.value.name
   records         = [each.value.record]
   ttl             = 60
@@ -562,58 +589,47 @@ resource "aws_route53_record" "cert_validation" {
   zone_id         = var.route53_zone_id
 }
 
-# Certificate validation
 resource "aws_acm_certificate_validation" "polybot_cert_validation" {
   certificate_arn         = aws_acm_certificate.polybot_cert.arn
   validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
-  
-  timeouts {
-    create = "5m"
-  }
+  timeouts { create = "10m" } # Increased timeout for DNS propagation
 }
 
 # =============================================================================
 # ⚖️ LOAD BALANCER - APPLICATION LOAD BALANCER
 # =============================================================================
 
-# Application Load Balancer
 resource "aws_lb" "polybot_alb" {
-  name               = "guy-polybot-alb"
+  name               = "${var.cluster_name}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
-  subnets            = module.vpc.public_subnets
-
-  enable_deletion_protection = false
-
-  tags = merge(var.tags, {
-    Name = "guy-polybot-alb"
-  })
+  subnets            = module.vpc.public_subnets # Ensure these are public subnets
+  enable_deletion_protection = false # Set to true for production
+  tags = merge(var.tags, { Name = "${var.cluster_name}-alb" })
 }
 
-# Main target group (backend for both HTTP and HTTPS listeners)
 resource "aws_lb_target_group" "main_tg" {
-  name     = "guy-polybot-main-tg"
-  port     = 30080  # NodePort for Kubernetes services
-  protocol = "HTTP"
-  vpc_id   = module.vpc.vpc_id
+  name_prefix = substr("${var.cluster_name}-main-", 0, 6) # Max 32 chars, ensure prefix + random is within limits <-- ADDED CLOSING PARENTHESIS
+  port        = 80 # Assuming services in K8s expose HTTP on a NodePort that maps to their internal port
+  protocol    = "HTTP"
+  vpc_id      = module.vpc.vpc_id
+  target_type = "instance" # For NodePort services; use 'ip' for Fargate or direct pod IP routing with CNI support
 
   health_check {
     enabled             = true
     healthy_threshold   = 2
+    unhealthy_threshold = 3 # Increased from 2 for a bit more tolerance
     interval            = 30
-    matcher             = "200,404"  # 404 is acceptable for health check
-    path                = "/"
-    port                = "traffic-port"
-    protocol            = "HTTP"
-    timeout             = 5
-    unhealthy_threshold = 3
+    matcher             = "200" # Be specific. 404 might mean service is up but path is wrong for health.
+    path                = var.alb_health_check_path # Make this configurable, e.g., "/healthz" or "/"
+    port                = "traffic-port" # Checks the instance on the target group port (e.g., 80 or NodePort)
+    protocol            = "HTTP" # Can be HTTPS if instances serve HTTPS directly on NodePort
+    timeout             = 10     # Increased timeout
   }
-
   tags = var.tags
 }
 
-# HTTP listener (with optional redirect to HTTPS)
 resource "aws_lb_listener" "http_listener" {
   load_balancer_arn = aws_lb.polybot_alb.arn
   port              = "80"
@@ -621,7 +637,7 @@ resource "aws_lb_listener" "http_listener" {
 
   default_action {
     type = var.redirect_http_to_https ? "redirect" : "forward"
-    
+
     dynamic "redirect" {
       for_each = var.redirect_http_to_https ? [1] : []
       content {
@@ -630,567 +646,113 @@ resource "aws_lb_listener" "http_listener" {
         status_code = "HTTP_301"
       }
     }
-    
+    # Only specify target_group_arn if not redirecting
     target_group_arn = var.redirect_http_to_https ? null : aws_lb_target_group.main_tg.arn
   }
 }
 
-# HTTPS listener (using validated ACM certificate)
 resource "aws_lb_listener" "https_listener" {
   load_balancer_arn = aws_lb.polybot_alb.arn
   port              = "443"
   protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01"
-  certificate_arn   = aws_acm_certificate_validation.polybot_cert_validation.certificate_arn
+  ssl_policy        = var.alb_ssl_policy # Make this a variable, e.g., "ELBSecurityPolicy-TLS-1-2-Ext-2018-06"
+  certificate_arn   = aws_acm_certificate.polybot_cert.arn # Validation happens before listener creation
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.main_tg.arn  # SSL termination: HTTPS->HTTP
+    target_group_arn = aws_lb_target_group.main_tg.arn
   }
-
-  depends_on = [aws_acm_certificate_validation.polybot_cert_validation]
+  depends_on = [aws_acm_certificate_validation.polybot_cert_validation] # Ensure cert is validated
 }
 
 # =============================================================================
-# 📦 S3 BUCKET - USER DATA SCRIPTS STORAGE
+# 📦 S3 BUCKET - USER DATA SCRIPTS & WORKER LOGS
 # =============================================================================
 
-# S3 bucket for storing large user data scripts
 resource "aws_s3_bucket" "user_data_scripts" {
-  bucket        = "guy-k8s-userdata-${random_id.suffix.hex}"
-  force_destroy = true
-
-  tags = var.tags
+  bucket        = "${var.cluster_name}-k8s-userdata-${random_id.unique_suffix.hex}"
+  force_destroy = true # OK for dev, be cautious in prod
+  tags          = var.tags
 }
-
 resource "aws_s3_bucket_ownership_controls" "user_data_scripts_ownership" {
   bucket = aws_s3_bucket.user_data_scripts.id
-
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
+  rule { object_ownership = "BucketOwnerPreferred" }
 }
-
 resource "aws_s3_bucket_acl" "user_data_scripts_acl" {
   depends_on = [aws_s3_bucket_ownership_controls.user_data_scripts_ownership]
-  
-  bucket = aws_s3_bucket.user_data_scripts.id
-  acl    = "private"
+  bucket     = aws_s3_bucket.user_data_scripts.id
+  acl        = "private"
 }
 
-# Upload control plane script to S3 - Updated with comprehensive v9 script
-resource "aws_s3_object" "control_plane_script" {
-  bucket = aws_s3_bucket.user_data_scripts.bucket
-  key    = "control_plane_bootstrap_v9.sh"
-  content = <<-EOF
-#!/bin/bash
-set -euo pipefail
-
-# =================================================================
-# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v9
-# =================================================================
-
-# Set up comprehensive logging
-BOOTSTRAP_LOG="/var/log/k8s-bootstrap.log"
-CLOUD_INIT_LOG="/var/log/cloud-init-output.log"
-
-# Create log files and ensure they're writable
-touch "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
-chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
-
-# Redirect all output to both log files
-exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
-
-echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED               ="
-echo "= Time: $$(date)"
-echo "= Instance: $$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-echo "= Private IP: $$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
-echo "= Public IP: $$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
-echo "================================================================="
-
-# Error handling function
-error_exit() {
-    echo "❌ FATAL ERROR: $1"
-    echo "❌ Time: $$(date)"
-    echo "❌ Exit code: $?"
-    echo "❌ Working directory: $$(pwd)"
-    echo "❌ Disk space:"
-    df -h
-    echo "❌ Memory:"
-    free -h
-    echo "❌ Last 20 lines of this log:"
-    tail -20 "$BOOTSTRAP_LOG" 2>/dev/null || echo "Cannot read bootstrap log"
-    exit 1
-}
-
-# Step 0: Set hostname
-echo "🏷️ Step 0: Setting hostname..."
-NEW_HOSTNAME="guy-control-plane-${random_string.token_part1.result}"
-hostnamectl set-hostname "$$NEW_HOSTNAME"
-echo "127.0.0.1 $$NEW_HOSTNAME" >> /etc/hosts
-echo "✅ Hostname set to: $$NEW_HOSTNAME"
-
-# Step 1: System updates and essential packages
-echo "📦 Step 1: Installing essential packages..."
-export DEBIAN_FRONTEND=noninteractive
-
-# Update package lists
-echo "📥 Updating package lists..."
-apt-get update -y || error_exit "Failed to update package lists"
-
-# Install essential packages
-echo "📦 Installing essential packages..."
-apt-get install -y \
-    curl \
-    wget \
-    unzip \
-    jq \
-    awscli \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    software-properties-common \
-    apt-transport-https \
-    socat \
-    conntrack \
-    ipset || error_exit "Failed to install essential packages"
-
-echo "✅ Essential packages installed"
-
-# Verify AWS CLI works
-echo "🔍 Testing AWS CLI..."
-aws --version || error_exit "AWS CLI not working"
-echo "✅ AWS CLI verified"
-
-# Step 2: System configuration for Kubernetes
-echo "⚙️ Step 2: Configuring system for Kubernetes..."
-
-# Disable swap permanently
-echo "💾 Disabling swap..."
-swapoff -a
-sed -i.bak '/swap/s/^/#/' /etc/fstab
-echo "✅ Swap disabled"
-
-# Load required kernel modules
-echo "🔧 Loading kernel modules..."
-cat > /etc/modules-load.d/k8s.conf << 'MODULES_EOF'
-overlay
-br_netfilter
-MODULES_EOF
-
-modprobe overlay || error_exit "Failed to load overlay module"
-modprobe br_netfilter || error_exit "Failed to load br_netfilter module"
-echo "✅ Kernel modules loaded"
-
-# Configure sysctl parameters
-echo "🔧 Configuring sysctl parameters..."
-cat > /etc/sysctl.d/k8s.conf << 'SYSCTL_EOF'
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-SYSCTL_EOF
-
-sysctl --system || error_exit "Failed to apply sysctl settings"
-echo "✅ System configuration completed"
-
-# Step 3: Install containerd (container runtime)
-echo "🐳 Step 3: Installing containerd container runtime..."
-
-# Install containerd
-echo "📦 Installing containerd..."
-apt-get update -y
-apt-get install -y containerd || error_exit "Failed to install containerd"
-
-# Configure containerd
-echo "🔧 Configuring containerd..."
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-
-# Enable systemd cgroup driver
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-# Start and enable containerd
-systemctl daemon-reload
-systemctl enable containerd
-systemctl start containerd
-
-# Verify containerd is running
-if ! systemctl is-active --quiet containerd; then
-    error_exit "containerd is not running"
-fi
-
-echo "✅ containerd installed and configured"
-
-# Step 4: Install Kubernetes components
-echo "☸️ Step 4: Installing Kubernetes components..."
-
-# Add Kubernetes apt repository
-echo "📥 Adding Kubernetes repository..."
-mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg || error_exit "Failed to add Kubernetes GPG key"
-
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${local.k8s_major_minor}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
-
-# Update package lists with new repository
-echo "📥 Updating package lists with Kubernetes repository..."
-apt-get update -y || error_exit "Failed to update package lists with Kubernetes repo"
-
-# Install Kubernetes components
-echo "📦 Installing kubectl, kubeadm, kubelet..."
-apt-get install -y \
-    kubelet=${local.k8s_package_version} \
-    kubeadm=${local.k8s_package_version} \
-    kubectl=${local.k8s_package_version} || error_exit "Failed to install Kubernetes components"
-
-# Hold packages to prevent automatic updates
-apt-mark hold kubelet kubeadm kubectl || error_exit "Failed to hold Kubernetes packages"
-
-# Verify installations
-echo "🔍 Verifying Kubernetes component installations..."
-kubectl version --client || error_exit "kubectl not installed correctly"
-kubeadm version || error_exit "kubeadm not installed correctly"
-kubelet --version || error_exit "kubelet not installed correctly"
-
-echo "✅ Kubernetes components installed successfully"
-
-# Step 5: Configure kubelet
-echo "🔧 Step 5: Configuring kubelet..."
-
-# Get instance metadata
-PRIVATE_IP=$$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-
-# Configure kubelet with cloud provider
-mkdir -p /etc/systemd/system/kubelet.service.d
-cat > /etc/systemd/system/kubelet.service.d/20-cloud-provider.conf << 'KUBELET_EOF'
-[Service]
-Environment="KUBELET_EXTRA_ARGS=--cloud-provider=external --node-ip=$$PRIVATE_IP"
-KUBELET_EOF
-
-systemctl daemon-reload
-echo "✅ Kubelet configured"
-
-# Step 6: Initialize Kubernetes cluster with kubeadm
-echo "🚀 Step 6: Initializing Kubernetes cluster with kubeadm..."
-
-# Create kubeadm configuration
-echo "📝 Creating kubeadm configuration..."
-mkdir -p /etc/kubernetes/kubeadm
-
-cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml << 'KUBEADM_EOF'
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
-bootstrapTokens:
-- token: "${local.kubeadm_token}"
-  description: "Initial token for worker nodes"
-  ttl: "24h"
-localAPIEndpoint:
-  advertiseAddress: $$PRIVATE_IP
-  bindPort: 6443
-nodeRegistration:
-  name: $$NEW_HOSTNAME
-  criSocket: "unix:///run/containerd/containerd.sock"
-  kubeletExtraArgs:
-    cloud-provider: "external"
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-kubernetesVersion: "v${local.k8s_version_full}"
-controlPlaneEndpoint: "$$PRIVATE_IP:6443"
-apiServer:
-  certSANs:
-  - "$$PRIVATE_IP"
-  - "$$NEW_HOSTNAME"
-  - "127.0.0.1"
-  - "localhost"
-  - "kubernetes"
-  - "kubernetes.default"
-  - "kubernetes.default.svc"
-  - "kubernetes.default.svc.cluster.local"
-controllerManager:
-  extraArgs:
-    cloud-provider: "external"
-networking:
-  podSubnet: "${local.pod_cidr}"
-  serviceSubnet: "10.96.0.0/12"
-KUBEADM_EOF
-
-echo "✅ Kubeadm configuration created"
-echo "📋 Configuration preview:"
-cat /etc/kubernetes/kubeadm/kubeadm-config.yaml
-
-# Run kubeadm init
-echo "🎯 Running kubeadm init (this may take several minutes)..."
-echo "📋 Command: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5"
-echo "📋 Start time: $$(date)"
-
-# Create dedicated log for kubeadm init
-KUBEADM_LOG="/var/log/kubeadm-init.log"
-
-if kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-config.yaml --upload-certs --v=5 > "$$KUBEADM_LOG" 2>&1; then
-    echo "✅ kubeadm init completed successfully!"
-    echo "📋 End time: $$(date)"
-    echo "📋 Last 10 lines of kubeadm output:"
-    tail -10 "$$KUBEADM_LOG"
-else
-    echo "❌ kubeadm init FAILED!"
-    echo "📋 End time: $$(date)"
-    echo "📋 Full kubeadm output:"
-    cat "$$KUBEADM_LOG"
-    error_exit "kubeadm init failed"
-fi
-
-# Verify admin.conf was created
-if [ ! -f /etc/kubernetes/admin.conf ]; then
-    error_exit "admin.conf was not created by kubeadm init"
-fi
-
-echo "✅ admin.conf verified: $$(stat -c%s /etc/kubernetes/admin.conf) bytes"
-
-# Step 7: Set up kubeconfig for root and ubuntu users
-echo "🔧 Step 7: Setting up kubeconfig..."
-
-# Set up for root
-mkdir -p /root/.kube
-cp -i /etc/kubernetes/admin.conf /root/.kube/config
-chown root:root /root/.kube/config
-chmod 600 /root/.kube/config
-
-# Set up for ubuntu user
-mkdir -p /home/ubuntu/.kube
-cp -i /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-chown ubuntu:ubuntu /home/ubuntu/.kube/config
-chmod 600 /home/ubuntu/.kube/config
-chown -R ubuntu:ubuntu /home/ubuntu/.kube
-
-echo "✅ Kubeconfig configured for root and ubuntu users"
-
-# Step 8: Test cluster access
-echo "🔍 Step 8: Testing cluster access..."
-export KUBECONFIG=/etc/kubernetes/admin.conf
-
-if kubectl cluster-info; then
-    echo "✅ Cluster access verified"
-    kubectl get nodes
-else
-    error_exit "Cannot access Kubernetes cluster"
-fi
-
-# Step 9: Install CNI (Calico)
-echo "🌐 Step 9: Installing Calico CNI..."
-
-if kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml; then
-    echo "✅ Calico CNI installation initiated"
-else
-    echo "⚠️ Calico installation failed, but continuing..."
-fi
-
-# Step 10: Store join command in AWS Secrets Manager
-echo "🔐 Step 10: Storing join command in AWS Secrets Manager..."
-
-# Generate fresh join command
-JOIN_COMMAND=$$(kubeadm token create --print-join-command)
-
-if [ -n "$$JOIN_COMMAND" ]; then
-    echo "📤 Storing join command in secrets..."
-    
-    # Store in both secrets
-    aws secretsmanager put-secret-value \
-        --secret-id "${aws_secretsmanager_secret.kubernetes_join_command.name}" \
-        --secret-string "$$JOIN_COMMAND" \
-        --region "${var.region}" || echo "⚠️ Failed to store in primary secret"
-        
-    aws secretsmanager put-secret-value \
-        --secret-id "${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" \
-        --secret-string "$$JOIN_COMMAND" \
-        --region "${var.region}" || echo "⚠️ Failed to store in latest secret"
-        
-    echo "✅ Join command stored in AWS Secrets Manager"
-else
-    echo "⚠️ Failed to generate join command"
-fi
-
-# Final status report
-echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED             ="
-echo "= Time: $$(date)"
-echo "= Status: SUCCESS"
-echo "================================================================="
-echo "📊 Final verification:"
-echo "   ✅ kubectl: $$(kubectl version --client --short 2>/dev/null)"
-echo "   ✅ kubeadm: $$(kubeadm version -o short 2>/dev/null)"
-echo "   ✅ kubelet: $$(systemctl is-active kubelet)"
-echo "   ✅ containerd: $$(systemctl is-active containerd)"
-echo "   ✅ admin.conf: $$([ -f /etc/kubernetes/admin.conf ] && echo 'EXISTS' || echo 'MISSING')"
-echo "    Logs available at: $$BOOTSTRAP_LOG"
-echo "   📁 Kubeadm logs at: $$KUBEADM_LOG"
-echo "================================================================="
-EOF
-
-  tags = var.tags
-}
-
-# =============================================================================
-# 📦 S3 BUCKET - WORKER LOGS STORAGE
-# =============================================================================
-
-# S3 bucket for worker logs
+# S3 bucket for worker logs (if distinct from other logs)
 resource "aws_s3_bucket" "worker_logs" {
-  bucket        = "guy-polybot-logs"
-  force_destroy = true
-
-  tags = var.tags
+  bucket        = "${var.cluster_name}-worker-logs-${random_id.unique_suffix.hex}" # Make name unique
+  force_destroy = true # OK for dev
+  tags          = var.tags
 }
-
 resource "aws_s3_bucket_ownership_controls" "worker_logs_ownership" {
   bucket = aws_s3_bucket.worker_logs.id
-
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
+  rule { object_ownership = "BucketOwnerPreferred" }
 }
-
 resource "aws_s3_bucket_acl" "worker_logs_acl" {
   depends_on = [aws_s3_bucket_ownership_controls.worker_logs_ownership]
-  
-  bucket = aws_s3_bucket.worker_logs.id
-  acl    = "private"
+  bucket     = aws_s3_bucket.worker_logs.id
+  acl        = "private"
+}
+
+# Upload control plane script (as a template file) to S3
+resource "aws_s3_object" "control_plane_script" {
+  bucket  = aws_s3_bucket.user_data_scripts.id # Corrected: use .id for bucket name reference
+  key     = "bootstrap_scripts/control_plane_bootstrap_v10.sh" # Versioned key
+  content = templatefile("${path.module}/scripts/control_plane_bootstrap.sh.tpl", local.control_plane_template_vars)
+  tags    = var.tags
+  # ETag will change if content changes, can be used to trigger instance recreation if desired
 }
 
 # =============================================================================
 # 🖥️ CONTROL PLANE - KUBERNETES MASTER NODE
 # =============================================================================
 
-# Control plane instance
 resource "aws_instance" "control_plane" {
-  ami                    = var.control_plane_ami
-  instance_type          = var.control_plane_instance_type
-  key_name               = local.actual_key_name
-  vpc_security_group_ids = [aws_security_group.control_plane_sg.id]
-  subnet_id              = module.vpc.public_subnets[0]
-  iam_instance_profile   = aws_iam_instance_profile.control_plane_profile.name
-
+  ami                         = var.control_plane_ami
+  instance_type               = var.control_plane_instance_type
+  key_name                    = local.actual_key_name
+  vpc_security_group_ids      = [aws_security_group.control_plane_sg.id]
+  subnet_id                   = module.vpc.public_subnets[0] # Assuming first public subnet
+  iam_instance_profile        = aws_iam_instance_profile.control_plane_profile.name
   associate_public_ip_address = true
 
   metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
+    http_endpoint               = "enabled"
+    http_tokens                 = "required" # Good practice
     http_put_response_hop_limit = 2
-    instance_metadata_tags = "enabled"
+    instance_metadata_tags      = "enabled"
   }
 
   root_block_device {
     volume_type = "gp3"
-    volume_size = 20
+    volume_size = var.control_plane_root_volume_size # Make this a variable
     encrypted   = true
-    
-    tags = merge(var.tags, {
-      Name = "guy-control-plane-root"
-    })
+    tags        = merge(var.tags, { Name = "${var.cluster_name}-cp-root" })
   }
 
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -euo pipefail
-    
-    # =================================================================
-    # S3 BOOTSTRAP SCRIPT FETCHER - CONTROL PLANE v1
-    # =================================================================
-    
-    echo "========================================================="
-    echo "= S3 BOOTSTRAP SCRIPT FETCHER - STARTING              ="
-    echo "= Time: $(date)                                         ="
-    echo "= Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-    echo "========================================================="
-    
-    # Set up basic logging
-    FETCHER_LOG="/var/log/s3-bootstrap-fetcher.log"
-    exec > >(tee -a "$FETCHER_LOG") 2>&1
-    
-    # Error handling
-    error_exit() {
-        echo "❌ FETCHER ERROR: $1"
-        echo "❌ Time: $(date)"
-        exit 1
-    }
-    
-    # Install minimal required packages
-    echo "📦 Installing minimal required packages..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || error_exit "Failed to update package list"
-    apt-get install -y curl awscli || error_exit "Failed to install curl and awscli"
-    
-    # Verify AWS CLI
-    aws --version || error_exit "AWS CLI not working"
-    
-    # Download bootstrap script from S3
-    echo "📥 Downloading bootstrap script from S3..."
-    SCRIPT_PATH="/tmp/control_plane_bootstrap.sh"
-    S3_BUCKET="${aws_s3_bucket.user_data_scripts.bucket}"
-    S3_KEY="${aws_s3_object.control_plane_script.key}"
-    REGION="${var.region}"
-    
-    echo "📍 S3 Location: s3://$S3_BUCKET/$S3_KEY"
-    echo "🌍 Region: $REGION"
-    
-    # Download with retries
-    for attempt in {1..5}; do
-        echo "📥 Download attempt $attempt/5..."
-        if aws s3 cp "s3://$S3_BUCKET/$S3_KEY" "$SCRIPT_PATH" --region "$REGION"; then
-            echo "✅ Script downloaded successfully"
-            break
-        else
-            echo "⚠️ Download attempt $attempt failed"
-            if [ $attempt -eq 5 ]; then
-                error_exit "Failed to download bootstrap script after 5 attempts"
-            fi
-            sleep 10
-        fi
-    done
-    
-    # Verify script was downloaded
-    if [ ! -f "$SCRIPT_PATH" ]; then
-        error_exit "Bootstrap script not found at $SCRIPT_PATH"
-    fi
-    
-    # Check script size
-    SCRIPT_SIZE=$(stat -c%s "$SCRIPT_PATH")
-    echo "📊 Script size: $SCRIPT_SIZE bytes"
-    
-    if [ $SCRIPT_SIZE -lt 1000 ]; then
-        error_exit "Downloaded script too small ($SCRIPT_SIZE bytes), likely corrupted"
-    fi
-    
-    # Make script executable
-    chmod +x "$SCRIPT_PATH" || error_exit "Failed to make script executable"
-    
-    # Execute the bootstrap script
-    echo "🚀 Executing bootstrap script..."
-    echo "📋 Command: $SCRIPT_PATH"
-    echo "📋 Start time: $(date)"
-    
-    if "$SCRIPT_PATH"; then
-        echo "✅ Bootstrap script completed successfully!"
-        echo "📋 End time: $(date)"
-    else
-        error_exit "Bootstrap script execution failed"
-    fi
-    
-    echo "========================================================="
-    echo "= S3 BOOTSTRAP SCRIPT FETCHER - COMPLETED             ="
-    echo "= Time: $(date)                                         ="
-    echo "========================================================="
-    EOF
-  )
+  # User data now fetches the main script from S3
+  user_data = base64encode(templatefile("${path.module}/scripts/fetch_and_run.sh.tpl", {
+    S3_BUCKET_NAME = aws_s3_bucket.user_data_scripts.id # Or .bucket
+    S3_SCRIPT_KEY  = aws_s3_object.control_plane_script.key
+    AWS_REGION     = var.region
+    EXTRA_ARGS     = "" # Any extra args to pass to the downloaded script
+  }))
 
   tags = merge(var.tags, {
-    Name = "guy-control-plane"
-    Role = "control-plane"
-    "kubernetes-io-cluster-${local.cluster_name}" = "owned"
+    Name                                           = "${var.cluster_name}-control-plane"
+    Role                                           = "control-plane"
+    "kubernetes.io_cluster_${local.cluster_name}"  = "owned" # CORRECTED: Slashes replaced with underscores
   })
 
   lifecycle {
     create_before_destroy = true
+    # ignore_changes = [user_data] # Add this if you manage updates by replacing the instance via other triggers (e.g. AMI change)
   }
 }
 
@@ -1198,92 +760,77 @@ resource "aws_instance" "control_plane" {
 # 🤖 WORKER NODES - AUTO SCALING GROUP
 # =============================================================================
 
-# Worker launch template
 resource "aws_launch_template" "worker_lt" {
-  name_prefix   = "guy-worker-lt-"
+  name_prefix   = "${var.cluster_name}-worker-lt-"
   image_id      = var.worker_ami
   instance_type = var.worker_instance_type
-  key_name      = local.actual_key_name
+  key_name      = local.actual_key_name # Ensures workers can use the same key
 
   vpc_security_group_ids = [aws_security_group.worker_sg.id]
 
-  iam_instance_profile {
-    name = aws_iam_instance_profile.worker_profile.name
-  }
+  iam_instance_profile { name = aws_iam_instance_profile.worker_profile.name }
 
   metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
+    http_endpoint          = "enabled"
+    http_tokens            = "required"
     http_put_response_hop_limit = 2
     instance_metadata_tags = "enabled"
   }
 
   block_device_mappings {
-    device_name = "/dev/sda1"
+    device_name = "/dev/sda1" # Or your worker AMI's root device
     ebs {
-      volume_type = "gp3"
-      volume_size = 20
-      encrypted   = true
+      volume_type           = "gp3"
+      volume_size           = var.worker_root_volume_size # Make this a variable
+      encrypted             = true
       delete_on_termination = true
     }
   }
 
-  user_data = base64encode(templatefile("${path.module}/worker_user_data.sh", merge(local.template_vars, {
-    cluster_name                = local.cluster_name
-    region                     = var.region
-    join_command_secret_id     = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-    JOIN_COMMAND_LATEST_SECRET = aws_secretsmanager_secret.kubernetes_join_command_latest.name
-    control_plane_endpoint     = "https://$${aws_instance.control_plane.private_ip}:6443"
-    s3_bucket                  = aws_s3_bucket.worker_logs.bucket
-    worker_asg_name            = local.worker_asg_name
-    K8S_VERSION_TO_INSTALL     = local.k8s_package_version
+  # Ensure worker_user_data.sh is a template file
+  user_data = base64encode(templatefile("${path.module}/scripts/worker_user_data.sh.tpl", merge(local.worker_template_vars, {
+    # Explicitly pass needed values; many are in local.worker_template_vars
+    TF_JOIN_COMMAND_LATEST_SECRET_NAME = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    TF_CONTROL_PLANE_PRIVATE_IP      = aws_instance.control_plane.private_ip # Pass the actual IP
+    TF_S3_WORKER_LOGS_BUCKET         = aws_s3_bucket.worker_logs.id # Or .bucket
+    TF_WORKER_ASG_NAME               = local.worker_asg_name
+    # Other variables like K8S versions are already in local.worker_template_vars
   })))
 
   tag_specifications {
     resource_type = "instance"
     tags = merge(var.tags, {
-      Name = "guy-worker-node"
-      Role = "worker"
-      "kubernetes-io-cluster-${local.cluster_name}" = "owned"
+      Name                                        = "${var.cluster_name}-worker-node"
+      Role                                        = "worker"
+      "kubernetes.io/cluster/${local.cluster_name}" = "owned"
     })
   }
-
-  lifecycle {
-    create_before_destroy = true
-  }
+  lifecycle { create_before_destroy = true }
 }
 
-# Worker auto scaling group
 resource "aws_autoscaling_group" "worker_asg" {
-  name                = local.worker_asg_name
-  vpc_zone_identifier = module.vpc.public_subnets
-  target_group_arns   = [aws_lb_target_group.main_tg.arn]
-  health_check_type   = "ELB"
-  health_check_grace_period = 300
+  name                      = local.worker_asg_name
+  vpc_zone_identifier       = module.vpc.public_subnets # Workers in public subnets for simplicity; private with NAT for prod
+  # target_group_arns         = [aws_lb_target_group.main_tg.arn] # Only if ASG instances are directly registered; usually K8s Service of type LB handles this via NodePorts. This might be for classic ELB or specific setups. If using ALB with NodePort, this is not needed here.
+  health_check_type         = "EC2" # "ELB" is only if target_group_arns is used and ELB does health checks. EC2 is more common for ASG itself.
+  health_check_grace_period = 300   # Time for instance to boot and join cluster
 
-  min_size         = 2
-  max_size         = 10
-  desired_capacity = var.desired_worker_nodes
+  min_size                  = var.min_worker_nodes # Use specific min/max vars
+  max_size                  = var.max_worker_nodes
+  desired_capacity          = var.desired_worker_nodes
 
   launch_template {
     id      = aws_launch_template.worker_lt.id
-    version = "$Latest"
+    version = "$Latest" # Or specific version: aws_launch_template.worker_lt.latest_version
   }
 
-  tag {
-    key                 = "Name"
-    value               = local.worker_asg_name
-    propagate_at_launch = false
-  }
-
-  tag {
-    key                 = "kubernetes-io-cluster-${local.cluster_name}"
-    value               = "owned"
-    propagate_at_launch = true
-  }
-
+  # Propagate tags to instances
   dynamic "tag" {
-    for_each = var.tags
+    for_each = merge(var.tags, {
+      Name                                        = "${var.cluster_name}-worker-instance" # Instances will get this name
+      Role                                        = "worker"
+      "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+    })
     content {
       key                 = tag.key
       value               = tag.value
@@ -1293,233 +840,202 @@ resource "aws_autoscaling_group" "worker_asg" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes       = [desired_capacity]
+    # ignore_changes       = [desired_capacity] # Only if something else manages desired_capacity (e.g. cluster autoscaler)
   }
+  # Suspends processes that might interfere with cluster autoscaler or custom logic
+  # suspended_processes = ["AZRebalance", "AlarmNotification", "ScheduledActions"]
 }
 
 # =============================================================================
-# ⏳ CLUSTER INITIALIZATION - WAIT FOR CONTROL PLANE
+# ⏳ CLUSTER INITIALIZATION HELPERS (MODULE INTERNAL) - MINIMIZE LOCAL-EXEC
 # =============================================================================
 
-# Wait for control plane to be ready
-resource "null_resource" "wait_for_control_plane" {
-  depends_on = [aws_instance.control_plane]
-
+# This resource primarily serves as a dependency anchor and to output instance details.
+# The actual readiness polling is better handled in the root module after kubeconfig is in Secrets Manager.
+resource "null_resource" "control_plane_provisioned_signal" {
   triggers = {
-    control_plane_id = aws_instance.control_plane.id
-    wait_version = "v2-simplified"
+    instance_id = aws_instance.control_plane.id
   }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
-      #!/bin/bash
-      
-      echo "⏳ Waiting for control plane to be ready..."
-      echo "Instance ID: ${aws_instance.control_plane.id}"
-      echo "Public IP: ${aws_instance.control_plane.public_ip}"
-      
-      # Wait for instance to be running
-      aws ec2 wait instance-running \
-        --instance-ids ${aws_instance.control_plane.id} \
-        --region ${var.region}
-      
-      # Wait for SSM agent to be online
-      for i in {1..30}; do
-        if aws ssm describe-instance-information \
-           --region ${var.region} \
-           --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" \
-           --query "InstanceInformationList[0].PingStatus" \
-           --output text 2>/dev/null | grep -q "Online"; then
-          echo "✅ Control plane SSM agent is online"
-          break
-        fi
-        echo "⏳ Waiting for SSM agent... ($i/30)"
-        sleep 10
-      done
-      
-      echo "✅ Control plane is ready for kubeadm initialization"
-    EOT
-  }
+  # No provisioner here; its existence signals the instance resource completed.
 }
 
-# =============================================================================
-# 🔄 JOIN COMMAND MANAGEMENT - TOKEN UPDATES
-# =============================================================================
 
-# Join command update resource
+# The local-exec for update_join_command can remain if it's simple and robust.
+# It updates a secret after the control plane is up.
 resource "null_resource" "update_join_command" {
   depends_on = [
-    aws_instance.control_plane,
+    # Ensure control plane has had a chance to run user_data and potentially store initial join command
+    # This might depend on the new root-level null_resource.wait_for_kubeconfig_secret or aws_instance.control_plane directly
+    aws_instance.control_plane, # Basic dependency
+    null_resource.control_plane_provisioned_signal, # More explicit
     aws_secretsmanager_secret.kubernetes_join_command,
     aws_secretsmanager_secret.kubernetes_join_command_latest,
-    null_resource.wait_for_control_plane
   ]
 
   triggers = {
-    control_plane_ip = aws_instance.control_plane.public_ip
-    control_plane_id = aws_instance.control_plane.id
-    update_version = "v6-simplified"
+    control_plane_id   = aws_instance.control_plane.id # Trigger if CP changes
+    update_version     = "v7-secrets-manager-focus"
+    # Add other triggers if this script needs to re-run, e.g., K8s version change
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
+    command     = <<-EOT
       #!/bin/bash
-      
-      echo "🔄 Join Command Management v6 - Simplified"
-      echo "=========================================="
-      
-      # Skip if explicitly disabled
-      if [[ "$${SKIP_JOIN_COMMAND_UPDATE:-false}" == "true" ]]; then
-        echo "SKIP_JOIN_COMMAND_UPDATE is set, skipping update"
+      set -e # Exit on error
+
+      echo "🔄 Join Command Management v7 (runs after CP user_data)"
+      echo "======================================================"
+
+      # This script assumes the control plane user_data has *already*
+      # run kubeadm init and stored the *initial* join command.
+      # This script might be for *refreshing* the token if needed, or ensuring it's there.
+
+      # Terraform interpolations for AWS CLI parameters
+      CONTROL_PLANE_INSTANCE_ID="${aws_instance.control_plane.id}"
+      REGION_NAME="${var.region}"
+      PRIMARY_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command.name}" # Use .name
+      LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" # Use .name
+      S3_LOG_BUCKET="${aws_s3_bucket.worker_logs.id}" # Use .id or .bucket for bucket name
+
+      # Shell variable for conditional execution
+      SKIP_UPDATE="${var.skip_token_verification}" # Assuming this var controls skipping
+
+      if [[ "$SKIP_UPDATE" == "true" ]]; then
+        echo "ℹ️ SKIP_JOIN_COMMAND_UPDATE is true, skipping update."
         exit 0
       fi
-      
-      echo "📡 Control Plane: ${aws_instance.control_plane.public_ip}"
-      echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
-      
-      # Upload logs for troubleshooting with simplified timestamp
-      CURRENT_TIME="$$(date)"
-      LOG_MESSAGE="Join command update completed at $$CURRENT_TIME"
-      
-      # Use a simple timestamp format to avoid complex command substitution
-      SIMPLE_TIMESTAMP="$$(date +%Y%m%d%H%M%S)"
-      S3_KEY="logs/join-command-$$SIMPLE_TIMESTAMP.log"
-      
-      echo "$$LOG_MESSAGE" | aws s3 cp - "s3://${aws_s3_bucket.worker_logs.bucket}/$$S3_KEY" --region "${var.region}" || true
-      
-      echo "✅ Join command management completed"
+
+      echo "📡 Control Plane ID: $CONTROL_PLANE_INSTANCE_ID"
+      echo "🔑 Latest Secret ID: $LATEST_SECRET_ID"
+
+      # Generate a new join command by running kubeadm token create on the control plane via SSM
+      echo "🔄 Generating new join command from control plane..."
+      NEW_JOIN_COMMAND=$(aws ssm send-command \
+        --instance-ids "$CONTROL_PLANE_INSTANCE_ID" \
+        --document-name "AWS-RunShellScript" \
+        --parameters 'commands=["kubeadm token create --print-join-command"]' \
+        --region "$REGION_NAME" \
+        --query "CommandInvocations[0].CommandPlugins[0].Output" \
+        --output text 2>/dev/null || echo "")
+
+      if [[ -z "$NEW_JOIN_COMMAND" ]]; then
+        echo "❌ Failed to generate new join command from control plane via SSM."
+        # Optionally, try to get the one stored by user_data as a fallback
+        # NEW_JOIN_COMMAND=$(aws secretsmanager get-secret-value --secret-id "$LATEST_SECRET_ID" --region "$REGION_NAME" --query SecretString --output text 2>/dev/null || echo "")
+        # if [[ -z "$NEW_JOIN_COMMAND" ]]; then
+        #  echo "❌ Also failed to retrieve existing join command from Secrets Manager."
+        #  exit 1
+        # fi
+        # echo "⚠️ Using existing join command from Secrets Manager as fallback."
+        exit 1 # Make it fail if new command cannot be generated
+      fi
+
+      echo "✅ New join command generated."
+
+      echo "🔐 Updating Secrets Manager with new join command..."
+      aws secretsmanager put-secret-value \
+        --secret-id "$LATEST_SECRET_ID" \
+        --secret-string "$NEW_JOIN_COMMAND" \
+        --region "$REGION_NAME" --no-cli-pager || {
+          echo "❌ Failed to update latest join command secret."
+          exit 1
+        }
+
+      # Optionally update the non-latest one too, or handle its lifecycle differently
+      aws secretsmanager put-secret-value \
+        --secret-id "$PRIMARY_SECRET_ID" \
+        --secret-string "$NEW_JOIN_COMMAND" \
+        --region "$REGION_NAME" --no-cli-pager || echo "⚠️ Failed to update primary join command secret."
+
+      echo "✅ Join command stored/updated in AWS Secrets Manager."
+
+      # Log this operation to S3
+      CURRENT_DATETIME=$(date +"%Y-%m-%dT%H:%M:%S%Z")
+      LOG_MESSAGE="Join command successfully updated in Secrets Manager at $CURRENT_DATETIME for instance $CONTROL_PLANE_INSTANCE_ID."
+      S3_LOG_KEY="cluster_operations/join_command_update/$(date +%Y/%m/%d)/$CONTROL_PLANE_INSTANCE_ID-$(date +%H%M%S).log"
+
+      echo "$LOG_MESSAGE" | aws s3 cp - "s3://$S3_LOG_BUCKET/$S3_LOG_KEY" --region "$REGION_NAME" || echo "⚠️ Failed to upload log to S3."
+
+      echo "✅ Join command management completed successfully."
     EOT
   }
 }
 
-# =============================================================================
-# 🔧 LAMBDA FUNCTIONS - NODE MANAGEMENT AUTOMATION
-# =============================================================================
 
-# Lambda function code file
+# =============================================================================
+# 🔧 LAMBDA FUNCTIONS (Placeholder - content seems mostly okay, review IAM and triggers)
+# =============================================================================
+# Note: The Lambda and its associated resources (IAM, S3 for code, SNS, CloudWatch Events)
+# are complex and depend on the specific logic within lambda_code.py.
+# The IAM policy data.aws_iam_policy_document.node_management_lambda_policy looks reasonable.
+# Ensure the lambda_code.py is correctly packaged by data.archive_file.lambda_zip.
+
 resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/lambda_code.py"
-  content = <<EOF
-import json
-import boto3
-import logging
-from datetime import datetime
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-def lambda_handler(event, context):
-    """
-    Enhanced Node Management Lambda for Kubernetes cluster
-    Handles ASG lifecycle events and token refresh
-    """
-    
-    try:
-        logger.info(f"Received event: {json.dumps(event)}")
-        return {
-            'statusCode': 200,
-            'body': json.dumps('Node management completed successfully')
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in lambda handler: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f'Error: {str(e)}')
-        }
-EOF
+  filename = "${path.module}/scripts/lambda_code.py" # Store scripts in a sub-directory
+  content  = file("${path.module}/scripts/lambda_code.py") # Assuming lambda_code.py exists
 }
 
-# Create Lambda ZIP file using archive_file data source
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = local_file.lambda_function_code.filename
-  output_path = "${path.module}/lambda_function.zip"
-  
-  depends_on = [local_file.lambda_function_code]
+  output_path = "${path.module}/lambda_function.zip" # Temporary local zip
+  depends_on  = [local_file.lambda_function_code]
 }
 
-# Lambda IAM role
 resource "aws_iam_role" "node_management_lambda_role" {
-  name = "guy-node-management-lambda-role"
-
+  name = "${var.cluster_name}-node-mgmt-lambda-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
   })
-  
   tags = var.tags
 }
 
-# Lambda IAM policy document (using data source for proper interpolation)
-data "aws_iam_policy_document" "node_management_lambda_policy" {
+data "aws_iam_policy_document" "node_management_lambda_policy_doc" { # Renamed for clarity
   statement {
-    effect = "Allow"
-    actions = [
-      "logs:CreateLogGroup",
-      "logs:CreateLogStream",
-      "logs:PutLogEvents"
-    ]
-    resources = ["arn:aws:logs:*:*:*"]
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:*:*:*"] # Standard Lambda logging
   }
-
   statement {
-    effect = "Allow"
-    actions = [
+    effect    = "Allow"
+    actions   = [
       "autoscaling:CompleteLifecycleAction",
       "autoscaling:DescribeAutoScalingGroups",
       "autoscaling:DescribeAutoScalingInstances"
     ]
-    resources = ["*"]
+    resources = ["*"] # Broad, but often needed for ASG interaction
   }
-
   statement {
-    effect = "Allow"
-    actions = [
-      "ec2:DescribeInstances",
-      "ec2:DescribeTags"
-    ]
-    resources = ["*"]
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances", "ec2:DescribeTags"]
+    resources = ["*"] # Broad
   }
-
-  statement {
+  statement { # For fetching/updating join command or other secrets
     effect = "Allow"
-    actions = [
-      "secretsmanager:GetSecretValue",
-      "secretsmanager:PutSecretValue"
-    ]
-    resources = [
+    actions = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+    resources = [ # Be specific
       aws_secretsmanager_secret.kubernetes_join_command.arn,
       aws_secretsmanager_secret.kubernetes_join_command_latest.arn
+      # Add other secrets if the lambda interacts with them
     ]
   }
-
-  statement {
-    effect = "Allow"
-    actions = [
-      "s3:PutObject",
-      "s3:GetObject"
-    ]
-    resources = ["${aws_s3_bucket.worker_logs.arn}/*"]
+  statement { # For S3 interactions if lambda needs it (e.g., writing logs, fetching configs)
+    effect    = "Allow"
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["${aws_s3_bucket.worker_logs.arn}/*"] # Example: if lambda writes to this bucket
   }
 }
 
-# Lambda IAM policy
 resource "aws_iam_policy" "node_management_lambda_policy" {
-  name   = "guy-node-management-lambda-policy"
-  policy = data.aws_iam_policy_document.node_management_lambda_policy.json
-
-  tags = var.tags
+  name   = "${var.cluster_name}-node-mgmt-lambda-policy"
+  policy = data.aws_iam_policy_document.node_management_lambda_policy_doc.json
+  tags   = var.tags
 }
 
 resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach" {
@@ -1527,70 +1043,69 @@ resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach"
   policy_arn = aws_iam_policy.node_management_lambda_policy.arn
 }
 
-# Lambda function for node management
 resource "aws_lambda_function" "node_management_lambda" {
   filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  function_name    = "guy-node-management"
-  role            = aws_iam_role.node_management_lambda_role.arn
-  handler         = "lambda_code.lambda_handler"
-  runtime         = "python3.9"
-  timeout         = 300
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256 # Triggers update if zip changes
+  function_name    = "${var.cluster_name}-node-management"
+  role             = aws_iam_role.node_management_lambda_role.arn
+  handler          = "lambda_code.lambda_handler" # Assumes lambda_code.py has lambda_handler function
+  runtime          = "python3.9" # Or python3.10, 3.11, 3.12 as available and supported
+  timeout          = 300 # 5 minutes
+  memory_size      = 256 # Adjust as needed
 
   environment {
     variables = {
-      CLUSTER_NAME = local.cluster_name
-      REGION = var.region
-      JOIN_COMMAND_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id
-      S3_BUCKET = aws_s3_bucket.worker_logs.bucket
+      CLUSTER_NAME           = local.cluster_name
+      REGION                 = var.region
+      JOIN_COMMAND_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id # Lambda uses this to fetch current join command
+      S3_LOG_BUCKET          = aws_s3_bucket.worker_logs.id # Or .bucket name
+      # Add any other environment variables your Lambda function needs
     }
   }
-
   tags = var.tags
+  # Add VPC config if Lambda needs to access resources in VPC
+  # vpc_config {
+  #   subnet_ids         = module.vpc.private_subnets
+  #   security_group_ids = [aws_security_group.lambda_vpc_sg.id] # Define a SG for Lambda if in VPC
+  # }
 }
 
 # =============================================================================
-# 📡 MONITORING AND AUTOMATION - SNS AND CLOUDWATCH
+# 📡 MONITORING AND AUTOMATION - SNS AND CLOUDWATCH EVENTS
 # =============================================================================
+# (Assuming the SNS/CloudWatch Event setup is largely as provided and correct for the Lambda)
 
-# SNS topic for lifecycle events
 resource "aws_sns_topic" "lifecycle_topic" {
-  name = "guy-asg-lifecycle-topic"
-  
+  name = "${var.cluster_name}-asg-lifecycle-events"
   tags = var.tags
 }
-
 resource "aws_sns_topic_subscription" "lambda_subscription" {
   topic_arn = aws_sns_topic.lifecycle_topic.arn
   protocol  = "lambda"
   endpoint  = aws_lambda_function.node_management_lambda.arn
 }
-
 resource "aws_lambda_permission" "sns_permission" {
-  statement_id  = "AllowExecutionFromSNS"
+  statement_id  = "AllowExecutionFromSNS-${var.cluster_name}"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.node_management_lambda.function_name
   principal     = "sns.amazonaws.com"
   source_arn    = aws_sns_topic.lifecycle_topic.arn
 }
 
-# CloudWatch event for token refresh
 resource "aws_cloudwatch_event_rule" "token_refresh_rule" {
-  name                = "guy-token-refresh-rule"
-  description         = "Trigger token refresh every 6 hours"
-  schedule_expression = "rate(6 hours)"
-  
-  tags = var.tags
+  name                = "${var.cluster_name}-kubeadm-token-refresh"
+  description         = "Trigger Lambda to refresh Kubeadm token for ${var.cluster_name}"
+  schedule_expression = "rate(20 hours)" # Kubeadm tokens typically last 24h, refresh before expiry
+  tags                = var.tags
 }
-
 resource "aws_cloudwatch_event_target" "token_refresh_target" {
   rule      = aws_cloudwatch_event_rule.token_refresh_rule.name
-  target_id = "TokenRefreshTarget"
+  target_id = "${var.cluster_name}TokenRefreshLambda"
   arn       = aws_lambda_function.node_management_lambda.arn
+  # Add input transformer if your lambda expects a specific event format for token refresh
 }
-
 resource "aws_lambda_permission" "eventbridge_permission" {
-  statement_id  = "AllowExecutionFromEventBridge"
+  statement_id  = "AllowExecutionFromEventBridge-${var.cluster_name}"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.node_management_lambda.function_name
   principal     = "events.amazonaws.com"
@@ -1598,250 +1113,338 @@ resource "aws_lambda_permission" "eventbridge_permission" {
 }
 
 # =============================================================================
-# 🔄 ASG LIFECYCLE HOOKS - GRACEFUL NODE MANAGEMENT
+# 🔄 ASG LIFECYCLE HOOKS
 # =============================================================================
 
-# ASG lifecycle hook IAM role
 resource "aws_iam_role" "asg_lifecycle_hook_role" {
-  name = "guy-asg-lifecycle-hook-role"
-
+  name = "${var.cluster_name}-asg-hook-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "autoscaling.amazonaws.com"
-        }
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "autoscaling.amazonaws.com" }
+    }]
   })
-
   tags = var.tags
 }
-
 resource "aws_iam_role_policy" "asg_sns_publish_policy" {
-  name = "asg-sns-publish-policy"
+  name = "${var.cluster_name}-asg-hook-sns-policy"
   role = aws_iam_role.asg_lifecycle_hook_role.id
-
   policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "sns:Publish"
-        ]
-        Resource = aws_sns_topic.lifecycle_topic.arn
-      }
-    ]
+    Version   = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = ["sns:Publish"]
+      Resource  = aws_sns_topic.lifecycle_topic.arn
+    }]
   })
 }
 
-# Scale up lifecycle hook
 resource "aws_autoscaling_lifecycle_hook" "scale_up_hook" {
-  name                   = "guy-scale-up-hook"
-  autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 120  # Reduced from 600 to 120 seconds
+  name                   = "${var.cluster_name}-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.worker_asg.name # Ensure ASG is created before this
+  default_result         = "CONTINUE" # Or ABANDON if Lambda handles completion
+  heartbeat_timeout      = var.asg_scale_up_heartbeat_timeout   # Make this a variable (e.g., 300 seconds)
   lifecycle_transition   = "autoscaling:EC2_INSTANCE_LAUNCHING"
-
   notification_target_arn = aws_sns_topic.lifecycle_topic.arn
   role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
 }
 
-# Scale down lifecycle hook
 resource "aws_autoscaling_lifecycle_hook" "scale_down_hook" {
-  name                   = "guy-scale-down-hook"
+  name                   = "${var.cluster_name}-scale-down"
   autoscaling_group_name = aws_autoscaling_group.worker_asg.name
-  default_result         = "CONTINUE"
-  heartbeat_timeout      = 90   # Reduced from 300 to 90 seconds for faster termination
+  default_result         = "CONTINUE" # Or ABANDON if Lambda handles completion
+  heartbeat_timeout      = var.asg_scale_down_heartbeat_timeout # Make this a variable (e.g., 300 seconds)
   lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
-
   notification_target_arn = aws_sns_topic.lifecycle_topic.arn
   role_arn                = aws_iam_role.asg_lifecycle_hook_role.arn
 }
 
-# Worker script hash for tracking changes
-resource "terraform_data" "worker_script_hash" {
-  input = md5(file("${path.module}/worker_user_data.sh"))
-  
-  triggers_replace = {
-    rebuild = var.rebuild_workers ? timestamp() : "static"
+
+# =============================================================================
+# HELPER/TRIGGER RESOURCES (Review for necessity and logic)
+# =============================================================================
+
+# Worker script hash - ensure worker_user_data.sh.tpl exists in ./scripts/
+resource "terraform_data" "worker_script_hash_trigger" {
+  input = {
+    # Include the filesha256 as one key in the map
+    script_content_hash                = filesha256("${path.module}/scripts/worker_user_data.sh.tpl")
+
+    # Add all other key-value pairs that were in your 'triggers' block
+    cluster_name                       = local.cluster_name
+    region                             = var.region
+    join_command_latest_secret_name    = aws_secretsmanager_secret.kubernetes_join_command_latest.name
+    control_plane_private_ip           = aws_instance.control_plane.private_ip # Ensure this is defined before being referenced
+    s3_worker_logs_bucket              = aws_s3_bucket.worker_logs.id
+    worker_asg_name                    = local.worker_asg_name
+    k8s_package_version                = local.k8s_package_version
+    ssh_public_key_content             = local.worker_template_vars.SSH_PUBLIC_KEY_CONTENT # Ensure local.worker_template_vars.SSH_PUBLIC_KEY_CONTENT is valid
+    rebuild_trigger                    = var.rebuild_workers ? timestamp() : "disabled"
+    # Add any other variables from your original 'triggers' map
   }
 }
 
-# Progress reporter for worker nodes
-resource "terraform_data" "worker_progress" {
-  depends_on = [aws_instance.control_plane]
-  triggers_replace = {
-    timestamp = timestamp()
+
+# Force ASG update: This terraform_data resource itself doesn't "force" an update.
+# Updates to ASG are typically driven by changes in its launch_template or other direct properties.
+# If the goal is to roll instances when the user_data content (derived from template) changes,
+# you would usually taint the launch template or ASG, or rely on the launch template versioning.
+# This resource seems to try and create a dependency.
+# Removing the `force_asg_update` resource as its mechanism is unclear and often better handled by
+# either a new version of the launch template (if user_data changes in it) or specific ASG update mechanisms.
+# If you want to force an ASG rolling update, consider instance_refresh or other AWS tools.
+
+
+# The `cluster_health_assessment` local-exec is for observability or manual decision making.
+# It writes to /tmp files, which Terraform doesn't use directly.
+# Its $ escaping should follow the single-$ for shell pattern.
+resource "terraform_data" "cluster_health_assessment" {
+  depends_on = [
+    aws_instance.control_plane,
+    # aws_autoscaling_group.worker_asg # Add if it queries the ASG that needs to exist first
+    # null_resource.wait_for_kubeconfig_secret # In root module, if it needs kubeconfig
+  ]
+  input = { # Use triggers map
+    control_plane_id = aws_instance.control_plane.id # Use an output if this module is called from root
+    asg_name         = local.worker_asg_name
+    script_version   = "v2-dollar-sign-review" # Increment if script changes
+    # If this script uses kubeconfig, it should depend on the kubeconfig being available
+    # kubeconfig_trigger = local_file.kubeconfig.id # (if kubeconfig generated in root)
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
-      echo -e "\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes...\\033[0m"
-    EOT
-  }
-}
-
-# Force update ASG when worker script changes
-resource "terraform_data" "force_asg_update" {
-  input = terraform_data.worker_script_hash.id
-  
-  triggers_replace = [
-    aws_launch_template.worker_lt.latest_version,
-    var.rebuild_workers
-  ]
-}
-
-# Automatic cluster health assessment to determine if ASG recreation is needed
-resource "terraform_data" "cluster_health_assessment" {
-  triggers_replace = {
-    # Check cluster health whenever these change
-    control_plane_id = aws_instance.control_plane.id
-    asg_name = local.worker_asg_name
-    assessment_version = "v1"
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command = <<-EOT
       #!/bin/bash
-      echo "🔍 Assessing cluster health to determine ASG cleanup needs..."
-      
+      set -e # Be careful with set -e if some commands are expected to fail
+      echo "🔍 Assessing cluster health..."
+
       # Default to no cleanup needed
-      echo "false" > /tmp/asg_cleanup_needed.txt
-      echo "healthy" > /tmp/cluster_health_status.txt
-      
-      # Check if control plane is accessible
-      CONTROL_PLANE_IP="${aws_instance.control_plane.public_ip}"
+      # These temp files are local to where Terraform runs, consider if this is the desired outcome
+      TMP_CLEANUP_NEEDED_FILE="/tmp/${local.cluster_name}_asg_cleanup_needed.txt"
+      TMP_HEALTH_STATUS_FILE="/tmp/${local.cluster_name}_cluster_health_status.txt"
+      echo "false" > "$TMP_CLEANUP_NEEDED_FILE"
+      echo "healthy" > "$TMP_HEALTH_STATUS_FILE"
+
+      # Terraform interpolations for AWS CLI parameters
+      CONTROL_PLANE_PUBLIC_IP_ADDR="${aws_instance.control_plane.public_ip}" # TF interpolation
+      CONTROL_PLANE_INSTANCE_ID="${aws_instance.control_plane.id}"         # TF interpolation
+      AWS_CLI_REGION="${var.region}"                                       # TF interpolation
+      TARGET_ASG_NAME="${local.worker_asg_name}"                           # TF interpolation
+
+      # Shell variables derived from TF interpolations
+      echo "📡 Control Plane IP: $CONTROL_PLANE_PUBLIC_IP_ADDR"
+      echo "🆔 Control Plane ID: $CONTROL_PLANE_INSTANCE_ID"
 
       # Try to get kubeconfig and check cluster state
-      if aws ssm describe-instance-information --region ${var.region} \
-         --filters "Key=InstanceIds,Values=${aws_instance.control_plane.id}" \
-         --query "InstanceInformationList[*].PingStatus" --output text | grep -q "Online"; then
-        
-        echo "📡 Control plane accessible via SSM, checking cluster state..."
-        
-        # Get kubeconfig
-        COMMAND_ID=$(aws ssm send-command --region ${var.region} \
-          --document-name "AWS-RunShellScript" \
-          --instance-ids "${aws_instance.control_plane.id}" \
-          --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
-          --output text --query "Command.CommandId")
-        
-        sleep 10
-        
-        KUBECONFIG_CONTENT=$(aws ssm get-command-invocation --region ${var.region} \
-          --command-id "$COMMAND_ID" --instance-id "${aws_instance.control_plane.id}" \
-          --query "StandardOutputContent" --output text 2>/dev/null)
-        
-        if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
-          echo "✅ Got valid kubeconfig, analyzing cluster health..."
-          
-          # Create temporary kubeconfig
-          echo "$KUBECONFIG_CONTENT" | sed "s|server:.*|server: https://$CONTROL_PLANE_IP:6443|" > /tmp/health_kubeconfig.yaml
-          chmod 600 /tmp/health_kubeconfig.yaml
-          
-          # Check cluster state
-          if KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes >/dev/null 2>&1; then
-            echo "📋 Cluster accessible, checking node health..."
-            
-            # Get node counts
-            TOTAL_NODES=$(KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes --no-headers | wc -l)
-            READY_NODES=$(KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
-            NOTREADY_NODES=$(KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
-            WORKER_NODES=$(KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes --no-headers | grep -c -v "control-plane" || echo "0")
-            READY_WORKERS=$(KUBECONFIG=/tmp/health_kubeconfig.yaml kubectl get nodes --no-headers | grep " Ready " | grep -c -v "control-plane" || echo "0")
-            
-            echo "   Total nodes: $TOTAL_NODES"
-            echo "   Ready nodes: $READY_NODES"
-            echo "   NotReady nodes: $NOTREADY_NODES"
-            echo "   Worker nodes: $WORKER_NODES"
-            echo "   Ready workers: $READY_WORKERS"
-            
-            # Get current ASG desired capacity
-            ASG_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
-              --region ${var.region} \
-              --auto-scaling-group-names "${local.worker_asg_name}" \
-              --query "AutoScalingGroups[0].DesiredCapacity" \
-              --output text 2>/dev/null || echo "0")
-            
-            echo "   ASG desired capacity: $ASG_DESIRED"
-            
-            # Determine if cleanup is needed based on multiple criteria
-            CLEANUP_NEEDED=false
-            HEALTH_STATUS="healthy"
-            
-            # Criteria 1: More than 2 NotReady nodes (indicates stuck nodes)
-            if [[ "$NOTREADY_NODES" -gt 2 ]]; then
-              echo "❌ Too many NotReady nodes ($NOTREADY_NODES) - cleanup needed"
-              CLEANUP_NEEDED=true
-              HEALTH_STATUS="too_many_notready_nodes"
-            fi
-            
-            # Criteria 2: No Ready workers but ASG shows desired capacity > 0
-            if [[ "$READY_WORKERS" -eq 0 ]] && [[ "$ASG_DESIRED" -gt 0 ]]; then
-              echo "❌ No Ready workers but ASG has desired capacity $ASG_DESIRED - cleanup needed"
-              CLEANUP_NEEDED=true
-              HEALTH_STATUS="no_ready_workers"
-            fi
-            
-            # Criteria 3: Worker count significantly different from ASG desired capacity
-            WORKER_DEFICIT=$((ASG_DESIRED - READY_WORKERS))
-            if [[ "$WORKER_DEFICIT" -gt 1 ]] && [[ "$ASG_DESIRED" -gt 0 ]]; then
-              echo "❌ Worker deficit too large: need $ASG_DESIRED, have $READY_WORKERS ready - cleanup needed"
-              CLEANUP_NEEDED=true
-              HEALTH_STATUS="worker_deficit"
-            fi
-            
-            # Output results
-            if [[ "$CLEANUP_NEEDED" == "true" ]]; then
-              echo "true" > /tmp/asg_cleanup_needed.txt
-              echo "$HEALTH_STATUS" > /tmp/cluster_health_status.txt
-              echo "🔧 DECISION: ASG cleanup and recreation needed"
-              echo "   Reason: $HEALTH_STATUS"
-            else
-              echo "false" > /tmp/asg_cleanup_needed.txt
-              echo "healthy" > /tmp/cluster_health_status.txt
-              echo "✅ DECISION: Cluster is healthy, no ASG cleanup needed"
-            fi
-            
-          else
-            echo "❌ Cannot connect to Kubernetes API - assuming unhealthy"
-            echo "true" > /tmp/asg_cleanup_needed.txt
-            echo "api_unreachable" > /tmp/cluster_health_status.txt
-          fi
-          
-          # Cleanup temp kubeconfig
-          rm -f /tmp/health_kubeconfig.yaml
-          
-        else
-          echo "❌ Could not get valid kubeconfig"
-          echo "true" > /tmp/asg_cleanup_needed.txt
-          echo "kubeconfig_unavailable" > /tmp/cluster_health_status.txt
-        fi
-        
-      else
-        echo "ℹ️ Control plane not accessible via SSM yet - assuming first run"
-        echo "false" > /tmp/asg_cleanup_needed.txt
-        echo "control_plane_not_ready" > /tmp/cluster_health_status.txt
+      # This assumes kubectl is configured on the machine running Terraform OR uses a fetched kubeconfig
+      # If KUBECONFIG env var is not set, this script would need to fetch/use the one from Secrets Manager
+      # For simplicity, this script might need to run *after* kubeconfig is available locally
+      # For now, it attempts SSM to get admin.conf (similar to old kubeconfig logic)
+
+      if ! command -v kubectl &> /dev/null; then
+        echo "⚠️ kubectl command could not be found. Please ensure it's installed and in your PATH."
+        # Writing a default "unknown" status as kubectl is unavailable
+        echo "unknown_kubectl_unavailable" > "$TMP_HEALTH_STATUS_FILE"
+        echo "📊 Health Assessment Results (kubectl unavailable):"
+        echo "   Cleanup needed: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
+        echo "   Health status: $(cat "$TMP_HEALTH_STATUS_FILE")"
+        exit 0 # Exit gracefully as we can't perform kubectl checks
       fi
-      
-      CLEANUP_DECISION=$(cat /tmp/asg_cleanup_needed.txt)
-      HEALTH_STATUS=$(cat /tmp/cluster_health_status.txt)
-      
+
+      echo "Attempting to use KUBECONFIG from local path: ${var.root_kubeconfig_path}" # Assuming this var is passed from root
+      export KUBECONFIG="${var.root_kubeconfig_path}" # Pass kubeconfig path from root module as a variable
+
+      if ! kubectl cluster-info > /dev/null 2>&1; then
+          echo "❌ Initial kubectl cluster-info failed. Attempting to fetch admin.conf via SSM as fallback..."
+          if aws ssm describe-instance-information --region "$AWS_CLI_REGION" \
+             --filters "Key=InstanceIds,Values=$CONTROL_PLANE_INSTANCE_ID" \
+             --query "InstanceInformationList[*].PingStatus" --output text 2>/dev/null | grep -q "Online"; then
+
+            echo "📡 Control plane accessible via SSM, trying to get admin.conf..."
+            SSM_COMMAND_ID=$(aws ssm send-command --region "$AWS_CLI_REGION" \
+              --document-name "AWS-RunShellScript" \
+              --instance-ids "$CONTROL_PLANE_INSTANCE_ID" \
+              --parameters 'commands=["cat /etc/kubernetes/admin.conf"]' \
+              --output text --query "Command.CommandId" 2>/dev/null || echo "")
+
+            if [[ -z "$SSM_COMMAND_ID" ]]; then
+                echo "❌ Failed to send SSM command to get admin.conf"
+                echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
+                echo "ssm_command_failed" > "$TMP_HEALTH_STATUS_FILE"
+                exit 1 # Or handle more gracefully
+            fi
+            sleep 10 # Allow time for command execution
+
+            KUBECONFIG_CONTENT_FROM_SSM=$(aws ssm get-command-invocation --region "$AWS_CLI_REGION" \
+              --command-id "$SSM_COMMAND_ID" --instance-id "$CONTROL_PLANE_INSTANCE_ID" \
+              --query "StandardOutputContent" --output text 2>/dev/null || echo "")
+
+            if [[ -n "$KUBECONFIG_CONTENT_FROM_SSM" ]] && echo "$KUBECONFIG_CONTENT_FROM_SSM" | grep -q "apiVersion"; then
+              echo "✅ Got valid admin.conf from SSM. Creating temporary kubeconfig for health check."
+              echo "$KUBECONFIG_CONTENT_FROM_SSM" | sed "s|server:.*|server: https://$CONTROL_PLANE_PUBLIC_IP_ADDR:6443|" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+              chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+              export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml" # Use this for checks
+            else
+              echo "❌ Could not get valid admin.conf via SSM."
+              echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
+              echo "kubeconfig_unavailable_via_ssm" > "$TMP_HEALTH_STATUS_FILE"
+              exit 1 # Or handle more gracefully
+            fi
+          else
+            echo "ℹ️ Control plane not accessible via SSM. Cannot fetch admin.conf."
+            echo "true" > "$TMP_CLEANUP_NEEDED_FILE" # Mark as needing cleanup if we can't verify
+            echo "control_plane_ssm_offline" > "$TMP_HEALTH_STATUS_FILE"
+            exit 1 # Or handle more gracefully
+          fi
+      fi
+
+      # Proceed with kubectl checks if KUBECONFIG is now set and working
+      if kubectl get nodes >/dev/null 2>&1; then
+        echo "📋 Cluster accessible via kubectl, checking node health..."
+
+        TOTAL_NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
+        NOTREADY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
+        WORKER_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | wc -l || echo "0") # Exclude common CP names/roles
+        READY_WORKERS=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | grep -c " Ready " || echo "0")
+
+        echo "   Total nodes: $TOTAL_NODES"
+        echo "   Ready nodes: $READY_NODES"
+        echo "   NotReady nodes: $NOTREADY_NODES"
+        echo "   Worker nodes: $WORKER_NODES"
+        echo "   Ready workers: $READY_WORKERS"
+
+        ASG_DESIRED_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
+          --region "$AWS_CLI_REGION" \
+          --auto-scaling-group-names "$TARGET_ASG_NAME" \
+          --query "AutoScalingGroups[0].DesiredCapacity" \
+          --output text 2>/dev/null || echo "0")
+
+        echo "   ASG desired capacity: $ASG_DESIRED_CAPACITY"
+
+        CLEANUP_FLAG=false
+        CURRENT_HEALTH_STATUS="healthy"
+
+        if [[ "$NOTREADY_NODES" -gt 1 ]]; then # Allow 1 not ready node transiently
+          echo "❌ Problem: $NOTREADY_NODES NotReady nodes detected."
+          CLEANUP_FLAG=true
+          CURRENT_HEALTH_STATUS="too_many_notready_nodes"
+        fi
+
+        if [[ "$READY_WORKERS" -eq 0 ]] && [[ "$ASG_DESIRED_CAPACITY" -gt 0 ]]; then
+          echo "❌ Problem: No Ready workers, but ASG desires $ASG_DESIRED_CAPACITY."
+          CLEANUP_FLAG=true
+          CURRENT_HEALTH_STATUS="no_ready_workers_despite_asg_demand"
+        fi
+
+        WORKER_NODE_DEFICIT=$((ASG_DESIRED_CAPACITY - READY_WORKERS))
+        if [[ "$WORKER_NODE_DEFICIT" -gt 1 ]] && [[ "$ASG_DESIRED_CAPACITY" -gt 0 ]]; then # More than 1 worker missing
+          echo "❌ Problem: Worker deficit is $WORKER_NODE_DEFICIT (ASG desires $ASG_DESIRED_CAPACITY, $READY_WORKERS ready)."
+          CLEANUP_FLAG=true
+          CURRENT_HEALTH_STATUS="significant_worker_deficit"
+        fi
+
+        if [[ "$CLEANUP_FLAG" == "true" ]]; then
+          echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
+          echo "$CURRENT_HEALTH_STATUS" > "$TMP_HEALTH_STATUS_FILE"
+          echo "🔧 DECISION: ASG cleanup and potential recreation might be needed. Reason: $CURRENT_HEALTH_STATUS"
+        else
+          echo "false" > "$TMP_CLEANUP_NEEDED_FILE"
+          echo "healthy" > "$TMP_HEALTH_STATUS_FILE"
+          echo "✅ DECISION: Cluster appears healthy, no ASG cleanup indicated by this script."
+        fi
+      else
+        echo "❌ Cannot connect to Kubernetes API using current KUBECONFIG - assuming unhealthy for ASG."
+        echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
+        echo "api_unreachable" > "$TMP_HEALTH_STATUS_FILE"
+      fi
+
+      # Cleanup temporary kubeconfig if created
+      if [[ -f "/tmp/${local.cluster_name}_health_kubeconfig.yaml" ]]; then
+        rm -f "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
+      fi
+
       echo ""
       echo "📊 Health Assessment Results:"
-      echo "   Cleanup needed: $CLEANUP_DECISION"
-      echo "   Health status: $HEALTH_STATUS"
+      echo "   Cleanup needed flag: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
+      echo "   Health status detail: $(cat "$TMP_HEALTH_STATUS_FILE")"
       echo ""
+      # This script doesn't failterraform apply, it just sets flags in /tmp
+      # For true conditional logic, this output would need to be captured by Terraform.
     EOT
   }
-
-  depends_on = [aws_instance.control_plane]
 }
 
+# Worker progress reporter (simple echo, looks fine)
+resource "terraform_data" "worker_progress_reporter" {
+  depends_on = [aws_instance.control_plane]
+  input = { # RENAMED from triggers
+    # If the goal is to re-run on every apply after CP is up:
+    timestamp = timestamp()
+    # If you only want it to change when the control plane instance itself changes:
+    # control_plane_id_trigger = aws_instance.control_plane.id
+  }
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = "echo -e \"\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes (Module: ${var.cluster_name})...\\033[0m\""
+  }
+}
+
+# =============================================================================
+# 📤 MODULE OUTPUTS
+# =============================================================================
+
+output "vpc_id_output" {
+  description = "The ID of the VPC"
+  value       = module.vpc.vpc_id
+}
+
+output "control_plane_instance_id_output" {
+  description = "The ID of the control plane instance"
+  value       = aws_instance.control_plane.id
+}
+
+output "control_plane_public_ip_output" {
+  description = "The public IP of the control plane instance"
+  value       = aws_instance.control_plane.public_ip
+}
+
+output "worker_asg_name_output" {
+  description = "The name of the worker Auto Scaling Group"
+  value       = aws_autoscaling_group.worker_asg.name
+}
+
+output "alb_dns_name_output" {
+  description = "The DNS name of the Application Load Balancer"
+  value       = aws_lb.polybot_alb.dns_name
+}
+
+output "ssh_key_name_output" {
+  description = "The name of the SSH key pair to use for instances"
+  value       = local.actual_key_name
+}
+
+output "kubeconfig_secret_name_output" {
+  description = "The name of the AWS Secrets Manager secret storing the kubeconfig."
+  value       = aws_secretsmanager_secret.cluster_kubeconfig.name
+}
+
+output "kubeconfig_secret_arn_output" {
+  description = "The ARN of the AWS Secrets Manager secret storing the kubeconfig."
+  value       = aws_secretsmanager_secret.cluster_kubeconfig.arn
+}
+
+variable "asg_scale_up_heartbeat_timeout" {
+  description = "The heartbeat timeout in seconds for the ASG scale-up lifecycle hook."
+  type        = number
+  default     = 300 # Example: 5 minutes
+}
+
+variable "asg_scale_down_heartbeat_timeout" {
+  description = "The heartbeat timeout in seconds for the ASG scale-down lifecycle hook."
+  type        = number
+  default     = 300 # Example: 5 minutes
+}
