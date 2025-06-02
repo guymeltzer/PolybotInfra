@@ -120,7 +120,7 @@ resource "terraform_data" "kubectl_provider_config" {
   triggers_replace = {
     control_plane_id  = module.k8s-cluster.control_plane_instance_id
     control_plane_ip  = module.k8s-cluster.control_plane_public_ip
-    kubeconfig_version = "v8-syntax-fixed"
+    kubeconfig_version = "v9-bash-fixed"
   }
 
   provisioner "local-exec" {
@@ -130,8 +130,8 @@ resource "terraform_data" "kubectl_provider_config" {
       set -e
       
       echo "========================================================="
-      echo "= ROBUST KUBECONFIG SETUP v8 - SYNTAX FIXED          ="
-      echo "= Date: \$\$(date)                                        ="
+      echo "= ROBUST KUBECONFIG SETUP v9 - BASH FIXED            ="
+      echo "= Date: $$(date)                                        ="
       echo "========================================================="
       
       INSTANCE_ID="${module.k8s-cluster.control_plane_instance_id}"
@@ -139,9 +139,9 @@ resource "terraform_data" "kubectl_provider_config" {
       REGION="${var.region}"
       KUBECONFIG_PATH="${local.kubeconfig_path}"
       
-      echo "📡 Control Plane: \$INSTANCE_ID (IP: \$PUBLIC_IP)"
-      echo "📁 Kubeconfig Path: \$KUBECONFIG_PATH"
-      echo "🌍 Region: \$REGION"
+      echo "📡 Control Plane: $$INSTANCE_ID (IP: $$PUBLIC_IP)"
+      echo "📁 Kubeconfig Path: $$KUBECONFIG_PATH"
+      echo "🌍 Region: $$REGION"
       
       # Enhanced function to check instance readiness
       wait_for_instance_ready() {
@@ -149,7 +149,7 @@ resource "terraform_data" "kubectl_provider_config" {
         
         # Wait for instance running state
         echo "⏳ Waiting for instance to be in running state..."
-        aws ec2 wait instance-running --instance-ids "\$INSTANCE_ID" --region "\$REGION" || {
+        aws ec2 wait instance-running --instance-ids "$$INSTANCE_ID" --region "$$REGION" || {
           echo "❌ Instance failed to reach running state"
           return 1
         }
@@ -160,51 +160,52 @@ resource "terraform_data" "kubectl_provider_config" {
         local ssm_waited=0
         local ssm_interval=15
         
-        echo "⏳ Waiting for SSM agent to be online (timeout: \$ssm_timeout seconds)..."
-        while [ \$ssm_waited -lt \$ssm_timeout ]; do
+        echo "⏳ Waiting for SSM agent to be online (timeout: $$ssm_timeout seconds)..."
+        while [ $$ssm_waited -lt $$ssm_timeout ]; do
           if aws ssm describe-instance-information \
-             --region "\$REGION" \
-             --filters "Key=InstanceIds,Values=\$INSTANCE_ID" \
+             --region "$$REGION" \
+             --filters "Key=InstanceIds,Values=$$INSTANCE_ID" \
              --query "InstanceInformationList[0].PingStatus" \
              --output text 2>/dev/null | grep -q "Online"; then
             echo "✅ SSM agent is online"
             return 0
           fi
-          echo "⏳ SSM agent not ready yet... (\$ssm_waited/\$ssm_timeout seconds)"
-          sleep \$ssm_interval
-          ssm_waited=\$((ssm_waited + ssm_interval))
+          echo "⏳ SSM agent not ready yet... ($$ssm_waited/$$ssm_timeout seconds)"
+          sleep $$ssm_interval
+          ssm_waited=$$((ssm_waited + ssm_interval))
         done
         
-        echo "❌ SSM agent failed to come online within \$ssm_timeout seconds"
+        echo "❌ SSM agent failed to come online within $$ssm_timeout seconds"
         return 1
       }
       
       # Enhanced function to wait for kubeadm completion
       wait_for_kubeadm() {
-        local max_wait=1200  # 20 minutes (increased from 15)
+        local max_wait=1200  # 20 minutes
         local check_interval=45
-        local max_checks=\$((max_wait / check_interval))
+        local max_checks=$$((max_wait / check_interval))
+        local max_wait_minutes=20
         
-        echo "🔍 Waiting for kubeadm init completion (max: \$\$((max_wait / 60)) minutes)..."
-        echo "   Check interval: \$check_interval seconds"
-        echo "   Max checks: \$\$max_checks"
+        echo "🔍 Waiting for kubeadm init completion (max: $$max_wait_minutes minutes)..."
+        echo "   Check interval: $$check_interval seconds"
+        echo "   Max checks: $$max_checks"
         
-        for check in \$\$(seq 1 \$\$max_checks); do
-          local elapsed=\$\$((check * check_interval))
-          local elapsed_minutes=\$\$((elapsed / 60))
+        for check in $$(seq 1 $$max_checks); do
+          local elapsed=$$((check * check_interval))
+          local elapsed_minutes=$$((elapsed / 60))
           echo ""
-          echo "🔄 Check \$\$check/\$\$max_checks ($${elapsed_minutes}m elapsed): Verifying kubeadm completion..."
+          echo "🔄 Check $$check/$$max_checks ($$elapsed_minutes minutes elapsed): Verifying kubeadm completion..."
           
           # Enhanced verification command with better logging
-          COMMAND_ID=\$\$(aws ssm send-command \
-            --region "\$\$REGION" \
+          COMMAND_ID=$$(aws ssm send-command \
+            --region "$$REGION" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "\$\$INSTANCE_ID" \
+            --instance-ids "$$INSTANCE_ID" \
             --parameters 'commands=[
               "#!/bin/bash",
-              "echo \"=== KUBEADM COMPLETION CHECK v8 ===\"",
-              "echo \"Timestamp: \$\$(date)\"",
-              "echo \"Hostname: \$\$(hostname)\"",
+              "echo \"=== KUBEADM COMPLETION CHECK v9 ===\"",
+              "echo \"Timestamp: $$(date)\"",
+              "echo \"Hostname: $$(hostname)\"",
               "echo \"\"",
               "# Check if initialization is still running",
               "if pgrep -f \"kubeadm init\" >/dev/null; then",
@@ -219,8 +220,8 @@ resource "terraform_data" "kubectl_provider_config" {
               "  if [ -s /etc/kubernetes/admin.conf ]; then",
               "    if grep -q \"apiVersion.*Config\" /etc/kubernetes/admin.conf; then",
               "      echo \"✅ admin.conf: EXISTS and VALID\"",
-              "      echo \"   Size: \$\$(stat -c%s /etc/kubernetes/admin.conf) bytes\"",
-              "      echo \"   Modified: \$\$(stat -c%y /etc/kubernetes/admin.conf)\"",
+              "      echo \"   Size: $$(stat -c%s /etc/kubernetes/admin.conf) bytes\"",
+              "      echo \"   Modified: $$(stat -c%y /etc/kubernetes/admin.conf)\"",
               "    else",
               "      echo \"❌ admin.conf: EXISTS but INVALID CONTENT\"",
               "      echo \"   First few lines:\"",
@@ -270,73 +271,73 @@ resource "terraform_data" "kubectl_provider_config" {
             --output text \
             --query "Command.CommandId" 2>/dev/null)
           
-          if [[ -z "\$\$COMMAND_ID" ]]; then
+          if [[ -z "$$COMMAND_ID" ]]; then
             echo "   ⚠️ Failed to send SSM command, retrying..."
-            sleep \$\$check_interval
+            sleep $$check_interval
             continue
           fi
           
-          echo "   📋 Waiting for check completion (Command ID: \$\$COMMAND_ID)..."
+          echo "   📋 Waiting for check completion (Command ID: $$COMMAND_ID)..."
           sleep 30  # Give command time to execute
           
           # Get command result with retries
           local result_attempts=0
           local max_result_attempts=3
-          while [ \$\$result_attempts -lt \$\$max_result_attempts ]; do
-            RESULT=\$\$(aws ssm get-command-invocation \
-              --region "\$\$REGION" \
-              --command-id "\$\$COMMAND_ID" \
-              --instance-id "\$\$INSTANCE_ID" \
+          while [ $$result_attempts -lt $$max_result_attempts ]; do
+            RESULT=$$(aws ssm get-command-invocation \
+              --region "$$REGION" \
+              --command-id "$$COMMAND_ID" \
+              --instance-id "$$INSTANCE_ID" \
               --output json 2>/dev/null || echo "{}")
             
-            STATUS=\$\$(echo "\$\$RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
-            STDOUT=\$\$(echo "\$\$RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-            STDERR=\$\$(echo "\$\$RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
+            STATUS=$$(echo "$$RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+            STDOUT=$$(echo "$$RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+            STDERR=$$(echo "$$RESULT" | jq -r '.StandardErrorContent // ""' 2>/dev/null || echo "")
             
-            if [[ -n "\$\$STATUS" ]]; then
+            if [[ -n "$$STATUS" ]]; then
               break
             fi
             
-            result_attempts=\$\$((result_attempts + 1))
-            echo "   ⏳ Waiting for command result... (attempt \$\$result_attempts/\$\$max_result_attempts)"
+            result_attempts=$$((result_attempts + 1))
+            echo "   ⏳ Waiting for command result... (attempt $$result_attempts/$$max_result_attempts)"
             sleep 10
           done
           
-          echo "   📋 Command Status: \$\$STATUS"
-          if [[ -n "\$\$STDOUT" ]]; then
+          echo "   📋 Command Status: $$STATUS"
+          if [[ -n "$$STDOUT" ]]; then
             echo "   📄 Output:"
-            echo "\$\$STDOUT" | sed 's/^/      /'
+            echo "$$STDOUT" | sed 's/^/      /'
           fi
-          if [[ -n "\$\$STDERR" && "\$\$STDERR" != "null" ]]; then
+          if [[ -n "$$STDERR" && "$$STDERR" != "null" ]]; then
             echo "   ⚠️ Errors:"
-            echo "\$\$STDERR" | sed 's/^/      /'
+            echo "$$STDERR" | sed 's/^/      /'
           fi
           
           # Check results
-          if [[ "\$\$STATUS" == "0" ]] && echo "\$\$STDOUT" | grep -q "KUBEADM INIT: COMPLETE AND VERIFIED"; then
+          if [[ "$$STATUS" == "0" ]] && echo "$$STDOUT" | grep -q "KUBEADM INIT: COMPLETE AND VERIFIED"; then
             echo "   ✅ kubeadm init completed successfully!"
           return 0
-          elif [[ "\$\$STATUS" == "2" ]]; then
+          elif [[ "$$STATUS" == "2" ]]; then
             echo "   🔄 kubeadm init still in progress..."
           else
-            echo "   ❌ kubeadm init verification failed (status: \$\$STATUS)"
+            echo "   ❌ kubeadm init verification failed (status: $$STATUS)"
           fi
           
-          if [[ \$\$check -eq \$\$max_checks ]]; then
+          if [[ $$check -eq $$max_checks ]]; then
             echo ""
-            echo "❌ TIMEOUT: kubeadm init did not complete after \$\$max_wait seconds (\$\$((max_wait / 60)) minutes)"
+            echo "❌ TIMEOUT: kubeadm init did not complete after $$max_wait seconds ($$max_wait_minutes minutes)"
             echo "   This suggests the control plane initialization failed."
             echo "   Check the logs on the control plane instance:"
-            echo "   - ssh -i YOUR_KEY.pem ubuntu@\$\$PUBLIC_IP"
-            echo "   - sudo cat /var/log/k8s-init.log"
+            echo "   - ssh -i YOUR_KEY.pem ubuntu@$$PUBLIC_IP"
+            echo "   - sudo cat /var/log/k8s-bootstrap.log"
             echo "   - sudo cat /var/log/kubeadm-init.log"
             echo "   - sudo systemctl status kubelet"
-            echo "   - sudo systemctl status crio"
+            echo "   - sudo systemctl status containerd"
             return 1
           fi
           
-          echo "   ⏳ Waiting \$\$check_interval seconds before next check..."
-          sleep \$\$check_interval
+          echo "   ⏳ Waiting $$check_interval seconds before next check..."
+          sleep $$check_interval
         done
         
         return 1
@@ -346,17 +347,17 @@ resource "terraform_data" "kubectl_provider_config" {
       fetch_kubeconfig() {
         echo "📁 Fetching kubeconfig from control plane..."
         
-        for attempt in \$\$(seq 1 5); do
-          echo "🔄 Fetch attempt \$\$attempt/5..."
+        for attempt in $$(seq 1 5); do
+          echo "🔄 Fetch attempt $$attempt/5..."
           
-          COMMAND_ID=\$\$(aws ssm send-command \
-            --region "\$\$REGION" \
+          COMMAND_ID=$$(aws ssm send-command \
+            --region "$$REGION" \
             --document-name "AWS-RunShellScript" \
-            --instance-ids "\$\$INSTANCE_ID" \
+            --instance-ids "$$INSTANCE_ID" \
             --parameters 'commands=[
               "#!/bin/bash",
-              "echo \"=== KUBECONFIG FETCH v8 ===\"",
-              "echo \"Timestamp: \$\$(date)\"",
+              "echo \"=== KUBECONFIG FETCH v9 ===\"",
+              "echo \"Timestamp: $$(date)\"",
               "echo \"File info:\"",
               "ls -la /etc/kubernetes/admin.conf",
               "echo \"\"",
@@ -369,53 +370,53 @@ resource "terraform_data" "kubectl_provider_config" {
           
           sleep 20
           
-          FETCH_RESULT=\$\$(aws ssm get-command-invocation \
-            --region "\$\$REGION" \
-            --command-id "\$\$COMMAND_ID" \
-            --instance-id "\$\$INSTANCE_ID" \
+          FETCH_RESULT=$$(aws ssm get-command-invocation \
+            --region "$$REGION" \
+            --command-id "$$COMMAND_ID" \
+            --instance-id "$$INSTANCE_ID" \
             --output json 2>/dev/null || echo "{}")
           
-          FETCH_STDOUT=\$\$(echo "\$\$FETCH_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
-          FETCH_STATUS=\$\$(echo "\$\$FETCH_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
+          FETCH_STDOUT=$$(echo "$$FETCH_RESULT" | jq -r '.StandardOutputContent // ""' 2>/dev/null || echo "")
+          FETCH_STATUS=$$(echo "$$FETCH_RESULT" | jq -r '.ResponseCode // ""' 2>/dev/null || echo "")
           
-          if [[ "\$\$FETCH_STATUS" != "0" ]]; then
-            echo "   ❌ Fetch command failed (status: \$\$FETCH_STATUS), retrying..."
+          if [[ "$$FETCH_STATUS" != "0" ]]; then
+            echo "   ❌ Fetch command failed (status: $$FETCH_STATUS), retrying..."
             sleep 20
             continue
           fi
           
-          KUBECONFIG_CONTENT=\$\$(echo "\$\$FETCH_STDOUT" | \
+          KUBECONFIG_CONTENT=$$(echo "$$FETCH_STDOUT" | \
             sed -n '/=== ADMIN.CONF CONTENT START ===/,/=== ADMIN.CONF CONTENT END ===/p' | \
-            sed '1d;\$\$d')
+            sed '1d;$$d')
           
-          if [[ -z "\$\$KUBECONFIG_CONTENT" ]]; then
+          if [[ -z "$$KUBECONFIG_CONTENT" ]]; then
             echo "   ❌ No kubeconfig content found, retrying..."
             sleep 20
             continue
           fi
           
           # Enhanced validation
-          if echo "\$\$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
-             echo "\$\$KUBECONFIG_CONTENT" | grep -q "kind.*Config" && \
-             echo "\$\$KUBECONFIG_CONTENT" | grep -q "clusters:" && \
-             echo "\$\$KUBECONFIG_CONTENT" | grep -q "users:" && \
-             echo "\$\$KUBECONFIG_CONTENT" | grep -q "contexts:"; then
+          if echo "$$KUBECONFIG_CONTENT" | grep -q "apiVersion.*Config" && \
+             echo "$$KUBECONFIG_CONTENT" | grep -q "kind.*Config" && \
+             echo "$$KUBECONFIG_CONTENT" | grep -q "clusters:" && \
+             echo "$$KUBECONFIG_CONTENT" | grep -q "users:" && \
+             echo "$$KUBECONFIG_CONTENT" | grep -q "contexts:"; then
             
             echo "   🔧 Updating server endpoint to public IP..."
-            UPDATED_KUBECONFIG=\$\$(echo "\$\$KUBECONFIG_CONTENT" | \
-              sed "s|server:.*|server: https://\$\$PUBLIC_IP:6443|g")
+            UPDATED_KUBECONFIG=$$(echo "$$KUBECONFIG_CONTENT" | \
+              sed "s|server:.*|server: https://$$PUBLIC_IP:6443|g")
             
             # Write kubeconfig to file
-            echo "\$\$UPDATED_KUBECONFIG" > "\$\$KUBECONFIG_PATH"
-            chmod 600 "\$\$KUBECONFIG_PATH"
+            echo "$$UPDATED_KUBECONFIG" > "$$KUBECONFIG_PATH"
+            chmod 600 "$$KUBECONFIG_PATH"
             
             # Verify the written file
-            if [[ -f "\$\$KUBECONFIG_PATH" ]] && [[ -s "\$\$KUBECONFIG_PATH" ]]; then
-              echo "   ✅ Kubeconfig written to: \$\$KUBECONFIG_PATH"
-              echo "   📊 File size: \$\$(stat -c%s "\$\$KUBECONFIG_PATH") bytes"
+            if [[ -f "$$KUBECONFIG_PATH" ]] && [[ -s "$$KUBECONFIG_PATH" ]]; then
+              echo "   ✅ Kubeconfig written to: $$KUBECONFIG_PATH"
+              echo "   📊 File size: $$(stat -c%s "$$KUBECONFIG_PATH") bytes"
               
               # Test the kubeconfig
-              if KUBECONFIG="\$\$KUBECONFIG_PATH" timeout 30 kubectl cluster-info >/dev/null 2>&1; then
+              if KUBECONFIG="$$KUBECONFIG_PATH" timeout 30 kubectl cluster-info >/dev/null 2>&1; then
                 echo "   ✅ Kubeconfig validation: PASSED"
                 return 0
               else
@@ -429,7 +430,7 @@ resource "terraform_data" "kubectl_provider_config" {
           else
             echo "   ❌ Invalid kubeconfig content structure, retrying..."
             echo "   Content preview:"
-            echo "\$\$KUBECONFIG_CONTENT" | head -10 | sed 's/^/      /'
+            echo "$$KUBECONFIG_CONTENT" | head -10 | sed 's/^/      /'
           fi
           
           sleep 20
@@ -453,12 +454,12 @@ resource "terraform_data" "kubectl_provider_config" {
         echo "❌ FAILED: kubeadm init did not complete successfully"
         echo ""
         echo "🔍 Troubleshooting steps:"
-        echo "1. SSH to the control plane: ssh -i YOUR_KEY.pem ubuntu@\$\$PUBLIC_IP"
-        echo "2. Check initialization logs: sudo cat /var/log/k8s-init.log"
+        echo "1. SSH to the control plane: ssh -i YOUR_KEY.pem ubuntu@$$PUBLIC_IP"
+        echo "2. Check initialization logs: sudo cat /var/log/k8s-bootstrap.log"
         echo "3. Check kubeadm logs: sudo cat /var/log/kubeadm-init.log" 
         echo "4. Check system services:"
         echo "   - sudo systemctl status kubelet"
-        echo "   - sudo systemctl status crio"
+        echo "   - sudo systemctl status containerd"
         echo "5. Check for errors in cloud-init: sudo cat /var/log/cloud-init-output.log"
         exit 1
       fi
@@ -472,19 +473,19 @@ resource "terraform_data" "kubectl_provider_config" {
       echo ""
       echo "========================================================="
       echo "= KUBECONFIG SETUP COMPLETED SUCCESSFULLY            ="
-      echo "= Date: \$\$(date)                                        ="
+      echo "= Date: $$(date)                                        ="
       echo "========================================================="
-      echo "✅ Kubeconfig file: \$\$KUBECONFIG_PATH"
-      echo "✅ API endpoint: https://\$\$PUBLIC_IP:6443"
-      echo "✅ Instance ID: \$\$INSTANCE_ID"
+      echo "✅ Kubeconfig file: $$KUBECONFIG_PATH"
+      echo "✅ API endpoint: https://$$PUBLIC_IP:6443"
+      echo "✅ Instance ID: $$INSTANCE_ID"
       echo ""
       echo "🔗 Test cluster access:"
-      echo "   export KUBECONFIG=\$\$KUBECONFIG_PATH"
+      echo "   export KUBECONFIG=$$KUBECONFIG_PATH"
       echo "   kubectl cluster-info"
       echo "   kubectl get nodes"
     EOT
   }
-  
+
   depends_on = [module.k8s-cluster]
 }
 
@@ -523,27 +524,27 @@ resource "null_resource" "cluster_readiness_check" {
       echo ""
       
       # Get node counts
-      ready_nodes=\$\$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
-      notready_nodes=\$\$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
-      ready_workers=\$\$(kubectl get nodes --no-headers | grep -v "control-plane" | grep -c " Ready " || echo "0")
+      ready_nodes=$(kubectl get nodes --no-headers | grep -c " Ready " || echo "0")
+      notready_nodes=$(kubectl get nodes --no-headers | grep -c " NotReady " || echo "0")
+      ready_workers=$(kubectl get nodes --no-headers | grep -v "control-plane" | grep -c " Ready " || echo "0")
       
-      echo "📊 Node Status: \$\$ready_nodes Ready, \$\$notready_nodes NotReady"
-      echo "🤖 Workers Ready: \$\$ready_workers"
+      echo "📊 Node Status: $ready_nodes Ready, $notready_nodes NotReady"
+      echo "🤖 Workers Ready: $ready_workers"
       
       # STRICT VALIDATIONS
-      if [[ "\$\$notready_nodes" -gt 0 ]]; then
-        echo "❌ FATAL: \$\$notready_nodes NotReady nodes found"
+      if [[ $notready_nodes -gt 0 ]]; then
+        echo "❌ FATAL: $notready_nodes NotReady nodes found"
         kubectl get nodes --no-headers | grep "NotReady"
         exit 1
       fi
       
-      if [[ "\$\$ready_nodes" -lt 3 ]]; then
-        echo "❌ FATAL: Only \$\$ready_nodes nodes (minimum 3 required)"
+      if [[ $ready_nodes -lt 3 ]]; then
+        echo "❌ FATAL: Only $ready_nodes nodes (minimum 3 required)"
         exit 1
       fi
       
-      if [[ "\$\$ready_workers" -lt 2 ]]; then
-        echo "❌ FATAL: Only \$\$ready_workers worker nodes (minimum 2 required)"
+      if [[ $ready_workers -lt 2 ]]; then
+        echo "❌ FATAL: Only $ready_workers worker nodes (minimum 2 required)"
         exit 1
       fi
       
@@ -551,20 +552,20 @@ resource "null_resource" "cluster_readiness_check" {
       echo "🔍 Validating core components..."
       
       # CoreDNS check
-      coredns_ready=\$\$(kubectl get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-      coredns_desired=\$\$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "2")
+      coredns_ready=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+      coredns_desired=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "2")
       
-      if [[ "\$\$coredns_ready" -lt "\$\$coredns_desired" ]]; then
-        echo "❌ FATAL: CoreDNS not ready (\$\$coredns_ready/\$\$coredns_desired)"
+      if [[ $coredns_ready -lt $coredns_desired ]]; then
+        echo "❌ FATAL: CoreDNS not ready ($coredns_ready/$coredns_desired)"
         exit 1
       fi
-      echo "   ✅ CoreDNS: \$\$coredns_ready/\$\$coredns_desired ready"
+      echo "   ✅ CoreDNS: $coredns_ready/$coredns_desired ready"
       
       # Check for problematic pods
-      problematic_pods=\$\$(kubectl get pods --all-namespaces | grep -E "(Pending|ContainerCreating|Error|CrashLoopBackOff)" | wc -l || echo "0")
+      problematic_pods=$(kubectl get pods --all-namespaces | grep -E "(Pending|ContainerCreating|Error|CrashLoopBackOff)" | wc -l || echo "0")
       
-      if [[ "\$\$problematic_pods" -gt 5 ]]; then
-        echo "❌ FATAL: Too many problematic pods (\$\$problematic_pods)"
+      if [[ $problematic_pods -gt 5 ]]; then
+        echo "❌ FATAL: Too many problematic pods ($problematic_pods)"
         kubectl get pods --all-namespaces | grep -E "(Pending|ContainerCreating|Error|CrashLoopBackOff)" | head -10
         exit 1
       fi
@@ -572,10 +573,10 @@ resource "null_resource" "cluster_readiness_check" {
       echo ""
       echo "✅ CLUSTER READY!"
       echo "🎉 All validations passed:"
-      echo "   • \$\$ready_nodes Ready nodes (\$\$ready_workers workers)"
+      echo "   • $ready_nodes Ready nodes ($ready_workers workers)"
       echo "   • 0 NotReady nodes"
       echo "   • CoreDNS operational"
-      echo "   • \$\$problematic_pods problematic pods (threshold: ≤5)"
+      echo "   • $problematic_pods problematic pods (threshold: ≤5)"
     EOT
   }
 }
@@ -613,7 +614,7 @@ resource "null_resource" "cluster_maintenance" {
       echo "👻 Checking for orphaned nodes..."
       
       # Get active ASG instances
-      active_instances=\$\$(aws ec2 describe-instances \
+      active_instances=$(aws ec2 describe-instances \
         --region ${var.region} \
         --filters "Name=tag:aws:autoscaling:groupName,Values=${local.worker_asg_name}" \
                   "Name=instance-state-name,Values=running,pending" \
@@ -621,40 +622,40 @@ resource "null_resource" "cluster_maintenance" {
         --output text 2>/dev/null || echo "")
       
       # Check worker nodes
-      worker_nodes=\$\$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print \$\$1}' || echo "")
+      worker_nodes=$(kubectl get nodes --no-headers | grep -v "control-plane" | awk '{print $1}' || echo "")
       
-      for node_name in \$\$worker_nodes; do
+      for node_name in $worker_nodes; do
         instance_id=""
         
         # Extract instance ID from node name
-        if [[ "$${node_name}" =~ worker-([a-f0-9]{17})$$ ]]; then
-          instance_id="i-$${BASH_REMATCH[1]}"
-        elif [[ "$${node_name}" =~ (i-[a-f0-9]{8,17}) ]]; then
-          instance_id="$${BASH_REMATCH[1]}"
+        if [[ "$node_name" =~ worker-([a-f0-9]{17})$ ]]; then
+          instance_id="i-${BASH_REMATCH[1]}"
+        elif [[ "$node_name" =~ (i-[a-f0-9]{8,17}) ]]; then
+          instance_id="${BASH_REMATCH[1]}"
         fi
         
         # Check if instance exists in ASG
-        if [[ -n "\$\$instance_id" ]] && ! echo "\$\$active_instances" | grep -q "\$\$instance_id"; then
-          echo "🗑️ Removing orphaned node: \$\$node_name (instance: \$\$instance_id)"
+        if [[ -n "$instance_id" ]] && ! echo "$active_instances" | grep -q "$instance_id"; then
+          echo "🗑️ Removing orphaned node: $node_name (instance: $instance_id)"
           
           # Force delete pods on this node
-          kubectl get pods --all-namespaces --field-selector spec.nodeName="\$\$node_name" --no-headers 2>/dev/null | \
+          kubectl get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null | \
             while read -r ns pod rest; do
-              kubectl delete pod "\$\$pod" -n "\$\$ns" --force --grace-period=0 --timeout=5s 2>/dev/null || true
+              kubectl delete pod $pod -n $ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
             done
           
           # Remove the node
-          kubectl delete node "\$\$node_name" --force --grace-period=0 2>/dev/null || true
+          kubectl delete node $node_name --force --grace-period=0 2>/dev/null || true
         fi
       done
       
       # 2. Clean up terminating pods
       echo "🗑️ Cleaning up stuck terminating pods..."
-      terminating_pods=\$\$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null || echo "")
+      terminating_pods=$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating --no-headers 2>/dev/null || echo "")
       
-      if [[ -n "\$\$terminating_pods" ]]; then
-        echo "\$\$terminating_pods" | while read -r ns pod rest; do
-          kubectl delete pod "\$\$pod" -n "\$\$ns" --force --grace-period=0 --timeout=5s 2>/dev/null || true
+      if [[ -n "$terminating_pods" ]]; then
+        echo "$terminating_pods" | while read -r ns pod rest; do
+          kubectl delete pod $pod -n $ns --force --grace-period=0 --timeout=5s 2>/dev/null || true
         done
       fi
       
@@ -695,8 +696,8 @@ resource "null_resource" "application_setup" {
       # Create namespaces
       echo "📁 Creating namespaces..."
       for namespace in prod dev; do
-        kubectl create namespace \$\$namespace --dry-run=client -o yaml | kubectl apply -f -
-        echo "   ✅ Namespace: \$\$namespace"
+        kubectl create namespace $namespace --dry-run=client -o yaml | kubectl apply -f -
+        echo "   ✅ Namespace: $namespace"
       done
       
       # Generate certificates for TLS secrets
@@ -717,16 +718,16 @@ resource "null_resource" "application_setup" {
       
       # Create secrets in both namespaces
       for namespace in prod dev; do
-        echo "🔑 Creating secrets in namespace: \$\$namespace"
+        echo "🔑 Creating secrets in namespace: $namespace"
         
         # TLS secret
         kubectl create secret tls polybot-tls \
-          --cert=polybot.crt --key=polybot.key -n \$\$namespace \
+          --cert=polybot.crt --key=polybot.key -n $namespace \
           --dry-run=client -o yaml | kubectl apply -f -
         
         # CA secret
         kubectl create secret generic polybot-ca \
-          --from-file=ca.crt=ca.crt -n \$\$namespace \
+          --from-file=ca.crt=ca.crt -n $namespace \
           --dry-run=client -o yaml | kubectl apply -f -
         
         # Application secrets
@@ -734,10 +735,10 @@ resource "null_resource" "application_setup" {
           --from-literal=app-secret=default-value \
           --from-literal=database-url=postgresql://polybot:password@localhost:5432/polybot \
           --from-literal=redis-url=redis://localhost:6379/0 \
-          -n \$\$namespace \
+          -n $namespace \
           --dry-run=client -o yaml | kubectl apply -f -
         
-        echo "   ✅ Secrets created in \$\$namespace"
+        echo "   ✅ Secrets created in $namespace"
       done
       
       # Cleanup
@@ -820,20 +821,20 @@ resource "null_resource" "install_argocd" {
       echo "🔑 Retrieving ArgoCD admin password..."
       for i in {1..10}; do
         if kubectl -n argocd get secret argocd-initial-admin-secret >/dev/null 2>&1; then
-          PASSWORD=\$\$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null || echo "")
-          if [[ -n "\$\$PASSWORD" ]]; then
-            echo "Password: \$\$PASSWORD"
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d 2>/dev/null || echo "")
+          if [[ -n "$PASSWORD" ]]; then
+            echo "Password: $PASSWORD"
             break
           fi
         fi
-        echo "   Waiting for password secret... (\$\$i/10)"
+        echo "   Waiting for password secret... ($i/10)"
         sleep 10
       done
       
       echo "✅ ArgoCD installation completed!"
       echo "🌐 Access: kubectl port-forward svc/argocd-server -n argocd 8081:443"
       echo "👤 Username: admin"
-      echo "🔑 Password: \$\$PASSWORD"
+      echo "🔑 Password: $PASSWORD"
     EOT
   }
 }
