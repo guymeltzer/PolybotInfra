@@ -162,8 +162,8 @@ resource "null_resource" "cluster_readiness_check" {
   depends_on = [local_file.kubeconfig] # Depends on kubeconfig file being created
 
   triggers = {
-    kubeconfig_content_hash = filesha256(local.kubeconfig_path) # Trigger if kubeconfig content changes
-    readiness_version       = "v4-refactored-strict"
+    kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
+    readiness_version     = "v4-refactored-strict"
   }
 
   provisioner "local-exec" {
