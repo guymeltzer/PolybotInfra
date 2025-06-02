@@ -159,11 +159,14 @@ resource "local_file" "kubeconfig" {
 
 # Comprehensive cluster readiness validation
 resource "null_resource" "cluster_readiness_check" {
-  depends_on = [local_file.kubeconfig] # Depends on kubeconfig file being created
+  depends_on = [
+    local_file.kubeconfig,
+    null_resource.wait_for_kubeconfig_secret # Ensure kubeconfig is available in Secrets Manager
+  ]
 
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
-    readiness_version     = "v4-refactored-strict"
+    readiness_version     = "v5-with-proper-wait"
   }
 
   provisioner "local-exec" {

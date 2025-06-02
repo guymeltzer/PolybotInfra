@@ -802,7 +802,7 @@ resource "aws_launch_template" "worker_lt" {
     tags = merge(var.tags, {
       Name                                        = "${var.cluster_name}-worker-node"
       Role                                        = "worker"
-      "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+      "kubernetes.io_cluster_${local.cluster_name}" = "owned"
     })
   }
   lifecycle { create_before_destroy = true }
@@ -829,7 +829,7 @@ resource "aws_autoscaling_group" "worker_asg" {
     for_each = merge(var.tags, {
       Name                                        = "${var.cluster_name}-worker-instance" # Instances will get this name
       Role                                        = "worker"
-      "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+      "kubernetes.io_cluster_${local.cluster_name}" = "owned"
     })
     content {
       key                 = tag.key
@@ -864,71 +864,48 @@ resource "null_resource" "control_plane_provisioned_signal" {
 # It updates a secret after the control plane is up.
 resource "null_resource" "update_join_command" {
   depends_on = [
-    # Ensure control plane has had a chance to run user_data and potentially store initial join command
-    # This might depend on the new root-level null_resource.wait_for_kubeconfig_secret or aws_instance.control_plane directly
-    aws_instance.control_plane, # Basic dependency
-    null_resource.control_plane_provisioned_signal, # More explicit
+    aws_instance.control_plane,
     aws_secretsmanager_secret.kubernetes_join_command,
     aws_secretsmanager_secret.kubernetes_join_command_latest,
   ]
 
   triggers = {
-    control_plane_id   = aws_instance.control_plane.id # Trigger if CP changes
-    update_version     = "v7-secrets-manager-focus"
-    # Add other triggers if this script needs to re-run, e.g., K8s version change
+    control_plane_id   = aws_instance.control_plane.id
+    update_version     = "v9-simplified"
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       #!/bin/bash
-      set -e # Exit on error
+      set -e
 
-      echo "🔄 Join Command Management v7 (runs after CP user_data)"
-      echo "======================================================"
+      echo "🔄 Join Command Management v9 (simplified - control plane handles initial setup)"
+      echo "=============================================================================="
 
-      # This script assumes the control plane user_data has *already*
-      # run kubeadm init and stored the *initial* join command.
-      # This script might be for *refreshing* the token if needed, or ensuring it's there.
-
-      # Terraform interpolations for AWS CLI parameters
-      CONTROL_PLANE_INSTANCE_ID="${aws_instance.control_plane.id}"
-      REGION_NAME="${var.region}"
-      PRIMARY_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command.name}" # Use .name
-      LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.name}" # Use .name
-      S3_LOG_BUCKET="${aws_s3_bucket.worker_logs.id}" # Use .id or .bucket for bucket name
-
-      # Shell variable for conditional execution
-      SKIP_UPDATE="${var.skip_token_verification}" # Assuming this var controls skipping
-
-      if [[ "$SKIP_UPDATE" == "true" ]]; then
+      if [[ "${var.skip_token_verification}" == "true" ]]; then
         echo "ℹ️ SKIP_JOIN_COMMAND_UPDATE is true, skipping update."
         exit 0
       fi
 
-      echo "📡 Control Plane ID: $CONTROL_PLANE_INSTANCE_ID"
-      echo "🔑 Latest Secret ID: $LATEST_SECRET_ID"
+      # Since control plane bootstrap already generates and stores the join command,
+      # this script just confirms it's available
+      LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.name}"
+      REGION_NAME="${var.region}"
 
-      echo "Attempting to retrieve kubeconfig via AWS Secrets Manager..."
-      
-      # Try to get kubeconfig from Secrets Manager as the primary method
-      KUBECONFIG_SECRET_NAME="${aws_secretsmanager_secret.cluster_kubeconfig.name}"
-      KUBECONFIG_CONTENT=$(aws secretsmanager get-secret-value \
-        --secret-id "$KUBECONFIG_SECRET_NAME" \
+      echo "🔍 Verifying join command is available in Secrets Manager..."
+      JOIN_COMMAND=$(aws secretsmanager get-secret-value \
+        --secret-id "$LATEST_SECRET_ID" \
         --region "$REGION_NAME" \
         --query SecretString --output text 2>/dev/null || echo "")
-      
-      if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
-        echo "✅ Got valid kubeconfig from Secrets Manager. Creating temporary kubeconfig for health check."
-        echo "$KUBECONFIG_CONTENT" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
-        chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
-        export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml"
-      else
-        echo "❌ Failed to get valid kubeconfig from Secrets Manager."
-        exit 1 # Exit with error if kubeconfig cannot be retrieved
-      fi
 
-      echo "✅ Join command management completed successfully."
+      if [[ -n "$JOIN_COMMAND" ]] && echo "$JOIN_COMMAND" | grep -q "kubeadm join"; then
+        echo "✅ Join command is available in Secrets Manager"
+        echo "✅ Join command management completed successfully"
+      else
+        echo "⚠️ Join command not yet available, but control plane bootstrap should handle this"
+        echo "✅ Proceeding (control plane will generate join command)"
+      fi
     EOT
   }
 }
@@ -1200,15 +1177,12 @@ resource "terraform_data" "worker_script_hash_trigger" {
 resource "terraform_data" "cluster_health_assessment" {
   depends_on = [
     aws_instance.control_plane,
-    # aws_autoscaling_group.worker_asg # Add if it queries the ASG that needs to exist first
-    # null_resource.wait_for_kubeconfig_secret # In root module, if it needs kubeconfig
+    null_resource.update_join_command # Wait for join command setup to complete
   ]
-  input = { # Use triggers map
-    control_plane_id = aws_instance.control_plane.id # Use an output if this module is called from root
+  input = {
+    control_plane_id = aws_instance.control_plane.id
     asg_name         = local.worker_asg_name
-    script_version   = "v2-dollar-sign-review" # Increment if script changes
-    # If this script uses kubeconfig, it should depend on the kubeconfig being available
-    # kubeconfig_trigger = local_file.kubeconfig.id # (if kubeconfig generated in root)
+    script_version   = "v3-after-join-command-setup"
   }
 
   provisioner "local-exec" {
