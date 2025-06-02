@@ -972,20 +972,24 @@ resource "null_resource" "update_join_command" {
 # Ensure the lambda_code.py is correctly packaged by data.archive_file.lambda_zip.
 
 # This was identified as problematic, assuming lambda_code.py is a source file you provide
-resource "local_file" "lambda_function_code" {
-  filename = "${path.module}/scripts/lambda_code.py"
-  content  = file("${path.module}/scripts/lambda_code.py")
+# =============================================================================
+# 🔧 LAMBDA FUNCTIONS - NODE MANAGEMENT AUTOMATION
+# =============================================================================
+
+# Data source to get current AWS account ID for more specific IAM policy resources
+data "aws_caller_identity" "current" {}
+
+# The archive_file data source now directly references your Python script.
+# IMPORTANT: Ensure modules/k8s-cluster/scripts/lambda_code.py exists and contains
+#            the Python code I helped you adapt in the previous step.
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "${path.module}/scripts/lambda_code.py" # Directly uses your .py file
+  output_path = "${path.module}/lambda_function.zip"    # Temporary path for the generated zip
 }
 
-# data "archive_file" "lambda_zip" {
-#   type        = "zip"
-#   source_file = local_file.lambda_function_code.filename
-#   output_path = "${path.module}/lambda_function.zip"
-#   depends_on  = [local_file.lambda_function_code]
-# }
-
 resource "aws_iam_role" "node_management_lambda_role" {
-  name = "${var.cluster_name}-node-mgmt-lambda-role"
+  name = "${var.cluster_name}-node-mgmt-lambda-role" # Using var.cluster_name
   assume_role_policy = jsonencode({
     Version   = "2012-10-17"
     Statement = [{
@@ -997,11 +1001,11 @@ resource "aws_iam_role" "node_management_lambda_role" {
   tags = var.tags
 }
 
-data "aws_iam_policy_document" "node_management_lambda_policy_doc" { # Renamed for clarity
+data "aws_iam_policy_document" "node_management_lambda_policy_doc" {
   statement {
     effect    = "Allow"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["arn:aws:logs:*:*:*"] # Standard Lambda logging
+    resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.cluster_name}-node-management:*"]
   }
   statement {
     effect    = "Allow"
@@ -1009,27 +1013,45 @@ data "aws_iam_policy_document" "node_management_lambda_policy_doc" { # Renamed f
       "autoscaling:CompleteLifecycleAction",
       "autoscaling:DescribeAutoScalingGroups",
       "autoscaling:DescribeAutoScalingInstances"
+      # Add "autoscaling:SetDesiredCapacity" if your Lambda might adjust ASG size
     ]
-    resources = ["*"] # Broad, but often needed for ASG interaction
+    resources = ["*"] # Consider scoping this down if possible, e.g., to specific ASG ARNs
   }
   statement {
     effect    = "Allow"
     actions   = ["ec2:DescribeInstances", "ec2:DescribeTags"]
-    resources = ["*"] # Broad
+    resources = ["*"] # Broad, but often needed for instance inspection
   }
-  statement { # For fetching/updating join command or other secrets
-    effect = "Allow"
-    actions = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
-    resources = [ # Be specific
+  statement {
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+    resources = [ # Be specific with secret ARNs
       aws_secretsmanager_secret.kubernetes_join_command.arn,
       aws_secretsmanager_secret.kubernetes_join_command_latest.arn
-      # Add other secrets if the lambda interacts with them
+      # Add any other secrets the Lambda needs to access
     ]
   }
-  statement { # For S3 interactions if lambda needs it (e.g., writing logs, fetching configs)
+  statement {
     effect    = "Allow"
-    actions   = ["s3:PutObject", "s3:GetObject"]
-    resources = ["${aws_s3_bucket.worker_logs.arn}/*"] # Example: if lambda writes to this bucket
+    actions   = ["s3:PutObject", "s3:GetObject"] # If Lambda writes/reads from S3
+    resources = ["${aws_s3_bucket.worker_logs.arn}/*"] # Example for worker_logs bucket
+  }
+
+  # ===> ADDED/MODIFIED SSM PERMISSIONS <===
+  statement {
+    effect  = "Allow"
+    actions = ["ssm:SendCommand"]
+    resources = [
+      # Permission to send to the specific control plane instance
+      "arn:aws:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.control_plane.id}",
+      # Permission to use the AWS-RunShellScript document
+      "arn:aws:ssm:${var.region}::document/AWS-RunShellScript"
+    ]
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["ssm:GetCommandInvocation"]
+    resources = ["*"] # GetCommandInvocation result doesn't have a specific resource ARN to scope to easily other than "*"
   }
 }
 
@@ -1046,30 +1068,33 @@ resource "aws_iam_role_policy_attachment" "node_management_lambda_policy_attach"
 
 resource "aws_lambda_function" "node_management_lambda" {
   filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256 # Triggers update if zip changes
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256 # Ensures Lambda updates if code changes
   function_name    = "${var.cluster_name}-node-management"
   role             = aws_iam_role.node_management_lambda_role.arn
-  handler          = "lambda_code.lambda_handler" # Assumes lambda_code.py has lambda_handler function
-  runtime          = "python3.9" # Or python3.10, 3.11, 3.12 as available and supported
-  timeout          = 300 # 5 minutes
-  memory_size      = 256 # Adjust as needed
+  handler          = "lambda_code.lambda_handler" # Assumes your Python file is lambda_code.py and has lambda_handler
+  runtime          = "python3.9" # Or your preferred supported Python runtime
+  timeout          = 300         # 5 minutes
+  memory_size      = 256         # Adjust as needed
 
   environment {
     variables = {
-      CLUSTER_NAME           = local.cluster_name
-      REGION                 = var.region
-      JOIN_COMMAND_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id # Lambda uses this to fetch current join command
-      S3_LOG_BUCKET          = aws_s3_bucket.worker_logs.id # Or .bucket name
-      # Add any other environment variables your Lambda function needs
+      REGION                      = var.region
+      CLUSTER_NAME                = local.cluster_name # Passed from module's locals
+      # This is the secret ID the Lambda will *update* with the latest join token
+      JOIN_COMMAND_LATEST_SECRET_ID = aws_secretsmanager_secret.kubernetes_join_command_latest.id
+      # This is the specific EC2 instance ID of your control plane
+      CONTROL_PLANE_INSTANCE_ID   = aws_instance.control_plane.id
+      S3_LOG_BUCKET               = aws_s3_bucket.worker_logs.id # Pass the bucket name/id
+      # KUBECONFIG_PATH_ON_CP is implicitly /etc/kubernetes/admin.conf in your Python code
     }
   }
-  tags = var.tags
-  # Add VPC config if Lambda needs to access resources in VPC
-  # vpc_config {
-  #   subnet_ids         = module.vpc.private_subnets
-  #   security_group_ids = [aws_security_group.lambda_vpc_sg.id] # Define a SG for Lambda if in VPC
-  # }
+  tags       = var.tags
+  depends_on = [aws_iam_role_policy_attachment.node_management_lambda_policy_attach, data.archive_file.lambda_zip]
 }
+
+# Note: The local_file "lambda_function_code" resource that was previously here trying to read
+# lambda_code.py has been REMOVED as it was causing errors if the file didn't exist.
+# You must now ensure modules/k8s-cluster/scripts/lambda_code.py contains your Python code.
 
 # =============================================================================
 # 📡 MONITORING AND AUTOMATION - SNS AND CLOUDWATCH EVENTS
