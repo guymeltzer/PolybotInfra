@@ -2,7 +2,7 @@
 set -euo pipefail # Exit on error, unset variable, or pipe failure
 
 # =================================================================
-# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v10.3 (Templated & Shell Corrected)
+# KUBERNETES CONTROL PLANE BOOTSTRAP - COMPREHENSIVE v10.4 (IMDSv2 & Shell Corrected)
 # =================================================================
 
 # Set up comprehensive logging
@@ -16,8 +16,36 @@ chmod 644 "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
 # Redirect all output (stdout and stderr) to both bootstrap log and cloud-init log
 exec > >(tee -a "$BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
 
+# --- IMDSv2 Token Fetch ---
+# Fetch the IMDSv2 token. If this fails, the script cannot proceed with metadata calls.
+# Retry fetching token a few times in case of transient issues.
+IMDS_TOKEN=""
+for i in 1 2 3; do
+    IMDS_TOKEN=$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null)
+    if [ -n "$IMDS_TOKEN" ]; then
+        break
+    fi
+    echo "Warning: Failed to fetch IMDSv2 token (attempt $i/3). Retrying in 2 seconds..."
+    sleep 2
+done
+
+if [ -z "$IMDS_TOKEN" ]; then
+    echo "CRITICAL: Failed to retrieve IMDSv2 token after 3 attempts. Cannot access instance metadata."
+    # Not calling error_exit here as it also uses metadata, just exit.
+    exit 1
+fi
+echo "IMDSv2 token fetched successfully."
+# --- End IMDSv2 Token Fetch ---
+
+# Function to get metadata using the token
+get_metadata() {
+    local path="$1"
+    curl -fsSL -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "http://169.254.169.254/latest/meta-data/$path" 2>/dev/null || echo "unknown"
+}
+
+
 echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED (TEMPLATE v10.3) ="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - STARTED (TEMPLATE v10.4) ="
 echo "= Template Variables Received & Used:                           ="
 echo "=   K8S Version Full:    ${K8S_VERSION_FULL}"
 echo "=   K8S Major.Minor:     ${K8S_MAJOR_MINOR}"
@@ -33,9 +61,9 @@ echo "=   Latest Join Secret:  ${JOIN_COMMAND_LATEST_SECRET_NAME}"
 echo "=   Calico Version:      ${CALICO_VERSION}"
 echo "================================================================="
 echo "= Current Time (UTC):    $(date -u)"
-echo "= Instance ID:         $(curl -fsSL http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-echo "= Private IP (metadata): $(curl -fsSL http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
-echo "= Public IP (metadata):  $(curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo 'unknown')"
+echo "= Instance ID:         $(get_metadata instance-id)"
+echo "= Private IP (metadata): $(get_metadata local-ipv4)"
+echo "= Public IP (metadata):  $(get_metadata public-ipv4)"
 echo "================================================================="
 
 # Error handling function
@@ -56,7 +84,7 @@ error_exit() {
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     if command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
         S3_DEBUG_BUCKET_NAME="${CLUSTER_NAME}-bootstrap-debug-logs"
-        INSTANCE_ID_DEBUG="$(curl -fsSL http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown-instance')"
+        INSTANCE_ID_DEBUG="$(get_metadata instance-id)" # Use get_metadata function
         LOG_S3_KEY="control-plane-failures/$INSTANCE_ID_DEBUG-bootstrap-$(date +%Y%m%d%H%M%S).log"
         echo "Attempting to upload full log to s3://$S3_DEBUG_BUCKET_NAME/$LOG_S3_KEY"
         aws s3 cp "$BOOTSTRAP_LOG" "s3://$S3_DEBUG_BUCKET_NAME/$LOG_S3_KEY" --region "${REGION}" || echo "Warning: Failed to upload full debug log to S3."
@@ -82,7 +110,8 @@ else
 fi
 echo "   Current effective hostname: $(hostname)"
 
-# Step 1: System updates and essential packages
+# Step 1: System updates and essential packages (No changes needed for IMDSv2 here)
+# ... (Content from your previous script, lines for Step 1 are generally fine) ...
 echo ""
 echo "📦 STEP 1: System updates and essential package installation..."
 export DEBIAN_FRONTEND=noninteractive
@@ -95,7 +124,8 @@ echo "   Verifying AWS CLI..."
 aws --version || error_exit "AWS CLI is not working after installation"
 echo "✅ AWS CLI verified."
 
-# Step 2: System configuration for Kubernetes
+# Step 2: System configuration for Kubernetes (No changes needed for IMDSv2 here)
+# ... (Content from your previous script, lines for Step 2 are generally fine) ...
 echo ""
 echo "⚙️  STEP 2: Configuring system for Kubernetes..."
 echo "   Disabling swap..."
@@ -122,7 +152,8 @@ sysctl --system || error_exit "Failed to apply sysctl settings from /etc/sysctl.
 echo "✅ Sysctl parameters configured."
 echo "✅ System configuration for Kubernetes completed."
 
-# Step 3: Install containerd (Container Runtime)
+# Step 3: Install containerd (No changes needed for IMDSv2 here)
+# ... (Content from your previous script, lines for Step 3 are generally fine) ...
 echo ""
 echo "🐳 STEP 3: Installing and configuring containerd..."
 echo "   Ensuring containerd dependencies are met..."
@@ -161,7 +192,8 @@ if ! systemctl is-active --quiet containerd; then
 fi
 echo "✅ Containerd installed and configured successfully."
 
-# Step 4: Install Kubernetes components (kubelet, kubeadm, kubectl)
+# Step 4: Install Kubernetes components (No changes needed for IMDSv2 here)
+# ... (Content from your previous script, lines for Step 4 are generally fine) ...
 echo ""
 echo "☸️  STEP 4: Installing Kubernetes components (kubelet, kubeadm, kubectl)..."
 echo "   Adding Kubernetes apt repository GPG key (Major.Minor: ${K8S_MAJOR_MINOR})..."
@@ -198,8 +230,8 @@ echo "✅ Kubernetes components installed and verified."
 # Step 5: Configure Kubelet
 echo ""
 echo "🛠️  STEP 5: Configuring Kubelet..."
-PRIVATE_IP="$(curl -fsSL http://169.254.169.254/latest/meta-data/local-ipv4)"
-if [ -z "$PRIVATE_IP" ]; then
+PRIVATE_IP="$(get_metadata local-ipv4)" # Use get_metadata function
+if [ -z "$PRIVATE_IP" ] || [ "$PRIVATE_IP" == "unknown" ]; then
     error_exit "Failed to retrieve private IP from instance metadata for Kubelet configuration"
 fi
 echo "   Retrieved Private IP for Kubelet: $PRIVATE_IP"
@@ -220,6 +252,7 @@ echo ""
 echo "🚀 STEP 6: Initializing Kubernetes cluster with Kubeadm..."
 echo "   Creating Kubeadm configuration file (/etc/kubernetes/kubeadm/kubeadm-config.yaml)..."
 mkdir -p /etc/kubernetes/kubeadm
+# PRIVATE_IP and NEW_HOSTNAME are now correctly expanded shell variables
 cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
@@ -253,7 +286,7 @@ apiServer:
   - "kubernetes.default"
   - "kubernetes.default.svc"
   - "kubernetes.default.svc.cluster.local"
-  # - "$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+  # - "$(get_metadata public-ipv4)" # If API needs to be exposed on public IP via cert
 controllerManager:
   extraArgs:
     cloud-provider: "external"
@@ -311,8 +344,8 @@ echo "✅ Kubeconfig setup for local users completed."
 echo ""
 echo "🔐 STEP 8: Preparing and Storing Kubeconfig in AWS Secrets Manager..."
 KUBECONFIG_CONTENT_ORIGINAL="$(cat /etc/kubernetes/admin.conf)"
-PUBLIC_IP_FOR_KUBECONFIG="$(curl -fsSL http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "$PRIVATE_IP")"
-if [ -z "$PUBLIC_IP_FOR_KUBECONFIG" ]; then
+PUBLIC_IP_FOR_KUBECONFIG="$(get_metadata public-ipv4 || echo "$PRIVATE_IP")"
+if [ -z "$PUBLIC_IP_FOR_KUBECONFIG" ] || [ "$PUBLIC_IP_FOR_KUBECONFIG" == "unknown" ]; then
     echo "Warning: Could not determine public IP for Kubeconfig. Using private IP: $PRIVATE_IP"
     PUBLIC_IP_FOR_KUBECONFIG="$PRIVATE_IP"
 fi
@@ -330,17 +363,18 @@ if ! echo "$MODIFIED_KUBECONFIG_FOR_SECRET" | grep -q "server: https://$PUBLIC_I
 fi
 if echo "$MODIFIED_KUBECONFIG_FOR_SECRET" | grep -q "apiVersion"; then
     echo "   Attempting to store modified kubeconfig in Secret: ${KUBECONFIG_SECRET_NAME}"
+    # REMOVED --no-cli-pager
     aws secretsmanager put-secret-value \
       --secret-id "${KUBECONFIG_SECRET_NAME}" \
       --secret-string "$MODIFIED_KUBECONFIG_FOR_SECRET" \
       --region "${REGION}" \
-      --no-cli-pager || error_exit "Failed to upload Kubeconfig to AWS Secrets Manager (${KUBECONFIG_SECRET_NAME})"
+      || error_exit "Failed to upload Kubeconfig to AWS Secrets Manager (${KUBECONFIG_SECRET_NAME})"
     echo "✅ Kubeconfig successfully stored in AWS Secrets Manager: ${KUBECONFIG_SECRET_NAME}"
 else
     error_exit "Generated Kubeconfig content for secret appears invalid (missing apiVersion after potential modification)."
 fi
 
-# Step 9: Test cluster access using the newly configured Kubeconfig
+# Step 9: Test cluster access (No changes needed for IMDSv2 here if KUBECONFIG is set)
 echo ""
 echo "🔍 STEP 9: Testing cluster access using local Kubeconfig (admin.conf)..."
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -354,7 +388,7 @@ else
 fi
 echo "✅ Cluster access test (local admin.conf) completed."
 
-# Step 10: Install CNI (Calico)
+# Step 10: Install CNI (Calico) (No changes needed for IMDSv2 here if KUBECONFIG is set)
 echo ""
 echo "🌐 STEP 10: Installing CNI (Calico)..."
 export KUBECONFIG=/etc/kubernetes/admin.conf
@@ -380,7 +414,7 @@ else
 fi
 echo "✅ CNI installation step completed."
 
-# Step 11: Store Join Command in AWS Secrets Manager
+# Step 11: Store Join Command (No changes needed for IMDSv2 here if KUBECONFIG is set)
 echo ""
 echo "🔑 STEP 11: Generating and storing new Kubeadm Join Command in AWS Secrets Manager..."
 echo "   Generating new join command (kubeadm token create --print-join-command)..."
@@ -389,26 +423,28 @@ FRESH_JOIN_COMMAND="$(kubeadm token create --print-join-command 2>/dev/null || e
 if [ -n "$FRESH_JOIN_COMMAND" ]; then
     echo "   Join command generated successfully."
     echo "   Storing join command in Primary Secret: ${JOIN_COMMAND_PRIMARY_SECRET_NAME}"
+    # REMOVED --no-cli-pager
     aws secretsmanager put-secret-value \
         --secret-id "${JOIN_COMMAND_PRIMARY_SECRET_NAME}" \
         --secret-string "$FRESH_JOIN_COMMAND" \
         --region "${REGION}" \
-        --no-cli-pager || echo "⚠️ Warning: Failed to store join command in primary secret (${JOIN_COMMAND_PRIMARY_SECRET_NAME})"
+        || echo "⚠️ Warning: Failed to store join command in primary secret (${JOIN_COMMAND_PRIMARY_SECRET_NAME})"
     echo "   Storing join command in Latest Secret: ${JOIN_COMMAND_LATEST_SECRET_NAME}"
+    # REMOVED --no-cli-pager
     aws secretsmanager put-secret-value \
         --secret-id "${JOIN_COMMAND_LATEST_SECRET_NAME}" \
         --secret-string "$FRESH_JOIN_COMMAND" \
         --region "${REGION}" \
-        --no-cli-pager || echo "⚠️ Warning: Failed to store join command in latest secret (${JOIN_COMMAND_LATEST_SECRET_NAME})"
+        || echo "⚠️ Warning: Failed to store join command in latest secret (${JOIN_COMMAND_LATEST_SECRET_NAME})"
     echo "✅ Join command stored/updated in AWS Secrets Manager."
 else
     error_exit "Failed to generate a fresh Kubeadm join command. Workers will not be able to join."
 fi
 
-# Final status report
+# Final status report (Use get_metadata for instance ID)
 echo ""
 echo "================================================================="
-echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED (TEMPLATE v10.2)="
+echo "= KUBERNETES CONTROL PLANE BOOTSTRAP - COMPLETED (TEMPLATE v10.4)="
 echo "= Current Time (UTC): $(date -u)"
 echo "= Overall Status: SUCCESS"
 echo "================================================================="
