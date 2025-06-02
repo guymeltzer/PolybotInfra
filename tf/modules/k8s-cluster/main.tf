@@ -766,9 +766,14 @@ resource "aws_launch_template" "worker_lt" {
   instance_type = var.worker_instance_type
   key_name      = local.actual_key_name # Ensures workers can use the same key
 
-  vpc_security_group_ids = [aws_security_group.worker_sg.id]
-
   iam_instance_profile { name = aws_iam_instance_profile.worker_profile.name }
+
+  # Add network configuration to ensure public IP assignment
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups            = [aws_security_group.worker_sg.id]
+    delete_on_termination      = true
+  }
 
   metadata_options {
     http_endpoint          = "enabled"
