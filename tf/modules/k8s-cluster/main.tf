@@ -1359,7 +1359,7 @@ resource "null_resource" "update_join_command" {
   triggers = {
     control_plane_ip = aws_instance.control_plane.public_ip
     control_plane_id = aws_instance.control_plane.id
-    update_version = "v4-syntax-fixed"
+    update_version = "v5-escaping-fixed"
   }
 
   provisioner "local-exec" {
@@ -1367,11 +1367,11 @@ resource "null_resource" "update_join_command" {
     command = <<-EOT
       #!/bin/bash
       
-      echo "🔄 Join Command Management v4 - Syntax Fixed"
-      echo "============================================"
+      echo "🔄 Join Command Management v5 - Escaping Fixed"
+      echo "============================================="
       
       # Skip if explicitly disabled
-      if [[ "$${SKIP_JOIN_COMMAND_UPDATE:-false}" == "true" ]]; then
+      if [[ "\$${SKIP_JOIN_COMMAND_UPDATE:-false}" == "true" ]]; then
         echo "SKIP_JOIN_COMMAND_UPDATE is set, skipping update"
         exit 0
       fi
@@ -1379,12 +1379,12 @@ resource "null_resource" "update_join_command" {
       echo "📡 Control Plane: ${aws_instance.control_plane.public_ip}"
       echo "🔑 Secrets: ${aws_secretsmanager_secret.kubernetes_join_command_latest.id}"
       
-      # Upload logs for troubleshooting with proper command substitution escaping
-      TIMESTAMP=$$(date +"%Y%m%d%H%M%S")
-      LOG_MESSAGE="Join command update completed at $$(date)"
-      S3_KEY="logs/join-command-$${TIMESTAMP}.log"
+      # Upload logs for troubleshooting with correct command substitution escaping
+      TIMESTAMP=\$(date +"%Y%m%d%H%M%S")
+      LOG_MESSAGE="Join command update completed at \$(date)"
+      S3_KEY="logs/join-command-\$${TIMESTAMP}.log"
       
-      echo "$$LOG_MESSAGE" | aws s3 cp - "s3://${aws_s3_bucket.worker_logs.bucket}/$$S3_KEY" --region "${var.region}" || true
+      echo "\$$LOG_MESSAGE" | aws s3 cp - "s3://${aws_s3_bucket.worker_logs.bucket}/\$$S3_KEY" --region "${var.region}" || true
       
       echo "✅ Join command management completed"
     EOT
