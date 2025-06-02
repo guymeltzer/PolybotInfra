@@ -190,8 +190,8 @@ resource "null_resource" "cluster_readiness_check" {
           
           # Extract host and port for connectivity test
           if [[ "$SERVER_URL" =~ https://([^:]+):([0-9]+) ]]; then
-            SERVER_HOST="${BASH_REMATCH[1]}"
-            SERVER_PORT="${BASH_REMATCH[2]}"
+            SERVER_HOST="$${BASH_REMATCH[1]}"
+            SERVER_PORT="$${BASH_REMATCH[2]}"
             echo "🔌 Testing TCP connectivity to $SERVER_HOST:$SERVER_PORT..."
             if timeout 10 bash -c "</dev/tcp/$SERVER_HOST/$SERVER_PORT" 2>/dev/null; then
               echo "✅ TCP connectivity confirmed"
