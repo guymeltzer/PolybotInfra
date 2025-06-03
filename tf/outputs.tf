@@ -20,6 +20,7 @@ output "cluster_overview" {
 
 output "control_plane_info" {
   description = "🖥️ Control plane detailed information"
+  sensitive   = true
   value = {
     "📍 Instance ID" = module.k8s-cluster.control_plane_instance_id
     "🌐 Public IP" = module.k8s-cluster.control_plane_public_ip
@@ -100,6 +101,7 @@ output "argocd_complete_access" {
 
 output "aws_infrastructure" {
   description = "🔧 AWS resources and infrastructure details"
+  sensitive   = true
   value = {
     "🏗️ Core Infrastructure" = {
       "Region" = var.region
@@ -129,6 +131,7 @@ output "aws_infrastructure" {
 
 output "quick_start_guide" {
   description = "🛠️ Complete quick start guide"
+  sensitive   = true
   value = <<-EOT
 🎉 POLYBOT KUBERNETES CLUSTER READY! 🎉
 
