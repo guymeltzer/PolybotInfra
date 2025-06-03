@@ -833,7 +833,7 @@ resource "null_resource" "application_setup" {
       
       # *** CRITICAL USER CONFIGURATION REQUIRED ***
       # TODO: Replace this with your actual AWS Secrets Manager secret name that contains static Polybot configuration
-      POLYBOT_AWS_SECRET_NAME="YOUR_ACTUAL_AWS_SECRET_NAME_HERE"
+      POLYBOT_AWS_SECRET_NAME="polybot-secrets"
       
       log_warning "🚨 CRITICAL: You MUST replace 'YOUR_ACTUAL_AWS_SECRET_NAME_HERE' with your actual AWS Secrets Manager secret name!"
       log_info "AWS Region for Secrets: $AWS_REGION_FOR_SECRETS"
@@ -963,8 +963,8 @@ resource "null_resource" "application_setup" {
         log_step "Creating docker-registry-credentials secret"
         
         # Prepare Docker credentials - try to get from AWS secret first, fallback to placeholder
-        DOCKER_USERNAME="placeholder-docker-username"
-        DOCKER_PASSWORD="placeholder-docker-password"
+        DOCKER_USERNAME="guymeltzer28@gmail.com"
+        DOCKER_PASSWORD="Candy2025!"
         
         # If we successfully fetched AWS secrets (for prod namespace), try to extract docker credentials
         if [[ "$namespace" == "prod" && -n "$POLYBOT_SECRET_JSON" ]]; then
