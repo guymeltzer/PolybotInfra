@@ -409,7 +409,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
     kubeconfig_ensured    = null_resource.ensure_local_kubeconfig.id # Trigger when kubeconfig is ensured
-    readiness_version     = "v10-create-namespaces"
+    readiness_version     = "v11-create-namespaces-and-ebs-csi"
   }
   
   provisioner "local-exec" {
@@ -475,13 +475,53 @@ resource "null_resource" "cluster_readiness_check" {
         
         # Create essential namespaces immediately after connectivity is confirmed
         log_subheader "🏗️ Creating essential namespaces"
-        for ns in argocd prod dev; do
+        for ns in argocd prod dev mongodb; do
           if kubectl --insecure-skip-tls-verify create namespace "$ns" 2>/dev/null; then
             log_success "Created namespace: $ns"
           else
             log_info "Namespace $ns already exists"
           fi
         done
+        
+        log_subheader "💾 Installing AWS EBS CSI Driver"
+        log_step "Applying EBS CSI driver manifests"
+        # Install AWS EBS CSI driver for proper volume provisioning
+        if kubectl --insecure-skip-tls-verify apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.28" 2>/dev/null; then
+          log_success "EBS CSI driver manifests applied successfully"
+          
+          log_step "Waiting for EBS CSI driver to be ready"
+          # Wait for the EBS CSI driver to be deployed
+          for i in {1..30}; do
+            if kubectl --insecure-skip-tls-verify get deployment ebs-csi-controller -n kube-system >/dev/null 2>&1; then
+              READY_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment ebs-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+              DESIRED_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment ebs-csi-controller -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+              
+              if [[ "$READY_REPLICAS" == "$DESIRED_REPLICAS" ]] && [[ "$READY_REPLICAS" -gt 0 ]]; then
+                log_success "EBS CSI driver is ready ($READY_REPLICAS/$DESIRED_REPLICAS replicas)"
+                break
+              fi
+            fi
+            
+            if [[ $i -eq 30 ]]; then
+              log_warning "EBS CSI driver not ready within timeout, but continuing"
+            else
+              log_info "Waiting for EBS CSI driver... attempt $i/30"
+              sleep 10
+            fi
+          done
+        else
+          log_warning "Failed to apply EBS CSI driver - trying alternative installation method"
+          
+          # Alternative: Apply from specific version URL
+          log_step "Trying alternative EBS CSI driver installation"
+          if kubectl --insecure-skip-tls-verify apply -f https://raw.githubusercontent.com/kubernetes-sigs/aws-ebs-csi-driver/v1.28.0/deploy/kubernetes/base/controller.yaml 2>/dev/null && \
+             kubectl --insecure-skip-tls-verify apply -f https://raw.githubusercontent.com/kubernetes-sigs/aws-ebs-csi-driver/v1.28.0/deploy/kubernetes/base/node.yaml 2>/dev/null; then
+            log_success "EBS CSI driver installed via alternative method"
+          else
+            log_warning "Could not install EBS CSI driver - manual installation may be required"
+            log_info "Manual installation command: kubectl apply -k 'github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.28'"
+          fi
+        fi
         
         log_subheader "📋 Current cluster state"
         log_cmd_output "$(kubectl --insecure-skip-tls-verify get nodes -o wide 2>/dev/null || echo "Failed to get detailed node info")"
@@ -727,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v17-fixed-file-paths-cleaned-debug" # FIXED: Corrected ArgoCD manifest file paths to use ../k8s/ and removed extensive debug logging
+    setup_version    = "v18-enhanced-argocd-apps-and-summary" # ENHANCED: Fixed MongoDB namespace conflicts, created individual app.yaml files, enhanced deployment summary with vibrant styling and dynamic data
   }
 
   provisioner "local-exec" {
@@ -1417,6 +1457,23 @@ resource "null_resource" "deployment_summary" {
         fi
       fi
 
+      # Enhanced Worker Node Details
+      log_subheader "🤖 Worker Node Details (Live from AWS)"
+      if command -v aws >/dev/null 2>&1; then
+        WORKER_DETAILS=$(aws ec2 describe-instances --region "$TF_VAR_REGION" \
+          --filters "Name=tag:aws:autoscaling:groupName,Values=$TF_VAR_WORKER_ASG_NAME" "Name=instance-state-name,Values=running,pending" \
+          --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value, InstanceId:InstanceId, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress, State:State.Name, LaunchTime:LaunchTime}' \
+          --output table 2>/dev/null || echo "Failed to retrieve worker details")
+        if [[ "$WORKER_DETAILS" == "Failed to retrieve worker details" || -z "$WORKER_DETAILS" ]]; then
+          log_warning "Could not fetch live worker details via AWS CLI"
+        else
+          log_info "Live Worker Instances:"
+          echo -e "$${CYAN}$WORKER_DETAILS$${RESET}"
+        fi
+      else
+        log_warning "AWS CLI not available for worker details"
+      fi
+
       log_section "Load Balancing & Networking"
       log_key_value "⚖️  ALB DNS Name" "$TF_VAR_ALB_DNS_NAME"
       log_key_value "🌐 ALB Zone ID" "$TF_VAR_ALB_ZONE_ID"
@@ -1428,6 +1485,19 @@ resource "null_resource" "deployment_summary" {
       log_key_value "📁 Kubeconfig Path" "$TF_KUBECONFIG_PATH"
       log_key_value "🔐 Kubeconfig Secret" "$TF_VAR_KUBECONFIG_SECRET_NAME"
       log_key_value "🎫 Join Command Secret" "$TF_VAR_JOIN_COMMAND_SECRET_NAME"
+      
+      # Enhanced Kubeconfig Details
+      log_subheader "🔑 Kubeconfig Details"
+      if [[ -f "$TF_KUBECONFIG_PATH" ]]; then
+        KUBE_API_SERVER=$(grep 'server:' "$TF_KUBECONFIG_PATH" | awk '{print $2}' | head -n 1)
+        KUBE_CURRENT_CONTEXT=$(grep 'current-context:' "$TF_KUBECONFIG_PATH" | awk '{print $2}' 2>/dev/null || echo "Not specified")
+        log_key_value "🎯 API Server" "$KUBE_API_SERVER"
+        log_key_value "📋 Current Context" "$KUBE_CURRENT_CONTEXT"
+        KUBECONFIG_SIZE=$(wc -c < "$TF_KUBECONFIG_PATH" 2>/dev/null || echo "unknown")
+        log_key_value "📄 File Size" "$KUBECONFIG_SIZE bytes"
+      else
+        log_warning "Kubeconfig file not found at: $TF_KUBECONFIG_PATH"
+      fi
       
       log_section "Node Status"
       if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
@@ -1474,7 +1544,23 @@ resource "null_resource" "deployment_summary" {
           if [[ "$TOTAL_APPS" -gt 0 ]]; then
             log_success "Found $TOTAL_APPS ArgoCD applications"
             kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REPO:.spec.source.repoURL" --no-headers 2>/dev/null | while read -r name sync health repo; do
-              log_info "    • $${BOLD}$name$${RESET} - Sync: $sync, Health: $health"
+              if [[ -n "$name" ]]; then
+                # Color code sync status
+                if [[ "$sync" == "Synced" ]]; then
+                  sync_colored="$${GREEN}$sync$${RESET}"
+                else
+                  sync_colored="$${YELLOW}$sync$${RESET}"
+                fi
+                # Color code health status
+                if [[ "$health" == "Healthy" ]]; then
+                  health_colored="$${GREEN}$health$${RESET}"
+                elif [[ "$health" == "Progressing" ]]; then
+                  health_colored="$${YELLOW}$health$${RESET}"
+                else
+                  health_colored="$${RED}$health$${RESET}"
+                fi
+                log_info "    • $${BOLD}$name$${RESET} - Sync: $sync_colored, Health: $health_colored"
+              fi
             done
           else
             log_warning "No ArgoCD applications found"
@@ -1487,14 +1573,16 @@ resource "null_resource" "deployment_summary" {
         log_key_value "🌐 Local URL" "https://localhost:8080 (via port-forward)"
         log_key_value "👤 Username" "admin"
         
-        # Try to get ArgoCD password
+        # Enhanced ArgoCD password retrieval
+        log_info "Retrieving ArgoCD Admin Password..."
         PASSWORD_SECRET_NAME="argocd-initial-admin-secret"
         RAW_PASSWORD=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
         if [[ -n "$RAW_PASSWORD" ]]; then
           ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d 2>/dev/null || echo "<decode-failed>")
-          log_key_value "🔑 Password" "$ARGOCD_PASSWORD"
+          log_key_value "🔑 Password" "$${BOLD}$${GREEN}$ARGOCD_PASSWORD$${RESET}"
         else
-          log_warning "ArgoCD password secret not found"
+          log_warning "ArgoCD password secret not found - may have been reset"
+          log_info "To reset password: kubectl -n argocd patch secret argocd-secret -p '{\"data\": {\"admin.password\": null, \"admin.passwordMtime\": null}}'"
         fi
       else
         log_warning "ArgoCD namespace not found - ArgoCD may not be installed"
@@ -1504,18 +1592,8 @@ resource "null_resource" "deployment_summary" {
       
       log_section "IAM Roles"
       log_key_value "🎛️  Control Plane Role" "$TF_VAR_CP_IAM_ROLE_ARN"
-      # TODO: Verify correct output name from module.k8s-cluster for worker IAM role
-      # log_key_value "🤖 Worker Node Role" "$TF_VAR_WORKER_IAM_ROLE_ARN"
-      
-      log_section "Automation & Monitoring"
-      # TODO: Verify correct output name from module.k8s-cluster for lambda function name
-      # log_key_value "🔧 Lambda Function" "$TF_VAR_LAMBDA_FUNCTION_NAME"
-      # TODO: Verify correct output name from module.k8s-cluster for SNS topic ARN
-      # log_key_value "📢 SNS Topic" "$TF_VAR_SNS_TOPIC_ARN"
       
       log_section "Storage"
-      # TODO: Verify correct output name from module.k8s-cluster for user data bucket
-      # log_key_value "📦 User Data Bucket" "$TF_VAR_S3_USER_DATA_BUCKET"
       log_key_value "📋 Worker Logs Bucket" "$TF_VAR_S3_WORKER_LOGS_BUCKET"
 
       log_header "🛠️ QUICK ACCESS COMMANDS"

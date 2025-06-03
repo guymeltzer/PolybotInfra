@@ -43,7 +43,7 @@ metadata:
   namespace: argocd
 spec:
   destination:
-    namespace: prod
+    namespace: mongodb
     server: https://kubernetes.default.svc
   project: default
   source:
@@ -53,4 +53,6 @@ spec:
   syncPolicy:
     automated:
       prune: true
-      selfHeal: true 
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true 
