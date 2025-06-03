@@ -112,7 +112,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
     secret_name      = module.k8s-cluster.kubeconfig_secret_name_output
     region           = var.region
-    script_version   = "v3-complete-refresh" # Force complete refresh
+    script_version   = "v4-total-rewrite" # Force complete refresh
   }
 
   provisioner "local-exec" {
@@ -121,7 +121,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
       #!/bin/bash
       set -e
       
-      # --- Style Definitions ---
+      # Style Definitions
       RESET='\033[0m'
       BOLD='\033[1m'
       GREEN='\033[0;32m'
@@ -142,7 +142,6 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
       log_info() { echo -e "💡 $${CYAN}$$1$${RESET}"; }
       log_progress() { echo -e "$${YELLOW}⏳ $$1...$${RESET}"; }
       log_cmd_output() { echo -e "$${WHITE}$$1$${RESET}"; }
-      # --- End Style Definitions ---
       
       log_header "🔧 Ensuring Local Kubeconfig Availability"
       
@@ -155,16 +154,13 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
       log_info "Region: $${BOLD}$$REGION$${RESET}"
       
       log_subheader "🔍 Checking Local Kubeconfig Status"
-      # Check if local kubeconfig exists and is valid
       if [[ -f "$$KUBECONFIG_PATH" ]]; then
         log_success "Local kubeconfig file exists"
         
-        # Quick validation - check if it contains required fields
         if grep -q "apiVersion" "$$KUBECONFIG_PATH" && grep -q "clusters:" "$$KUBECONFIG_PATH"; then
           log_success "Local kubeconfig appears valid"
           
           log_step "Testing connectivity to ensure it works"
-          # Test connectivity to ensure it works
           if timeout 10 kubectl --kubeconfig="$$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
             log_success "Local kubeconfig connectivity confirmed - no action needed"
             exit 0
@@ -179,7 +175,6 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
       fi
       
       log_subheader "📥 Downloading Fresh Kubeconfig"
-      # Download fresh kubeconfig from Secrets Manager
       log_progress "Downloading kubeconfig from Secrets Manager"
       KUBECONFIG_CONTENT=$$(aws secretsmanager get-secret-value \
         --secret-id "$$SECRET_NAME" \
@@ -191,18 +186,15 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
         log_success "Retrieved valid kubeconfig from Secrets Manager"
         
         log_step "Creating directory if it doesn't exist"
-        # Create directory if it doesn't exist
         mkdir -p "$$(dirname "$$KUBECONFIG_PATH")"
         
         log_step "Writing kubeconfig to file"
-        # Write kubeconfig to file
         echo "$$KUBECONFIG_CONTENT" > "$$KUBECONFIG_PATH"
         chmod 600 "$$KUBECONFIG_PATH"
         
         log_success "Local kubeconfig file created: $${BOLD}$$KUBECONFIG_PATH$${RESET}"
         
         log_step "Verifying the new file works"
-        # Verify the new file works
         if timeout 10 kubectl --kubeconfig="$$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
           log_success "New kubeconfig connectivity verified"
         else

@@ -896,7 +896,7 @@ resource "null_resource" "update_join_command" {
 
   triggers = {
     control_plane_id   = aws_instance.control_plane.id
-    update_version     = "v11-complete-refresh" # Force complete refresh
+    update_version     = "v12-total-rewrite" # Force complete refresh
   }
 
   provisioner "local-exec" {
@@ -905,7 +905,7 @@ resource "null_resource" "update_join_command" {
       #!/bin/bash
       set -e
 
-      # --- Style Definitions ---
+      # Style Definitions
       RESET='\033[0m'
       BOLD='\033[1m'
       GREEN='\033[0;32m'
@@ -926,17 +926,14 @@ resource "null_resource" "update_join_command" {
       log_info() { echo -e "💡 $${CYAN}$$1$${RESET}"; }
       log_progress() { echo -e "$${YELLOW}⏳ $$1...$${RESET}"; }
       log_cmd_output() { echo -e "$${WHITE}$$1$${RESET}"; }
-      # --- End Style Definitions ---
       
-      log_header "🔄 Join Command Management v9 (simplified - control plane handles initial setup)"
+      log_header "🔄 Join Command Management v12 (simplified - control plane handles initial setup)"
 
       if [[ "${var.skip_token_verification}" == "true" ]]; then
         log_info "SKIP_JOIN_COMMAND_UPDATE is true, skipping update."
         exit 0
       fi
 
-      # Since control plane bootstrap already generates and stores the join command,
-      # this script just confirms it's available
       LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.name}"
       REGION_NAME="${var.region}"
 
