@@ -905,11 +905,33 @@ resource "null_resource" "update_join_command" {
       #!/bin/bash
       set -e
 
-      echo "🔄 Join Command Management v9 (simplified - control plane handles initial setup)"
-      echo "=============================================================================="
+      # --- Style Definitions ---
+      RESET='\033[0m'
+      BOLD='\033[1m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[0;33m'
+      BLUE='\033[0;34m'
+      PURPLE='\033[0;35m'
+      CYAN='\033[0;36m'
+      RED='\033[0;31m'
+      WHITE='\033[0;37m'
+
+      # Helper Functions for logging
+      log_header() { echo -e "\n${BOLD}${PURPLE}===== $1 =====${RESET}"; }
+      log_subheader() { echo -e "\n${BOLD}${CYAN}--- $1 ---${RESET}"; }
+      log_step() { echo -e "${BLUE}▶ $1${RESET}"; }
+      log_success() { echo -e "${GREEN}✅ $1${RESET}"; }
+      log_warning() { echo -e "${YELLOW}⚠️ $1${RESET}"; }
+      log_error() { echo -e "${RED}❌ $1${RESET}"; }
+      log_info() { echo -e "💡 ${CYAN}$1${RESET}"; }
+      log_progress() { echo -e "${YELLOW}⏳ $1...${RESET}"; }
+      log_cmd_output() { echo -e "${WHITE}$1${RESET}"; }
+      # --- End Style Definitions ---
+      
+      log_header "🔄 Join Command Management v9 (simplified - control plane handles initial setup)"
 
       if [[ "${var.skip_token_verification}" == "true" ]]; then
-        echo "ℹ️ SKIP_JOIN_COMMAND_UPDATE is true, skipping update."
+        log_info "SKIP_JOIN_COMMAND_UPDATE is true, skipping update."
         exit 0
       fi
 
@@ -918,18 +940,22 @@ resource "null_resource" "update_join_command" {
       LATEST_SECRET_ID="${aws_secretsmanager_secret.kubernetes_join_command_latest.name}"
       REGION_NAME="${var.region}"
 
-      echo "🔍 Verifying join command is available in Secrets Manager..."
+      log_subheader "🔍 Verifying join command availability"
+      log_step "Verifying join command is available in Secrets Manager"
+      log_info "Secret ID: ${BOLD}$LATEST_SECRET_ID${RESET}"
+      log_info "Region: ${BOLD}$REGION_NAME${RESET}"
+      
       JOIN_COMMAND=$(aws secretsmanager get-secret-value \
         --secret-id "$LATEST_SECRET_ID" \
         --region "$REGION_NAME" \
         --query SecretString --output text 2>/dev/null || echo "")
 
       if [[ -n "$JOIN_COMMAND" ]] && echo "$JOIN_COMMAND" | grep -q "kubeadm join"; then
-        echo "✅ Join command is available in Secrets Manager"
-        echo "✅ Join command management completed successfully"
+        log_success "Join command is available in Secrets Manager"
+        log_success "Join command management completed successfully"
       else
-        echo "⚠️ Join command not yet available, but control plane bootstrap should handle this"
-        echo "✅ Proceeding (control plane will generate join command)"
+        log_warning "Join command not yet available, but control plane bootstrap should handle this"
+        log_success "Proceeding (control plane will generate join command)"
       fi
     EOT
   }
@@ -1215,7 +1241,31 @@ resource "terraform_data" "cluster_health_assessment" {
     command     = <<-EOT
       #!/bin/bash
       # Removed set -e to allow graceful error handling during initial setup
-      echo "🔍 Assessing cluster health (non-blocking)..."
+      
+      # --- Style Definitions ---
+      RESET='\033[0m'
+      BOLD='\033[1m'
+      GREEN='\033[0;32m'
+      YELLOW='\033[0;33m'
+      BLUE='\033[0;34m'
+      PURPLE='\033[0;35m'
+      CYAN='\033[0;36m'
+      RED='\033[0;31m'
+      WHITE='\033[0;37m'
+
+      # Helper Functions for logging
+      log_header() { echo -e "\n${BOLD}${PURPLE}===== $1 =====${RESET}"; }
+      log_subheader() { echo -e "\n${BOLD}${CYAN}--- $1 ---${RESET}"; }
+      log_step() { echo -e "${BLUE}▶ $1${RESET}"; }
+      log_success() { echo -e "${GREEN}✅ $1${RESET}"; }
+      log_warning() { echo -e "${YELLOW}⚠️ $1${RESET}"; }
+      log_error() { echo -e "${RED}❌ $1${RESET}"; }
+      log_info() { echo -e "💡 ${CYAN}$1${RESET}"; }
+      log_progress() { echo -e "${YELLOW}⏳ $1...${RESET}"; }
+      log_cmd_output() { echo -e "${WHITE}$1${RESET}"; }
+      # --- End Style Definitions ---
+      
+      log_header "🔍 Assessing cluster health (non-blocking)"
 
       # Default to no cleanup needed
       # These temp files are local to where Terraform runs, consider if this is the desired outcome
@@ -1230,20 +1280,23 @@ resource "terraform_data" "cluster_health_assessment" {
       AWS_CLI_REGION="${var.region}"                                       # TF interpolation
       TARGET_ASG_NAME="${local.worker_asg_name}"                           # TF interpolation
 
+      log_subheader "📊 Environment Information"
       # Shell variables derived from TF interpolations
-      echo "📡 Control Plane IP: $CONTROL_PLANE_PUBLIC_IP_ADDR"
-      echo "🆔 Control Plane ID: $CONTROL_PLANE_INSTANCE_ID"
+      log_info "Control Plane IP: ${BOLD}$CONTROL_PLANE_PUBLIC_IP_ADDR${RESET}"
+      log_info "Control Plane ID: ${BOLD}$CONTROL_PLANE_INSTANCE_ID${RESET}"
+      log_info "Target ASG Name: ${BOLD}$TARGET_ASG_NAME${RESET}"
 
       if ! command -v kubectl &> /dev/null; then
-        echo "⚠️ kubectl command could not be found. Health assessment will be skipped."
+        log_warning "kubectl command could not be found. Health assessment will be skipped."
         echo "unknown_kubectl_unavailable" > "$TMP_HEALTH_STATUS_FILE"
-        echo "📊 Health Assessment Results (kubectl unavailable):"
-        echo "   Cleanup needed: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
-        echo "   Health status: $(cat "$TMP_HEALTH_STATUS_FILE")"
+        log_subheader "📊 Health Assessment Results (kubectl unavailable)"
+        log_info "Cleanup needed: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
+        log_info "Health status: $(cat "$TMP_HEALTH_STATUS_FILE")"
         exit 0 # Exit gracefully as we can't perform kubectl checks
       fi
 
-      echo "Attempting to retrieve kubeconfig via AWS Secrets Manager..."
+      log_subheader "🔐 Retrieving kubeconfig"
+      log_step "Attempting to retrieve kubeconfig via AWS Secrets Manager"
       
       # Try to get kubeconfig from Secrets Manager as the primary method
       KUBECONFIG_SECRET_NAME="${aws_secretsmanager_secret.cluster_kubeconfig.name}"
@@ -1253,26 +1306,26 @@ resource "terraform_data" "cluster_health_assessment" {
         --query SecretString --output text 2>/dev/null || echo "")
       
       if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
-        echo "✅ Got valid kubeconfig from Secrets Manager. Creating temporary kubeconfig for health check."
+        log_success "Got valid kubeconfig from Secrets Manager. Creating temporary kubeconfig for health check."
         echo "$KUBECONFIG_CONTENT" > "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
         chmod 600 "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
         export KUBECONFIG="/tmp/${local.cluster_name}_health_kubeconfig.yaml"
       else
-        echo "⚠️ Failed to get valid kubeconfig from Secrets Manager."
-        echo "   This may be expected during initial cluster setup."
-        echo "   The kubeconfig secret might not be populated yet by the control plane."
+        log_warning "Failed to get valid kubeconfig from Secrets Manager."
+        log_info "This may be expected during initial cluster setup."
+        log_info "The kubeconfig secret might not be populated yet by the control plane."
         echo "unknown_kubeconfig_unavailable" > "$TMP_HEALTH_STATUS_FILE"
-        echo ""
-        echo "📊 Health Assessment Results (kubeconfig unavailable):"
-        echo "   Cleanup needed: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
-        echo "   Health status: $(cat "$TMP_HEALTH_STATUS_FILE")"
-        echo "   Note: This is non-blocking and expected during initial cluster setup"
+        
+        log_subheader "📊 Health Assessment Results (kubeconfig unavailable)"
+        log_info "Cleanup needed: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
+        log_info "Health status: $(cat "$TMP_HEALTH_STATUS_FILE")"
+        log_info "Note: This is non-blocking and expected during initial cluster setup"
         exit 0 # Exit gracefully without failing the deployment
       fi
 
       # Proceed with kubectl checks if KUBECONFIG is now set and working
       if kubectl get nodes >/dev/null 2>&1; then
-        echo "📋 Cluster accessible via kubectl, checking node health..."
+        log_subheader "📋 Cluster accessible via kubectl, checking node health"
 
         TOTAL_NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
         READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
@@ -1280,11 +1333,11 @@ resource "terraform_data" "cluster_health_assessment" {
         WORKER_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | wc -l || echo "0") # Exclude common CP names/roles
         READY_WORKERS=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | grep -c " Ready " || echo "0")
 
-        echo "   Total nodes: $TOTAL_NODES"
-        echo "   Ready nodes: $READY_NODES"
-        echo "   NotReady nodes: $NOTREADY_NODES"
-        echo "   Worker nodes: $WORKER_NODES"
-        echo "   Ready workers: $READY_WORKERS"
+        log_info "Total nodes: ${BOLD}$TOTAL_NODES${RESET}"
+        log_info "Ready nodes: ${BOLD}$READY_NODES${RESET}"
+        log_info "NotReady nodes: ${BOLD}$NOTREADY_NODES${RESET}"
+        log_info "Worker nodes: ${BOLD}$WORKER_NODES${RESET}"
+        log_info "Ready workers: ${BOLD}$READY_WORKERS${RESET}"
 
         ASG_DESIRED_CAPACITY=$(aws autoscaling describe-auto-scaling-groups \
           --region "$AWS_CLI_REGION" \
@@ -1292,27 +1345,27 @@ resource "terraform_data" "cluster_health_assessment" {
           --query "AutoScalingGroups[0].DesiredCapacity" \
           --output text 2>/dev/null || echo "0")
 
-        echo "   ASG desired capacity: $ASG_DESIRED_CAPACITY"
+        log_info "ASG desired capacity: ${BOLD}$ASG_DESIRED_CAPACITY${RESET}"
 
         CLEANUP_FLAG=false
         CURRENT_HEALTH_STATUS="healthy"
 
         # More lenient thresholds for initial setup
         if [[ "$NOTREADY_NODES" -gt 3 ]]; then # Allow more not ready nodes during startup
-          echo "⚠️ Warning: $NOTREADY_NODES NotReady nodes detected (allowed during startup)."
+          log_warning "Warning: $NOTREADY_NODES NotReady nodes detected (allowed during startup)."
           CLEANUP_FLAG=true
           CURRENT_HEALTH_STATUS="too_many_notready_nodes"
         fi
 
         if [[ "$READY_WORKERS" -eq 0 ]] && [[ "$ASG_DESIRED_CAPACITY" -gt 0 ]] && [[ "$TOTAL_NODES" -gt 1 ]]; then
-          echo "⚠️ Warning: No Ready workers, but ASG wants $ASG_DESIRED_CAPACITY and cluster has nodes."
+          log_warning "Warning: No Ready workers, but ASG wants $ASG_DESIRED_CAPACITY and cluster has nodes."
           CLEANUP_FLAG=true
           CURRENT_HEALTH_STATUS="no_ready_workers_despite_asg_demand"
         fi
 
         WORKER_NODE_DEFICIT=$((ASG_DESIRED_CAPACITY - READY_WORKERS))
         if [[ "$WORKER_NODE_DEFICIT" -gt 2 ]] && [[ "$ASG_DESIRED_CAPACITY" -gt 0 ]]; then # Allow larger deficit during startup
-          echo "⚠️ Warning: Worker deficit is $WORKER_NODE_DEFICIT (ASG desires $ASG_DESIRED_CAPACITY, $READY_WORKERS ready)."
+          log_warning "Warning: Worker deficit is $WORKER_NODE_DEFICIT (ASG desires $ASG_DESIRED_CAPACITY, $READY_WORKERS ready)."
           CLEANUP_FLAG=true
           CURRENT_HEALTH_STATUS="significant_worker_deficit"
         fi
@@ -1320,15 +1373,15 @@ resource "terraform_data" "cluster_health_assessment" {
         if [[ "$CLEANUP_FLAG" == "true" ]]; then
           echo "true" > "$TMP_CLEANUP_NEEDED_FILE"
           echo "$CURRENT_HEALTH_STATUS" > "$TMP_HEALTH_STATUS_FILE"
-          echo "🔧 OBSERVATION: ASG cleanup might be beneficial later. Reason: $CURRENT_HEALTH_STATUS"
+          log_warning "OBSERVATION: ASG cleanup might be beneficial later. Reason: ${BOLD}$CURRENT_HEALTH_STATUS${RESET}"
         else
           echo "false" > "$TMP_CLEANUP_NEEDED_FILE"
           echo "healthy" > "$TMP_HEALTH_STATUS_FILE"
-          echo "✅ OBSERVATION: Cluster appears healthy, no ASG cleanup needed."
+          log_success "OBSERVATION: Cluster appears healthy, no ASG cleanup needed."
         fi
       else
-        echo "⚠️ Cannot connect to Kubernetes API using current KUBECONFIG."
-        echo "   This may be expected during initial cluster setup."
+        log_warning "Cannot connect to Kubernetes API using current KUBECONFIG."
+        log_info "This may be expected during initial cluster setup."
         echo "api_unreachable_during_setup" > "$TMP_HEALTH_STATUS_FILE"
         echo "false" > "$TMP_CLEANUP_NEEDED_FILE"  # Don't trigger cleanup during initial setup
       fi
@@ -1338,12 +1391,10 @@ resource "terraform_data" "cluster_health_assessment" {
         rm -f "/tmp/${local.cluster_name}_health_kubeconfig.yaml"
       fi
 
-      echo ""
-      echo "📊 Health Assessment Results (non-blocking):"
-      echo "   Cleanup needed flag: $(cat "$TMP_CLEANUP_NEEDED_FILE")"
-      echo "   Health status detail: $(cat "$TMP_HEALTH_STATUS_FILE")"
-      echo "   Note: This assessment is informational and doesn't block deployment"
-      echo ""
+      log_subheader "📊 Health Assessment Results (non-blocking)"
+      log_info "Cleanup needed flag: ${BOLD}$(cat "$TMP_CLEANUP_NEEDED_FILE")${RESET}"
+      log_info "Health status detail: ${BOLD}$(cat "$TMP_HEALTH_STATUS_FILE")${RESET}"
+      log_info "Note: This assessment is informational and doesn't block deployment"
     EOT
   }
 }
@@ -1359,7 +1410,17 @@ resource "terraform_data" "worker_progress_reporter" {
   }
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = "echo -e \"\\033[0;32m➡️  Step 2/4: Control Plane Ready, Configuring Worker Nodes (Module: ${var.cluster_name})...\\033[0m\""
+    command     = <<-EOT
+      # --- Enhanced Style Definitions ---
+      RESET='\033[0m'
+      BOLD='\033[1m'
+      GREEN='\033[0;32m'
+      BLUE='\033[0;34m'
+      CYAN='\033[0;36m'
+      
+      # Enhanced progress message with consistent styling and emojis
+      echo -e "${BOLD}${GREEN}🚀 Step 2/4: Control Plane Ready, Configuring Worker Nodes${RESET} ${CYAN}(Module: ${BOLD}${var.cluster_name}${RESET}${CYAN})${RESET}${GREEN}...${RESET}"
+    EOT
   }
 }
 
