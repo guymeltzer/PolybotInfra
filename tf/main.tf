@@ -162,10 +162,10 @@ resource "null_resource" "ensure_local_kubeconfig" {
   triggers = {
     # Re-run if control plane changes (new deployment)
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
-    # Re-run if kubeconfig file is missing locally
-    kubeconfig_exists = fileexists(local.kubeconfig_path)
     # Re-run if kubeconfig content changes
     kubeconfig_content_hash = data.aws_secretsmanager_secret_version.retrieved_kubeconfig.version_id
+    # Version for tracking script changes
+    script_version = "v1-stable"
   }
 
   provisioner "local-exec" {
