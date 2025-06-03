@@ -727,7 +727,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v13-enhanced-debugging-diagnostics" # Enhanced debugging for namespace detection and ArgoCD diagnostics
+    setup_version    = "v14-kubectl-auth-debug" # Deep debugging for kubectl authentication/redirection issues
   }
 
   provisioner "local-exec" {
@@ -760,7 +760,7 @@ resource "null_resource" "application_setup" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔐 Application Setup v13 (Enhanced Debugging & Diagnostics for Namespace Detection)"
+      log_header "🔐 Application Setup v14 (Deep Kubectl Authentication & Redirection Debugging)"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -808,6 +808,19 @@ resource "null_resource" "application_setup" {
       log_step "Brief pause to ensure namespace readiness after initial checks"
       sleep 10
       
+      # === SCRIPT ENVIRONMENT DEBUGGING ===
+      log_step "DEBUG: Checking script environment for potential kubectl disruption"
+      log_info "DEBUG: Current working directory: $PWD"
+      log_info "DEBUG: Initial KUBECONFIG before secret operations: '$KUBECONFIG'"
+      log_info "DEBUG: PATH variable: $PATH"
+      log_info "DEBUG: kubectl location: $(which kubectl 2>/dev/null || echo 'not found')"
+      log_info "DEBUG: kubectl version info:"
+      kubectl version --client --short 2>/dev/null || log_warning "   Could not get kubectl client version"
+      
+      # Check if we're in the same directory as when script started
+      SCRIPT_START_PWD="$PWD"
+      log_info "DEBUG: Recording script start PWD as: $SCRIPT_START_PWD"
+
       # Generate certificates for TLS secrets (dummy for now, should be managed properly)
       CERT_DIR="/tmp/polybot-certs-$$" # Use process ID for temp uniqueness
       log_step "Creating temporary certificate directory: $CERT_DIR"
@@ -835,12 +848,78 @@ resource "null_resource" "application_setup" {
         log_step "Waiting for namespace $namespace to be ready (with verbose debugging)"
         
         for retry in {1..6}; do
-          # Enhanced debugging: capture kubectl output and exit code
-          log_info "Attempt $retry: Checking namespace '$namespace' with verbose output..."
-          KUBECTL_GET_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify get namespace "$namespace" 2>&1)
+          # === COMPREHENSIVE DEBUGGING SECTION ===
+          log_info "=== DEBUG SECTION START (Attempt $retry for namespace '$namespace') ==="
+          
+          # 1. Verify and log kubeconfig details
+          log_info "DEBUG: Current KUBECONFIG env var: '$KUBECONFIG'"
+          if [[ -f "$KUBECONFIG" ]]; then
+            KUBE_SERVER_URL_IN_LOOP=$(grep 'server:' "$KUBECONFIG" | awk '{print $2}' | head -n 1)
+            log_info "DEBUG: Server URL in Kubeconfig ('$KUBECONFIG') at this point: $KUBE_SERVER_URL_IN_LOOP"
+            
+            # Check insecure-skip-tls-verify setting
+            INSECURE_SETTING=$(grep -A 2 "server: $KUBE_SERVER_URL_IN_LOOP" "$KUBECONFIG" | grep "insecure-skip-tls-verify:" | awk '{print $2}' || echo "not-found")
+            log_info "DEBUG: Kubeconfig insecure-skip-tls-verify status: $INSECURE_SETTING"
+            
+            # Check kubeconfig file size and modification time
+            KUBECONFIG_SIZE=$(wc -c < "$KUBECONFIG" 2>/dev/null || echo "unknown")
+            KUBECONFIG_MTIME=$(stat -f %m "$KUBECONFIG" 2>/dev/null || echo "unknown")
+            log_info "DEBUG: Kubeconfig file size: $KUBECONFIG_SIZE bytes, mtime: $KUBECONFIG_MTIME"
+          else
+            log_warning "DEBUG: KUBECONFIG file '$KUBECONFIG' not found at this point!"
+          fi
+          
+          # 2. Check relevant environment variables
+          log_info "DEBUG: Relevant ENV VARS at this point:"
+          log_info "DEBUG:   HTTPS_PROXY='$HTTPS_PROXY'"
+          log_info "DEBUG:   HTTP_PROXY='$HTTP_PROXY'"
+          log_info "DEBUG:   NO_PROXY='$NO_PROXY'"
+          log_info "DEBUG:   KUBERNETES_SERVICE_HOST='$KUBERNETES_SERVICE_HOST'"
+          log_info "DEBUG:   KUBERNETES_SERVICE_PORT='$KUBERNETES_SERVICE_PORT'"
+          log_info "DEBUG:   PWD='$PWD'"
+          
+          # Check if working directory has changed
+          if [[ "$PWD" != "$SCRIPT_START_PWD" ]]; then
+            log_warning "DEBUG: Working directory has changed! Started in '$SCRIPT_START_PWD', now in '$PWD'"
+          else
+            log_info "DEBUG: Working directory unchanged from script start"
+          fi
+          
+          # 3. Test basic connectivity with a simple kubectl command first
+          log_info "DEBUG: Testing basic kubectl connectivity with 'kubectl version --short'..."
+          KUBECTL_VERSION_OUTPUT=$(kubectl --insecure-skip-tls-verify --v=7 version --short 2>&1)
+          KUBECTL_VERSION_EXIT_CODE=$?
+          log_info "DEBUG: kubectl version exit code: $KUBECTL_VERSION_EXIT_CODE"
+          log_info "DEBUG: kubectl version output:"
+          echo "$KUBECTL_VERSION_OUTPUT"
+          
+          # 5. Network/DNS debugging if kubectl is behaving strangely
+          if [[ -n "$KUBE_SERVER_URL_IN_LOOP" ]]; then
+            # Extract hostname from server URL
+            KUBE_SERVER_HOST=$(echo "$KUBE_SERVER_URL_IN_LOOP" | sed 's|https\?://||' | cut -d: -f1)
+            log_info "DEBUG: Extracted kubectl target host: '$KUBE_SERVER_HOST'"
+            
+            # Test DNS resolution
+            log_info "DEBUG: Testing DNS resolution for '$KUBE_SERVER_HOST':"
+            nslookup "$KUBE_SERVER_HOST" 2>&1 | head -10 || log_info "   nslookup failed or not available"
+            
+            # Test basic connectivity to the host:port
+            KUBE_SERVER_PORT=$(echo "$KUBE_SERVER_URL_IN_LOOP" | sed 's|https\?://[^:]*:||' | cut -d/ -f1)
+            if [[ -n "$KUBE_SERVER_PORT" && "$KUBE_SERVER_PORT" != "$KUBE_SERVER_URL_IN_LOOP" ]]; then
+              log_info "DEBUG: Testing TCP connectivity to '$KUBE_SERVER_HOST:$KUBE_SERVER_PORT':"
+              timeout 5 bash -c "</dev/tcp/$KUBE_SERVER_HOST/$KUBE_SERVER_PORT" 2>&1 && log_info "   TCP connection successful" || log_info "   TCP connection failed"
+            fi
+          fi
+          
+          log_info "=== DEBUG SECTION END ==="
+          
+          # 6. Now perform the actual kubectl get namespace command with full verbosity
+          log_info "Attempt $retry: Checking namespace '$namespace' with kubectl --v=9 (maximum verbosity)..."
+          KUBECTL_GET_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify --v=9 get namespace "$namespace" 2>&1)
           KUBECTL_GET_NS_EXIT_CODE=$?
-          log_info "kubectl get namespace '$namespace' exit code: $KUBECTL_GET_NS_EXIT_CODE"
-          log_info "kubectl get namespace '$namespace' output: $KUBECTL_GET_NS_OUTPUT"
+          log_info "kubectl --v=9 get namespace '$namespace' exit code: $KUBECTL_GET_NS_EXIT_CODE"
+          log_info "kubectl --v=9 get namespace '$namespace' FULL OUTPUT:"
+          echo "$KUBECTL_GET_NS_OUTPUT"
 
           if [[ $KUBECTL_GET_NS_EXIT_CODE -eq 0 ]]; then
             # Check if namespace is in Active phase
@@ -908,21 +987,89 @@ resource "null_resource" "application_setup" {
       
       # Enhanced ArgoCD namespace detection with verbose debugging and reliable checks
       for retry in {1..9}; do
-        # Enhanced debugging: capture kubectl output and exit code for ArgoCD namespace
-        log_info "Attempt $retry: Checking ArgoCD namespace '$ARGOCD_NAMESPACE' with verbose output..."
-        KUBECTL_GET_ARGOCD_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" 2>&1)
+        # === COMPREHENSIVE DEBUGGING SECTION FOR ARGOCD ===
+        log_info "=== ARGOCD DEBUG SECTION START (Attempt $retry for ArgoCD namespace '$ARGOCD_NAMESPACE') ==="
+        
+        # 1. Verify and log kubeconfig details
+        log_info "DEBUG: Current KUBECONFIG env var: '$KUBECONFIG'"
+        if [[ -f "$KUBECONFIG" ]]; then
+          KUBE_SERVER_URL_IN_ARGOCD_LOOP=$(grep 'server:' "$KUBECONFIG" | awk '{print $2}' | head -n 1)
+          log_info "DEBUG: Server URL in Kubeconfig ('$KUBECONFIG') at this point: $KUBE_SERVER_URL_IN_ARGOCD_LOOP"
+          
+          # Check insecure-skip-tls-verify setting
+          INSECURE_SETTING_ARGOCD=$(grep -A 2 "server: $KUBE_SERVER_URL_IN_ARGOCD_LOOP" "$KUBECONFIG" | grep "insecure-skip-tls-verify:" | awk '{print $2}' || echo "not-found")
+          log_info "DEBUG: Kubeconfig insecure-skip-tls-verify status: $INSECURE_SETTING_ARGOCD"
+          
+          # Check kubeconfig file size and modification time
+          KUBECONFIG_SIZE_ARGOCD=$(wc -c < "$KUBECONFIG" 2>/dev/null || echo "unknown")
+          KUBECONFIG_MTIME_ARGOCD=$(stat -f %m "$KUBECONFIG" 2>/dev/null || echo "unknown")
+          log_info "DEBUG: Kubeconfig file size: $KUBECONFIG_SIZE_ARGOCD bytes, mtime: $KUBECONFIG_MTIME_ARGOCD"
+        else
+          log_warning "DEBUG: KUBECONFIG file '$KUBECONFIG' not found at this point!"
+        fi
+        
+        # 2. Check relevant environment variables
+        log_info "DEBUG: Relevant ENV VARS at this point:"
+        log_info "DEBUG:   HTTPS_PROXY='$HTTPS_PROXY'"
+        log_info "DEBUG:   HTTP_PROXY='$HTTP_PROXY'"
+        log_info "DEBUG:   NO_PROXY='$NO_PROXY'"
+        log_info "DEBUG:   KUBERNETES_SERVICE_HOST='$KUBERNETES_SERVICE_HOST'"
+        log_info "DEBUG:   KUBERNETES_SERVICE_PORT='$KUBERNETES_SERVICE_PORT'"
+        log_info "DEBUG:   PWD='$PWD'"
+        
+        # Check if working directory has changed
+        if [[ "$PWD" != "$SCRIPT_START_PWD" ]]; then
+          log_warning "DEBUG: Working directory has changed! Started in '$SCRIPT_START_PWD', now in '$PWD'"
+        else
+          log_info "DEBUG: Working directory unchanged from script start"
+        fi
+        
+        # 3. Test basic connectivity with a simple kubectl command first
+        log_info "DEBUG: Testing basic kubectl connectivity with 'kubectl version --short'..."
+        KUBECTL_VERSION_OUTPUT_ARGOCD=$(kubectl --insecure-skip-tls-verify --v=7 version --short 2>&1)
+        KUBECTL_VERSION_EXIT_CODE_ARGOCD=$?
+        log_info "DEBUG: kubectl version exit code: $KUBECTL_VERSION_EXIT_CODE_ARGOCD"
+        log_info "DEBUG: kubectl version output:"
+        echo "$KUBECTL_VERSION_OUTPUT_ARGOCD"
+        
+        # 5. Network/DNS debugging if kubectl is behaving strangely
+        if [[ -n "$KUBE_SERVER_URL_IN_ARGOCD_LOOP" ]]; then
+          # Extract hostname from server URL
+          KUBE_SERVER_HOST=$(echo "$KUBE_SERVER_URL_IN_ARGOCD_LOOP" | sed 's|https\?://||' | cut -d: -f1)
+          log_info "DEBUG: Extracted kubectl target host: '$KUBE_SERVER_HOST'"
+          
+          # Test DNS resolution
+          log_info "DEBUG: Testing DNS resolution for '$KUBE_SERVER_HOST':"
+          nslookup "$KUBE_SERVER_HOST" 2>&1 | head -10 || log_info "   nslookup failed or not available"
+          
+          # Test basic connectivity to the host:port
+          KUBE_SERVER_PORT=$(echo "$KUBE_SERVER_URL_IN_ARGOCD_LOOP" | sed 's|https\?://[^:]*:||' | cut -d/ -f1)
+          if [[ -n "$KUBE_SERVER_PORT" && "$KUBE_SERVER_PORT" != "$KUBE_SERVER_URL_IN_ARGOCD_LOOP" ]]; then
+            log_info "DEBUG: Testing TCP connectivity to '$KUBE_SERVER_HOST:$KUBE_SERVER_PORT':"
+            timeout 5 bash -c "</dev/tcp/$KUBE_SERVER_HOST/$KUBE_SERVER_PORT" 2>&1 && log_info "   TCP connection successful" || log_info "   TCP connection failed"
+          fi
+        fi
+        
+        log_info "=== ARGOCD DEBUG SECTION END ==="
+        
+        # 6. Now perform the actual kubectl get namespace command for ArgoCD with full verbosity
+        log_info "Attempt $retry: Checking ArgoCD namespace '$ARGOCD_NAMESPACE' with kubectl --v=9 (maximum verbosity)..."
+        KUBECTL_GET_ARGOCD_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify --v=9 get namespace "$ARGOCD_NAMESPACE" 2>&1)
         KUBECTL_GET_ARGOCD_NS_EXIT_CODE=$?
-        log_info "kubectl get namespace '$ARGOCD_NAMESPACE' exit code: $KUBECTL_GET_ARGOCD_NS_EXIT_CODE"
-        log_info "kubectl get namespace '$ARGOCD_NAMESPACE' output: $KUBECTL_GET_ARGOCD_NS_OUTPUT"
+        log_info "kubectl --v=9 get namespace '$ARGOCD_NAMESPACE' exit code: $KUBECTL_GET_ARGOCD_NS_EXIT_CODE"
+        log_info "kubectl --v=9 get namespace '$ARGOCD_NAMESPACE' FULL OUTPUT:"
+        echo "$KUBECTL_GET_ARGOCD_NS_OUTPUT"
 
         if [[ $KUBECTL_GET_ARGOCD_NS_EXIT_CODE -eq 0 ]]; then
           log_info "ArgoCD namespace '$ARGOCD_NAMESPACE' found on attempt $retry. Verifying CRDs..."
           
           # Enhanced CRD check with verbose output
-          KUBECTL_GET_CRD_OUTPUT=$(kubectl --insecure-skip-tls-verify get crd applications.argoproj.io 2>&1)
+          log_info "DEBUG: Testing ArgoCD CRD with kubectl --v=7..."
+          KUBECTL_GET_CRD_OUTPUT=$(kubectl --insecure-skip-tls-verify --v=7 get crd applications.argoproj.io 2>&1)
           KUBECTL_GET_CRD_EXIT_CODE=$?
-          log_info "kubectl get crd applications.argoproj.io exit code: $KUBECTL_GET_CRD_EXIT_CODE"
-          log_info "kubectl get crd applications.argoproj.io output: $KUBECTL_GET_CRD_OUTPUT"
+          log_info "kubectl --v=7 get crd applications.argoproj.io exit code: $KUBECTL_GET_CRD_EXIT_CODE"
+          log_info "kubectl --v=7 get crd applications.argoproj.io FULL OUTPUT:"
+          echo "$KUBECTL_GET_CRD_OUTPUT"
           
           if [[ $KUBECTL_GET_CRD_EXIT_CODE -eq 0 ]]; then
             log_success "ArgoCD namespace and CRDs confirmed ready on attempt $retry"
