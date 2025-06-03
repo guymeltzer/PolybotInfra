@@ -8,7 +8,7 @@ metadata:
 spec:
   ingressClassName: "nginx"
   rules:
-    - host: guy-polybot-lg.devops-int-college.com
+    - host: guy-polybot.devops-int-college.com
       http:
         paths:
           - path: /
