@@ -767,17 +767,17 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v22-hybrid-static-dynamic-secrets" # NEW: Combine static AWS secrets with dynamic TF outputs
+    setup_version    = "v23-comprehensive-hybrid-prioritization-fixed" # FIXED: AWS secret name, dynamic TF outputs (S3/SQS/ALB), prioritization logic, Docker credentials (DOCKERHUB_*)
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {
       # Dynamic values from current Terraform deployment (to be combined with static AWS secrets)
-      TF_VAR_S3_BUCKET_NAME    = module.k8s-cluster.worker_logs_bucket           # Dynamic: S3 bucket from this deployment
-      TF_VAR_SQS_QUEUE_URL     = "https://sqs.${var.region}.amazonaws.com/YOUR_ACCOUNT_ID/YOUR_SQS_QUEUE_NAME" # TODO: Replace with actual SQS output when available
-      TF_VAR_TELEGRAM_APP_URL  = "https://${var.domain_name}"                    # Dynamic: ALB/Route53 derived app URL
-      TF_VAR_AWS_REGION        = var.region                                      # AWS region for secrets manager
+      TF_VAR_S3_BUCKET_NAME    = aws_s3_bucket.polybot_storage.bucket                # Dynamic: S3 bucket from generated-secrets.tf
+      TF_VAR_SQS_QUEUE_URL     = aws_sqs_queue.polybot_queue.url                     # Dynamic: SQS queue from generated-secrets.tf
+      TF_VAR_TELEGRAM_APP_URL  = "https://${module.k8s-cluster.alb_dns_name_output}" # Dynamic: ALB DNS from k8s-cluster module
+      TF_VAR_AWS_REGION        = var.region                                          # AWS region for secrets manager
     }
     command     = <<-EOT
       #!/bin/bash
@@ -968,8 +968,8 @@ resource "null_resource" "application_setup" {
         
         # If we successfully fetched AWS secrets (for prod namespace), try to extract docker credentials
         if [[ "$namespace" == "prod" && -n "$POLYBOT_SECRET_JSON" ]]; then
-          AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKER_USERNAME // ""' 2>/dev/null)
-          AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKER_PASSWORD // ""' 2>/dev/null)
+          AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_USERNAME // ""' 2>/dev/null)
+          AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_PASSWORD // ""' 2>/dev/null)
           
           if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" ]]; then
             DOCKER_USERNAME="$AWS_DOCKER_USERNAME"
@@ -1064,15 +1064,58 @@ EOF_DOCKER_SECRET
           if [[ $AWS_FETCH_EXIT_CODE -eq 0 && -n "$POLYBOT_SECRET_JSON" && "$POLYBOT_SECRET_JSON" != "null" ]]; then
             log_success "Successfully retrieved static secrets JSON from AWS Secrets Manager."
             
-            # Prepare --from-literal arguments for static secrets
-            log_step "Extracting static secrets from AWS JSON"
+            # Prepare --from-literal arguments for all secrets with prioritization logic
+            log_step "Combining static secrets (from AWS) with dynamic secrets (from Terraform)"
             LITERAL_ARGS=""
+            MISSING_KEYS=""
+            
+            # ===== DYNAMIC VALUES WITH PRIORITIZATION =====
+            # Priority: Terraform outputs first, then AWS secrets as fallback
+            
+            log_info "Processing dynamic values with Terraform priority:"
+            
+            # S3_BUCKET_NAME (Terraform priority)
+            S3_VAL_FROM_TF="$TF_VAR_S3_BUCKET_NAME"
+            S3_VAL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".S3_BUCKET_NAME // \"\"" 2>/dev/null)
+            FINAL_S3_BUCKET_NAME="$${S3_VAL_FROM_TF:-$S3_VAL_FROM_AWS}" # Use TF if set, else AWS
+            if [[ -n "$FINAL_S3_BUCKET_NAME" && "$FINAL_S3_BUCKET_NAME" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=S3_BUCKET_NAME=$FINAL_S3_BUCKET_NAME"
+              log_info "   ✓ S3_BUCKET_NAME: $FINAL_S3_BUCKET_NAME (source: $${S3_VAL_FROM_TF:+Terraform}$${S3_VAL_FROM_TF:-AWS})"
+            else
+              log_warning "   ✗ S3_BUCKET_NAME missing from both Terraform and AWS Secret"
+              MISSING_KEYS="$MISSING_KEYS S3_BUCKET_NAME"
+            fi
+            
+            # SQS_QUEUE_URL (Terraform priority)
+            SQS_VAL_FROM_TF="$TF_VAR_SQS_QUEUE_URL"
+            SQS_VAL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".SQS_QUEUE_URL // \"\"" 2>/dev/null)
+            FINAL_SQS_QUEUE_URL="$${SQS_VAL_FROM_TF:-$SQS_VAL_FROM_AWS}" # Use TF if set, else AWS
+            if [[ -n "$FINAL_SQS_QUEUE_URL" && "$FINAL_SQS_QUEUE_URL" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=SQS_QUEUE_URL=$FINAL_SQS_QUEUE_URL"
+              log_info "   ✓ SQS_QUEUE_URL: $FINAL_SQS_QUEUE_URL (source: $${SQS_VAL_FROM_TF:+Terraform}$${SQS_VAL_FROM_TF:-AWS})"
+            else
+              log_warning "   ✗ SQS_QUEUE_URL missing from both Terraform and AWS Secret"
+              MISSING_KEYS="$MISSING_KEYS SQS_QUEUE_URL"
+            fi
+            
+            # TELEGRAM_APP_URL (Terraform priority)
+            TELEGRAM_URL_FROM_TF="$TF_VAR_TELEGRAM_APP_URL"
+            TELEGRAM_URL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".TELEGRAM_APP_URL // \"\"" 2>/dev/null)
+            FINAL_TELEGRAM_APP_URL="$${TELEGRAM_URL_FROM_TF:-$TELEGRAM_URL_FROM_AWS}" # Use TF if set, else AWS
+            if [[ -n "$FINAL_TELEGRAM_APP_URL" && "$FINAL_TELEGRAM_APP_URL" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=TELEGRAM_APP_URL=$FINAL_TELEGRAM_APP_URL"
+              log_info "   ✓ TELEGRAM_APP_URL: $FINAL_TELEGRAM_APP_URL (source: $${TELEGRAM_URL_FROM_TF:+Terraform}$${TELEGRAM_URL_FROM_TF:-AWS})"
+            else
+              log_warning "   ✗ TELEGRAM_APP_URL missing from both Terraform and AWS Secret"
+              MISSING_KEYS="$MISSING_KEYS TELEGRAM_APP_URL"
+            fi
+            
+            # ===== STATIC VALUES FROM AWS SECRETS MANAGER =====
+            log_info "Processing static values (from AWS Secrets Manager only):"
             
             # Define list of static keys expected from AWS Secrets Manager
-            # User should ensure these exact keys (case-sensitive) exist in their AWS Secret JSON
             STATIC_KEYS_TO_FETCH="TELEGRAM_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY MONGO_URI MONGO_DB MONGO_COLLECTION POLYBOT_URL"
             
-            MISSING_STATIC_KEYS=""
             for key in $STATIC_KEYS_TO_FETCH; do
               value=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".$${key} // \"\"" 2>/dev/null)
               if [[ -n "$value" && "$value" != "null" ]]; then
@@ -1080,40 +1123,15 @@ EOF_DOCKER_SECRET
                 log_info "   ✓ $key (from AWS)"
               else
                 log_warning "   ✗ $key not found or empty in AWS Secret JSON"
-                MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS $key"
+                MISSING_KEYS="$MISSING_KEYS $key"
               fi
             done
             
-            # Add dynamic values from Terraform outputs
-            log_step "Adding dynamic secrets from Terraform deployment"
-            if [[ -n "$TF_VAR_S3_BUCKET_NAME" && "$TF_VAR_S3_BUCKET_NAME" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=S3_BUCKET_NAME=$TF_VAR_S3_BUCKET_NAME"
-              log_info "   ✓ S3_BUCKET_NAME (from Terraform)"
-            else
-              log_warning "   ✗ TF_VAR_S3_BUCKET_NAME not set for prod/polybot-secrets"
-              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS S3_BUCKET_NAME"
-            fi
-            
-            if [[ -n "$TF_VAR_SQS_QUEUE_URL" && "$TF_VAR_SQS_QUEUE_URL" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=SQS_QUEUE_URL=$TF_VAR_SQS_QUEUE_URL"
-              log_info "   ✓ SQS_QUEUE_URL (from Terraform)"
-            else
-              log_warning "   ✗ TF_VAR_SQS_QUEUE_URL not set for prod/polybot-secrets"
-              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS SQS_QUEUE_URL"
-            fi
-            
-            if [[ -n "$TF_VAR_TELEGRAM_APP_URL" && "$TF_VAR_TELEGRAM_APP_URL" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=TELEGRAM_APP_URL=$TF_VAR_TELEGRAM_APP_URL"
-              log_info "   ✓ TELEGRAM_APP_URL (from Terraform)"
-            else
-              log_warning "   ✗ TF_VAR_TELEGRAM_APP_URL not set for prod/polybot-secrets"
-              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS TELEGRAM_APP_URL"
-            fi
-            
             # Check if we have sufficient secrets to proceed
-            if [[ -n "$MISSING_STATIC_KEYS" ]]; then
-              log_warning "Some required secrets are missing: $MISSING_STATIC_KEYS"
+            if [[ -n "$MISSING_KEYS" ]]; then
+              log_warning "Some required secrets are missing:$MISSING_KEYS"
               log_info "The application may not function correctly without these values."
+              log_info "Please ensure your AWS Secret 'polybot-secrets' contains all required keys."
             fi
             
             # Create the Kubernetes Secret with all gathered secrets
