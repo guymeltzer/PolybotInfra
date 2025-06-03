@@ -727,7 +727,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v12-simplified-namespace-detection" # Simplified namespace detection for better reliability
+    setup_version    = "v13-enhanced-debugging-diagnostics" # Enhanced debugging for namespace detection and ArgoCD diagnostics
   }
 
   provisioner "local-exec" {
@@ -760,7 +760,7 @@ resource "null_resource" "application_setup" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔐 Application Setup v12 (Simplified Namespace Detection for Better Reliability)"
+      log_header "🔐 Application Setup v13 (Enhanced Debugging & Diagnostics for Namespace Detection)"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -803,6 +803,11 @@ resource "null_resource" "application_setup" {
       done
 
       log_subheader "🔐 Ensuring TLS certificates and secrets"
+      
+      # Brief pause to account for any minimal namespace propagation delay
+      log_step "Brief pause to ensure namespace readiness after initial checks"
+      sleep 10
+      
       # Generate certificates for TLS secrets (dummy for now, should be managed properly)
       CERT_DIR="/tmp/polybot-certs-$$" # Use process ID for temp uniqueness
       log_step "Creating temporary certificate directory: $CERT_DIR"
@@ -825,15 +830,22 @@ resource "null_resource" "application_setup" {
       for namespace in prod dev; do
         log_subheader "🔑 Ensuring secrets in namespace: $${BOLD}$namespace$${RESET}"
 
-        # Simplified namespace detection with reliable Active status check
+        # Enhanced namespace detection with verbose debugging
         NAMESPACE_FOUND=false
-        log_step "Waiting for namespace $namespace to be ready (simplified check)"
+        log_step "Waiting for namespace $namespace to be ready (with verbose debugging)"
         
         for retry in {1..6}; do
-          # Use a simplified but reliable check for namespace existence and Active status
-          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
+          # Enhanced debugging: capture kubectl output and exit code
+          log_info "Attempt $retry: Checking namespace '$namespace' with verbose output..."
+          KUBECTL_GET_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify get namespace "$namespace" 2>&1)
+          KUBECTL_GET_NS_EXIT_CODE=$?
+          log_info "kubectl get namespace '$namespace' exit code: $KUBECTL_GET_NS_EXIT_CODE"
+          log_info "kubectl get namespace '$namespace' output: $KUBECTL_GET_NS_OUTPUT"
+
+          if [[ $KUBECTL_GET_NS_EXIT_CODE -eq 0 ]]; then
             # Check if namespace is in Active phase
             NAMESPACE_PHASE=$(kubectl --insecure-skip-tls-verify get namespace "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            log_info "Namespace phase for '$namespace': $NAMESPACE_PHASE"
             if [[ "$NAMESPACE_PHASE" == "Active" ]]; then
               log_success "Namespace $namespace confirmed ACTIVE on attempt $retry"
               NAMESPACE_FOUND=true
@@ -842,7 +854,7 @@ resource "null_resource" "application_setup" {
               log_info "Namespace $namespace exists but status is '$NAMESPACE_PHASE' on attempt $retry/6, waiting 5 seconds..."
             fi
           else
-            log_info "Namespace $namespace not found on attempt $retry/6, waiting 5 seconds..."
+            log_info "Namespace $namespace not found (or error) on attempt $retry/6, waiting 5 seconds..."
           fi
           
           if [[ $retry -lt 6 ]]; then
@@ -853,6 +865,8 @@ resource "null_resource" "application_setup" {
         if [[ "$NAMESPACE_FOUND" != "true" ]]; then
           log_warning "Namespace $namespace not found/ready after 6 retries (30 seconds total)"
           log_error "Skipping secret creation for namespace $namespace"
+          log_info "DEBUG: Final namespace listing to verify existence:"
+          kubectl --insecure-skip-tls-verify get namespaces | grep -E "(NAME|$namespace|argocd|prod|dev)" || log_info "   No matching namespaces found in final check"
           continue
         fi
 
@@ -889,16 +903,28 @@ resource "null_resource" "application_setup" {
       # Deploy ArgoCD applications only if ArgoCD is installed
       ARGOCD_NAMESPACE="argocd"
       
-      log_step "Checking if ArgoCD is installed and ready (simplified detection with reliable checks)"
+      log_step "Checking if ArgoCD is installed and ready (enhanced debugging with verbose checks)"
       ARGOCD_NAMESPACE_FOUND=false
       
-      # Simplified ArgoCD namespace detection with reliable checks
+      # Enhanced ArgoCD namespace detection with verbose debugging and reliable checks
       for retry in {1..9}; do
-        # Check namespace existence and verify ArgoCD CRDs
-        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+        # Enhanced debugging: capture kubectl output and exit code for ArgoCD namespace
+        log_info "Attempt $retry: Checking ArgoCD namespace '$ARGOCD_NAMESPACE' with verbose output..."
+        KUBECTL_GET_ARGOCD_NS_OUTPUT=$(kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" 2>&1)
+        KUBECTL_GET_ARGOCD_NS_EXIT_CODE=$?
+        log_info "kubectl get namespace '$ARGOCD_NAMESPACE' exit code: $KUBECTL_GET_ARGOCD_NS_EXIT_CODE"
+        log_info "kubectl get namespace '$ARGOCD_NAMESPACE' output: $KUBECTL_GET_ARGOCD_NS_OUTPUT"
+
+        if [[ $KUBECTL_GET_ARGOCD_NS_EXIT_CODE -eq 0 ]]; then
           log_info "ArgoCD namespace '$ARGOCD_NAMESPACE' found on attempt $retry. Verifying CRDs..."
-          # Additional check: verify ArgoCD CRDs are installed
-          if kubectl --insecure-skip-tls-verify get crd applications.argoproj.io >/dev/null 2>&1; then
+          
+          # Enhanced CRD check with verbose output
+          KUBECTL_GET_CRD_OUTPUT=$(kubectl --insecure-skip-tls-verify get crd applications.argoproj.io 2>&1)
+          KUBECTL_GET_CRD_EXIT_CODE=$?
+          log_info "kubectl get crd applications.argoproj.io exit code: $KUBECTL_GET_CRD_EXIT_CODE"
+          log_info "kubectl get crd applications.argoproj.io output: $KUBECTL_GET_CRD_OUTPUT"
+          
+          if [[ $KUBECTL_GET_CRD_EXIT_CODE -eq 0 ]]; then
             log_success "ArgoCD namespace and CRDs confirmed ready on attempt $retry"
             ARGOCD_NAMESPACE_FOUND=true
             break
@@ -906,7 +932,7 @@ resource "null_resource" "application_setup" {
             log_info "ArgoCD namespace exists but CRDs not ready yet on attempt $retry/9, waiting 10 seconds..."
           fi
         else
-          log_info "ArgoCD namespace not found on attempt $retry/9, waiting 10 seconds..."
+          log_info "ArgoCD namespace not found (or error) on attempt $retry/9, waiting 10 seconds..."
         fi
         
         if [[ $retry -lt 9 ]]; then
@@ -917,6 +943,9 @@ resource "null_resource" "application_setup" {
       if [[ "$ARGOCD_NAMESPACE_FOUND" != "true" ]]; then
         log_warning "ArgoCD namespace not found/ready after 9 retries (90 seconds total)"
         log_info "This suggests ArgoCD installation may not have completed successfully"
+        log_info "DEBUG: Final ArgoCD namespace and CRD status:"
+        kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" 2>&1 || log_info "   ArgoCD namespace check failed"
+        kubectl --insecure-skip-tls-verify get crd applications.argoproj.io 2>&1 || log_info "   ArgoCD CRD check failed"
         log_info "ArgoCD applications can be deployed manually later with:"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n argocd"
@@ -1070,6 +1099,46 @@ resource "null_resource" "application_setup" {
         done || true
       else
         log_warning "No ArgoCD application controller pods found"
+      fi
+
+      log_subheader "🩺 ArgoCD Server Pod Readiness Check"
+      log_step "Investigating ArgoCD server pod readiness (diagnosing 0/1 Ready issue)"
+      ARGOCD_SERVER_POD_NAME=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "not-found")
+      
+      if [[ "$ARGOCD_SERVER_POD_NAME" != "not-found" ]]; then
+        log_info "ArgoCD Server Pod: $${BOLD}$ARGOCD_SERVER_POD_NAME$${RESET}"
+        
+        log_step "ArgoCD server pod status:"
+        kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o wide 2>/dev/null || log_warning "   Could not get pod status"
+        
+        log_step "ArgoCD server pod readiness and liveness probe status:"
+        kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.conditions}' 2>/dev/null | jq . 2>/dev/null || kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.conditions}' 2>/dev/null || log_info "   Could not get condition details"
+        
+        log_step "Describing ArgoCD Server Pod (events and detailed status):"
+        kubectl --insecure-skip-tls-verify describe pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not describe pod"
+        
+        log_step "Recent logs from ArgoCD Server Pod (last 50 lines):"
+        kubectl --insecure-skip-tls-verify logs --tail=50 "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not retrieve pod logs"
+        
+        # Check if there are multiple containers in the pod
+        CONTAINER_COUNT=$(kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null | wc -w || echo "0")
+        if [[ "$CONTAINER_COUNT" -gt 1 ]]; then
+          log_info "Pod has $CONTAINER_COUNT containers. Checking individual container statuses:"
+          kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | while read -r container_name; do
+            if [[ -n "$container_name" ]]; then
+              log_step "Container '$container_name' logs:"
+              kubectl --insecure-skip-tls-verify logs --tail=20 "$ARGOCD_SERVER_POD_NAME" -c "$container_name" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_info "   Could not get logs for container $container_name"
+            fi
+          done
+        fi
+        
+        log_step "ArgoCD server service status:"
+        kubectl --insecure-skip-tls-verify get service argocd-server -n "$ARGOCD_NAMESPACE" -o wide 2>/dev/null || log_warning "   ArgoCD server service not found"
+        
+      else
+        log_warning "ArgoCD Server pod not found."
+        log_step "All pods in ArgoCD namespace:"
+        kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not list pods in ArgoCD namespace"
       fi
 
       log_success "Application setup and ArgoCD deployment completed successfully"
