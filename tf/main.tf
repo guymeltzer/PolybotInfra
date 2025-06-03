@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v24-critical-case-mapping-fix" # CRITICAL FIX: telegram_token case mapping, .env file approach, robust AWS secret fetching
+    setup_version    = "v25-critical-ssl-certificate-fix" # CRITICAL SSL FIX: Use actual TLS certificate from k8s/shared/polybot-tls-secret.yaml instead of dummy content
   }
 
   provisioner "local-exec" {
@@ -826,7 +826,7 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v24 (CRITICAL: Case-Mapping Fix for telegram_token)"
+      log_header "🔐 Application Setup v25 (CRITICAL: Case-Mapping + SSL Certificate Fix)"
 
       # AWS Configuration & User Settings
       AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
@@ -952,13 +952,38 @@ resource "null_resource" "application_setup" {
           continue
         fi
 
-        log_step "Creating TLS secret"
-        # TLS secret (using generic type with dummy content to avoid PEM validation issues)
-        kubectl --insecure-skip-tls-verify create secret generic polybot-tls \
-          --from-literal=tls.crt="---dummy cert for polybot.crt---" \
-          --from-literal=tls.key="---dummy key for polybot.key---" \
-          -n "$namespace" \
-          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-tls secret in $namespace handled (may already exist)"
+        log_step "Creating/Updating TLS secret 'polybot-tls' using actual certificate files"
+        
+        # Use the actual TLS certificate YAML file from k8s/shared directory
+        TLS_SECRET_FILE_PATH="$TERRAFORM_EXEC_DIR/../k8s/shared/polybot-tls-secret.yaml"
+        
+        if [[ ! -f "$TLS_SECRET_FILE_PATH" ]]; then
+          log_error "CRITICAL: Actual TLS certificate file not found at: $TLS_SECRET_FILE_PATH"
+          log_error "Skipping creation of polybot-tls secret for '$namespace' with actual certificate. Flask app will fail SSL."
+          log_info "The file should contain base64-encoded certificate and key data."
+        else
+          log_info "Using TLS certificate YAML file: $TLS_SECRET_FILE_PATH"
+          
+          # Delete existing secret first to ensure it's updated correctly, especially if its type was previously 'Opaque' (generic)
+          kubectl --insecure-skip-tls-verify delete secret polybot-tls -n "$namespace" --ignore-not-found=true 2>/dev/null
+          
+          # Create a temporary modified version of the YAML file for the current namespace
+          TLS_SECRET_TEMP_FILE=$(mktemp "/tmp/polybot_tls_$namespace.XXXXXX.yaml")
+          
+          # Modify the namespace in the YAML file to match the current namespace
+          sed "s/namespace: prod/namespace: $namespace/" "$TLS_SECRET_FILE_PATH" > "$TLS_SECRET_TEMP_FILE"
+          
+          # Apply the TLS secret YAML file
+          if kubectl --insecure-skip-tls-verify apply -f "$TLS_SECRET_TEMP_FILE" 2>/dev/null; then
+            log_success "polybot-tls secret created/updated in '$namespace' using actual certificate data."
+            log_info "Secret type: kubernetes.io/tls with proper base64-encoded certificate data"
+          else
+            log_error "Failed to create/update polybot-tls secret in '$namespace' using actual certificate file. Check kubectl errors."
+          fi
+          
+          # Clean up temporary file
+          rm -f "$TLS_SECRET_TEMP_FILE"
+        fi
 
         log_step "Creating CA secret"
         # CA secret
