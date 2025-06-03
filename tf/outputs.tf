@@ -302,13 +302,3 @@ output "quick_start" {
        # Password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
   EOT
 }
-
-output "generated_secrets_info" {
-  description = "Information about generated secrets and credentials"
-  sensitive   = true
-  value = {
-    ssh_key_generated = var.key_name == "" ? true : false
-    ssh_key_location = var.key_name == "" ? "${path.module}/polybot-key.pem" : "Using provided key: ${var.key_name}"
-    argocd_password_location = "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
-  }
-}
