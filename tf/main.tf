@@ -767,11 +767,18 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v21-aws-secrets-manager-integration" # NEW: Fetch secrets from AWS Secrets Manager instead of placeholders
+    setup_version    = "v22-hybrid-static-dynamic-secrets" # NEW: Combine static AWS secrets with dynamic TF outputs
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
+    environment = {
+      # Dynamic values from current Terraform deployment (to be combined with static AWS secrets)
+      TF_VAR_S3_BUCKET_NAME    = module.k8s-cluster.worker_logs_bucket           # Dynamic: S3 bucket from this deployment
+      TF_VAR_SQS_QUEUE_URL     = "https://sqs.${var.region}.amazonaws.com/YOUR_ACCOUNT_ID/YOUR_SQS_QUEUE_NAME" # TODO: Replace with actual SQS output when available
+      TF_VAR_TELEGRAM_APP_URL  = "https://${var.domain_name}"                    # Dynamic: ALB/Route53 derived app URL
+      TF_VAR_AWS_REGION        = var.region                                      # AWS region for secrets manager
+    }
     command     = <<-EOT
       #!/bin/bash
       # Removed set -e to allow graceful error handling during initial setup
@@ -819,18 +826,24 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v21 (AWS Secrets Manager Integration)"
+      log_header "🔐 Application Setup v22 (Hybrid Static+Dynamic Secrets)"
 
-      # AWS Configuration
-      AWS_REGION="${var.region}"
+      # AWS Configuration & User Settings
+      AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
       
-      # *** USER CONFIGURATION REQUIRED ***
-      # Replace this with your actual AWS Secrets Manager secret name that contains Polybot configuration
-      POLYBOT_AWS_SECRET_NAME="name-of-your-aws-secret-for-polybot"
+      # *** CRITICAL USER CONFIGURATION REQUIRED ***
+      # TODO: Replace this with your actual AWS Secrets Manager secret name that contains static Polybot configuration
+      POLYBOT_AWS_SECRET_NAME="YOUR_ACTUAL_AWS_SECRET_NAME_HERE"
       
-      log_info "AWS Region: $AWS_REGION"
+      log_warning "🚨 CRITICAL: You MUST replace 'YOUR_ACTUAL_AWS_SECRET_NAME_HERE' with your actual AWS Secrets Manager secret name!"
+      log_info "AWS Region for Secrets: $AWS_REGION_FOR_SECRETS"
       log_info "Polybot AWS Secret Name: $${BOLD}$POLYBOT_AWS_SECRET_NAME$${RESET}"
-      log_warning "⚠️  IMPORTANT: Replace '$POLYBOT_AWS_SECRET_NAME' with your actual AWS Secrets Manager secret name"
+      
+      # Dynamic values from Terraform (passed via environment)
+      log_subheader "📊 Dynamic Values from Current Terraform Deployment"
+      log_info "S3 Bucket Name: $${BOLD}$TF_VAR_S3_BUCKET_NAME$${RESET}"
+      log_info "SQS Queue URL: $${BOLD}$TF_VAR_SQS_QUEUE_URL$${RESET}"
+      log_info "Telegram App URL: $${BOLD}$TF_VAR_TELEGRAM_APP_URL$${RESET}"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -846,10 +859,6 @@ resource "null_resource" "application_setup" {
         
         log_subheader "🔄 Skipping for now"
         log_info "Skipping application setup for now - it can be run later when cluster is ready."
-        log_info "You can manually run the setup later with:"
-        log_cmd_output "   kubectl --insecure-skip-tls-verify create namespace prod"
-        log_cmd_output "   kubectl --insecure-skip-tls-verify create namespace dev"
-        
         exit 0 # Exit gracefully instead of failing the deployment
       fi
 
@@ -950,9 +959,37 @@ resource "null_resource" "application_setup" {
           --from-file=ca.crt="$CA_FILE" -n "$namespace" \
           --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-ca secret in $namespace handled (may already exist)"
 
+        # ===== DOCKER REGISTRY CREDENTIALS =====
         log_step "Creating docker-registry-credentials secret"
-        # Docker registry secret for pulling images (proper dockerconfigjson type)
-        DUMMY_DOCKERCONFIGJSON='{"auths":{"https://index.docker.io/v1/":{"auth":"ZHVtbXk6ZHVtbXk="}}}'
+        
+        # Prepare Docker credentials - try to get from AWS secret first, fallback to placeholder
+        DOCKER_USERNAME="placeholder-docker-username"
+        DOCKER_PASSWORD="placeholder-docker-password"
+        
+        # If we successfully fetched AWS secrets (for prod namespace), try to extract docker credentials
+        if [[ "$namespace" == "prod" && -n "$POLYBOT_SECRET_JSON" ]]; then
+          AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKER_USERNAME // ""' 2>/dev/null)
+          AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKER_PASSWORD // ""' 2>/dev/null)
+          
+          if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" ]]; then
+            DOCKER_USERNAME="$AWS_DOCKER_USERNAME"
+            log_info "Using Docker username from AWS Secrets Manager"
+          fi
+          
+          if [[ -n "$AWS_DOCKER_PASSWORD" && "$AWS_DOCKER_PASSWORD" != "null" ]]; then
+            DOCKER_PASSWORD="$AWS_DOCKER_PASSWORD"
+            log_info "Using Docker password from AWS Secrets Manager"
+          fi
+        fi
+        
+        # Create the docker auth string
+        DOCKER_AUTH_ENCODED=$(echo -n "$${DOCKER_USERNAME}:$${DOCKER_PASSWORD}" | base64 -w0)
+        DOCKERCONFIGJSON="{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$DOCKER_AUTH_ENCODED\"}}}"
+        
+        # Delete existing secret if it exists (to handle type immutability issues)
+        kubectl --insecure-skip-tls-verify delete secret docker-registry-credentials -n "$namespace" --ignore-not-found=true 2>/dev/null
+        
+        # Create the secret using kubectl apply with YAML (more robust than create)
         cat <<EOF_DOCKER_SECRET | kubectl --insecure-skip-tls-verify apply -f -
 apiVersion: v1
 kind: Secret
@@ -961,25 +998,37 @@ metadata:
   namespace: $namespace
 type: kubernetes.io/dockerconfigjson
 data:
-  .dockerconfigjson: $(echo -n "$DUMMY_DOCKERCONFIGJSON" | base64 -w0)
+  .dockerconfigjson: $(echo -n "$DOCKERCONFIGJSON" | base64 -w0)
 EOF_DOCKER_SECRET
         if [ $? -eq 0 ]; then 
           log_success "docker-registry-credentials secret created/configured in $namespace"
+          if [[ "$DOCKER_USERNAME" == "placeholder-docker-username" ]]; then
+            log_warning "Using placeholder Docker credentials. Update if using private registry."
+          fi
         else 
           log_warning "Failed to create/configure docker-registry-credentials in $namespace"
         fi
 
+        # ===== POLYBOT APPLICATION SECRETS =====
         log_step "Creating application secrets for namespace: $namespace"
         
-        # NEW: AWS Secrets Manager Integration for Polybot Secrets
+        # For prod namespace: Combine static AWS secrets with dynamic Terraform values
         if [[ "$namespace" == "prod" ]]; then
-          log_subheader "🔐 Fetching Polybot secrets from AWS Secrets Manager"
-          log_step "Fetching Polybot secrets from AWS Secrets Manager (secret: $POLYBOT_AWS_SECRET_NAME)"
+          log_subheader "🔐 Hybrid Secret Creation: AWS Static + Terraform Dynamic"
+          
+          # Validate placeholder replacement
+          if [[ "$POLYBOT_AWS_SECRET_NAME" == "YOUR_ACTUAL_AWS_SECRET_NAME_HERE" ]]; then
+            log_error "CRITICAL: You must replace 'YOUR_ACTUAL_AWS_SECRET_NAME_HERE' with your actual AWS Secrets Manager secret name!"
+            log_error "Example: POLYBOT_AWS_SECRET_NAME='polybot-prod-secrets'"
+            log_error "The AWS secret should contain static keys like: TELEGRAM_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MONGO_URI, etc."
+            log_error "Skipping prod/polybot-secrets creation until you configure the correct AWS secret name."
+            continue
+          fi
           
           # Check if jq is available
           if ! command -v jq >/dev/null 2>&1; then
             log_error "jq is not installed. jq is required to parse JSON from AWS Secrets Manager."
-            log_info "Installing jq or use fallback approach..."
+            log_info "Installing jq..."
             # Try to install jq if possible
             if command -v apt-get >/dev/null 2>&1; then
               log_step "Attempting to install jq via apt-get"
@@ -994,125 +1043,142 @@ EOF_DOCKER_SECRET
             
             # Check again if jq is now available
             if ! command -v jq >/dev/null 2>&1; then
-              log_error "jq installation failed. Falling back to placeholder secrets for $namespace."
-              # Fallback to placeholder approach
-              kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-                --from-literal=s3_bucket_name='YOUR_S3_BUCKET_NAME_PLACEHOLDER' \
-                --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
-                --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
-                --from-literal=TELEGRAM_APP_URL='YOUR_TELEGRAM_APP_URL_PLACEHOLDER' \
-                --from-literal=AWS_ACCESS_KEY_ID='YOUR_AWS_ACCESS_KEY_ID_PLACEHOLDER' \
-                --from-literal=AWS_SECRET_ACCESS_KEY='YOUR_AWS_SECRET_ACCESS_KEY_PLACEHOLDER' \
-                --from-literal=MONGO_COLLECTION='YOUR_MONGO_COLLECTION_PLACEHOLDER' \
-                --from-literal=MONGO_DB='YOUR_MONGO_DB_PLACEHOLDER' \
-                --from-literal=MONGO_URI='YOUR_MONGO_URI_PLACEHOLDER' \
-                --from-literal=POLYBOT_URL='YOUR_POLYBOT_URL_PLACEHOLDER' \
-                -n "$namespace" \
-                --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
-              log_warning "Using placeholder secrets. You must update them manually with actual values."
-              continue
+              log_error "jq installation failed. Cannot parse AWS Secrets Manager JSON without jq."
+              log_error "Please install jq manually: apt-get install jq OR yum install jq OR brew install jq"
+              exit 1
             fi
           fi
           
-          # Fetch secrets from AWS Secrets Manager
-          log_progress "Fetching secrets from AWS Secrets Manager"
+          log_step "Fetching static secrets from AWS Secrets Manager (secret: $POLYBOT_AWS_SECRET_NAME)"
+          log_info "AWS CLI command: aws secretsmanager get-secret-value --secret-id '$POLYBOT_AWS_SECRET_NAME' --region '$AWS_REGION_FOR_SECRETS'"
+          
+          # Fetch secrets from AWS Secrets Manager with detailed error handling
           POLYBOT_SECRET_JSON=$(aws secretsmanager get-secret-value \
             --secret-id "$POLYBOT_AWS_SECRET_NAME" \
-            --region "$AWS_REGION" \
+            --region "$AWS_REGION_FOR_SECRETS" \
             --query SecretString \
-            --output text 2>/dev/null)
+            --output text 2>&1)
           
           AWS_FETCH_EXIT_CODE=$?
           
           if [[ $AWS_FETCH_EXIT_CODE -eq 0 && -n "$POLYBOT_SECRET_JSON" && "$POLYBOT_SECRET_JSON" != "null" ]]; then
-            log_success "Successfully retrieved Polybot secrets JSON from AWS Secrets Manager."
+            log_success "Successfully retrieved static secrets JSON from AWS Secrets Manager."
             
-            # Create a temporary .env file
-            TEMP_ENV_FILE=$(mktemp "/tmp/polybot_prod_secrets.XXXXXX.env")
-            log_step "Creating temporary .env file at: $TEMP_ENV_FILE"
+            # Prepare --from-literal arguments for static secrets
+            log_step "Extracting static secrets from AWS JSON"
+            LITERAL_ARGS=""
             
-            # Parse JSON and create .env file
-            if echo "$POLYBOT_SECRET_JSON" | jq -r 'to_entries|map("\(.key)=\(.value|tostring)")|.[]' > "$TEMP_ENV_FILE" 2>/dev/null; then
-              # Verify the .env file was created and has content
-              if [[ -s "$TEMP_ENV_FILE" ]]; then
-                log_success "Temporary .env file created successfully with secrets."
-                log_info "Number of secrets parsed: $(wc -l < "$TEMP_ENV_FILE")"
-                
-                # Show first few entries for verification (without values for security)
-                log_info "First few secret keys found:"
-                head -5 "$TEMP_ENV_FILE" | cut -d'=' -f1 | while read -r key; do
-                  log_info "   • $key"
-                done
-                
-                log_step "Creating/Updating Kubernetes secret 'polybot-secrets' in namespace '$namespace' from .env file"
-                if kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-                    --from-env-file="$TEMP_ENV_FILE" \
-                    -n "$namespace" \
-                    --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null; then
-                  log_success "Kubernetes secret '$namespace/polybot-secrets' created/updated from AWS Secrets Manager."
-                  
-                  # Verify the secret was created with expected keys
-                  log_step "Verifying secret keys in Kubernetes"
-                  SECRET_KEYS=$(kubectl --insecure-skip-tls-verify get secret polybot-secrets -n "$namespace" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null | sort || echo "")
-                  if [[ -n "$SECRET_KEYS" ]]; then
-                    log_success "Secret verification - Found keys:"
-                    echo "$SECRET_KEYS" | while read -r key; do
-                      log_info "   ✓ $key"
-                    done
-                  else
-                    log_warning "Could not verify secret keys (kubectl or jq may have failed)"
-                  fi
-                else
-                  log_error "Failed to create/update Kubernetes secret '$namespace/polybot-secrets'."
-                fi
-                
-                # Clean up temp file
-                rm -f "$TEMP_ENV_FILE"
-                log_step "Cleaned up temporary .env file"
+            # Define list of static keys expected from AWS Secrets Manager
+            # User should ensure these exact keys (case-sensitive) exist in their AWS Secret JSON
+            STATIC_KEYS_TO_FETCH="TELEGRAM_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY MONGO_URI MONGO_DB MONGO_COLLECTION POLYBOT_URL"
+            
+            MISSING_STATIC_KEYS=""
+            for key in $STATIC_KEYS_TO_FETCH; do
+              value=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".${key} // \"\"" 2>/dev/null)
+              if [[ -n "$value" && "$value" != "null" ]]; then
+                LITERAL_ARGS="$LITERAL_ARGS --from-literal=${key}=$value"
+                log_info "   ✓ $key (from AWS)"
               else
-                log_error "Temporary .env file was created but is empty. JSON parsing may have failed."
-                rm -f "$TEMP_ENV_FILE"
+                log_warning "   ✗ $key not found or empty in AWS Secret JSON"
+                MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS $key"
+              fi
+            done
+            
+            # Add dynamic values from Terraform outputs
+            log_step "Adding dynamic secrets from Terraform deployment"
+            if [[ -n "$TF_VAR_S3_BUCKET_NAME" && "$TF_VAR_S3_BUCKET_NAME" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=S3_BUCKET_NAME=$TF_VAR_S3_BUCKET_NAME"
+              log_info "   ✓ S3_BUCKET_NAME (from Terraform)"
+            else
+              log_warning "   ✗ TF_VAR_S3_BUCKET_NAME not set for prod/polybot-secrets"
+              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS S3_BUCKET_NAME"
+            fi
+            
+            if [[ -n "$TF_VAR_SQS_QUEUE_URL" && "$TF_VAR_SQS_QUEUE_URL" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=SQS_QUEUE_URL=$TF_VAR_SQS_QUEUE_URL"
+              log_info "   ✓ SQS_QUEUE_URL (from Terraform)"
+            else
+              log_warning "   ✗ TF_VAR_SQS_QUEUE_URL not set for prod/polybot-secrets"
+              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS SQS_QUEUE_URL"
+            fi
+            
+            if [[ -n "$TF_VAR_TELEGRAM_APP_URL" && "$TF_VAR_TELEGRAM_APP_URL" != "null" ]]; then
+              LITERAL_ARGS="$LITERAL_ARGS --from-literal=TELEGRAM_APP_URL=$TF_VAR_TELEGRAM_APP_URL"
+              log_info "   ✓ TELEGRAM_APP_URL (from Terraform)"
+            else
+              log_warning "   ✗ TF_VAR_TELEGRAM_APP_URL not set for prod/polybot-secrets"
+              MISSING_STATIC_KEYS="$MISSING_STATIC_KEYS TELEGRAM_APP_URL"
+            fi
+            
+            # Check if we have sufficient secrets to proceed
+            if [[ -n "$MISSING_STATIC_KEYS" ]]; then
+              log_warning "Some required secrets are missing: $MISSING_STATIC_KEYS"
+              log_info "The application may not function correctly without these values."
+            fi
+            
+            # Create the Kubernetes Secret with all gathered secrets
+            if [[ -n "$LITERAL_ARGS" ]]; then
+              log_step "Creating/Updating Kubernetes secret 'polybot-secrets' in namespace 'prod'"
+              
+              # Delete existing secret first to ensure clean application of all keys
+              kubectl --insecure-skip-tls-verify delete secret polybot-secrets -n prod --ignore-not-found=true 2>/dev/null
+              
+              # Create with all gathered literals. Note: $LITERAL_ARGS should not be quoted here to allow word splitting.
+              # shellcheck disable=SC2086
+              if kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+                  $LITERAL_ARGS \
+                  -n prod 2>/dev/null; then
+                log_success "Kubernetes secret 'prod/polybot-secrets' created successfully with hybrid static+dynamic secrets."
+                
+                # Verify the secret was created with expected keys
+                log_step "Verifying secret keys in Kubernetes"
+                SECRET_KEYS=$(kubectl --insecure-skip-tls-verify get secret polybot-secrets -n prod -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null | sort || echo "")
+                if [[ -n "$SECRET_KEYS" ]]; then
+                  SECRET_COUNT=$(echo "$SECRET_KEYS" | wc -l)
+                  log_success "Secret verification - Found $SECRET_COUNT keys:"
+                  echo "$SECRET_KEYS" | while read -r key; do
+                    log_info "     ✓ $key"
+                  done
+                else
+                  log_warning "Could not verify secret keys (kubectl or jq may have failed)"
+                fi
+              else
+                log_error "Failed to create Kubernetes secret 'prod/polybot-secrets'."
+                exit 1
               fi
             else
-              log_error "Failed to parse secrets JSON with jq. The JSON may be malformed or jq failed."
-              log_info "Raw JSON (first 200 chars): $${POLYBOT_SECRET_JSON:0:200}..."
-              rm -f "$TEMP_ENV_FILE"
+              log_error "No secret data prepared for prod/polybot-secrets. Both AWS fetch and Terraform variables failed."
+              exit 1
             fi
           else
-            log_error "Failed to retrieve secrets for Polybot from AWS Secrets Manager: $POLYBOT_AWS_SECRET_NAME"
-            log_error "AWS CLI exit code: $AWS_FETCH_EXIT_CODE"
-            log_info "Possible causes:"
-            log_info "   • Secret name '$POLYBOT_AWS_SECRET_NAME' does not exist"
-            log_info "   • Insufficient IAM permissions to access Secrets Manager"
-            log_info "   • Secret is in a different AWS region"
-            log_info "   • AWS CLI is not properly configured"
-            log_info ""
-            log_info "Creating placeholder secret for now. You MUST update it with actual values:"
-            
-            # Fallback to comprehensive placeholder secret
-            kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-              --from-literal=s3_bucket_name='YOUR_S3_BUCKET_NAME_PLACEHOLDER' \
-              --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
-              --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
-              --from-literal=TELEGRAM_APP_URL='YOUR_TELEGRAM_APP_URL_PLACEHOLDER' \
-              --from-literal=AWS_ACCESS_KEY_ID='YOUR_AWS_ACCESS_KEY_ID_PLACEHOLDER' \
-              --from-literal=AWS_SECRET_ACCESS_KEY='YOUR_AWS_SECRET_ACCESS_KEY_PLACEHOLDER' \
-              --from-literal=MONGO_COLLECTION='YOUR_MONGO_COLLECTION_PLACEHOLDER' \
-              --from-literal=MONGO_DB='YOUR_MONGO_DB_PLACEHOLDER' \
-              --from-literal=MONGO_URI='YOUR_MONGO_URI_PLACEHOLDER' \
-              --from-literal=POLYBOT_URL='YOUR_POLYBOT_URL_PLACEHOLDER' \
-              -n "$namespace" \
-              --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+            log_error "FAILED to retrieve secrets from AWS Secrets Manager!"
+            log_error "Secret Name: '$POLYBOT_AWS_SECRET_NAME'"
+            log_error "Region: '$AWS_REGION_FOR_SECRETS'"
+            log_error "AWS CLI Exit Code: $AWS_FETCH_EXIT_CODE"
+            log_error "Raw Output: $POLYBOT_SECRET_JSON"
+            log_error ""
+            log_error "Troubleshooting Steps:"
+            log_error "  1. Ensure the AWS Secret '$POLYBOT_AWS_SECRET_NAME' exists in region '$AWS_REGION_FOR_SECRETS'"
+            log_error "  2. Verify the secret value is a valid JSON object with required keys"
+            log_error "  3. Check that the Terraform execution role has 'secretsmanager:GetSecretValue' permissions"
+            log_error "  4. Confirm AWS CLI is properly configured with correct credentials"
+            log_error "  5. Test manually: aws secretsmanager get-secret-value --secret-id '$POLYBOT_AWS_SECRET_NAME' --region '$AWS_REGION_FOR_SECRETS'"
+            log_error ""
+            log_error "Required JSON structure in AWS Secret:"
+            log_error '  {"TELEGRAM_TOKEN":"your-token","AWS_ACCESS_KEY_ID":"your-key","AWS_SECRET_ACCESS_KEY":"your-secret","MONGO_URI":"your-uri","MONGO_DB":"your-db","MONGO_COLLECTION":"your-collection","POLYBOT_URL":"your-url"}'
+            log_error ""
+            log_error "DEPLOYMENT WILL FAIL - Fix AWS Secrets Manager configuration and retry."
+            exit 1
           fi
         else
           # For dev and other namespaces, use simplified secrets (or fetch from different AWS secret if needed)
           log_info "For namespace '$namespace': Creating basic application secrets (not fetching from AWS Secrets Manager)"
+          kubectl --insecure-skip-tls-verify delete secret polybot-secrets -n "$namespace" --ignore-not-found=true 2>/dev/null
           kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
             --from-literal=app-secret='default-app-secret-value' \
             --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
             --from-literal=redis-url='redis://your-redis-host:6379/0' \
-            -n "$namespace" \
-            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+            -n "$namespace" 2>/dev/null || log_warning "Failed to create basic polybot-secrets in $namespace"
         fi
 
         log_success "Secrets processed for $${BOLD}$namespace$${RESET}"
@@ -1232,19 +1298,19 @@ EOF_DOCKER_SECRET
           log_success "MongoDB ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
-          log_info "MongoDB application.yaml already includes CreateNamespace=true for 'mongodb' namespace"
-          log_info "If MongoDB shows StorageClass parameter conflicts in ArgoCD:"
-          log_info "  1. Check existing StorageClass: kubectl get sc mongodb-storage -o yaml"
-          log_info "  2. Compare with k8s/MongoDB/storageclass.yaml in Git"
-          log_info "  3. If Git version is correct, manually delete existing: kubectl delete sc mongodb-storage"
-          log_info "  4. ArgoCD will recreate it correctly on next sync"
         fi
+        log_info "MongoDB application.yaml includes CreateNamespace=true for 'mongodb' namespace"
+        log_info "If MongoDB shows StorageClass parameter conflicts in ArgoCD:"
+        log_info "  1. Check existing StorageClass: kubectl get sc mongodb-storage -o yaml"
+        log_info "  2. Compare with k8s/MongoDB/storageclass.yaml in Git"
+        log_info "  3. If Git version is correct, manually delete existing: kubectl delete sc mongodb-storage"
+        log_info "  4. ArgoCD will recreate it correctly on next sync"
       else
         log_info "MongoDB application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/MongoDB/application.yaml"
       fi
 
       # Check for Polybot application file
-      log_step "Checking for Polybot ArgoCD Application"
+      log_step "Applying individual Polybot ArgoCD Application"
       if [[ -f "$TERRAFORM_EXEC_DIR/../k8s/Polybot/application.yaml" ]]; then
         if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/../k8s/Polybot/application.yaml" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
           log_success "Polybot ArgoCD Application applied successfully"
@@ -1253,10 +1319,11 @@ EOF_DOCKER_SECRET
         fi
       else
         log_warning "Polybot application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/Polybot/application.yaml"
+        log_info "This file should be created to deploy Polybot application"
       fi
 
-      # Check for Yolo5 application file (note: directory is Yolo5, not YOLOv5)
-      log_step "Checking for Yolo5 ArgoCD Application"
+      # Check for Yolo5 application file
+      log_step "Applying individual Yolo5 ArgoCD Application"
       if [[ -f "$TERRAFORM_EXEC_DIR/../k8s/Yolo5/application.yaml" ]]; then
         if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/../k8s/Yolo5/application.yaml" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
           log_success "Yolo5 ArgoCD Application applied successfully"
@@ -1265,6 +1332,7 @@ EOF_DOCKER_SECRET
         fi
       else
         log_warning "Yolo5 application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/Yolo5/application.yaml"
+        log_info "This file should be created to deploy Yolo5 application"
       fi
 
       # Check for any other application.yaml files in subdirectories
@@ -1321,20 +1389,22 @@ EOF_DOCKER_SECRET
       log_success "Application setup and ArgoCD deployment completed successfully"
       
       log_subheader "🔧 Post-Deployment Action Items Required"
-      log_warning "IMPORTANT: Configure AWS Secrets Manager secret name"
-      log_info "1. Update the AWS Secrets Manager secret name in this script:"
-      log_cmd_output "   Replace 'name-of-your-aws-secret-for-polybot' with your actual AWS secret name"
-      log_info "2. Ensure your AWS secret contains all required Polybot keys:"
-      log_cmd_output "   s3_bucket_name, sqs_queue_url, telegram_token, TELEGRAM_APP_URL,"
-      log_cmd_output "   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MONGO_COLLECTION,"
-      log_cmd_output "   MONGO_DB, MONGO_URI, POLYBOT_URL"
-      log_info "3. Verify application status:"
+      log_warning "IMPORTANT: Complete AWS Secrets Manager Configuration"
+      log_info "1. ✅ Replace AWS secret name in this script:"
+      log_cmd_output "   Change 'YOUR_ACTUAL_AWS_SECRET_NAME_HERE' to your actual AWS secret name"
+      log_info "2. ✅ Ensure your AWS secret contains required static keys:"
+      log_cmd_output "   TELEGRAM_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,"
+      log_cmd_output "   MONGO_URI, MONGO_DB, MONGO_COLLECTION, POLYBOT_URL"
+      log_info "3. ✅ Update SQS Queue URL in environment variables (TF_VAR_SQS_QUEUE_URL)"
+      log_info "4. ✅ Verify application status:"
       log_cmd_output "   kubectl --insecure-skip-tls-verify get applications -n argocd"
       log_cmd_output "   kubectl --insecure-skip-tls-verify get pods -n prod"
-      log_info "4. If StorageClass conflicts occur for MongoDB:"
+      log_info "5. ✅ If StorageClass conflicts occur for MongoDB:"
       log_cmd_output "   kubectl delete sc mongodb-storage  # if parameters differ from Git"
-      log_info "5. Check secret was populated correctly:"
+      log_info "6. ✅ Check secret was populated correctly:"
       log_cmd_output "   kubectl --insecure-skip-tls-verify get secret polybot-secrets -n prod -o jsonpath='{.data}' | jq 'keys'"
+      log_info "7. ✅ Create missing application.yaml files:"
+      log_cmd_output "   k8s/Polybot/application.yaml and k8s/Yolo5/application.yaml"
     EOT
   }
 }
