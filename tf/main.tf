@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v26-domain-url-fix" # CRITICAL FIXES: SSL certificate fix + correct domain guy-polybot.devops-int-college.com
+    setup_version    = "v27-critical-aws-region-fix" # CRITICAL FIXES: SSL + Domain + AWS Region (us-east-1 vs eu-north-1)
   }
 
   provisioner "local-exec" {
@@ -826,7 +826,7 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v26 (CRITICAL: Case-Mapping + SSL + Domain URL Fix)"
+      log_header "🔐 Application Setup v27 (CRITICAL: Case-Mapping + SSL + Domain + AWS Region Fix)"
 
       # AWS Configuration & User Settings
       AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
@@ -1154,6 +1154,10 @@ EOF_DOCKER_SECRET
             
             # ===== DYNAMIC VALUES WITH TERRAFORM PRIORITY =====
             log_info "Adding dynamic values (Terraform outputs override AWS placeholders):"
+            
+            # AWS_REGION: Critical for Polybot application to use correct region for AWS services
+            echo "aws_region=$${TF_VAR_AWS_REGION}" >> "$TEMP_ENV_FILE_PROD"
+            log_info "   ✓ aws_region (from Terraform: $TF_VAR_AWS_REGION) - CRITICAL: Overrides hardcoded eu-north-1"
             
             # S3_BUCKET_NAME: Use Terraform value if available, fallback to AWS
             if [[ -n "$TF_VAR_S3_BUCKET_NAME" && "$TF_VAR_S3_BUCKET_NAME" != "null" ]]; then
