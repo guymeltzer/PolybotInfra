@@ -9,8 +9,13 @@ spec:
   source:
     repoURL: https://github.com/guymeltzer/PolybotInfra.git
     path: k8s/MongoDB
+    targetRevision: HEAD
   destination:
     server: https://kubernetes.default.svc
     namespace: mongodb
   syncPolicy:
-    automated: {}
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true

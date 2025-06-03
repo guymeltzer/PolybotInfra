@@ -5,8 +5,10 @@ metadata:
   annotations:
     storageclass.kubernetes.io/is-default-class: "false"
     # ArgoCD annotations to handle immutable StorageClass parameters
-    argocd.argoproj.io/sync-options: Prune=false,ServerSideApply=true
+    argocd.argoproj.io/sync-options: Prune=false,ServerSideApply=true,Replace=false
     argocd.argoproj.io/compare-options: IgnoreExtraneous
+    # Additional annotation to help with parameter conflicts
+    argocd.argoproj.io/sync-wave: "-1"
 provisioner: ebs.csi.aws.com
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Retain

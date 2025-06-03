@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v19-fixed-secrets-and-storageclass" # FIXED: Added docker-registry-credentials and telegram_token secrets, fixed MongoDB StorageClass with ArgoCD annotations, enhanced application deployment strategy
+    setup_version    = "v20-fixed-all-secret-keys-and-imagepull" # FIXED: Added sqs_queue_url to polybot-secrets, fixed docker-registry-credentials secret type, enhanced MongoDB StorageClass handling, added comprehensive user guidance
   }
 
   provisioner "local-exec" {
@@ -940,26 +940,38 @@ resource "null_resource" "application_setup" {
           --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-ca secret in $namespace handled (may already exist)"
 
         log_step "Creating docker-registry-credentials secret"
-        # Docker registry secret for pulling images
+        # Docker registry secret for pulling images (proper dockerconfigjson type)
         DUMMY_DOCKERCONFIGJSON='{"auths":{"https://index.docker.io/v1/":{"auth":"ZHVtbXk6ZHVtbXk="}}}'
-        kubectl --insecure-skip-tls-verify create secret generic docker-registry-credentials \
-          --from-literal=.dockerconfigjson="$DUMMY_DOCKERCONFIGJSON" \
-          -n "$namespace" \
-          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "docker-registry-credentials secret in $namespace handled (may already exist)"
+        cat <<EOF_DOCKER_SECRET | kubectl --insecure-skip-tls-verify apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: docker-registry-credentials
+  namespace: $namespace
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $(echo -n "$DUMMY_DOCKERCONFIGJSON" | base64 -w0)
+EOF_DOCKER_SECRET
+        if [ $? -eq 0 ]; then 
+          log_success "docker-registry-credentials secret created/configured in $namespace"
+        else 
+          log_warning "Failed to create/configure docker-registry-credentials in $namespace"
+        fi
 
         log_step "Creating application secrets"
         # Application secrets with telegram_token for Polybot
         if [[ "$namespace" == "prod" ]]; then
-          # For prod namespace, include telegram_token
+          # For prod namespace, include telegram_token and sqs_queue_url
           kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
             --from-literal=app-secret='default-app-secret-value' \
             --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
             --from-literal=redis-url='redis://your-redis-host:6379/0' \
             --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
+            --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
             -n "$namespace" \
             --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
         else
-          # For other namespaces, standard secrets without telegram_token
+          # For other namespaces, standard secrets without telegram_token and sqs_queue_url
           kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
             --from-literal=app-secret='default-app-secret-value' \
             --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
@@ -1085,6 +1097,11 @@ resource "null_resource" "application_setup" {
           log_success "MongoDB ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
+          log_info "If MongoDB shows StorageClass parameter conflicts in ArgoCD:"
+          log_info "  1. Check existing StorageClass: kubectl get sc mongodb-storage -o yaml"
+          log_info "  2. Compare with k8s/MongoDB/storageclass.yaml in Git"
+          log_info "  3. If Git version is correct, manually delete existing: kubectl delete sc mongodb-storage"
+          log_info "  4. ArgoCD will recreate it correctly on next sync"
         fi
       else
         log_info "MongoDB application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/MongoDB/application.yaml"
@@ -1218,6 +1235,18 @@ resource "null_resource" "application_setup" {
       fi
 
       log_success "Application setup and ArgoCD deployment completed successfully"
+      
+      log_subheader "🔧 Post-Deployment Action Items Required"
+      log_warning "IMPORTANT: Replace placeholder values in secrets with actual credentials"
+      log_info "1. Update Telegram Token:"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify patch secret polybot-secrets -n prod -p '{\"data\":{\"telegram_token\":\"'$$(echo -n \"YOUR_ACTUAL_TELEGRAM_TOKEN\" | base64)'\"}}"
+      log_info "2. Update SQS Queue URL:"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify patch secret polybot-secrets -n prod -p '{\"data\":{\"sqs_queue_url\":\"'$$(echo -n \"YOUR_ACTUAL_SQS_QUEUE_URL\" | base64)'\"}}"
+      log_info "3. Update Docker Registry Credentials (if using private registry):"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify create secret docker-registry docker-registry-credentials --docker-server=your-registry --docker-username=your-user --docker-password=your-pass -n prod --dry-run=client -o yaml | kubectl apply -f -"
+      log_info "4. Verify application status:"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify get applications -n argocd"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify get pods -n prod"
     EOT
   }
 }
