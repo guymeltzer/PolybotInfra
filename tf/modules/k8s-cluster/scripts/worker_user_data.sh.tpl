@@ -13,10 +13,9 @@ chmod 644 "$WORKER_BOOTSTRAP_LOG" "$CLOUD_INIT_LOG"
 exec > >(tee -a "$WORKER_BOOTSTRAP_LOG" "$CLOUD_INIT_LOG") 2>&1
 
 echo "================================================================="
-echo "= KUBERNETES WORKER NODE BOOTSTRAP - STARTED (TEMPLATE v1)   ="
-echo "= Template Variables Used (examples):                           ="
-echo "=   K8S Version Full:    ${K8S_VERSION_FULL}"
-echo "=   K8S Major.Minor:     ${K8S_MAJOR_MINOR}"
+echo "= KUBERNETES WORKER NODE BOOTSTRAP SCRIPT (TEMPLATE VERSION) ="
+echo "================================================================="
+echo "= K8S Major.Minor:       ${K8S_MAJOR_MINOR}"
 echo "=   K8S Package Version: ${K8S_PACKAGE_VERSION}"
 echo "=   Region:              ${REGION}"
 echo "=   Cluster Name:        ${CLUSTER_NAME}"
@@ -24,8 +23,16 @@ echo "=   Join Secret Name:    ${TF_JOIN_COMMAND_LATEST_SECRET_NAME}"
 echo "=   Control Plane IP:    ${TF_CONTROL_PLANE_PRIVATE_IP} (Note: kubeadm join uses discovery, not this IP directly)"
 echo "================================================================="
 echo "= Current Time (UTC):    $(date -u)"
-echo "= Instance ID:         $(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown')"
-echo "= Private IP (metadata): $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo 'unknown')"
+
+# Get IMDSv2 token for instance metadata
+IMDS_TOKEN_INITIAL=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+if [ -n "$IMDS_TOKEN_INITIAL" ]; then
+    echo "= Instance ID:         $(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN_INITIAL" -s "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || echo 'unknown')"
+    echo "= Private IP (metadata): $(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN_INITIAL" -s "http://169.254.169.254/latest/meta-data/local-ipv4" 2>/dev/null || echo 'unknown')"
+else
+    echo "= Instance ID:         $(echo 'unknown - IMDS token failed')"
+    echo "= Private IP (metadata): $(echo 'unknown - IMDS token failed')"
+fi
 echo "================================================================="
 
 # Error handling function
@@ -48,7 +55,15 @@ error_exit() {
     if [ -n "${TF_S3_WORKER_LOGS_BUCKET}" ] && [ -n "${TF_WORKER_ASG_NAME}" ] && command -v aws >/dev/null && aws sts get-caller-identity >/dev/null 2>&1; then
         S3_LOG_BUCKET_NAME="${TF_S3_WORKER_LOGS_BUCKET}"
         ASG_NAME_LOG="${TF_WORKER_ASG_NAME}"
-        INSTANCE_ID_FOR_LOG="$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'unknown-instance')"
+        
+        # Get instance ID using IMDSv2
+        IMDS_TOKEN_ERROR=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "")
+        if [ -n "$IMDS_TOKEN_ERROR" ]; then
+            INSTANCE_ID_FOR_LOG="$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN_ERROR" -s "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || echo 'unknown-instance')"
+        else
+            INSTANCE_ID_FOR_LOG="unknown-instance-no-token"
+        fi
+        
         LOG_S3_KEY="worker-node-failures/$ASG_NAME_LOG/$INSTANCE_ID_FOR_LOG-bootstrap-$(date +%Y%m%d%H%M%S).log"
         echo "Attempting to upload full log to s3://$S3_LOG_BUCKET_NAME/$LOG_S3_KEY"
         aws s3 cp "$WORKER_BOOTSTRAP_LOG" "s3://$S3_LOG_BUCKET_NAME/$LOG_S3_KEY" --region "${REGION}" || echo "Warning: Failed to upload full debug log to S3."
@@ -212,7 +227,16 @@ echo "✅ Kubernetes components installed and verified."
 # Step 5: Configure Kubelet (Worker specific)
 echo ""
 echo "🛠️  STEP 5: Configuring Kubelet for worker node..."
-PRIVATE_IP="$(curl -fsSL http://169.254.169.254/latest/meta-data/local-ipv4)"
+
+# Get IMDSv2 token first, then use it to get private IP
+echo "   Getting IMDSv2 session token..."
+IMDS_TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null)
+if [ -z "$IMDS_TOKEN" ]; then
+    error_exit "Failed to retrieve IMDSv2 session token"
+fi
+
+echo "   Retrieving private IP using IMDSv2..."
+PRIVATE_IP="$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -fsSL "http://169.254.169.254/latest/meta-data/local-ipv4" 2>/dev/null)"
 if [ -z "$PRIVATE_IP" ]; then
     error_exit "Failed to retrieve private IP for Kubelet configuration on worker."
 fi
