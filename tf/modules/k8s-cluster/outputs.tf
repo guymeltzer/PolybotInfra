@@ -207,6 +207,36 @@ output "worker_iam_role_name" {
   value       = aws_iam_role.worker_role.name
 }
 
+output "control_plane_security_group_id" {
+  description = "ID of the security group for the control plane" #OUTPUT
+  value       = aws_security_group.control_plane_sg.id
+}
+
+output "worker_security_group_id" {
+  description = "ID of the security group for worker nodes" #OUTPUT
+  value       = aws_security_group.worker_sg.id
+}
+
+output "alb_security_group_id" {
+  description = "ID of the security group for the Application Load Balancer" #OUTPUT
+  value       = aws_security_group.alb_sg.id
+}
+
+output "sns_topic_arn" {
+  description = "ARN of the SNS topic for ASG lifecycle events" #OUTPUT
+  value       = aws_sns_topic.lifecycle_topic.arn
+}
+
+output "asg_scale_up_hook_name" {
+  description = "Name of the ASG scale-up lifecycle hook" #OUTPUT
+  value       = aws_autoscaling_lifecycle_hook.scale_up_hook.name
+}
+
+output "asg_scale_down_hook_name" {
+  description = "Name of the ASG scale-down lifecycle hook" #OUTPUT
+  value       = aws_autoscaling_lifecycle_hook.scale_down_hook.name
+}
+
 output "control_plane_instance" {
   description = "Control plane EC2 instance resource" #OUTPUT
   value       = aws_instance.control_plane

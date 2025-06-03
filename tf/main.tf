@@ -831,11 +831,18 @@ resource "null_resource" "application_setup" {
       # AWS Configuration & User Settings
       AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
       
-      # *** CRITICAL USER CONFIGURATION REQUIRED ***
-      # TODO: Replace this with your actual AWS Secrets Manager secret name that contains static Polybot configuration
+      # AWS Secrets Manager secret name for static Polybot configuration
       POLYBOT_AWS_SECRET_NAME="polybot-secrets"
       
-      log_warning "🚨 CRITICAL: You MUST replace 'YOUR_ACTUAL_AWS_SECRET_NAME_HERE' with your actual AWS Secrets Manager secret name!"
+      # Validate that the secret name has been properly configured
+      if [[ "$POLYBOT_AWS_SECRET_NAME" == "YOUR_ACTUAL_AWS_SECRET_NAME_HERE" ]]; then
+        log_error "CRITICAL: AWS secret name is still set to placeholder value!"
+        log_error "The POLYBOT_AWS_SECRET_NAME variable must be updated with your actual AWS Secrets Manager secret name."
+        log_error "Current value: $POLYBOT_AWS_SECRET_NAME"
+        exit 1
+      fi
+      
+      log_success "AWS Secrets Manager Configuration Validated"
       log_info "AWS Region for Secrets: $AWS_REGION_FOR_SECRETS"
       log_info "Polybot AWS Secret Name: $${BOLD}$POLYBOT_AWS_SECRET_NAME$${RESET}"
       
@@ -1613,30 +1620,59 @@ resource "null_resource" "deployment_summary" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     environment = {
-      TF_VAR_REGION                 = var.region
+      # Core Infrastructure
+      TF_VAR_AWS_REGION             = var.region
       TF_VAR_CLUSTER_NAME           = local.cluster_name
       TF_VAR_VPC_ID                 = module.k8s-cluster.vpc_id_output
-      TF_VAR_CONTROL_PLANE_IP       = module.k8s-cluster.control_plane_public_ip_output
+      TF_VAR_PUBLIC_SUBNET_IDS      = join(",", module.k8s-cluster.public_subnet_ids)
+      TF_VAR_PRIVATE_SUBNET_IDS     = join(",", module.k8s-cluster.private_subnet_ids)
+      
+      # Control Plane Details
       TF_VAR_CONTROL_PLANE_ID       = module.k8s-cluster.control_plane_instance_id_output
+      TF_VAR_CONTROL_PLANE_IP       = module.k8s-cluster.control_plane_public_ip_output
       TF_VAR_CONTROL_PLANE_PRIVATE_IP = module.k8s-cluster.control_plane_private_ip
       TF_VAR_SSH_KEY_NAME           = module.k8s-cluster.ssh_key_name_output
+      
+      # Worker Node Infrastructure
       TF_VAR_WORKER_ASG_NAME        = module.k8s-cluster.worker_asg_name_output
       TF_VAR_LAUNCH_TEMPLATE_ID     = module.k8s-cluster.worker_launch_template_id
+      
+      # Load Balancer & Networking
       TF_VAR_ALB_DNS_NAME           = module.k8s-cluster.alb_dns_name_output
       TF_VAR_ALB_ZONE_ID            = module.k8s-cluster.alb_zone_id
       TF_VAR_DOMAIN_NAME            = var.domain_name
+      TF_VAR_APPLICATION_URL        = "https://${var.domain_name}"
+      
+      # Security Groups
+      TF_VAR_CP_SG_ID               = module.k8s-cluster.control_plane_security_group_id
+      TF_VAR_WORKER_SG_ID           = module.k8s-cluster.worker_security_group_id
+      TF_VAR_ALB_SG_ID              = module.k8s-cluster.alb_security_group_id
+      
+      # IAM Roles
       TF_VAR_CP_IAM_ROLE_ARN        = module.k8s-cluster.control_plane_iam_role_arn
-      # TODO: Verify correct output name from module.k8s-cluster for worker IAM role
-      # TF_VAR_WORKER_IAM_ROLE_ARN    = module.k8s-cluster.worker_iam_role_arn_output
-      # TODO: Verify correct output name from module.k8s-cluster for lambda function name
-      # TF_VAR_LAMBDA_FUNCTION_NAME   = module.k8s-cluster.lambda_function_name_output
-      # TODO: Verify correct output name from module.k8s-cluster for SNS topic ARN
-      # TF_VAR_SNS_TOPIC_ARN          = module.k8s-cluster.sns_topic_arn_output
+      TF_VAR_WORKER_IAM_ROLE_ARN    = module.k8s-cluster.worker_iam_role_arn
+      TF_VAR_WORKER_IAM_ROLE_NAME   = module.k8s-cluster.worker_iam_role_name
+      
+      # Auto Scaling Group Lifecycle
+      TF_VAR_ASG_SCALE_UP_HOOK_NAME = module.k8s-cluster.asg_scale_up_hook_name
+      TF_VAR_ASG_SCALE_DOWN_HOOK_NAME = module.k8s-cluster.asg_scale_down_hook_name
+      TF_VAR_SNS_TOPIC_ARN          = module.k8s-cluster.sns_topic_arn
+      
+      # AWS Secrets Manager
       TF_VAR_KUBECONFIG_SECRET_NAME = module.k8s-cluster.kubeconfig_secret_name_output
-      TF_VAR_JOIN_COMMAND_SECRET_NAME = module.k8s-cluster.kubernetes_join_command_secrets.latest_secret
-      # TODO: Verify correct output name from module.k8s-cluster for user data bucket
-      # TF_VAR_S3_USER_DATA_BUCKET    = module.k8s-cluster.user_data_bucket_name_output
+      TF_VAR_JOIN_CMD_SECRET_NAME   = module.k8s-cluster.kubernetes_join_command_secrets.latest_secret
+      TF_VAR_POLYBOT_CFG_SECRET_NAME = "polybot-secrets"  # Matches application_setup
+      
+      # AWS Resources from generated-secrets.tf
+      TF_VAR_SQS_QUEUE_URL          = aws_sqs_queue.polybot_queue.url
+      TF_VAR_S3_BUCKET_NAME         = aws_s3_bucket.polybot_storage.bucket
+      TF_VAR_S3_BUCKET_ARN          = aws_s3_bucket.polybot_storage.arn
       TF_VAR_S3_WORKER_LOGS_BUCKET  = module.k8s-cluster.worker_logs_bucket
+      
+      # ArgoCD configuration
+      TF_VAR_ARGOCD_NAMESPACE       = "argocd"  # ArgoCD default namespace
+      
+      # Kubeconfig Path
       TF_KUBECONFIG_PATH            = local.kubeconfig_path
     }
     command = <<-EOT
@@ -1660,9 +1696,9 @@ resource "null_resource" "deployment_summary" {
       BG_CYAN='\033[46m'
       BG_YELLOW='\033[43m'
 
-      # Enhanced Helper Functions
-      log_header() { echo -e "\n$${BOLD}$${BG_PURPLE}$${WHITE} ===== $1 ===== $${RESET}"; }
-      log_subheader() { echo -e "\n$${BOLD}$${BG_CYAN}$${WHITE} --- $1 --- $${RESET}"; }
+      # Enhanced Helper Functions for Vibrant Styling
+      log_header() { echo -e "\n$${BOLD}$${BG_PURPLE}$${WHITE} 🚀 $1 🚀 $${RESET}"; }
+      log_subheader() { echo -e "\n$${BOLD}$${BG_CYAN}$${WHITE} $1 $${RESET}"; }
       log_section() { echo -e "\n$${BOLD}$${BLUE}🔹 $1$${RESET}"; }
       log_key_value() { echo -e "  $${BOLD}$${CYAN}$1:$${RESET} $${WHITE}$2$${RESET}"; }
       log_command() { echo -e "  $${DIM}$${YELLOW}💻 $1$${RESET}"; }
@@ -1673,22 +1709,22 @@ resource "null_resource" "deployment_summary" {
       log_celebration() { echo -e "$${BOLD}$${BG_GREEN}$${WHITE} 🎉 $1 🎉 $${RESET}"; }
       log_separator() { echo -e "$${DIM}$${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$${RESET}"; }
 
-      # Set kubeconfig
-      export KUBECONFIG="$TF_KUBECONFIG_PATH"
-
+      # Set paths and kubeconfig
+      TERRAFORM_EXEC_DIR=$(pwd)
+      KUBECONFIG="$TF_KUBECONFIG_PATH"
+      export KUBECONFIG
+      
       echo ""
       echo ""
       log_celebration "POLYBOT KUBERNETES CLUSTER DEPLOYMENT COMPLETE"
       echo ""
       log_separator
 
-      log_header "🏗️ INFRASTRUCTURE OVERVIEW"
+      # =============================================================================
+      # 1. CLUSTER DETAILS (TOP PRIORITY)
+      # =============================================================================
       
-      log_section "Core Infrastructure"
-      log_key_value "🌍 AWS Region" "$TF_VAR_REGION"
-      log_key_value "🏷️  Cluster Name" "$TF_VAR_CLUSTER_NAME"
-      log_key_value "🌐 VPC ID" "$TF_VAR_VPC_ID"
-      log_key_value "🌎 Domain Name" "$TF_VAR_DOMAIN_NAME"
+      log_header "🏗️ CLUSTER DETAILS"
       
       log_section "Control Plane"
       log_key_value "📍 Instance ID" "$TF_VAR_CONTROL_PLANE_ID"
@@ -1696,200 +1732,171 @@ resource "null_resource" "deployment_summary" {
       log_key_value "🔒 Private IP" "$TF_VAR_CONTROL_PLANE_PRIVATE_IP"
       log_key_value "🔗 API Endpoint" "https://$TF_VAR_CONTROL_PLANE_IP:6443"
       log_key_value "🔑 SSH Key" "$TF_VAR_SSH_KEY_NAME"
-
-      log_section "Worker Nodes & Auto Scaling"
-      log_key_value "🤖 ASG Name" "$TF_VAR_WORKER_ASG_NAME"
-      log_key_value "🚀 Launch Template" "$TF_VAR_LAUNCH_TEMPLATE_ID"
       
-      # Get current ASG status
-      if command -v aws >/dev/null 2>&1; then
-        ASG_INFO=$(aws autoscaling describe-auto-scaling-groups --region "$TF_VAR_REGION" --auto-scaling-group-names "$TF_VAR_WORKER_ASG_NAME" --query "AutoScalingGroups[0].{DesiredCapacity:DesiredCapacity,MinSize:MinSize,MaxSize:MaxSize,Instances:length(Instances)}" --output text 2>/dev/null || echo "N/A N/A N/A N/A")
-        read -r DESIRED MIN MAX INSTANCES <<< "$ASG_INFO"
-        if [[ "$DESIRED" != "N/A" ]]; then
-          log_key_value "📊 ASG Configuration" "Desired: $DESIRED, Min: $MIN, Max: $MAX, Current: $INSTANCES"
-        else
-          log_warning "Could not retrieve ASG information"
-        fi
-      fi
-
-      # Enhanced Worker Node Details
-      log_subheader "🤖 Worker Node Details (Live from AWS)"
-      if command -v aws >/dev/null 2>&1; then
-        WORKER_DETAILS=$(aws ec2 describe-instances --region "$TF_VAR_REGION" \
+      log_subheader "💻 Worker Node Details (Live from AWS)"
+      if command -v aws >/dev/null 2>&1 && [[ -n "$TF_VAR_WORKER_ASG_NAME" && -n "$TF_VAR_AWS_REGION" ]]; then
+        log_info "Fetching worker instance details from ASG: $${BOLD}$TF_VAR_WORKER_ASG_NAME$${RESET}..."
+        
+        # Query AWS for worker node details with enhanced formatting
+        aws ec2 describe-instances --region "$TF_VAR_AWS_REGION" \
           --filters "Name=tag:aws:autoscaling:groupName,Values=$TF_VAR_WORKER_ASG_NAME" "Name=instance-state-name,Values=running,pending" \
-          --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value, InstanceId:InstanceId, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress, State:State.Name, LaunchTime:LaunchTime}' \
-          --output table 2>/dev/null || echo "Failed to retrieve worker details")
-        if [[ "$WORKER_DETAILS" == "Failed to retrieve worker details" || -z "$WORKER_DETAILS" ]]; then
-          log_warning "Could not fetch live worker details via AWS CLI"
-        else
-          log_info "Live Worker Instances:"
-          echo -e "$${CYAN}$WORKER_DETAILS$${RESET}"
-        fi
+          --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value, ID:InstanceId, PublicIP:PublicIpAddress, PrivateIP:PrivateIpAddress, State:State.Name}' \
+          --output table 2>/dev/null | while IFS= read -r line; do 
+            echo -e "$${CYAN}    $line$${RESET}"
+          done || log_warning "Could not fetch worker details. AWS CLI error or no running workers."
+        
+        # Get count of workers
+        WORKER_COUNT=$(aws ec2 describe-instances --region "$TF_VAR_AWS_REGION" \
+          --filters "Name=tag:aws:autoscaling:groupName,Values=$TF_VAR_WORKER_ASG_NAME" "Name=instance-state-name,Values=running,pending" \
+          --query 'Reservations[*].Instances[*].InstanceId' --output text 2>/dev/null | wc -w || echo "0")
+        log_key_value "🤖 Worker Node Count" "$WORKER_COUNT nodes"
+        
       else
-        log_warning "AWS CLI not available for worker details"
+        log_warning "AWS CLI not found or Worker ASG Name/Region not provided. Cannot fetch live worker details."
+        log_key_value "🤖 Worker ASG Name" "$TF_VAR_WORKER_ASG_NAME"
       fi
 
-      log_section "Load Balancing & Networking"
-      log_key_value "⚖️  ALB DNS Name" "$TF_VAR_ALB_DNS_NAME"
-      log_key_value "🌐 ALB Zone ID" "$TF_VAR_ALB_ZONE_ID"
-      log_key_value "🔗 Application URL" "https://$TF_VAR_DOMAIN_NAME"
-
-      log_header "☸️ KUBERNETES CLUSTER STATUS"
+      # =============================================================================
+      # 2. ARGOCD ACCESS
+      # =============================================================================
       
-      log_section "Cluster Access"
-      log_key_value "📁 Kubeconfig Path" "$TF_KUBECONFIG_PATH"
-      log_key_value "🔐 Kubeconfig Secret" "$TF_VAR_KUBECONFIG_SECRET_NAME"
-      log_key_value "🎫 Join Command Secret" "$TF_VAR_JOIN_COMMAND_SECRET_NAME"
+      log_header "🔐 ARGOCD ACCESS"
       
-      # Enhanced Kubeconfig Details
-      log_subheader "🔑 Kubeconfig Details"
-      if [[ -f "$TF_KUBECONFIG_PATH" ]]; then
-        KUBE_API_SERVER=$(grep 'server:' "$TF_KUBECONFIG_PATH" | awk '{print $2}' | head -n 1)
-        KUBE_CURRENT_CONTEXT=$(grep 'current-context:' "$TF_KUBECONFIG_PATH" | awk '{print $2}' 2>/dev/null || echo "Not specified")
-        log_key_value "🎯 API Server" "$KUBE_API_SERVER"
-        log_key_value "📋 Current Context" "$KUBE_CURRENT_CONTEXT"
-        KUBECONFIG_SIZE=$(wc -c < "$TF_KUBECONFIG_PATH" 2>/dev/null || echo "unknown")
-        log_key_value "📄 File Size" "$KUBECONFIG_SIZE bytes"
-      else
-        log_warning "Kubeconfig file not found at: $TF_KUBECONFIG_PATH"
-      fi
-      
-      log_section "Node Status"
-      if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
-        TOTAL_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-        READY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
-        NOTREADY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
-        READY_WORKERS=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "0")
+      if [[ -f "$KUBECONFIG" ]]; then
+        log_info "Using Kubeconfig: $${BOLD}$KUBECONFIG$${RESET}"
         
-        log_key_value "📊 Total Nodes" "$TOTAL_NODES"
-        log_key_value "✅ Ready Nodes" "$READY_NODES"
-        log_key_value "⚠️  NotReady Nodes" "$NOTREADY_NODES"
-        log_key_value "🤖 Ready Workers" "$READY_WORKERS"
-        
-        log_info "Node Details:"
-        kubectl --insecure-skip-tls-verify get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[?(@.type=='Ready')].status,ROLE:.metadata.labels.node-role\.kubernetes\.io/control-plane,AGE:.metadata.creationTimestamp,VERSION:.status.nodeInfo.kubeletVersion" --no-headers 2>/dev/null | while read -r name status role age version; do
-          if [[ "$role" == "<none>" ]]; then role="worker"; fi
-          if [[ "$status" == "True" ]]; then status="Ready"; else status="NotReady"; fi
-          log_info "    • $${BOLD}$name$${RESET} ($status) - $role - $version"
-        done || log_warning "Could not retrieve detailed node information"
-      else
-        log_error "Cannot connect to Kubernetes cluster"
-      fi
-
-      log_header "🔐 ARGOCD GITOPS PLATFORM"
-      
-      ARGOCD_NAMESPACE="argocd"
-      if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-        log_section "ArgoCD Status"
-        
-        # ArgoCD deployment status
-        ARGOCD_READY=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-        ARGOCD_DESIRED=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
-        
-        if [[ "$ARGOCD_READY" == "$ARGOCD_DESIRED" ]] && [[ "$ARGOCD_READY" -gt 0 ]]; then
-          log_success "ArgoCD Server: $ARGOCD_READY/$ARGOCD_DESIRED replicas ready"
-        else
-          log_warning "ArgoCD Server: $ARGOCD_READY/$ARGOCD_DESIRED replicas ready"
-        fi
-        
-        # ArgoCD applications
-        log_section "ArgoCD Applications"
-        if kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-          TOTAL_APPS=$(kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
-          if [[ "$TOTAL_APPS" -gt 0 ]]; then
-            log_success "Found $TOTAL_APPS ArgoCD applications"
-            kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REPO:.spec.source.repoURL" --no-headers 2>/dev/null | while read -r name sync health repo; do
-              if [[ -n "$name" ]]; then
-                # Color code sync status
-                if [[ "$sync" == "Synced" ]]; then
-                  sync_colored="$${GREEN}$sync$${RESET}"
-                else
-                  sync_colored="$${YELLOW}$sync$${RESET}"
-                fi
-                # Color code health status
-                if [[ "$health" == "Healthy" ]]; then
-                  health_colored="$${GREEN}$health$${RESET}"
-                elif [[ "$health" == "Progressing" ]]; then
-                  health_colored="$${YELLOW}$health$${RESET}"
-                else
-                  health_colored="$${RED}$health$${RESET}"
-                fi
-                log_info "    • $${BOLD}$name$${RESET} - Sync: $sync_colored, Health: $health_colored"
-              fi
-            done
-          else
-            log_warning "No ArgoCD applications found"
-          fi
-        else
-          log_warning "ArgoCD Application CRD not available"
-        fi
-        
-        log_section "ArgoCD Access"
-        log_key_value "🌐 Local URL" "https://localhost:8080 (via port-forward)"
-        log_key_value "👤 Username" "admin"
-        
-        # Enhanced ArgoCD password retrieval
+        # Retrieve ArgoCD Admin Password
         log_info "Retrieving ArgoCD Admin Password..."
-        PASSWORD_SECRET_NAME="argocd-initial-admin-secret"
-        RAW_PASSWORD=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
-        if [[ -n "$RAW_PASSWORD" ]]; then
-          ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d 2>/dev/null || echo "<decode-failed>")
-          log_key_value "🔑 Password" "$${BOLD}$${GREEN}$ARGOCD_PASSWORD$${RESET}"
+        ARGOCD_PASSWORD_SUMMARY=$(kubectl --kubeconfig="$KUBECONFIG" --insecure-skip-tls-verify -n "$TF_VAR_ARGOCD_NAMESPACE" get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "ERROR_FETCHING_ARGOCD_PASSWORD")
+        
+        if [[ "$ARGOCD_PASSWORD_SUMMARY" != "ERROR_FETCHING_ARGOCD_PASSWORD" ]]; then
+          log_key_value "👤 Username" "admin"
+          log_key_value "🔑 Admin Password" "$${BOLD}$${GREEN}$ARGOCD_PASSWORD_SUMMARY$${RESET}"
+          log_success "ArgoCD password retrieved successfully!"
         else
-          log_warning "ArgoCD password secret not found - may have been reset"
-          log_info "To reset password: kubectl -n argocd patch secret argocd-secret -p '{\"data\": {\"admin.password\": null, \"admin.passwordMtime\": null}}'"
+          log_warning "Could not retrieve ArgoCD password. ArgoCD may not be fully ready yet."
+          log_key_value "👤 Username" "admin"
+          log_key_value "🔑 Admin Password" "⚠️  Run: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath=\"{.data.password}\" | base64 -d"
         fi
+        
+        log_key_value "🌐 Access URL" "$${BOLD}$${BLUE}https://localhost:8080$${RESET} (via port-forward)"
+        log_key_value "🔗 Connect Command" "$${BOLD}$${YELLOW}./argocd-connect.sh $TF_VAR_CONTROL_PLANE_IP$${RESET}"
+        
+        # Port-forward command
+        log_info "To access ArgoCD UI:"
+        log_command "kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n argocd 8080:443"
+        log_info "Then visit: $${BOLD}$${BLUE}https://localhost:8080$${RESET}"
+        
       else
-        log_warning "ArgoCD namespace not found - ArgoCD may not be installed"
+        log_warning "Kubeconfig file not found at: $KUBECONFIG"
+        log_info "ArgoCD access commands will be available once kubeconfig is ready."
       fi
 
-      log_header "🔧 IAM & AUTOMATION"
+      # =============================================================================
+      # 3. KEY AWS INFRASTRUCTURE DETAILS
+      # =============================================================================
+      
+      log_header "🌐 KEY AWS INFRASTRUCTURE DETAILS"
+      
+      log_section "VPC & Networking"
+      log_key_value "🌍 VPC ID" "$TF_VAR_VPC_ID"
+      log_key_value "🌐 Public Subnets" "$TF_VAR_PUBLIC_SUBNET_IDS"
+      log_key_value "🔒 Private Subnets" "$TF_VAR_PRIVATE_SUBNET_IDS"
+      log_key_value "🌍 AWS Region" "$TF_VAR_AWS_REGION"
+      
+      log_section "Security Groups"
+      log_key_value "🛡️  Control Plane SG" "$TF_VAR_CP_SG_ID"
+      log_key_value "🛡️  Worker Node SG" "$TF_VAR_WORKER_SG_ID"
+      log_key_value "🛡️  ALB SG" "$TF_VAR_ALB_SG_ID"
       
       log_section "IAM Roles"
-      log_key_value "🎛️  Control Plane Role" "$TF_VAR_CP_IAM_ROLE_ARN"
+      log_key_value "🎛️  CP IAM Role ARN" "$TF_VAR_CP_IAM_ROLE_ARN"
+      log_key_value "🤖 Worker IAM Role ARN" "$TF_VAR_WORKER_IAM_ROLE_ARN"
+      log_key_value "🤖 Worker IAM Role Name" "$TF_VAR_WORKER_IAM_ROLE_NAME"
       
-      log_section "Storage"
+      log_section "Auto Scaling Group (ASG)"
+      log_key_value "🤖 ASG Name" "$TF_VAR_WORKER_ASG_NAME"
+      log_key_value "🚀 Launch Template" "$TF_VAR_LAUNCH_TEMPLATE_ID"
+      log_key_value "📈 Scale Up Hook" "$TF_VAR_ASG_SCALE_UP_HOOK_NAME"
+      log_key_value "📉 Scale Down Hook" "$TF_VAR_ASG_SCALE_DOWN_HOOK_NAME"
+      
+      # Get current ASG status if AWS CLI available
+      if command -v aws >/dev/null 2>&1; then
+        ASG_INFO=$(aws autoscaling describe-auto-scaling-groups --region "$TF_VAR_AWS_REGION" --auto-scaling-group-names "$TF_VAR_WORKER_ASG_NAME" --query "AutoScalingGroups[0].{DesiredCapacity:DesiredCapacity,MinSize:MinSize,MaxSize:MaxSize,Instances:length(Instances)}" --output text 2>/dev/null || echo "N/A N/A N/A N/A")
+        read -r DESIRED MIN MAX INSTANCES <<< "$ASG_INFO"
+        if [[ "$DESIRED" != "N/A" ]]; then
+          log_key_value "📊 ASG Status" "Desired: $DESIRED, Min: $MIN, Max: $MAX, Current: $INSTANCES"
+        fi
+      fi
+      
+      log_section "AWS Secrets Manager"
+      log_key_value "🔐 Kubeconfig Secret (AWS)" "$TF_VAR_KUBECONFIG_SECRET_NAME"
+      log_key_value "🎫 Join Cmd Secret (AWS)" "$TF_VAR_JOIN_CMD_SECRET_NAME"
+      log_key_value "🤖 Polybot Cfg Secret (AWS)" "$TF_VAR_POLYBOT_CFG_SECRET_NAME"
+      
+      log_section "Application Resources"
+      log_key_value "📧 SQS Queue URL" "$TF_VAR_SQS_QUEUE_URL"
+      log_key_value "🪣 S3 Storage Bucket" "$TF_VAR_S3_BUCKET_NAME"
+      log_key_value "🪣 S3 Bucket ARN" "$TF_VAR_S3_BUCKET_ARN"
       log_key_value "📋 Worker Logs Bucket" "$TF_VAR_S3_WORKER_LOGS_BUCKET"
-
-      log_header "🛠️ QUICK ACCESS COMMANDS"
       
-      log_section "Kubernetes Cluster Access"
-      log_command "export KUBECONFIG=$TF_KUBECONFIG_PATH"
+      log_section "Load Balancer & DNS"
+      log_key_value "⚖️  ALB DNS Name" "$TF_VAR_ALB_DNS_NAME"
+      log_key_value "🌐 ALB Zone ID" "$TF_VAR_ALB_ZONE_ID"
+      log_key_value "🌍 Domain Name" "$TF_VAR_DOMAIN_NAME"
+      log_key_value "🔗 Application URL (R53)" "$TF_VAR_APPLICATION_URL"
+      
+      log_section "SNS & Notifications"
+      log_key_value "📢 SNS Topic (ASG Events)" "$TF_VAR_SNS_TOPIC_ARN"
+
+      # =============================================================================
+      # 4. KUBECONFIG LOCATION
+      # =============================================================================
+      
+      log_header "📁 KUBECONFIG LOCATION"
+      
+      log_key_value "📂 Local Kubeconfig Path" "$${BOLD}$${GREEN}$KUBECONFIG$${RESET}"
+      
+      if [[ -f "$KUBECONFIG" ]]; then
+        KUBECONFIG_SIZE=$(wc -c < "$KUBECONFIG" 2>/dev/null || echo "unknown")
+        log_key_value "📄 File Size" "$KUBECONFIG_SIZE bytes"
+        
+        # Extract key details from kubeconfig
+        if command -v grep >/dev/null 2>&1; then
+          KUBE_API_SERVER=$(grep 'server:' "$KUBECONFIG" | awk '{print $2}' | head -n 1 2>/dev/null || echo "Not found")
+          KUBE_CURRENT_CONTEXT=$(grep 'current-context:' "$KUBECONFIG" | awk '{print $2}' 2>/dev/null || echo "Not specified")
+          log_key_value "🎯 API Server in Kubeconfig" "$KUBE_API_SERVER"
+          log_key_value "📋 Current Context" "$KUBE_CURRENT_CONTEXT"
+        fi
+        
+        log_success "Kubeconfig file is ready for use!"
+        log_info "Export command: $${BOLD}export KUBECONFIG=$KUBECONFIG$${RESET}"
+        
+      else
+        log_warning "Kubeconfig file not found. It may still be generating."
+      fi
+
+      # =============================================================================
+      # FINAL COMMANDS & NEXT STEPS
+      # =============================================================================
+      
+      log_header "🛠️ ESSENTIAL COMMANDS"
+      
+      log_section "Cluster Access"
+      log_command "export KUBECONFIG=$KUBECONFIG"
       log_command "kubectl --insecure-skip-tls-verify get nodes"
       log_command "kubectl --insecure-skip-tls-verify get pods --all-namespaces"
       
       log_section "SSH Access"
-      if [[ -n "$TF_VAR_SSH_KEY_NAME" && "$TF_VAR_SSH_KEY_NAME" != "null" ]]; then
-        log_command "ssh -i $TF_VAR_SSH_KEY_NAME.pem ubuntu@$TF_VAR_CONTROL_PLANE_IP"
-      else
-        log_command "ssh -i <your-ssh-key.pem> ubuntu@$TF_VAR_CONTROL_PLANE_IP"
-      fi
+      log_command "ssh -i $TF_VAR_SSH_KEY_NAME.pem ubuntu@$TF_VAR_CONTROL_PLANE_IP"
       
       log_section "ArgoCD Access"
       log_command "kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n argocd 8080:443"
-      log_info "Then visit: https://localhost:8080"
-      
-      log_section "Log Access"
-      log_command "# Control Plane Bootstrap Log"
-      log_command "ssh -i <key> ubuntu@$TF_VAR_CONTROL_PLANE_IP 'sudo tail -f /var/log/cloud-init-output.log'"
-      log_command ""
-      log_command "# ArgoCD Application Controller Logs"
-      log_command "kubectl --insecure-skip-tls-verify logs -n argocd -l app.kubernetes.io/name=argocd-application-controller -f"
-      log_command ""
-      log_command "# Worker Node Logs (after SSH to worker)"
-      log_command "sudo tail -f /var/log/cloud-init-output.log"
-
-      log_header "📋 NEXT STEPS"
-      
-      log_info "1. 🔗 Access ArgoCD UI using the port-forward command above"
-      log_info "2. 🔍 Verify applications are syncing properly in ArgoCD"
-      log_info "3. 🚀 Deploy your applications via ArgoCD or kubectl"
-      log_info "4. 📊 Monitor cluster health and application status"
-      log_info "5. 🔧 Configure monitoring and logging as needed"
+      log_command "./argocd-connect.sh $TF_VAR_CONTROL_PLANE_IP"
       
       echo ""
       log_separator
-      log_celebration "DEPLOYMENT SUMMARY COMPLETE - CLUSTER READY FOR USE"
+      log_celebration "DEPLOYMENT COMPLETE - POLYBOT CLUSTER READY FOR USE"
       log_separator
       echo ""
     EOT
