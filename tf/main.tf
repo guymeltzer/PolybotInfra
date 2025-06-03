@@ -112,7 +112,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
     secret_name      = module.k8s-cluster.kubeconfig_secret_name_output
     region           = var.region
-    script_version   = "v5-bash-syntax-fixed" # Fixed bash variable syntax
+    script_version   = "v5-bash-syntax-corrected" # Fixed bash variable syntax
   }
 
   provisioner "local-exec" {
@@ -236,7 +236,7 @@ resource "null_resource" "ensure_local_kubeconfig" {
     # Re-run if kubeconfig content changes
     kubeconfig_content_hash = data.aws_secretsmanager_secret_version.retrieved_kubeconfig.version_id
     # Version for tracking script changes
-    script_version = "v4-bash-syntax-fixed" # Fixed bash variable syntax
+    script_version = "v5-bash-syntax-corrected" # Fixed bash variable syntax
   }
 
   provisioner "local-exec" {
@@ -257,15 +257,15 @@ resource "null_resource" "ensure_local_kubeconfig" {
       WHITE='\033[0;37m'
 
       # Helper Functions for logging
-      log_header() { echo -e "\n$${BOLD}$${PURPLE}===== $$1 =====$${RESET}"; }
-      log_subheader() { echo -e "\n$${BOLD}$${CYAN}--- $$1 ---$${RESET}"; }
-      log_step() { echo -e "$${BLUE}▶ $$1$${RESET}"; }
-      log_success() { echo -e "$${GREEN}✅ $$1$${RESET}"; }
-      log_warning() { echo -e "$${YELLOW}⚠️ $$1$${RESET}"; }
-      log_error() { echo -e "$${RED}❌ $$1$${RESET}"; }
-      log_info() { echo -e "💡 $${CYAN}$$1$${RESET}"; }
-      log_progress() { echo -e "$${YELLOW}⏳ $$1...$${RESET}"; }
-      log_cmd_output() { echo -e "$${WHITE}$$1$${RESET}"; }
+      log_header() { echo -e "\n$${BOLD}$${PURPLE}===== $1 =====$${RESET}"; }
+      log_subheader() { echo -e "\n$${BOLD}$${CYAN}--- $1 ---$${RESET}"; }
+      log_step() { echo -e "$${BLUE}▶ $1$${RESET}"; }
+      log_success() { echo -e "$${GREEN}✅ $1$${RESET}"; }
+      log_warning() { echo -e "$${YELLOW}⚠️ $1$${RESET}"; }
+      log_error() { echo -e "$${RED}❌ $1$${RESET}"; }
+      log_info() { echo -e "💡 $${CYAN}$1$${RESET}"; }
+      log_progress() { echo -e "$${YELLOW}⏳ $1...$${RESET}"; }
+      log_cmd_output() { echo -e "$${WHITE}$1$${RESET}"; }
       # --- End Style Definitions ---
       
       log_header "🔧 Ensuring Local Kubeconfig Availability"
@@ -274,22 +274,22 @@ resource "null_resource" "ensure_local_kubeconfig" {
       SECRET_NAME="${module.k8s-cluster.kubeconfig_secret_name_output}"
       REGION="${var.region}"
       
-      log_info "Target kubeconfig path: $${BOLD}$$KUBECONFIG_PATH$${RESET}"
-      log_info "Secret name: $${BOLD}$$SECRET_NAME$${RESET}"
-      log_info "Region: $${BOLD}$$REGION$${RESET}"
+      log_info "Target kubeconfig path: $${BOLD}$KUBECONFIG_PATH$${RESET}"
+      log_info "Secret name: $${BOLD}$SECRET_NAME$${RESET}"
+      log_info "Region: $${BOLD}$REGION$${RESET}"
       
       log_subheader "🔍 Checking Local Kubeconfig Status"
       # Check if local kubeconfig exists and is valid
-      if [[ -f "$$KUBECONFIG_PATH" ]]; then
+      if [[ -f "$KUBECONFIG_PATH" ]]; then
         log_success "Local kubeconfig file exists"
         
         # Quick validation - check if it contains required fields
-        if grep -q "apiVersion" "$$KUBECONFIG_PATH" && grep -q "clusters:" "$$KUBECONFIG_PATH"; then
+        if grep -q "apiVersion" "$KUBECONFIG_PATH" && grep -q "clusters:" "$KUBECONFIG_PATH"; then
           log_success "Local kubeconfig appears valid"
           
           log_step "Testing connectivity to ensure it works"
           # Test connectivity to ensure it works
-          if timeout 10 kubectl --kubeconfig="$$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+          if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
             log_success "Local kubeconfig connectivity confirmed - no action needed"
             exit 0
           else
@@ -305,29 +305,29 @@ resource "null_resource" "ensure_local_kubeconfig" {
       log_subheader "📥 Downloading Fresh Kubeconfig"
       # Download fresh kubeconfig from Secrets Manager
       log_progress "Downloading kubeconfig from Secrets Manager"
-      KUBECONFIG_CONTENT=$$(aws secretsmanager get-secret-value \
-        --secret-id "$$SECRET_NAME" \
-        --region "$$REGION" \
+      KUBECONFIG_CONTENT=$(aws secretsmanager get-secret-value \
+        --secret-id "$SECRET_NAME" \
+        --region "$REGION" \
         --query SecretString \
         --output text)
       
-      if [[ -n "$$KUBECONFIG_CONTENT" ]] && echo "$$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
+      if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
         log_success "Retrieved valid kubeconfig from Secrets Manager"
         
         log_step "Creating directory if it doesn't exist"
         # Create directory if it doesn't exist
-        mkdir -p "$$(dirname "$$KUBECONFIG_PATH")"
+        mkdir -p "$(dirname "$KUBECONFIG_PATH")"
         
         log_step "Writing kubeconfig to file"
         # Write kubeconfig to file
-        echo "$$KUBECONFIG_CONTENT" > "$$KUBECONFIG_PATH"
-        chmod 600 "$$KUBECONFIG_PATH"
+        echo "$KUBECONFIG_CONTENT" > "$KUBECONFIG_PATH"
+        chmod 600 "$KUBECONFIG_PATH"
         
-        log_success "Local kubeconfig file created: $${BOLD}$$KUBECONFIG_PATH$${RESET}"
+        log_success "Local kubeconfig file created: $${BOLD}$KUBECONFIG_PATH$${RESET}"
         
         log_step "Verifying the new file works"
         # Verify the new file works
-        if timeout 10 kubectl --kubeconfig="$$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+        if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
           log_success "New kubeconfig connectivity verified"
         else
           log_warning "New kubeconfig created but connectivity test failed (may be temporary)"
@@ -354,7 +354,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
     kubeconfig_ensured    = null_resource.ensure_local_kubeconfig.id # Trigger when kubeconfig is ensured
-    readiness_version     = "v7-bash-syntax-fixed"
+    readiness_version     = "v7-bash-syntax-corrected"
   }
   
   provisioner "local-exec" {
@@ -400,8 +400,8 @@ resource "null_resource" "cluster_readiness_check" {
           
           # Extract host and port for connectivity test
           if [[ "$SERVER_URL" =~ https://([^:]+):([0-9]+) ]]; then
-            SERVER_HOST="$${BASH_REMATCH[1]}"
-            SERVER_PORT="$${BASH_REMATCH[2]}"
+            SERVER_HOST="${BASH_REMATCH[1]}"
+            SERVER_PORT="${BASH_REMATCH[2]}"
             log_step "Testing TCP connectivity to $SERVER_HOST:$SERVER_PORT"
             if timeout 10 bash -c "</dev/tcp/$SERVER_HOST/$SERVER_PORT" 2>/dev/null; then
               log_success "TCP connectivity confirmed"
@@ -519,7 +519,7 @@ resource "null_resource" "cluster_maintenance" {
   triggers = {
     cluster_ready_id    = null_resource.cluster_readiness_check.id
     kubeconfig_ensured  = null_resource.ensure_local_kubeconfig.id # Added trigger
-    maintenance_version = "v3-bash-syntax-fixed"
+    maintenance_version = "v3-bash-syntax-corrected"
   }
 
   provisioner "local-exec" {
@@ -636,7 +636,7 @@ resource "null_resource" "application_setup" {
   
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    setup_version      = "v4-bash-syntax-fixed"
+    setup_version      = "v4-bash-syntax-corrected"
   }
 
   provisioner "local-exec" {
@@ -787,7 +787,7 @@ resource "null_resource" "install_argocd" {
 
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    argocd_version     = "v5-bash-syntax-fixed"
+    argocd_version     = "v5-bash-syntax-corrected"
   }
 
   provisioner "local-exec" {
@@ -930,7 +930,7 @@ resource "null_resource" "deployment_summary" {
     maintenance_id  = null_resource.cluster_maintenance.id
     setup_id        = null_resource.application_setup.id
     argocd_id       = try(null_resource.install_argocd[0].id, "skipped") # Correct for count
-    summary_version = "v4-bash-syntax-fixed"
+    summary_version = "v4-bash-syntax-corrected"
   }
 
   provisioner "local-exec" {

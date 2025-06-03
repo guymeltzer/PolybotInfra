@@ -896,7 +896,7 @@ resource "null_resource" "update_join_command" {
 
   triggers = {
     control_plane_id   = aws_instance.control_plane.id
-    update_version     = "v13-bash-syntax-fixed" # Fixed bash variable syntax
+    update_version     = "v14-bash-syntax-corrected" # Fixed bash variable syntax
   }
 
   provisioner "local-exec" {
@@ -1230,7 +1230,7 @@ resource "terraform_data" "cluster_health_assessment" {
   input = {
     control_plane_id = aws_instance.control_plane.id
     asg_name         = local.worker_asg_name
-    script_version   = "v4-bash-syntax-fixed"
+    script_version   = "v5-bash-syntax-corrected"
   }
 
   provisioner "local-exec" {
