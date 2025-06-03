@@ -1419,7 +1419,7 @@ resource "terraform_data" "worker_progress_reporter" {
       CYAN='\033[0;36m'
       
       # Enhanced progress message with consistent styling and emojis
-      echo -e "$${BOLD}$${GREEN}🚀 Step 2/4: Control Plane Ready, Configuring Worker Nodes$${RESET} $${CYAN}(Module: $${BOLD}${var.cluster_name}$${RESET}$${CYAN})$${RESET}$${GREEN}...$${RESET}"
+      echo -e "$${BOLD}$${GREEN}🚀 Step 2/4: Control Plane Ready, Configuring Worker Nodes$${RESET} $${CYAN}[Module: $${BOLD}${var.cluster_name}$${RESET}$${CYAN}]$${RESET}$${GREEN}...$${RESET}"
     EOT
   }
 }
