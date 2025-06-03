@@ -727,7 +727,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v11-enhanced-namespace-detection" # Enhanced namespace detection with better retries
+    setup_version    = "v12-simplified-namespace-detection" # Simplified namespace detection for better reliability
   }
 
   provisioner "local-exec" {
@@ -760,7 +760,7 @@ resource "null_resource" "application_setup" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔐 Application Setup v9 (verify namespaces created by cluster_readiness_check)"
+      log_header "🔐 Application Setup v12 (Simplified Namespace Detection for Better Reliability)"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -825,46 +825,35 @@ resource "null_resource" "application_setup" {
       for namespace in prod dev; do
         log_subheader "🔑 Ensuring secrets in namespace: $${BOLD}$namespace$${RESET}"
 
-        # Enhanced namespace detection with more robust retries
+        # Simplified namespace detection with reliable Active status check
         NAMESPACE_FOUND=false
-        log_step "Waiting for namespace $namespace to be ready (enhanced detection)"
+        log_step "Waiting for namespace $namespace to be ready (simplified check)"
         
         for retry in {1..6}; do
-          # Use a more comprehensive check that ensures namespace is truly ready
-          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1 && \
-             kubectl --insecure-skip-tls-verify get serviceaccount default -n "$namespace" >/dev/null 2>&1; then
-            log_success "Namespace $namespace confirmed ready on attempt $retry"
-            NAMESPACE_FOUND=true
-            break
+          # Use a simplified but reliable check for namespace existence and Active status
+          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
+            # Check if namespace is in Active phase
+            NAMESPACE_PHASE=$(kubectl --insecure-skip-tls-verify get namespace "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            if [[ "$NAMESPACE_PHASE" == "Active" ]]; then
+              log_success "Namespace $namespace confirmed ACTIVE on attempt $retry"
+              NAMESPACE_FOUND=true
+              break
+            else
+              log_info "Namespace $namespace exists but status is '$NAMESPACE_PHASE' on attempt $retry/6, waiting 5 seconds..."
+            fi
           else
-            if [[ $retry -eq 1 ]]; then
-              log_info "Initial namespace check failed, starting robust retry sequence..."
-            fi
-            log_info "Namespace $namespace not ready on attempt $retry/6, waiting 5 seconds..."
-            if [[ $retry -lt 6 ]]; then
-              sleep 5
-            fi
+            log_info "Namespace $namespace not found on attempt $retry/6, waiting 5 seconds..."
+          fi
+          
+          if [[ $retry -lt 6 ]]; then
+            sleep 5
           fi
         done
         
         if [[ "$NAMESPACE_FOUND" != "true" ]]; then
           log_warning "Namespace $namespace not found/ready after 6 retries (30 seconds total)"
-          log_info "Attempting fallback namespace creation..."
-          
-          # Fallback: try to create the namespace explicitly
-          if kubectl --insecure-skip-tls-verify create namespace "$namespace" 2>/dev/null; then
-            log_success "Created namespace $namespace via fallback"
-            # Wait a moment for it to be fully ready
-            sleep 3
-            NAMESPACE_FOUND=true
-          elif kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
-            log_info "Namespace $namespace exists but may still be initializing"
-            sleep 3
-            NAMESPACE_FOUND=true
-          else
-            log_error "Failed to create or verify namespace $namespace - skipping secret creation"
-            continue
-          fi
+          log_error "Skipping secret creation for namespace $namespace"
+          continue
         fi
 
         log_step "Creating TLS secret"
@@ -900,15 +889,14 @@ resource "null_resource" "application_setup" {
       # Deploy ArgoCD applications only if ArgoCD is installed
       ARGOCD_NAMESPACE="argocd"
       
-      log_step "Checking if ArgoCD is installed and ready (enhanced detection with more patience)"
+      log_step "Checking if ArgoCD is installed and ready (simplified detection with reliable checks)"
       ARGOCD_NAMESPACE_FOUND=false
       
-      # Enhanced ArgoCD namespace detection with more retries and comprehensive checks
+      # Simplified ArgoCD namespace detection with reliable checks
       for retry in {1..9}; do
-        # Check both namespace existence AND that ArgoCD components are present
-        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1 && \
-           kubectl --insecure-skip-tls-verify get serviceaccount default -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-          
+        # Check namespace existence and verify ArgoCD CRDs
+        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          log_info "ArgoCD namespace '$ARGOCD_NAMESPACE' found on attempt $retry. Verifying CRDs..."
           # Additional check: verify ArgoCD CRDs are installed
           if kubectl --insecure-skip-tls-verify get crd applications.argoproj.io >/dev/null 2>&1; then
             log_success "ArgoCD namespace and CRDs confirmed ready on attempt $retry"
@@ -918,7 +906,7 @@ resource "null_resource" "application_setup" {
             log_info "ArgoCD namespace exists but CRDs not ready yet on attempt $retry/9, waiting 10 seconds..."
           fi
         else
-          log_info "ArgoCD namespace not found/ready on attempt $retry/9, waiting 10 seconds..."
+          log_info "ArgoCD namespace not found on attempt $retry/9, waiting 10 seconds..."
         fi
         
         if [[ $retry -lt 9 ]]; then
