@@ -720,12 +720,14 @@ resource "null_resource" "cluster_maintenance" {
 # Essential namespace and secret creation
 resource "null_resource" "application_setup" {
   depends_on = [
-    null_resource.cluster_readiness_check # Ensure cluster is ready and namespaces exist
+    null_resource.cluster_readiness_check, # Ensure cluster is ready and namespaces exist
+    null_resource.install_argocd           # Ensure ArgoCD is installed before deploying applications
   ]
   
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
-    setup_version    = "v10-fixed-dependencies" # Fixed circular dependency
+    argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
+    setup_version    = "v11-enhanced-namespace-detection" # Enhanced namespace detection with better retries
   }
 
   provisioner "local-exec" {
@@ -784,13 +786,19 @@ resource "null_resource" "application_setup" {
       log_success "Cluster connectivity confirmed. Proceeding with application setup..."
 
       log_subheader "📁 Verifying namespaces"
-      # Verify namespaces exist (created by cluster_readiness_check)
-      log_step "Verifying namespaces exist (created by cluster_readiness_check)"
-      for namespace in prod dev; do
-        if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
-          log_success "Namespace: $${BOLD}$namespace$${RESET} confirmed"
+      # Initial namespace status check for debugging
+      log_step "Initial namespace status check for debugging"
+      ALL_NAMESPACES=$(kubectl --insecure-skip-tls-verify get namespaces --no-headers -o custom-columns="NAME:.metadata.name" 2>/dev/null | tr '\n' ' ' || echo "failed-to-list")
+      log_info "Current namespaces: $ALL_NAMESPACES"
+      
+      # Check for expected namespaces specifically
+      for ns in argocd prod dev; do
+        if kubectl --insecure-skip-tls-verify get namespace "$ns" >/dev/null 2>&1; then
+          # Check if namespace is fully ready
+          NS_STATUS=$(kubectl --insecure-skip-tls-verify get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+          log_success "Initial check: Namespace $ns exists (status: $NS_STATUS)"
         else
-          log_warning "Namespace: $${BOLD}$namespace$${RESET} not found - may need to wait for cluster_readiness_check"
+          log_warning "Initial check: Namespace $ns not found"
         fi
       done
 
@@ -817,21 +825,46 @@ resource "null_resource" "application_setup" {
       for namespace in prod dev; do
         log_subheader "🔑 Ensuring secrets in namespace: $${BOLD}$namespace$${RESET}"
 
-        # Check if namespace exists before trying to create secrets with retries
+        # Enhanced namespace detection with more robust retries
         NAMESPACE_FOUND=false
-        for retry in {1..3}; do
-          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
+        log_step "Waiting for namespace $namespace to be ready (enhanced detection)"
+        
+        for retry in {1..6}; do
+          # Use a more comprehensive check that ensures namespace is truly ready
+          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1 && \
+             kubectl --insecure-skip-tls-verify get serviceaccount default -n "$namespace" >/dev/null 2>&1; then
+            log_success "Namespace $namespace confirmed ready on attempt $retry"
             NAMESPACE_FOUND=true
             break
           else
-            log_info "Namespace $namespace not found on attempt $retry, waiting 3 seconds..."
-            sleep 3
+            if [[ $retry -eq 1 ]]; then
+              log_info "Initial namespace check failed, starting robust retry sequence..."
+            fi
+            log_info "Namespace $namespace not ready on attempt $retry/6, waiting 5 seconds..."
+            if [[ $retry -lt 6 ]]; then
+              sleep 5
+            fi
           fi
         done
         
         if [[ "$NAMESPACE_FOUND" != "true" ]]; then
-          log_warning "Namespace $namespace not found after retries, skipping secret creation"
-          continue
+          log_warning "Namespace $namespace not found/ready after 6 retries (30 seconds total)"
+          log_info "Attempting fallback namespace creation..."
+          
+          # Fallback: try to create the namespace explicitly
+          if kubectl --insecure-skip-tls-verify create namespace "$namespace" 2>/dev/null; then
+            log_success "Created namespace $namespace via fallback"
+            # Wait a moment for it to be fully ready
+            sleep 3
+            NAMESPACE_FOUND=true
+          elif kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
+            log_info "Namespace $namespace exists but may still be initializing"
+            sleep 3
+            NAMESPACE_FOUND=true
+          else
+            log_error "Failed to create or verify namespace $namespace - skipping secret creation"
+            continue
+          fi
         fi
 
         log_step "Creating TLS secret"
@@ -867,32 +900,42 @@ resource "null_resource" "application_setup" {
       # Deploy ArgoCD applications only if ArgoCD is installed
       ARGOCD_NAMESPACE="argocd"
       
-      log_step "Checking if ArgoCD is installed and ready (with retries)"
+      log_step "Checking if ArgoCD is installed and ready (enhanced detection with more patience)"
       ARGOCD_NAMESPACE_FOUND=false
       
-      # Enhanced ArgoCD namespace detection with retries
-      for retry in {1..6}; do
-        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-          log_success "ArgoCD namespace found on attempt $retry"
-          ARGOCD_NAMESPACE_FOUND=true
-          break
-        else
-          log_info "ArgoCD namespace not found on attempt $retry/6, waiting 10 seconds..."
-          if [[ $retry -lt 6 ]]; then
-            sleep 10
+      # Enhanced ArgoCD namespace detection with more retries and comprehensive checks
+      for retry in {1..9}; do
+        # Check both namespace existence AND that ArgoCD components are present
+        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1 && \
+           kubectl --insecure-skip-tls-verify get serviceaccount default -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          
+          # Additional check: verify ArgoCD CRDs are installed
+          if kubectl --insecure-skip-tls-verify get crd applications.argoproj.io >/dev/null 2>&1; then
+            log_success "ArgoCD namespace and CRDs confirmed ready on attempt $retry"
+            ARGOCD_NAMESPACE_FOUND=true
+            break
+          else
+            log_info "ArgoCD namespace exists but CRDs not ready yet on attempt $retry/9, waiting 10 seconds..."
           fi
+        else
+          log_info "ArgoCD namespace not found/ready on attempt $retry/9, waiting 10 seconds..."
+        fi
+        
+        if [[ $retry -lt 9 ]]; then
+          sleep 10
         fi
       done
       
       if [[ "$ARGOCD_NAMESPACE_FOUND" != "true" ]]; then
-        log_warning "ArgoCD namespace not found after retries. Skipping application deployment."
+        log_warning "ArgoCD namespace not found/ready after 9 retries (90 seconds total)"
+        log_info "This suggests ArgoCD installation may not have completed successfully"
         log_info "ArgoCD applications can be deployed manually later with:"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n argocd"
         exit 0
       fi
       
-      log_success "ArgoCD namespace confirmed. Proceeding with application deployment..."
+      log_success "ArgoCD namespace and CRDs confirmed ready. Proceeding with application deployment..."
         
       # Wait for ArgoCD to be ready with extended timeout and better verification
       log_step "Waiting for ArgoCD server to be ready (timeout: 120s)"
