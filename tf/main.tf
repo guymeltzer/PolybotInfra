@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v18-enhanced-argocd-apps-and-summary" # ENHANCED: Fixed MongoDB namespace conflicts, created individual app.yaml files, enhanced deployment summary with vibrant styling and dynamic data
+    setup_version    = "v19-fixed-secrets-and-storageclass" # FIXED: Added docker-registry-credentials and telegram_token secrets, fixed MongoDB StorageClass with ArgoCD annotations, enhanced application deployment strategy
   }
 
   provisioner "local-exec" {
@@ -939,14 +939,34 @@ resource "null_resource" "application_setup" {
           --from-file=ca.crt="$CA_FILE" -n "$namespace" \
           --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-ca secret in $namespace handled (may already exist)"
 
-        log_step "Creating application secrets"
-        # Application secrets (ensure values are appropriate or use more secure methods for production)
-        kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-          --from-literal=app-secret='default-app-secret-value' \
-          --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
-          --from-literal=redis-url='redis://your-redis-host:6379/0' \
+        log_step "Creating docker-registry-credentials secret"
+        # Docker registry secret for pulling images
+        DUMMY_DOCKERCONFIGJSON='{"auths":{"https://index.docker.io/v1/":{"auth":"ZHVtbXk6ZHVtbXk="}}}'
+        kubectl --insecure-skip-tls-verify create secret generic docker-registry-credentials \
+          --from-literal=.dockerconfigjson="$DUMMY_DOCKERCONFIGJSON" \
           -n "$namespace" \
-          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "docker-registry-credentials secret in $namespace handled (may already exist)"
+
+        log_step "Creating application secrets"
+        # Application secrets with telegram_token for Polybot
+        if [[ "$namespace" == "prod" ]]; then
+          # For prod namespace, include telegram_token
+          kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+            --from-literal=app-secret='default-app-secret-value' \
+            --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
+            --from-literal=redis-url='redis://your-redis-host:6379/0' \
+            --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
+            -n "$namespace" \
+            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+        else
+          # For other namespaces, standard secrets without telegram_token
+          kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+            --from-literal=app-secret='default-app-secret-value' \
+            --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
+            --from-literal=redis-url='redis://your-redis-host:6379/0' \
+            -n "$namespace" \
+            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+        fi
 
         log_success "Secrets processed for $${BOLD}$namespace$${RESET}"
       done
@@ -1004,6 +1024,11 @@ resource "null_resource" "application_setup" {
       fi
       
       log_success "ArgoCD namespace and CRDs confirmed ready. Proceeding with application deployment..."
+      
+      log_info "Application Deployment Strategy:"
+      log_info "  • Global applications file: defines all apps in one place"
+      log_info "  • Individual application files: provide backup/alternative deployment method"
+      log_info "  • Both methods will be attempted for robustness"
         
       # Wait for ArgoCD to be ready with extended timeout and better verification
       log_step "Waiting for ArgoCD server to be ready (timeout: 120s)"
@@ -1074,7 +1099,7 @@ resource "null_resource" "application_setup" {
           log_warning "Failed to apply Polybot ArgoCD Application (may already exist or CRDs not ready)"
         fi
       else
-        log_info "Polybot application.yaml not found - applications should be defined in global argocd-applications.yaml"
+        log_warning "Polybot application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/Polybot/application.yaml"
       fi
 
       # Check for Yolo5 application file (note: directory is Yolo5, not YOLOv5)
@@ -1086,7 +1111,7 @@ resource "null_resource" "application_setup" {
           log_warning "Failed to apply Yolo5 ArgoCD Application (may already exist or CRDs not ready)"
         fi
       else
-        log_info "Yolo5 application.yaml not found - applications should be defined in global argocd-applications.yaml"
+        log_warning "Yolo5 application.yaml not found at $TERRAFORM_EXEC_DIR/../k8s/Yolo5/application.yaml"
       fi
 
       # Check for any other application.yaml files in subdirectories
