@@ -1081,21 +1081,25 @@ resource "null_resource" "deployment_summary" {
       TF_VAR_VPC_ID                 = module.k8s-cluster.vpc_id_output
       TF_VAR_CONTROL_PLANE_IP       = module.k8s-cluster.control_plane_public_ip_output
       TF_VAR_CONTROL_PLANE_ID       = module.k8s-cluster.control_plane_instance_id_output
-      TF_VAR_CONTROL_PLANE_PRIVATE_IP = module.k8s-cluster.control_plane_private_ip_output
+      TF_VAR_CONTROL_PLANE_PRIVATE_IP = module.k8s-cluster.control_plane_private_ip
       TF_VAR_SSH_KEY_NAME           = module.k8s-cluster.ssh_key_name_output
       TF_VAR_WORKER_ASG_NAME        = module.k8s-cluster.worker_asg_name_output
-      TF_VAR_LAUNCH_TEMPLATE_ID     = module.k8s-cluster.launch_template_id_output
+      TF_VAR_LAUNCH_TEMPLATE_ID     = module.k8s-cluster.worker_launch_template_id
       TF_VAR_ALB_DNS_NAME           = module.k8s-cluster.alb_dns_name_output
-      TF_VAR_ALB_ZONE_ID            = module.k8s-cluster.alb_zone_id_output
+      TF_VAR_ALB_ZONE_ID            = module.k8s-cluster.alb_zone_id
       TF_VAR_DOMAIN_NAME            = var.domain_name
-      TF_VAR_CP_IAM_ROLE_ARN        = module.k8s-cluster.control_plane_iam_role_arn_output
-      TF_VAR_WORKER_IAM_ROLE_ARN    = module.k8s-cluster.worker_iam_role_arn_output
-      TF_VAR_LAMBDA_FUNCTION_NAME   = module.k8s-cluster.lambda_function_name_output
-      TF_VAR_SNS_TOPIC_ARN          = module.k8s-cluster.sns_topic_arn_output
+      TF_VAR_CP_IAM_ROLE_ARN        = module.k8s-cluster.control_plane_iam_role_arn
+      # TODO: Verify correct output name from module.k8s-cluster for worker IAM role
+      # TF_VAR_WORKER_IAM_ROLE_ARN    = module.k8s-cluster.worker_iam_role_arn_output
+      # TODO: Verify correct output name from module.k8s-cluster for lambda function name
+      # TF_VAR_LAMBDA_FUNCTION_NAME   = module.k8s-cluster.lambda_function_name_output
+      # TODO: Verify correct output name from module.k8s-cluster for SNS topic ARN
+      # TF_VAR_SNS_TOPIC_ARN          = module.k8s-cluster.sns_topic_arn_output
       TF_VAR_KUBECONFIG_SECRET_NAME = module.k8s-cluster.kubeconfig_secret_name_output
-      TF_VAR_JOIN_COMMAND_SECRET_NAME = module.k8s-cluster.join_command_secret_name_output
-      TF_VAR_S3_USER_DATA_BUCKET    = module.k8s-cluster.user_data_bucket_name_output
-      TF_VAR_S3_WORKER_LOGS_BUCKET  = module.k8s-cluster.worker_logs_bucket_name_output
+      TF_VAR_JOIN_COMMAND_SECRET_NAME = module.k8s-cluster.kubernetes_join_command_secrets.latest_secret
+      # TODO: Verify correct output name from module.k8s-cluster for user data bucket
+      # TF_VAR_S3_USER_DATA_BUCKET    = module.k8s-cluster.user_data_bucket_name_output
+      TF_VAR_S3_WORKER_LOGS_BUCKET  = module.k8s-cluster.worker_logs_bucket
       TF_KUBECONFIG_PATH            = local.kubeconfig_path
     }
     command = <<-EOT
@@ -1258,14 +1262,18 @@ resource "null_resource" "deployment_summary" {
       
       log_section "IAM Roles"
       log_key_value "🎛️  Control Plane Role" "$TF_VAR_CP_IAM_ROLE_ARN"
-      log_key_value "🤖 Worker Node Role" "$TF_VAR_WORKER_IAM_ROLE_ARN"
+      # TODO: Verify correct output name from module.k8s-cluster for worker IAM role
+      # log_key_value "🤖 Worker Node Role" "$TF_VAR_WORKER_IAM_ROLE_ARN"
       
       log_section "Automation & Monitoring"
-      log_key_value "🔧 Lambda Function" "$TF_VAR_LAMBDA_FUNCTION_NAME"
-      log_key_value "📢 SNS Topic" "$TF_VAR_SNS_TOPIC_ARN"
+      # TODO: Verify correct output name from module.k8s-cluster for lambda function name
+      # log_key_value "🔧 Lambda Function" "$TF_VAR_LAMBDA_FUNCTION_NAME"
+      # TODO: Verify correct output name from module.k8s-cluster for SNS topic ARN
+      # log_key_value "📢 SNS Topic" "$TF_VAR_SNS_TOPIC_ARN"
       
       log_section "Storage"
-      log_key_value "📦 User Data Bucket" "$TF_VAR_S3_USER_DATA_BUCKET"
+      # TODO: Verify correct output name from module.k8s-cluster for user data bucket
+      # log_key_value "📦 User Data Bucket" "$TF_VAR_S3_USER_DATA_BUCKET"
       log_key_value "📋 Worker Logs Bucket" "$TF_VAR_S3_WORKER_LOGS_BUCKET"
 
       log_header "🛠️ QUICK ACCESS COMMANDS"
