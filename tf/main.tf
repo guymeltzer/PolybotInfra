@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v20-fixed-all-secret-keys-and-imagepull" # FIXED: Added sqs_queue_url to polybot-secrets, fixed docker-registry-credentials secret type, enhanced MongoDB StorageClass handling, added comprehensive user guidance
+    setup_version    = "v21-aws-secrets-manager-integration" # NEW: Fetch secrets from AWS Secrets Manager instead of placeholders
   }
 
   provisioner "local-exec" {
@@ -819,7 +819,18 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v14 (Deep Kubectl Authentication & Redirection Debugging)"
+      log_header "🔐 Application Setup v21 (AWS Secrets Manager Integration)"
+
+      # AWS Configuration
+      AWS_REGION="${var.region}"
+      
+      # *** USER CONFIGURATION REQUIRED ***
+      # Replace this with your actual AWS Secrets Manager secret name that contains Polybot configuration
+      POLYBOT_AWS_SECRET_NAME="name-of-your-aws-secret-for-polybot"
+      
+      log_info "AWS Region: $AWS_REGION"
+      log_info "Polybot AWS Secret Name: $${BOLD}$POLYBOT_AWS_SECRET_NAME$${RESET}"
+      log_warning "⚠️  IMPORTANT: Replace '$POLYBOT_AWS_SECRET_NAME' with your actual AWS Secrets Manager secret name"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -851,7 +862,7 @@ resource "null_resource" "application_setup" {
       log_info "Current namespaces: $ALL_NAMESPACES"
       
       # Check for expected namespaces specifically
-      for ns in argocd prod dev; do
+      for ns in argocd prod dev mongodb; do
         if kubectl --insecure-skip-tls-verify get namespace "$ns" >/dev/null 2>&1; then
           # Check if namespace is fully ready
           NS_STATUS=$(kubectl --insecure-skip-tls-verify get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
@@ -958,20 +969,144 @@ EOF_DOCKER_SECRET
           log_warning "Failed to create/configure docker-registry-credentials in $namespace"
         fi
 
-        log_step "Creating application secrets"
-        # Application secrets with telegram_token for Polybot
+        log_step "Creating application secrets for namespace: $namespace"
+        
+        # NEW: AWS Secrets Manager Integration for Polybot Secrets
         if [[ "$namespace" == "prod" ]]; then
-          # For prod namespace, include telegram_token and sqs_queue_url
-          kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-            --from-literal=app-secret='default-app-secret-value' \
-            --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
-            --from-literal=redis-url='redis://your-redis-host:6379/0' \
-            --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
-            --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
-            -n "$namespace" \
-            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+          log_subheader "🔐 Fetching Polybot secrets from AWS Secrets Manager"
+          log_step "Fetching Polybot secrets from AWS Secrets Manager (secret: $POLYBOT_AWS_SECRET_NAME)"
+          
+          # Check if jq is available
+          if ! command -v jq >/dev/null 2>&1; then
+            log_error "jq is not installed. jq is required to parse JSON from AWS Secrets Manager."
+            log_info "Installing jq or use fallback approach..."
+            # Try to install jq if possible
+            if command -v apt-get >/dev/null 2>&1; then
+              log_step "Attempting to install jq via apt-get"
+              sudo apt-get update -y && sudo apt-get install -y jq >/dev/null 2>&1 || log_warning "Failed to install jq via apt-get"
+            elif command -v yum >/dev/null 2>&1; then
+              log_step "Attempting to install jq via yum"
+              sudo yum install -y jq >/dev/null 2>&1 || log_warning "Failed to install jq via yum"
+            elif command -v brew >/dev/null 2>&1; then
+              log_step "Attempting to install jq via brew"
+              brew install jq >/dev/null 2>&1 || log_warning "Failed to install jq via brew"
+            fi
+            
+            # Check again if jq is now available
+            if ! command -v jq >/dev/null 2>&1; then
+              log_error "jq installation failed. Falling back to placeholder secrets for $namespace."
+              # Fallback to placeholder approach
+              kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+                --from-literal=s3_bucket_name='YOUR_S3_BUCKET_NAME_PLACEHOLDER' \
+                --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
+                --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
+                --from-literal=TELEGRAM_APP_URL='YOUR_TELEGRAM_APP_URL_PLACEHOLDER' \
+                --from-literal=AWS_ACCESS_KEY_ID='YOUR_AWS_ACCESS_KEY_ID_PLACEHOLDER' \
+                --from-literal=AWS_SECRET_ACCESS_KEY='YOUR_AWS_SECRET_ACCESS_KEY_PLACEHOLDER' \
+                --from-literal=MONGO_COLLECTION='YOUR_MONGO_COLLECTION_PLACEHOLDER' \
+                --from-literal=MONGO_DB='YOUR_MONGO_DB_PLACEHOLDER' \
+                --from-literal=MONGO_URI='YOUR_MONGO_URI_PLACEHOLDER' \
+                --from-literal=POLYBOT_URL='YOUR_POLYBOT_URL_PLACEHOLDER' \
+                -n "$namespace" \
+                --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+              log_warning "Using placeholder secrets. You must update them manually with actual values."
+              continue
+            fi
+          fi
+          
+          # Fetch secrets from AWS Secrets Manager
+          log_progress "Fetching secrets from AWS Secrets Manager"
+          POLYBOT_SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$POLYBOT_AWS_SECRET_NAME" \
+            --region "$AWS_REGION" \
+            --query SecretString \
+            --output text 2>/dev/null)
+          
+          AWS_FETCH_EXIT_CODE=$?
+          
+          if [[ $AWS_FETCH_EXIT_CODE -eq 0 && -n "$POLYBOT_SECRET_JSON" && "$POLYBOT_SECRET_JSON" != "null" ]]; then
+            log_success "Successfully retrieved Polybot secrets JSON from AWS Secrets Manager."
+            
+            # Create a temporary .env file
+            TEMP_ENV_FILE=$(mktemp "/tmp/polybot_prod_secrets.XXXXXX.env")
+            log_step "Creating temporary .env file at: $TEMP_ENV_FILE"
+            
+            # Parse JSON and create .env file
+            if echo "$POLYBOT_SECRET_JSON" | jq -r 'to_entries|map("\(.key)=\(.value|tostring)")|.[]' > "$TEMP_ENV_FILE" 2>/dev/null; then
+              # Verify the .env file was created and has content
+              if [[ -s "$TEMP_ENV_FILE" ]]; then
+                log_success "Temporary .env file created successfully with secrets."
+                log_info "Number of secrets parsed: $(wc -l < "$TEMP_ENV_FILE")"
+                
+                # Show first few entries for verification (without values for security)
+                log_info "First few secret keys found:"
+                head -5 "$TEMP_ENV_FILE" | cut -d'=' -f1 | while read -r key; do
+                  log_info "   • $key"
+                done
+                
+                log_step "Creating/Updating Kubernetes secret 'polybot-secrets' in namespace '$namespace' from .env file"
+                if kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+                    --from-env-file="$TEMP_ENV_FILE" \
+                    -n "$namespace" \
+                    --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null; then
+                  log_success "Kubernetes secret '$namespace/polybot-secrets' created/updated from AWS Secrets Manager."
+                  
+                  # Verify the secret was created with expected keys
+                  log_step "Verifying secret keys in Kubernetes"
+                  SECRET_KEYS=$(kubectl --insecure-skip-tls-verify get secret polybot-secrets -n "$namespace" -o jsonpath='{.data}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null | sort || echo "")
+                  if [[ -n "$SECRET_KEYS" ]]; then
+                    log_success "Secret verification - Found keys:"
+                    echo "$SECRET_KEYS" | while read -r key; do
+                      log_info "   ✓ $key"
+                    done
+                  else
+                    log_warning "Could not verify secret keys (kubectl or jq may have failed)"
+                  fi
+                else
+                  log_error "Failed to create/update Kubernetes secret '$namespace/polybot-secrets'."
+                fi
+                
+                # Clean up temp file
+                rm -f "$TEMP_ENV_FILE"
+                log_step "Cleaned up temporary .env file"
+              else
+                log_error "Temporary .env file was created but is empty. JSON parsing may have failed."
+                rm -f "$TEMP_ENV_FILE"
+              fi
+            else
+              log_error "Failed to parse secrets JSON with jq. The JSON may be malformed or jq failed."
+              log_info "Raw JSON (first 200 chars): $${POLYBOT_SECRET_JSON:0:200}..."
+              rm -f "$TEMP_ENV_FILE"
+            fi
+          else
+            log_error "Failed to retrieve secrets for Polybot from AWS Secrets Manager: $POLYBOT_AWS_SECRET_NAME"
+            log_error "AWS CLI exit code: $AWS_FETCH_EXIT_CODE"
+            log_info "Possible causes:"
+            log_info "   • Secret name '$POLYBOT_AWS_SECRET_NAME' does not exist"
+            log_info "   • Insufficient IAM permissions to access Secrets Manager"
+            log_info "   • Secret is in a different AWS region"
+            log_info "   • AWS CLI is not properly configured"
+            log_info ""
+            log_info "Creating placeholder secret for now. You MUST update it with actual values:"
+            
+            # Fallback to comprehensive placeholder secret
+            kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
+              --from-literal=s3_bucket_name='YOUR_S3_BUCKET_NAME_PLACEHOLDER' \
+              --from-literal=sqs_queue_url='YOUR_SQS_QUEUE_URL_PLACEHOLDER' \
+              --from-literal=telegram_token='YOUR_TELEGRAM_TOKEN_PLACEHOLDER' \
+              --from-literal=TELEGRAM_APP_URL='YOUR_TELEGRAM_APP_URL_PLACEHOLDER' \
+              --from-literal=AWS_ACCESS_KEY_ID='YOUR_AWS_ACCESS_KEY_ID_PLACEHOLDER' \
+              --from-literal=AWS_SECRET_ACCESS_KEY='YOUR_AWS_SECRET_ACCESS_KEY_PLACEHOLDER' \
+              --from-literal=MONGO_COLLECTION='YOUR_MONGO_COLLECTION_PLACEHOLDER' \
+              --from-literal=MONGO_DB='YOUR_MONGO_DB_PLACEHOLDER' \
+              --from-literal=MONGO_URI='YOUR_MONGO_URI_PLACEHOLDER' \
+              --from-literal=POLYBOT_URL='YOUR_POLYBOT_URL_PLACEHOLDER' \
+              -n "$namespace" \
+              --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+          fi
         else
-          # For other namespaces, standard secrets without telegram_token and sqs_queue_url
+          # For dev and other namespaces, use simplified secrets (or fetch from different AWS secret if needed)
+          log_info "For namespace '$namespace': Creating basic application secrets (not fetching from AWS Secrets Manager)"
           kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
             --from-literal=app-secret='default-app-secret-value' \
             --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
@@ -1097,6 +1232,7 @@ EOF_DOCKER_SECRET
           log_success "MongoDB ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
+          log_info "MongoDB application.yaml already includes CreateNamespace=true for 'mongodb' namespace"
           log_info "If MongoDB shows StorageClass parameter conflicts in ArgoCD:"
           log_info "  1. Check existing StorageClass: kubectl get sc mongodb-storage -o yaml"
           log_info "  2. Compare with k8s/MongoDB/storageclass.yaml in Git"
@@ -1181,72 +1317,24 @@ EOF_DOCKER_SECRET
         log_warning "ArgoCD Application CRD not yet available - ArgoCD may still be initializing"
         log_info "You can check status later with: kubectl get applications -n argocd"
       fi
-      
-      log_subheader "🔍 ArgoCD Application Controller Status"
-      log_step "Checking ArgoCD application controller pod status"
-      APP_CONTROLLER_PODS=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller --no-headers 2>/dev/null | wc -l || echo "0")
-      if [[ "$APP_CONTROLLER_PODS" -gt 0 ]]; then
-        log_success "Found $APP_CONTROLLER_PODS ArgoCD application controller pod(s)"
-        kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller 2>/dev/null | while read -r line; do
-          log_info "   $line"
-        done || true
-      else
-        log_warning "No ArgoCD application controller pods found"
-      fi
-
-      log_subheader "🩺 ArgoCD Server Pod Readiness Check"
-      log_step "Investigating ArgoCD server pod readiness (diagnosing 0/1 Ready issue)"
-      ARGOCD_SERVER_POD_NAME=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "not-found")
-      
-      if [[ "$ARGOCD_SERVER_POD_NAME" != "not-found" ]]; then
-        log_info "ArgoCD Server Pod: $${BOLD}$ARGOCD_SERVER_POD_NAME$${RESET}"
-        
-        log_step "ArgoCD server pod status:"
-        kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o wide 2>/dev/null || log_warning "   Could not get pod status"
-        
-        log_step "ArgoCD server pod readiness and liveness probe status:"
-        kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.conditions}' 2>/dev/null | jq . 2>/dev/null || kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.status.conditions}' 2>/dev/null || log_info "   Could not get condition details"
-        
-        log_step "Describing ArgoCD Server Pod (events and detailed status):"
-        kubectl --insecure-skip-tls-verify describe pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not describe pod"
-        
-        log_step "Recent logs from ArgoCD Server Pod (last 50 lines):"
-        kubectl --insecure-skip-tls-verify logs --tail=50 "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not retrieve pod logs"
-        
-        # Check if there are multiple containers in the pod
-        CONTAINER_COUNT=$(kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null | wc -w || echo "0")
-        if [[ "$CONTAINER_COUNT" -gt 1 ]]; then
-          log_info "Pod has $CONTAINER_COUNT containers. Checking individual container statuses:"
-          kubectl --insecure-skip-tls-verify get pod "$ARGOCD_SERVER_POD_NAME" -n "$ARGOCD_NAMESPACE" -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | while read -r container_name; do
-            if [[ -n "$container_name" ]]; then
-              log_step "Container '$container_name' logs:"
-              kubectl --insecure-skip-tls-verify logs --tail=20 "$ARGOCD_SERVER_POD_NAME" -c "$container_name" -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_info "   Could not get logs for container $container_name"
-            fi
-          done
-        fi
-        
-        log_step "ArgoCD server service status:"
-        kubectl --insecure-skip-tls-verify get service argocd-server -n "$ARGOCD_NAMESPACE" -o wide 2>/dev/null || log_warning "   ArgoCD server service not found"
-        
-      else
-        log_warning "ArgoCD Server pod not found."
-        log_step "All pods in ArgoCD namespace:"
-        kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_warning "   Could not list pods in ArgoCD namespace"
-      fi
 
       log_success "Application setup and ArgoCD deployment completed successfully"
       
       log_subheader "🔧 Post-Deployment Action Items Required"
-      log_warning "IMPORTANT: Replace placeholder values in secrets with actual credentials"
-      log_info "1. Update Telegram Token:"
-      log_cmd_output "   kubectl --insecure-skip-tls-verify patch secret polybot-secrets -n prod -p '{\"data\":{\"telegram_token\":\"'$$(echo -n \"YOUR_ACTUAL_TELEGRAM_TOKEN\" | base64)'\"}}"
-      log_info "2. Update SQS Queue URL:"
-      log_cmd_output "   kubectl --insecure-skip-tls-verify patch secret polybot-secrets -n prod -p '{\"data\":{\"sqs_queue_url\":\"'$$(echo -n \"YOUR_ACTUAL_SQS_QUEUE_URL\" | base64)'\"}}"
-      log_info "3. Update Docker Registry Credentials (if using private registry):"
-      log_cmd_output "   kubectl --insecure-skip-tls-verify create secret docker-registry docker-registry-credentials --docker-server=your-registry --docker-username=your-user --docker-password=your-pass -n prod --dry-run=client -o yaml | kubectl apply -f -"
-      log_info "4. Verify application status:"
+      log_warning "IMPORTANT: Configure AWS Secrets Manager secret name"
+      log_info "1. Update the AWS Secrets Manager secret name in this script:"
+      log_cmd_output "   Replace 'name-of-your-aws-secret-for-polybot' with your actual AWS secret name"
+      log_info "2. Ensure your AWS secret contains all required Polybot keys:"
+      log_cmd_output "   s3_bucket_name, sqs_queue_url, telegram_token, TELEGRAM_APP_URL,"
+      log_cmd_output "   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MONGO_COLLECTION,"
+      log_cmd_output "   MONGO_DB, MONGO_URI, POLYBOT_URL"
+      log_info "3. Verify application status:"
       log_cmd_output "   kubectl --insecure-skip-tls-verify get applications -n argocd"
       log_cmd_output "   kubectl --insecure-skip-tls-verify get pods -n prod"
+      log_info "4. If StorageClass conflicts occur for MongoDB:"
+      log_cmd_output "   kubectl delete sc mongodb-storage  # if parameters differ from Git"
+      log_info "5. Check secret was populated correctly:"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify get secret polybot-secrets -n prod -o jsonpath='{.data}' | jq 'keys'"
     EOT
   }
 }
