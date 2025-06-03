@@ -687,11 +687,15 @@ resource "null_resource" "cluster_maintenance" {
 
 # Essential namespace and secret creation
 resource "null_resource" "application_setup" {
-  depends_on = [null_resource.ensure_local_kubeconfig] # Changed to depend on kubeconfig being ensured
+  depends_on = [
+    null_resource.ensure_local_kubeconfig, # Ensure kubeconfig is available
+    null_resource.install_argocd           # Ensure ArgoCD is installed before deploying applications
+  ]
   
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    setup_version      = "v5-tls-fix-applied"
+    argocd_installed   = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
+    setup_version      = "v6-argocd-apps-added" # Updated version for ArgoCD app deployment
   }
 
   provisioner "local-exec" {
@@ -825,7 +829,88 @@ metadata:
       rm -rf "$CERT_DIR"
       log_step "Cleaned up temporary certificate directory"
 
-      log_success "Application setup completed successfully"
+      log_subheader "🚀 Deploying ArgoCD Applications"
+      # Deploy ArgoCD applications only if ArgoCD is installed
+      ARGOCD_NAMESPACE="argocd"
+      
+      log_step "Checking if ArgoCD is installed and ready"
+      if ! kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+        log_warning "ArgoCD namespace not found. Skipping application deployment."
+        log_info "ArgoCD applications can be deployed manually later with:"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n argocd"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/Polybot/application.yaml -n argocd"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/YOLOv5/application.yaml -n argocd"
+      else
+        log_success "ArgoCD namespace found. Proceeding with application deployment..."
+        
+        # Wait for ArgoCD to be ready
+        log_step "Waiting for ArgoCD server to be ready (timeout: 60s)"
+        if kubectl --insecure-skip-tls-verify wait deployment -n "$ARGOCD_NAMESPACE" argocd-server --for condition=Available --timeout=60s 2>/dev/null; then
+          log_success "ArgoCD server is ready"
+        else
+          log_warning "ArgoCD server not ready within timeout, proceeding anyway"
+        fi
+        
+        # Apply ArgoCD Applications
+        log_step "Applying MongoDB ArgoCD Application"
+        if [[ -f "./k8s/MongoDB/application.yaml" ]]; then
+          kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n "$ARGOCD_NAMESPACE" && \
+            log_success "MongoDB ArgoCD Application applied successfully" || \
+            log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or file not found)"
+        else
+          log_warning "MongoDB application.yaml not found at ./k8s/MongoDB/application.yaml"
+        fi
+
+        log_step "Applying Polybot ArgoCD Application"
+        if [[ -f "./k8s/Polybot/application.yaml" ]]; then
+          kubectl --insecure-skip-tls-verify apply -f ./k8s/Polybot/application.yaml -n "$ARGOCD_NAMESPACE" && \
+            log_success "Polybot ArgoCD Application applied successfully" || \
+            log_warning "Failed to apply Polybot ArgoCD Application (may already exist or file not found)"
+        else
+          log_warning "Polybot application.yaml not found at ./k8s/Polybot/application.yaml"
+        fi
+
+        log_step "Applying YOLOv5 ArgoCD Application"
+        if [[ -f "./k8s/YOLOv5/application.yaml" ]]; then
+          kubectl --insecure-skip-tls-verify apply -f ./k8s/YOLOv5/application.yaml -n "$ARGOCD_NAMESPACE" && \
+            log_success "YOLOv5 ArgoCD Application applied successfully" || \
+            log_warning "Failed to apply YOLOv5 ArgoCD Application (may already exist or file not found)"
+        else
+          log_warning "YOLOv5 application.yaml not found at ./k8s/YOLOv5/application.yaml"
+        fi
+
+        # Check for any other application.yaml files in subdirectories
+        log_step "Scanning for additional ArgoCD applications"
+        if find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|YOLOv5)" >/dev/null 2>&1; then
+          find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|YOLOv5)" | while read -r app_file; do
+            app_name=$(basename "$(dirname "$app_file")")
+            log_step "Applying $app_name ArgoCD Application"
+            kubectl --insecure-skip-tls-verify apply -f "$app_file" -n "$ARGOCD_NAMESPACE" && \
+              log_success "$app_name ArgoCD Application applied successfully" || \
+              log_warning "Failed to apply $app_name ArgoCD Application"
+          done
+        else
+          log_info "No additional ArgoCD applications found"
+        fi
+        
+        log_subheader "🔍 Verifying ArgoCD Applications"
+        log_step "Listing deployed ArgoCD applications"
+        if kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          APPLICATIONS=$(kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
+          if [[ "$APPLICATIONS" -gt 0 ]]; then
+            log_success "Found $APPLICATIONS ArgoCD applications deployed"
+            kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" 2>/dev/null | while read -r line; do
+              log_info "   $line"
+            done
+          else
+            log_warning "No ArgoCD applications found after deployment"
+          fi
+        else
+          log_warning "Unable to verify ArgoCD applications (CRD may not be ready)"
+        fi
+      fi
+
+      log_success "Application setup and ArgoCD deployment completed successfully"
     EOT
   }
 }
@@ -976,7 +1061,7 @@ resource "null_resource" "install_argocd" {
 # Comprehensive deployment summary
 resource "null_resource" "deployment_summary" {
   depends_on = [
-    null_resource.cluster_maintenance, # Ensure this is intended, maintenance might not always run before summary
+    null_resource.cluster_maintenance,
     null_resource.application_setup,
     null_resource.install_argocd
   ]
@@ -984,19 +1069,43 @@ resource "null_resource" "deployment_summary" {
   triggers = {
     maintenance_id  = null_resource.cluster_maintenance.id
     setup_id        = null_resource.application_setup.id
-    argocd_id       = try(null_resource.install_argocd[0].id, "skipped") # Correct for count
-    summary_version = "v5-tls-fix-applied"
+    argocd_id       = try(null_resource.install_argocd[0].id, "skipped")
+    summary_version = "v6-comprehensive-enhanced" # Enhanced with styling and comprehensive info
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    environment = {
+      TF_VAR_REGION                 = var.region
+      TF_VAR_CLUSTER_NAME           = local.cluster_name
+      TF_VAR_VPC_ID                 = module.k8s-cluster.vpc_id_output
+      TF_VAR_CONTROL_PLANE_IP       = module.k8s-cluster.control_plane_public_ip_output
+      TF_VAR_CONTROL_PLANE_ID       = module.k8s-cluster.control_plane_instance_id_output
+      TF_VAR_CONTROL_PLANE_PRIVATE_IP = module.k8s-cluster.control_plane_private_ip_output
+      TF_VAR_SSH_KEY_NAME           = module.k8s-cluster.ssh_key_name_output
+      TF_VAR_WORKER_ASG_NAME        = module.k8s-cluster.worker_asg_name_output
+      TF_VAR_LAUNCH_TEMPLATE_ID     = module.k8s-cluster.launch_template_id_output
+      TF_VAR_ALB_DNS_NAME           = module.k8s-cluster.alb_dns_name_output
+      TF_VAR_ALB_ZONE_ID            = module.k8s-cluster.alb_zone_id_output
+      TF_VAR_DOMAIN_NAME            = var.domain_name
+      TF_VAR_CP_IAM_ROLE_ARN        = module.k8s-cluster.control_plane_iam_role_arn_output
+      TF_VAR_WORKER_IAM_ROLE_ARN    = module.k8s-cluster.worker_iam_role_arn_output
+      TF_VAR_LAMBDA_FUNCTION_NAME   = module.k8s-cluster.lambda_function_name_output
+      TF_VAR_SNS_TOPIC_ARN          = module.k8s-cluster.sns_topic_arn_output
+      TF_VAR_KUBECONFIG_SECRET_NAME = module.k8s-cluster.kubeconfig_secret_name_output
+      TF_VAR_JOIN_COMMAND_SECRET_NAME = module.k8s-cluster.join_command_secret_name_output
+      TF_VAR_S3_USER_DATA_BUCKET    = module.k8s-cluster.user_data_bucket_name_output
+      TF_VAR_S3_WORKER_LOGS_BUCKET  = module.k8s-cluster.worker_logs_bucket_name_output
+      TF_KUBECONFIG_PATH            = local.kubeconfig_path
+    }
+    command = <<-EOT
       #!/bin/bash
-      set -e # Exit on error, but many commands below have || true or error checks
+      set -e
 
       # Style Definitions
       RESET='\033[0m'
       BOLD='\033[1m'
+      DIM='\033[2m'
       GREEN='\033[0;32m'
       YELLOW='\033[0;33m'
       BLUE='\033[0;34m'
@@ -1004,109 +1113,201 @@ resource "null_resource" "deployment_summary" {
       CYAN='\033[0;36m'
       RED='\033[0;31m'
       WHITE='\033[0;37m'
-      BG_GREEN='\033[0;42m'
-      BG_BLUE='\033[0;44m'
-      BG_PURPLE='\033[0;45m'
+      BG_GREEN='\033[42m'
+      BG_BLUE='\033[44m'
+      BG_PURPLE='\033[45m'
+      BG_CYAN='\033[46m'
+      BG_YELLOW='\033[43m'
 
-      # Helper Functions for logging
-      log_header() { echo -e "\n$${BOLD}$${BG_PURPLE}$${WHITE}===== $1 =====$${RESET}"; }
-      log_subheader() { echo -e "\n$${BOLD}$${CYAN}--- $1 ---$${RESET}"; }
-      log_step() { echo -e "$${BLUE}▶ $1$${RESET}"; }
-      log_success() { echo -e "$${GREEN}✅ $1$${RESET}"; }
-      log_warning() { echo -e "$${YELLOW}⚠️ $1$${RESET}"; }
-      log_error() { echo -e "$${RED}❌ $1$${RESET}"; }
-      log_info() { echo -e "💡 $${CYAN}$1$${RESET}"; }
-      log_key_value() { echo -e "$${BOLD}$1:$${RESET} $${WHITE}$2$${RESET}"; }
-      log_cmd_output() { echo -e "$${WHITE}$1$${RESET}"; }
-      log_celebration() { echo -e "$${BOLD}$${BG_GREEN}$${WHITE} $1 $${RESET}"; }
+      # Enhanced Helper Functions
+      log_header() { echo -e "\n$${BOLD}$${BG_PURPLE}$${WHITE} ===== $1 ===== $${RESET}"; }
+      log_subheader() { echo -e "\n$${BOLD}$${BG_CYAN}$${WHITE} --- $1 --- $${RESET}"; }
+      log_section() { echo -e "\n$${BOLD}$${BLUE}🔹 $1$${RESET}"; }
+      log_key_value() { echo -e "  $${BOLD}$${CYAN}$1:$${RESET} $${WHITE}$2$${RESET}"; }
+      log_command() { echo -e "  $${DIM}$${YELLOW}💻 $1$${RESET}"; }
+      log_info() { echo -e "  $${CYAN}💡 $1$${RESET}"; }
+      log_success() { echo -e "  $${GREEN}✅ $1$${RESET}"; }
+      log_warning() { echo -e "  $${YELLOW}⚠️  $1$${RESET}"; }
+      log_error() { echo -e "  $${RED}❌ $1$${RESET}"; }
+      log_celebration() { echo -e "$${BOLD}$${BG_GREEN}$${WHITE} 🎉 $1 🎉 $${RESET}"; }
+      log_separator() { echo -e "$${DIM}$${WHITE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$${RESET}"; }
 
-      # Ensure KUBECONFIG is set from local.kubeconfig_path
-      export KUBECONFIG="${local.kubeconfig_path}"
+      # Set kubeconfig
+      export KUBECONFIG="$TF_KUBECONFIG_PATH"
 
       echo ""
-      log_celebration "🎉 POLYBOT KUBERNETES CLUSTER DEPLOYMENT SUMMARY 🎉"
       echo ""
+      log_celebration "POLYBOT KUBERNETES CLUSTER DEPLOYMENT COMPLETE"
+      echo ""
+      log_separator
 
-      log_header "🖥️ CONTROL PLANE INFORMATION"
-      # Control Plane Information (ensure module outputs are correctly referenced)
-      # These come from Terraform interpolations, no $ needed for shell interpretation after TF processes them.
-      # Assuming module.k8s-cluster has these outputs defined in its outputs.tf
-      PUBLIC_IP_VAL="${module.k8s-cluster.control_plane_public_ip_output}"
-      INSTANCE_ID_VAL="${module.k8s-cluster.control_plane_instance_id_output}"
-      KEY_NAME_VAL="${module.k8s-cluster.ssh_key_name_output}" # Assuming an output for key name from module
+      log_header "🏗️ INFRASTRUCTURE OVERVIEW"
+      
+      log_section "Core Infrastructure"
+      log_key_value "🌍 AWS Region" "$TF_VAR_REGION"
+      log_key_value "🏷️  Cluster Name" "$TF_VAR_CLUSTER_NAME"
+      log_key_value "🌐 VPC ID" "$TF_VAR_VPC_ID"
+      log_key_value "🌎 Domain Name" "$TF_VAR_DOMAIN_NAME"
+      
+      log_section "Control Plane"
+      log_key_value "📍 Instance ID" "$TF_VAR_CONTROL_PLANE_ID"
+      log_key_value "🌐 Public IP" "$TF_VAR_CONTROL_PLANE_IP"
+      log_key_value "🔒 Private IP" "$TF_VAR_CONTROL_PLANE_PRIVATE_IP"
+      log_key_value "🔗 API Endpoint" "https://$TF_VAR_CONTROL_PLANE_IP:6443"
+      log_key_value "🔑 SSH Key" "$TF_VAR_SSH_KEY_NAME"
 
-      log_key_value "📍 Instance ID" "$INSTANCE_ID_VAL"
-      log_key_value "🌐 Public IP" "$PUBLIC_IP_VAL"
-      log_key_value "🔗 API Endpoint" "https://$PUBLIC_IP_VAL:6443"
-      if [[ -n "$KEY_NAME_VAL" && "$KEY_NAME_VAL" != "null" ]]; then # Check if key name is available
-        log_key_value "🔑 SSH Command" "ssh -i $KEY_NAME_VAL.pem ubuntu@$PUBLIC_IP_VAL"
-      else
-        log_key_value "🔑 SSH Command" "ssh -i <your-key-name.pem> ubuntu@$PUBLIC_IP_VAL"
+      log_section "Worker Nodes & Auto Scaling"
+      log_key_value "🤖 ASG Name" "$TF_VAR_WORKER_ASG_NAME"
+      log_key_value "🚀 Launch Template" "$TF_VAR_LAUNCH_TEMPLATE_ID"
+      
+      # Get current ASG status
+      if command -v aws >/dev/null 2>&1; then
+        ASG_INFO=$(aws autoscaling describe-auto-scaling-groups --region "$TF_VAR_REGION" --auto-scaling-group-names "$TF_VAR_WORKER_ASG_NAME" --query "AutoScalingGroups[0].{DesiredCapacity:DesiredCapacity,MinSize:MinSize,MaxSize:MaxSize,Instances:length(Instances)}" --output text 2>/dev/null || echo "N/A N/A N/A N/A")
+        read -r DESIRED MIN MAX INSTANCES <<< "$ASG_INFO"
+        if [[ "$DESIRED" != "N/A" ]]; then
+          log_key_value "📊 ASG Configuration" "Desired: $DESIRED, Min: $MIN, Max: $MAX, Current: $INSTANCES"
+        else
+          log_warning "Could not retrieve ASG information"
+        fi
       fi
 
-      log_header "☸️ CLUSTER STATUS"
-      # Cluster Status
+      log_section "Load Balancing & Networking"
+      log_key_value "⚖️  ALB DNS Name" "$TF_VAR_ALB_DNS_NAME"
+      log_key_value "🌐 ALB Zone ID" "$TF_VAR_ALB_ZONE_ID"
+      log_key_value "🔗 Application URL" "https://$TF_VAR_DOMAIN_NAME"
+
+      log_header "☸️ KUBERNETES CLUSTER STATUS"
+      
+      log_section "Cluster Access"
+      log_key_value "📁 Kubeconfig Path" "$TF_KUBECONFIG_PATH"
+      log_key_value "🔐 Kubeconfig Secret" "$TF_VAR_KUBECONFIG_SECRET_NAME"
+      log_key_value "🎫 Join Command Secret" "$TF_VAR_JOIN_COMMAND_SECRET_NAME"
+      
+      log_section "Node Status"
       if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
-        TOTAL_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "N/A")
-        READY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "N/A")
-        # Assuming control plane has 'control-plane' in its name or a label.
-        # Adjust if using a specific label like !node-role.kubernetes.io/master or !node-role.kubernetes.io/control-plane
-        READY_WORKERS=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "N/A")
-
-        log_key_value "📊 Nodes" "$READY_NODES/$TOTAL_NODES Ready ($READY_WORKERS workers)"
+        TOTAL_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        READY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
+        NOTREADY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
+        READY_WORKERS=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "0")
         
-        log_subheader "📋 Node Details"
-        kubectl --insecure-skip-tls-verify get nodes -o wide 2>/dev/null | tail -n +2 | while read -r node status role age version internal_ip external_ip os_image kernel container_runtime; do
-          log_info "• $${BOLD}$node$${RESET} ($status) - $role"
-        done || log_warning "Could not retrieve node details."
+        log_key_value "📊 Total Nodes" "$TOTAL_NODES"
+        log_key_value "✅ Ready Nodes" "$READY_NODES"
+        log_key_value "⚠️  NotReady Nodes" "$NOTREADY_NODES"
+        log_key_value "🤖 Ready Workers" "$READY_WORKERS"
+        
+        log_info "Node Details:"
+        kubectl --insecure-skip-tls-verify get nodes -o custom-columns="NAME:.metadata.name,STATUS:.status.conditions[?(@.type=='Ready')].status,ROLE:.metadata.labels.node-role\.kubernetes\.io/control-plane,AGE:.metadata.creationTimestamp,VERSION:.status.nodeInfo.kubeletVersion" --no-headers 2>/dev/null | while read -r name status role age version; do
+          if [[ "$role" == "<none>" ]]; then role="worker"; fi
+          if [[ "$status" == "True" ]]; then status="Ready"; else status="NotReady"; fi
+          log_info "    • $${BOLD}$name$${RESET} ($status) - $role - $version"
+        done || log_warning "Could not retrieve detailed node information"
       else
-        log_warning "Cannot connect to cluster to retrieve status."
+        log_error "Cannot connect to Kubernetes cluster"
       fi
 
-      log_header "🔗 KUBERNETES ACCESS"
-      # Kubernetes Access
-      log_key_value "📁 Kubeconfig" "${local.kubeconfig_path}" # Terraform interpolation
-      log_subheader "🚀 Quick Setup Commands"
-      log_cmd_output "   export KUBECONFIG=${local.kubeconfig_path}" # Terraform interpolation
-      log_cmd_output "   kubectl --insecure-skip-tls-verify get nodes"
-
-      log_header "🔐 ARGOCD ACCESS"
-      # ArgoCD Access
+      log_header "🔐 ARGOCD GITOPS PLATFORM"
+      
       ARGOCD_NAMESPACE="argocd"
       if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-        ARGOCD_READY_REPLICAS=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-        ARGOCD_DESIRED_REPLICAS=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "N/A")
-        log_key_value "📊 Status" "$ARGOCD_READY_REPLICAS/$ARGOCD_DESIRED_REPLICAS ready replicas"
-        log_key_value "🌐 URL (via port-forward)" "https://localhost:8080 (or specified port)" # Changed to 8080 as common example
+        log_section "ArgoCD Status"
+        
+        # ArgoCD deployment status
+        ARGOCD_READY=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        ARGOCD_DESIRED=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        
+        if [[ "$ARGOCD_READY" == "$ARGOCD_DESIRED" ]] && [[ "$ARGOCD_READY" -gt 0 ]]; then
+          log_success "ArgoCD Server: $ARGOCD_READY/$ARGOCD_DESIRED replicas ready"
+        else
+          log_warning "ArgoCD Server: $ARGOCD_READY/$ARGOCD_DESIRED replicas ready"
+        fi
+        
+        # ArgoCD applications
+        log_section "ArgoCD Applications"
+        if kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          TOTAL_APPS=$(kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
+          if [[ "$TOTAL_APPS" -gt 0 ]]; then
+            log_success "Found $TOTAL_APPS ArgoCD applications"
+            kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REPO:.spec.source.repoURL" --no-headers 2>/dev/null | while read -r name sync health repo; do
+              log_info "    • $${BOLD}$name$${RESET} - Sync: $sync, Health: $health"
+            done
+          else
+            log_warning "No ArgoCD applications found"
+          fi
+        else
+          log_warning "ArgoCD Application CRD not available"
+        fi
+        
+        log_section "ArgoCD Access"
+        log_key_value "🌐 Local URL" "https://localhost:8080 (via port-forward)"
         log_key_value "👤 Username" "admin"
-
+        
+        # Try to get ArgoCD password
         PASSWORD_SECRET_NAME="argocd-initial-admin-secret"
         RAW_PASSWORD=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
         if [[ -n "$RAW_PASSWORD" ]]; then
-          ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d 2>/dev/null || echo "<failed to decode>")
-          log_key_value "🔑 Password" "$ARGOCD_PASSWORD (this is the initial password, may have changed)"
+          ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d 2>/dev/null || echo "<decode-failed>")
+          log_key_value "🔑 Password" "$ARGOCD_PASSWORD"
         else
-          log_key_value "🔑 Password" "(Initial admin secret not found or password field empty; use current password)"
+          log_warning "ArgoCD password secret not found"
         fi
-        log_subheader "🔗 Setup Port Forward"
-        log_cmd_output "   kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n $ARGOCD_NAMESPACE 8080:443"
       else
-        log_info "ArgoCD namespace not found (ArgoCD might be skipped or not installed)."
+        log_warning "ArgoCD namespace not found - ArgoCD may not be installed"
       fi
 
-      log_header "☁️ AWS RESOURCES"
-      # AWS Resources (ensure module outputs are correct)
-      log_key_value "🌐 VPC ID" "${module.k8s-cluster.vpc_id_output}" # Assuming module output, e.g., vpc_id_output
-      ALB_DNS_NAME="${module.k8s-cluster.alb_dns_name_output}" # Assuming module output
-      if [[ -n "$ALB_DNS_NAME" && "$ALB_DNS_NAME" != "null" ]]; then
-        log_key_value "⚖️ Load Balancer DNS" "$ALB_DNS_NAME"
-      else
-        log_key_value "⚖️ Load Balancer DNS" "(Not available or ALB not created)"
-      fi
-      log_key_value "🔄 Auto Scaling Group" "${module.k8s-cluster.worker_asg_name_output}" # Assuming module output
+      log_header "🔧 IAM & AUTOMATION"
+      
+      log_section "IAM Roles"
+      log_key_value "🎛️  Control Plane Role" "$TF_VAR_CP_IAM_ROLE_ARN"
+      log_key_value "🤖 Worker Node Role" "$TF_VAR_WORKER_IAM_ROLE_ARN"
+      
+      log_section "Automation & Monitoring"
+      log_key_value "🔧 Lambda Function" "$TF_VAR_LAMBDA_FUNCTION_NAME"
+      log_key_value "📢 SNS Topic" "$TF_VAR_SNS_TOPIC_ARN"
+      
+      log_section "Storage"
+      log_key_value "📦 User Data Bucket" "$TF_VAR_S3_USER_DATA_BUCKET"
+      log_key_value "📋 Worker Logs Bucket" "$TF_VAR_S3_WORKER_LOGS_BUCKET"
 
+      log_header "🛠️ QUICK ACCESS COMMANDS"
+      
+      log_section "Kubernetes Cluster Access"
+      log_command "export KUBECONFIG=$TF_KUBECONFIG_PATH"
+      log_command "kubectl --insecure-skip-tls-verify get nodes"
+      log_command "kubectl --insecure-skip-tls-verify get pods --all-namespaces"
+      
+      log_section "SSH Access"
+      if [[ -n "$TF_VAR_SSH_KEY_NAME" && "$TF_VAR_SSH_KEY_NAME" != "null" ]]; then
+        log_command "ssh -i $TF_VAR_SSH_KEY_NAME.pem ubuntu@$TF_VAR_CONTROL_PLANE_IP"
+      else
+        log_command "ssh -i <your-ssh-key.pem> ubuntu@$TF_VAR_CONTROL_PLANE_IP"
+      fi
+      
+      log_section "ArgoCD Access"
+      log_command "kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n argocd 8080:443"
+      log_info "Then visit: https://localhost:8080"
+      
+      log_section "Log Access"
+      log_command "# Control Plane Bootstrap Log"
+      log_command "ssh -i <key> ubuntu@$TF_VAR_CONTROL_PLANE_IP 'sudo tail -f /var/log/cloud-init-output.log'"
+      log_command ""
+      log_command "# ArgoCD Application Controller Logs"
+      log_command "kubectl --insecure-skip-tls-verify logs -n argocd -l app.kubernetes.io/name=argocd-application-controller -f"
+      log_command ""
+      log_command "# Worker Node Logs (after SSH to worker)"
+      log_command "sudo tail -f /var/log/cloud-init-output.log"
+
+      log_header "📋 NEXT STEPS"
+      
+      log_info "1. 🔗 Access ArgoCD UI using the port-forward command above"
+      log_info "2. 🔍 Verify applications are syncing properly in ArgoCD"
+      log_info "3. 🚀 Deploy your applications via ArgoCD or kubectl"
+      log_info "4. 📊 Monitor cluster health and application status"
+      log_info "5. 🔧 Configure monitoring and logging as needed"
+      
       echo ""
-      log_celebration "✅ DEPLOYMENT SUMMARY COMPLETE ✅"
+      log_separator
+      log_celebration "DEPLOYMENT SUMMARY COMPLETE - CLUSTER READY FOR USE"
+      log_separator
       echo ""
     EOT
   }
