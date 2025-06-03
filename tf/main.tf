@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v23-comprehensive-hybrid-prioritization-fixed" # FIXED: AWS secret name, dynamic TF outputs (S3/SQS/ALB), prioritization logic, Docker credentials (DOCKERHUB_*)
+    setup_version    = "v24-critical-case-mapping-fix" # CRITICAL FIX: telegram_token case mapping, .env file approach, robust AWS secret fetching
   }
 
   provisioner "local-exec" {
@@ -826,7 +826,7 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v22 (Hybrid Static+Dynamic Secrets)"
+      log_header "🔐 Application Setup v24 (CRITICAL: Case-Mapping Fix for telegram_token)"
 
       # AWS Configuration & User Settings
       AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
@@ -1058,89 +1058,138 @@ EOF_DOCKER_SECRET
           if [[ $AWS_FETCH_EXIT_CODE -eq 0 && -n "$POLYBOT_SECRET_JSON" && "$POLYBOT_SECRET_JSON" != "null" ]]; then
             log_success "Successfully retrieved static secrets JSON from AWS Secrets Manager."
             
-            # Prepare --from-literal arguments for all secrets with prioritization logic
-            log_step "Combining static secrets (from AWS) with dynamic secrets (from Terraform)"
-            LITERAL_ARGS=""
-            MISSING_KEYS=""
+            # ===== CRITICAL FIX: CASE-SENSITIVE KEY MAPPING =====
+            log_step "Creating case-mapped secrets for Kubernetes (fixing TELEGRAM_TOKEN -> telegram_token)"
             
-            # ===== DYNAMIC VALUES WITH PRIORITIZATION =====
-            # Priority: Terraform outputs first, then AWS secrets as fallback
+            # Create temporary .env file for precise key mapping
+            TEMP_ENV_FILE_PROD=$(mktemp "/tmp/polybot_prod_secrets.XXXXXX.env")
+            log_info "Creating temporary .env file: $TEMP_ENV_FILE_PROD"
             
-            log_info "Processing dynamic values with Terraform priority:"
+            # ===== STATIC KEYS FROM AWS - WITH EXPLICIT CASE MAPPING =====
+            log_info "Mapping static keys from AWS Secrets Manager (with case corrections):"
             
-            # S3_BUCKET_NAME (Terraform priority)
-            S3_VAL_FROM_TF="$TF_VAR_S3_BUCKET_NAME"
-            S3_VAL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".S3_BUCKET_NAME // \"\"" 2>/dev/null)
-            FINAL_S3_BUCKET_NAME="$${S3_VAL_FROM_TF:-$S3_VAL_FROM_AWS}" # Use TF if set, else AWS
-            if [[ -n "$FINAL_S3_BUCKET_NAME" && "$FINAL_S3_BUCKET_NAME" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=S3_BUCKET_NAME=$FINAL_S3_BUCKET_NAME"
-              log_info "   ✓ S3_BUCKET_NAME: $FINAL_S3_BUCKET_NAME (source: $${S3_VAL_FROM_TF:+Terraform}$${S3_VAL_FROM_TF:-AWS})"
+            # CRITICAL: Map TELEGRAM_TOKEN (AWS) -> telegram_token (K8s) for application compatibility
+            TELEGRAM_TOKEN_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".TELEGRAM_TOKEN // \"\"" 2>/dev/null)
+            if [[ -n "$TELEGRAM_TOKEN_FROM_AWS" && "$TELEGRAM_TOKEN_FROM_AWS" != "null" ]]; then
+              echo "telegram_token=$${TELEGRAM_TOKEN_FROM_AWS}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ Mapped TELEGRAM_TOKEN (AWS) -> telegram_token (K8s Secret)"
             else
-              log_warning "   ✗ S3_BUCKET_NAME missing from both Terraform and AWS Secret"
-              MISSING_KEYS="$MISSING_KEYS S3_BUCKET_NAME"
+              log_warning "   ✗ TELEGRAM_TOKEN not found in AWS Secret JSON"
+              echo "# MISSING: telegram_token" >> "$TEMP_ENV_FILE_PROD"
             fi
             
-            # SQS_QUEUE_URL (Terraform priority)
-            SQS_VAL_FROM_TF="$TF_VAR_SQS_QUEUE_URL"
-            SQS_VAL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".SQS_QUEUE_URL // \"\"" 2>/dev/null)
-            FINAL_SQS_QUEUE_URL="$${SQS_VAL_FROM_TF:-$SQS_VAL_FROM_AWS}" # Use TF if set, else AWS
-            if [[ -n "$FINAL_SQS_QUEUE_URL" && "$FINAL_SQS_QUEUE_URL" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=SQS_QUEUE_URL=$FINAL_SQS_QUEUE_URL"
-              log_info "   ✓ SQS_QUEUE_URL: $FINAL_SQS_QUEUE_URL (source: $${SQS_VAL_FROM_TF:+Terraform}$${SQS_VAL_FROM_TF:-AWS})"
+            # Map other static keys (assuming applications expect lowercase or adjust as needed)
+            AWS_ACCESS_KEY_ID_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".AWS_ACCESS_KEY_ID // \"\"" 2>/dev/null)
+            if [[ -n "$AWS_ACCESS_KEY_ID_VAL" && "$AWS_ACCESS_KEY_ID_VAL" != "null" ]]; then
+              echo "aws_access_key_id=$${AWS_ACCESS_KEY_ID_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ aws_access_key_id (from AWS_ACCESS_KEY_ID)"
             else
-              log_warning "   ✗ SQS_QUEUE_URL missing from both Terraform and AWS Secret"
-              MISSING_KEYS="$MISSING_KEYS SQS_QUEUE_URL"
+              log_warning "   ✗ AWS_ACCESS_KEY_ID not found in AWS Secret"
             fi
             
-            # TELEGRAM_APP_URL (Terraform priority)
-            TELEGRAM_URL_FROM_TF="$TF_VAR_TELEGRAM_APP_URL"
-            TELEGRAM_URL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".TELEGRAM_APP_URL // \"\"" 2>/dev/null)
-            FINAL_TELEGRAM_APP_URL="$${TELEGRAM_URL_FROM_TF:-$TELEGRAM_URL_FROM_AWS}" # Use TF if set, else AWS
-            if [[ -n "$FINAL_TELEGRAM_APP_URL" && "$FINAL_TELEGRAM_APP_URL" != "null" ]]; then
-              LITERAL_ARGS="$LITERAL_ARGS --from-literal=TELEGRAM_APP_URL=$FINAL_TELEGRAM_APP_URL"
-              log_info "   ✓ TELEGRAM_APP_URL: $FINAL_TELEGRAM_APP_URL (source: $${TELEGRAM_URL_FROM_TF:+Terraform}$${TELEGRAM_URL_FROM_TF:-AWS})"
+            AWS_SECRET_ACCESS_KEY_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".AWS_SECRET_ACCESS_KEY // \"\"" 2>/dev/null)
+            if [[ -n "$AWS_SECRET_ACCESS_KEY_VAL" && "$AWS_SECRET_ACCESS_KEY_VAL" != "null" ]]; then
+              echo "aws_secret_access_key=$${AWS_SECRET_ACCESS_KEY_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ aws_secret_access_key (from AWS_SECRET_ACCESS_KEY)"
             else
-              log_warning "   ✗ TELEGRAM_APP_URL missing from both Terraform and AWS Secret"
-              MISSING_KEYS="$MISSING_KEYS TELEGRAM_APP_URL"
+              log_warning "   ✗ AWS_SECRET_ACCESS_KEY not found in AWS Secret"
             fi
             
-            # ===== STATIC VALUES FROM AWS SECRETS MANAGER =====
-            log_info "Processing static values (from AWS Secrets Manager only):"
+            MONGO_URI_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".MONGO_URI // \"\"" 2>/dev/null)
+            if [[ -n "$MONGO_URI_VAL" && "$MONGO_URI_VAL" != "null" ]]; then
+              echo "mongo_uri=$${MONGO_URI_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ mongo_uri (from MONGO_URI)"
+            else
+              log_warning "   ✗ MONGO_URI not found in AWS Secret"
+            fi
             
-            # Define list of static keys expected from AWS Secrets Manager
-            STATIC_KEYS_TO_FETCH="TELEGRAM_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY MONGO_URI MONGO_DB MONGO_COLLECTION POLYBOT_URL"
+            MONGO_DB_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".MONGO_DB // \"\"" 2>/dev/null)
+            if [[ -n "$MONGO_DB_VAL" && "$MONGO_DB_VAL" != "null" ]]; then
+              echo "mongo_db=$${MONGO_DB_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ mongo_db (from MONGO_DB)"
+            else
+              log_warning "   ✗ MONGO_DB not found in AWS Secret"
+            fi
             
-            for key in $STATIC_KEYS_TO_FETCH; do
-              value=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".$${key} // \"\"" 2>/dev/null)
-              if [[ -n "$value" && "$value" != "null" ]]; then
-                LITERAL_ARGS="$LITERAL_ARGS --from-literal=$${key}=$value"
-                log_info "   ✓ $key (from AWS)"
+            MONGO_COLLECTION_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".MONGO_COLLECTION // \"\"" 2>/dev/null)
+            if [[ -n "$MONGO_COLLECTION_VAL" && "$MONGO_COLLECTION_VAL" != "null" ]]; then
+              echo "mongo_collection=$${MONGO_COLLECTION_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ mongo_collection (from MONGO_COLLECTION)"
+            else
+              log_warning "   ✗ MONGO_COLLECTION not found in AWS Secret"
+            fi
+            
+            POLYBOT_URL_VAL=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".POLYBOT_URL // \"\"" 2>/dev/null)
+            if [[ -n "$POLYBOT_URL_VAL" && "$POLYBOT_URL_VAL" != "null" ]]; then
+              echo "polybot_url=$${POLYBOT_URL_VAL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ polybot_url (from POLYBOT_URL)"
+            else
+              log_warning "   ✗ POLYBOT_URL not found in AWS Secret"
+            fi
+            
+            # ===== DYNAMIC VALUES WITH TERRAFORM PRIORITY =====
+            log_info "Adding dynamic values (Terraform outputs override AWS placeholders):"
+            
+            # S3_BUCKET_NAME: Use Terraform value if available, fallback to AWS
+            if [[ -n "$TF_VAR_S3_BUCKET_NAME" && "$TF_VAR_S3_BUCKET_NAME" != "null" ]]; then
+              echo "s3_bucket_name=$${TF_VAR_S3_BUCKET_NAME}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ s3_bucket_name (from Terraform: $TF_VAR_S3_BUCKET_NAME)"
+            else
+              S3_BUCKET_NAME_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".S3_BUCKET_NAME // \"\"" 2>/dev/null)
+              if [[ -n "$S3_BUCKET_NAME_FROM_AWS" && "$S3_BUCKET_NAME_FROM_AWS" != "null" ]]; then
+                echo "s3_bucket_name=$${S3_BUCKET_NAME_FROM_AWS}" >> "$TEMP_ENV_FILE_PROD"
+                log_info "   ✓ s3_bucket_name (from AWS fallback: $S3_BUCKET_NAME_FROM_AWS)"
               else
-                log_warning "   ✗ $key not found or empty in AWS Secret JSON"
-                MISSING_KEYS="$MISSING_KEYS $key"
+                log_warning "   ✗ s3_bucket_name not available from Terraform or AWS"
               fi
-            done
-            
-            # Check if we have sufficient secrets to proceed
-            if [[ -n "$MISSING_KEYS" ]]; then
-              log_warning "Some required secrets are missing:$MISSING_KEYS"
-              log_info "The application may not function correctly without these values."
-              log_info "Please ensure your AWS Secret 'polybot-secrets' contains all required keys."
             fi
             
-            # Create the Kubernetes Secret with all gathered secrets
-            if [[ -n "$LITERAL_ARGS" ]]; then
+            # SQS_QUEUE_URL: Use Terraform value if available, fallback to AWS
+            if [[ -n "$TF_VAR_SQS_QUEUE_URL" && "$TF_VAR_SQS_QUEUE_URL" != "null" ]]; then
+              echo "sqs_queue_url=$${TF_VAR_SQS_QUEUE_URL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ sqs_queue_url (from Terraform: $TF_VAR_SQS_QUEUE_URL)"
+            else
+              SQS_URL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".SQS_QUEUE_URL // \"\"" 2>/dev/null)
+              if [[ -n "$SQS_URL_FROM_AWS" && "$SQS_URL_FROM_AWS" != "null" ]]; then
+                echo "sqs_queue_url=$${SQS_URL_FROM_AWS}" >> "$TEMP_ENV_FILE_PROD"
+                log_info "   ✓ sqs_queue_url (from AWS fallback: $SQS_URL_FROM_AWS)"
+              else
+                log_warning "   ✗ sqs_queue_url not available from Terraform or AWS"
+              fi
+            fi
+            
+            # TELEGRAM_APP_URL: Use Terraform value if available, fallback to AWS
+            if [[ -n "$TF_VAR_TELEGRAM_APP_URL" && "$TF_VAR_TELEGRAM_APP_URL" != "null" ]]; then
+              echo "telegram_app_url=$${TF_VAR_TELEGRAM_APP_URL}" >> "$TEMP_ENV_FILE_PROD"
+              log_info "   ✓ telegram_app_url (from Terraform: $TF_VAR_TELEGRAM_APP_URL)"
+            else
+              TELEGRAM_APP_URL_FROM_AWS=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".TELEGRAM_APP_URL // \"\"" 2>/dev/null)
+              if [[ -n "$TELEGRAM_APP_URL_FROM_AWS" && "$TELEGRAM_APP_URL_FROM_AWS" != "null" ]]; then
+                echo "telegram_app_url=$${TELEGRAM_APP_URL_FROM_AWS}" >> "$TEMP_ENV_FILE_PROD"
+                log_info "   ✓ telegram_app_url (from AWS fallback: $TELEGRAM_APP_URL_FROM_AWS)"
+              else
+                log_warning "   ✗ telegram_app_url not available from Terraform or AWS"
+              fi
+            fi
+            
+            # ===== CREATE KUBERNETES SECRET FROM .ENV FILE =====
+            if [[ -s "$TEMP_ENV_FILE_PROD" ]]; then
               log_step "Creating/Updating Kubernetes secret 'polybot-secrets' in namespace 'prod'"
               
-              # Delete existing secret first to ensure clean application of all keys
+              # Show what we're about to create (without showing sensitive values)
+              log_info "Secret will contain the following keys:"
+              grep -v "^#" "$TEMP_ENV_FILE_PROD" | cut -d'=' -f1 | while read -r key; do
+                log_info "     ✓ $key"
+              done
+              
+              # Delete existing secret first to ensure clean application
               kubectl --insecure-skip-tls-verify delete secret polybot-secrets -n prod --ignore-not-found=true 2>/dev/null
               
-              # Create with all gathered literals. Note: $LITERAL_ARGS should not be quoted here to allow word splitting.
-              # shellcheck disable=SC2086
+              # Create secret from .env file
               if kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
-                  $LITERAL_ARGS \
+                  --from-env-file="$TEMP_ENV_FILE_PROD" \
                   -n prod 2>/dev/null; then
-                log_success "Kubernetes secret 'prod/polybot-secrets' created successfully with hybrid static+dynamic secrets."
+                log_success "Kubernetes secret 'prod/polybot-secrets' created successfully with case-corrected keys."
                 
                 # Verify the secret was created with expected keys
                 log_step "Verifying secret keys in Kubernetes"
@@ -1151,33 +1200,51 @@ EOF_DOCKER_SECRET
                   echo "$SECRET_KEYS" | while read -r key; do
                     log_info "     ✓ $key"
                   done
+                  
+                  # Critical verification: Check if telegram_token exists
+                  if echo "$SECRET_KEYS" | grep -q "^telegram_token$"; then
+                    log_success "✅ CRITICAL: 'telegram_token' key found in secret - Polybot application should work!"
+                  else
+                    log_error "❌ CRITICAL: 'telegram_token' key NOT found in secret - Polybot will fail!"
+                  fi
                 else
                   log_warning "Could not verify secret keys (kubectl or jq may have failed)"
                 fi
               else
                 log_error "Failed to create Kubernetes secret 'prod/polybot-secrets'."
+                log_info "Temporary .env file content (for debugging):"
+                cat "$TEMP_ENV_FILE_PROD"
+                rm -f "$TEMP_ENV_FILE_PROD"
                 exit 1
               fi
+            else
+              log_error "Temporary .env file is empty - no secrets to create"
+              rm -f "$TEMP_ENV_FILE_PROD"
+              exit 1
+            fi
+            
+            # Clean up temporary file
+            rm -f "$TEMP_ENV_FILE_PROD"
+            
+            # ===== UPDATE DOCKER REGISTRY CREDENTIALS FOR PROD =====
+            log_step "Updating Docker registry credentials for prod namespace with AWS secret values"
+            
+            # Extract Docker credentials from AWS secret
+            AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_USERNAME // ""' 2>/dev/null)
+            AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_PASSWORD // ""' 2>/dev/null)
+            
+            if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" && -n "$AWS_DOCKER_PASSWORD" && "$AWS_DOCKER_PASSWORD" != "null" ]]; then
+              log_info "Found Docker credentials in AWS secret - updating docker-registry-credentials for prod"
               
-              # ===== UPDATE DOCKER REGISTRY CREDENTIALS FOR PROD =====
-              log_step "Updating Docker registry credentials for prod namespace with AWS secret values"
+              # Create updated docker auth string
+              DOCKER_AUTH_ENCODED=$(echo -n "$${AWS_DOCKER_USERNAME}:$${AWS_DOCKER_PASSWORD}" | base64 -w0)
+              DOCKERCONFIGJSON="{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$DOCKER_AUTH_ENCODED\"}}}"
               
-              # Extract Docker credentials from AWS secret
-              AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_USERNAME // ""' 2>/dev/null)
-              AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_PASSWORD // ""' 2>/dev/null)
+              # Delete existing secret and recreate with real credentials
+              kubectl --insecure-skip-tls-verify delete secret docker-registry-credentials -n prod --ignore-not-found=true 2>/dev/null
               
-              if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" && -n "$AWS_DOCKER_PASSWORD" && "$AWS_DOCKER_PASSWORD" != "null" ]]; then
-                log_info "Found Docker credentials in AWS secret - updating docker-registry-credentials for prod"
-                
-                # Create updated docker auth string
-                DOCKER_AUTH_ENCODED=$(echo -n "$${AWS_DOCKER_USERNAME}:$${AWS_DOCKER_PASSWORD}" | base64 -w0)
-                DOCKERCONFIGJSON="{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$DOCKER_AUTH_ENCODED\"}}}"
-                
-                # Delete existing secret and recreate with real credentials
-                kubectl --insecure-skip-tls-verify delete secret docker-registry-credentials -n prod --ignore-not-found=true 2>/dev/null
-                
-                # Create the secret using kubectl apply with YAML
-                cat <<EOF_DOCKER_SECRET | kubectl --insecure-skip-tls-verify apply -f -
+              # Create the secret using kubectl apply with YAML
+              cat <<EOF_DOCKER_SECRET | kubectl --insecure-skip-tls-verify apply -f -
 apiVersion: v1
 kind: Secret
 metadata:
@@ -1187,18 +1254,14 @@ type: kubernetes.io/dockerconfigjson
 data:
   .dockerconfigjson: $(echo -n "$DOCKERCONFIGJSON" | base64 -w0)
 EOF_DOCKER_SECRET
-                if [ $? -eq 0 ]; then 
-                  log_success "docker-registry-credentials secret updated in prod with real AWS credentials"
-                else 
-                  log_warning "Failed to update docker-registry-credentials in prod"
-                fi
-              else
-                log_warning "DOCKERHUB_USERNAME or DOCKERHUB_PASSWORD not found in AWS secret - keeping placeholder Docker credentials for prod"
-                log_info "Add DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD to your AWS secret 'polybot-secrets' for private registry access"
+              if [ $? -eq 0 ]; then 
+                log_success "docker-registry-credentials secret updated in prod with real AWS credentials"
+              else 
+                log_warning "Failed to update docker-registry-credentials in prod"
               fi
             else
-              log_error "No secret data prepared for prod/polybot-secrets. Both AWS fetch and Terraform variables failed."
-              exit 1
+              log_warning "DOCKERHUB_USERNAME or DOCKERHUB_PASSWORD not found in AWS secret - keeping placeholder Docker credentials for prod"
+              log_info "Add DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD to your AWS secret 'polybot-secrets' for private registry access"
             fi
           else
             log_error "FAILED to retrieve secrets from AWS Secrets Manager!"
