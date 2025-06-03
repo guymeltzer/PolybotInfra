@@ -511,6 +511,7 @@ resource "aws_iam_role_policy_attachment" "worker_eks_policies" { # Renamed for 
   role       = aws_iam_role.worker_role.name
   policy_arn = each.value
 }
+
 # Add S3 read for worker_logs if workers need to fetch anything or for consistency (though less common)
 data "aws_iam_policy_document" "worker_s3_logs_policy_doc" {
   statement {
@@ -531,6 +532,25 @@ resource "aws_iam_role_policy" "worker_s3_logs_policy" {
   policy = data.aws_iam_policy_document.worker_s3_logs_policy_doc.json
 }
 
+# Worker nodes need Secrets Manager access to retrieve join commands
+data "aws_iam_policy_document" "worker_secrets_manager_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue"
+    ]
+    resources = [
+      aws_secretsmanager_secret.kubernetes_join_command.arn,
+      aws_secretsmanager_secret.kubernetes_join_command_latest.arn
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "worker_secrets_manager_policy" {
+  name   = "${var.cluster_name}-worker-secrets-manager-policy"
+  role   = aws_iam_role.worker_role.id
+  policy = data.aws_iam_policy_document.worker_secrets_manager_policy_doc.json
+}
 
 resource "aws_iam_instance_profile" "worker_profile" {
   name = "${var.cluster_name}-worker-profile"
