@@ -354,7 +354,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
     kubeconfig_ensured    = null_resource.ensure_local_kubeconfig.id # Trigger when kubeconfig is ensured
-    readiness_version     = "v7-bash-syntax-corrected"
+    readiness_version     = "v8-bash-rematch-fixed"
   }
   
   provisioner "local-exec" {
@@ -400,8 +400,8 @@ resource "null_resource" "cluster_readiness_check" {
           
           # Extract host and port for connectivity test
           if [[ "$SERVER_URL" =~ https://([^:]+):([0-9]+) ]]; then
-            SERVER_HOST="${BASH_REMATCH[1]}"
-            SERVER_PORT="${BASH_REMATCH[2]}"
+            SERVER_HOST="$${BASH_REMATCH[1]}"
+            SERVER_PORT="$${BASH_REMATCH[2]}"
             log_step "Testing TCP connectivity to $SERVER_HOST:$SERVER_PORT"
             if timeout 10 bash -c "</dev/tcp/$SERVER_HOST/$SERVER_PORT" 2>/dev/null; then
               log_success "TCP connectivity confirmed"
