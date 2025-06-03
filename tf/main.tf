@@ -727,7 +727,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v14-kubectl-auth-debug" # Deep debugging for kubectl authentication/redirection issues
+    setup_version    = "v15-absolute-kubeconfig-path-fix" # FIXED: Use absolute path for KUBECONFIG to prevent relative path issues when script changes working directory
   }
 
   provisioner "local-exec" {
@@ -758,7 +758,26 @@ resource "null_resource" "application_setup" {
       log_progress() { echo -e "$${YELLOW}⏳ $1...$${RESET}"; }
       log_cmd_output() { echo -e "$${WHITE}$1$${RESET}"; }
       
-      export KUBECONFIG="${local.kubeconfig_path}"
+      # CRITICAL FIX: Capture initial working directory and set KUBECONFIG to absolute path
+      TERRAFORM_EXEC_DIR=$(pwd)
+      ABSOLUTE_KUBECONFIG_PATH="$TERRAFORM_EXEC_DIR/kubeconfig.yaml"
+      export KUBECONFIG="$ABSOLUTE_KUBECONFIG_PATH"
+      log_info "KUBECONFIG environment variable set to absolute path: $KUBECONFIG"
+
+      # Add verification step to ensure the file exists at this absolute path
+      if [[ ! -f "$KUBECONFIG" ]]; then
+        log_error "CRITICAL: Kubeconfig file not found at absolute path: $KUBECONFIG. This script will likely fail."
+        log_error "Expected kubeconfig location: $KUBECONFIG"
+        log_error "Current working directory: $(pwd)"
+        log_error "Contents of current directory:"
+        ls -la . | head -10
+        # Exit early as subsequent kubectl commands will not work without kubeconfig
+        exit 1
+      else
+        log_success "Verified Kubeconfig file exists at: $KUBECONFIG"
+        KUBECONFIG_SIZE=$(wc -c < "$KUBECONFIG" 2>/dev/null || echo "unknown")
+        log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
+      fi
 
       log_header "🔐 Application Setup v14 (Deep Kubectl Authentication & Redirection Debugging)"
 
@@ -812,6 +831,7 @@ resource "null_resource" "application_setup" {
       log_step "DEBUG: Checking script environment for potential kubectl disruption"
       log_info "DEBUG: Current working directory: $PWD"
       log_info "DEBUG: Initial KUBECONFIG before secret operations: '$KUBECONFIG'"
+      log_info "DEBUG: Terraform execution directory: '$TERRAFORM_EXEC_DIR'"
       log_info "DEBUG: PATH variable: $PATH"
       log_info "DEBUG: kubectl location: $(which kubectl 2>/dev/null || echo 'not found')"
       log_info "DEBUG: kubectl version info:"
@@ -1094,8 +1114,8 @@ resource "null_resource" "application_setup" {
         kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" 2>&1 || log_info "   ArgoCD namespace check failed"
         kubectl --insecure-skip-tls-verify get crd applications.argoproj.io 2>&1 || log_info "   ArgoCD CRD check failed"
         log_info "ArgoCD applications can be deployed manually later with:"
-        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml"
-        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n argocd"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f $TERRAFORM_EXEC_DIR/k8s/argocd-applications.yaml"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f $TERRAFORM_EXEC_DIR/k8s/MongoDB/application.yaml -n argocd"
         exit 0
       fi
       
@@ -1137,34 +1157,34 @@ resource "null_resource" "application_setup" {
       
       # Apply global ArgoCD applications file first (contains all applications)
       log_step "Applying global ArgoCD applications file"
-      if [[ -f "./k8s/argocd-applications.yaml" ]]; then
-        log_info "Found global applications file: ./k8s/argocd-applications.yaml"
-        if kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml 2>/dev/null; then
+      if [[ -f "$TERRAFORM_EXEC_DIR/k8s/argocd-applications.yaml" ]]; then
+        log_info "Found global applications file: $TERRAFORM_EXEC_DIR/k8s/argocd-applications.yaml"
+        if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/k8s/argocd-applications.yaml" 2>/dev/null; then
           log_success "Global ArgoCD applications file applied successfully"
         else
           log_warning "Failed to apply global ArgoCD applications file - this may be expected during first run"
           log_info "ArgoCD CRDs may still be initializing. Will try individual files."
         fi
       else
-        log_info "Global applications file not found, proceeding with individual application files"
+        log_info "Global applications file not found at $TERRAFORM_EXEC_DIR/k8s/argocd-applications.yaml, proceeding with individual application files"
       fi
       
       # Apply individual ArgoCD Applications as backup/supplement
       log_step "Applying individual MongoDB ArgoCD Application"
-      if [[ -f "./k8s/MongoDB/application.yaml" ]]; then
-        if kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+      if [[ -f "$TERRAFORM_EXEC_DIR/k8s/MongoDB/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/k8s/MongoDB/application.yaml" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
           log_success "MongoDB ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
         fi
       else
-        log_info "MongoDB application.yaml not found at ./k8s/MongoDB/application.yaml"
+        log_info "MongoDB application.yaml not found at $TERRAFORM_EXEC_DIR/k8s/MongoDB/application.yaml"
       fi
 
       # Check for Polybot application file
       log_step "Checking for Polybot ArgoCD Application"
-      if [[ -f "./k8s/Polybot/application.yaml" ]]; then
-        if kubectl --insecure-skip-tls-verify apply -f ./k8s/Polybot/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+      if [[ -f "$TERRAFORM_EXEC_DIR/k8s/Polybot/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/k8s/Polybot/application.yaml" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
           log_success "Polybot ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply Polybot ArgoCD Application (may already exist or CRDs not ready)"
@@ -1175,8 +1195,8 @@ resource "null_resource" "application_setup" {
 
       # Check for Yolo5 application file (note: directory is Yolo5, not YOLOv5)
       log_step "Checking for Yolo5 ArgoCD Application"
-      if [[ -f "./k8s/Yolo5/application.yaml" ]]; then
-        if kubectl --insecure-skip-tls-verify apply -f ./k8s/Yolo5/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+      if [[ -f "$TERRAFORM_EXEC_DIR/k8s/Yolo5/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f "$TERRAFORM_EXEC_DIR/k8s/Yolo5/application.yaml" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
           log_success "Yolo5 ArgoCD Application applied successfully"
         else
           log_warning "Failed to apply Yolo5 ArgoCD Application (may already exist or CRDs not ready)"
@@ -1187,8 +1207,8 @@ resource "null_resource" "application_setup" {
 
       # Check for any other application.yaml files in subdirectories
       log_step "Scanning for additional ArgoCD applications"
-      if find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" >/dev/null 2>&1; then
-        find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" | while read -r app_file; do
+      if find "$TERRAFORM_EXEC_DIR/k8s" -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" >/dev/null 2>&1; then
+        find "$TERRAFORM_EXEC_DIR/k8s" -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" | while read -r app_file; do
           app_name=$(basename "$(dirname "$app_file")")
           log_step "Applying $app_name ArgoCD Application"
           if kubectl --insecure-skip-tls-verify apply -f "$app_file" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
