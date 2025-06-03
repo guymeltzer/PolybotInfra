@@ -61,7 +61,7 @@ module "k8s-cluster" {
   region                       = var.region
   cluster_name                 = local.cluster_name
   route53_zone_id              = var.route53_zone_id
-  domain_name                  = var.domain_name
+  domain_name                  = "guy-polybot.devops-int-college.com"
 
   # Instance configuration
   control_plane_ami            = var.control_plane_ami
@@ -767,7 +767,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_installed = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version    = "v25-critical-ssl-certificate-fix" # CRITICAL SSL FIX: Use actual TLS certificate from k8s/shared/polybot-tls-secret.yaml instead of dummy content
+    setup_version    = "v26-domain-url-fix" # CRITICAL FIXES: SSL certificate fix + correct domain guy-polybot.devops-int-college.com
   }
 
   provisioner "local-exec" {
@@ -776,7 +776,7 @@ resource "null_resource" "application_setup" {
       # Dynamic values from current Terraform deployment (to be combined with static AWS secrets)
       TF_VAR_S3_BUCKET_NAME    = aws_s3_bucket.polybot_storage.bucket                # Dynamic: S3 bucket from generated-secrets.tf
       TF_VAR_SQS_QUEUE_URL     = aws_sqs_queue.polybot_queue.url                     # Dynamic: SQS queue from generated-secrets.tf
-      TF_VAR_TELEGRAM_APP_URL  = "https://${module.k8s-cluster.alb_dns_name_output}" # Dynamic: ALB DNS from k8s-cluster module
+      TF_VAR_TELEGRAM_APP_URL  = "https://guy-polybot.devops-int-college.com"        # Static: Proper domain for Polybot API webhook
       TF_VAR_AWS_REGION        = var.region                                          # AWS region for secrets manager
     }
     command     = <<-EOT
@@ -826,7 +826,7 @@ resource "null_resource" "application_setup" {
         log_info "Kubeconfig file size: $KUBECONFIG_SIZE bytes"
       fi
 
-      log_header "🔐 Application Setup v25 (CRITICAL: Case-Mapping + SSL Certificate Fix)"
+      log_header "🔐 Application Setup v26 (CRITICAL: Case-Mapping + SSL + Domain URL Fix)"
 
       # AWS Configuration & User Settings
       AWS_REGION_FOR_SECRETS="$TF_VAR_AWS_REGION"
@@ -1728,8 +1728,8 @@ resource "null_resource" "deployment_summary" {
       # Load Balancer & Networking
       TF_VAR_ALB_DNS_NAME           = module.k8s-cluster.alb_dns_name_output
       TF_VAR_ALB_ZONE_ID            = module.k8s-cluster.alb_zone_id
-      TF_VAR_DOMAIN_NAME            = var.domain_name
-      TF_VAR_APPLICATION_URL        = "https://${var.domain_name}"
+      TF_VAR_DOMAIN_NAME            = "guy-polybot.devops-int-college.com"
+      TF_VAR_APPLICATION_URL        = "https://guy-polybot.devops-int-college.com"
       
       # Security Groups
       TF_VAR_CP_SG_ID               = module.k8s-cluster.control_plane_security_group_id
