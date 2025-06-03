@@ -963,8 +963,8 @@ resource "null_resource" "application_setup" {
         log_step "Creating docker-registry-credentials secret"
         
         # Prepare Docker credentials - try to get from AWS secret first, fallback to placeholder
-        DOCKER_USERNAME="guymeltzer28@gmail.com"
-        DOCKER_PASSWORD="Candy2025!"
+        DOCKER_USERNAME="placeholder-docker-username"
+        DOCKER_PASSWORD="placeholder-docker-password"
         
         # If we successfully fetched AWS secrets (for prod namespace), try to extract docker credentials
         if [[ "$namespace" == "prod" && -n "$POLYBOT_SECRET_JSON" ]]; then
@@ -1074,9 +1074,9 @@ EOF_DOCKER_SECRET
             
             MISSING_STATIC_KEYS=""
             for key in $STATIC_KEYS_TO_FETCH; do
-              value=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".${key} // \"\"" 2>/dev/null)
+              value=$(echo "$POLYBOT_SECRET_JSON" | jq -r ".$${key} // \"\"" 2>/dev/null)
               if [[ -n "$value" && "$value" != "null" ]]; then
-                LITERAL_ARGS="$LITERAL_ARGS --from-literal=${key}=$value"
+                LITERAL_ARGS="$LITERAL_ARGS --from-literal=$${key}=$value"
                 log_info "   ✓ $key (from AWS)"
               else
                 log_warning "   ✗ $key not found or empty in AWS Secret JSON"
