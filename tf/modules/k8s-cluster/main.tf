@@ -896,7 +896,7 @@ resource "null_resource" "update_join_command" {
 
   triggers = {
     control_plane_id   = aws_instance.control_plane.id
-    update_version     = "v10-bash-fix" # Updated version to force refresh
+    update_version     = "v11-complete-refresh" # Force complete refresh
   }
 
   provisioner "local-exec" {

@@ -112,7 +112,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
     secret_name      = module.k8s-cluster.kubeconfig_secret_name_output
     region           = var.region
-    script_version   = "v2-bash-fix" # Updated version to force refresh
+    script_version   = "v3-complete-refresh" # Force complete refresh
   }
 
   provisioner "local-exec" {
@@ -244,7 +244,7 @@ resource "null_resource" "ensure_local_kubeconfig" {
     # Re-run if kubeconfig content changes
     kubeconfig_content_hash = data.aws_secretsmanager_secret_version.retrieved_kubeconfig.version_id
     # Version for tracking script changes
-    script_version = "v2-bash-fix" # Updated version to force refresh
+    script_version = "v3-complete-refresh" # Force complete refresh
   }
 
   provisioner "local-exec" {
