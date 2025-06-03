@@ -279,16 +279,26 @@ if [ -z "$JOIN_COMMAND" ]; then
     error_exit "Failed to retrieve a valid join command from Secrets Manager (${TF_JOIN_COMMAND_LATEST_SECRET_NAME}) after multiple attempts."
 fi
 
+# Generate standardized worker node name using instance ID
+echo "   Generating standardized worker node name..."
+INSTANCE_ID="$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -fsSL "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null)"
+if [ -z "$INSTANCE_ID" ]; then
+    error_exit "Failed to retrieve instance ID for worker node naming."
+fi
+WORKER_NODE_NAME="guy-worker-node-$INSTANCE_ID"
+echo "   Worker node will be named: $WORKER_NODE_NAME"
+
 echo "   Retrieved Join Command (first 30 chars): $(echo "$JOIN_COMMAND" | cut -c 1-30)..."
-echo "   Executing 'kubeadm join'..."
-echo "   Command: $JOIN_COMMAND --v=5"
+echo "   Executing 'kubeadm join' with custom node name..."
+echo "   Command: $JOIN_COMMAND --node-name=$WORKER_NODE_NAME --v=5"
 echo "   Start time (UTC): $(date -u)"
 KUBEADM_JOIN_LOG="/var/log/kubeadm-join.log"
 
-# Execute kubeadm join
-if eval "$JOIN_COMMAND --v=5" > "$KUBEADM_JOIN_LOG" 2>&1; then
+# Execute kubeadm join with custom node name
+if eval "$JOIN_COMMAND --node-name=$WORKER_NODE_NAME --v=5" > "$KUBEADM_JOIN_LOG" 2>&1; then
     echo "✅ 'kubeadm join' completed successfully!"
     echo "   End time (UTC): $(date -u)"
+    echo "   Worker node joined as: $WORKER_NODE_NAME"
     echo "   Last 10 lines of kubeadm join log ($KUBEADM_JOIN_LOG):"
     tail -n 10 "$KUBEADM_JOIN_LOG"
 else

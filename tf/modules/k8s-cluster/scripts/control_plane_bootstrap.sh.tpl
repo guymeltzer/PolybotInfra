@@ -252,6 +252,11 @@ echo ""
 echo "🚀 STEP 6: Initializing Kubernetes cluster with Kubeadm..."
 echo "   Creating Kubeadm configuration file (/etc/kubernetes/kubeadm/kubeadm-config.yaml)..."
 mkdir -p /etc/kubernetes/kubeadm
+
+# Set standardized control plane node name
+CONTROL_PLANE_NODE_NAME="guy-control-plane"
+echo "   Setting control plane node name to: $CONTROL_PLANE_NODE_NAME"
+
 # PRIVATE_IP and NEW_HOSTNAME are now correctly expanded shell variables
 cat > /etc/kubernetes/kubeadm/kubeadm-config.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta3
@@ -267,7 +272,7 @@ localAPIEndpoint:
   advertiseAddress: "$PRIVATE_IP"
   bindPort: 6443
 nodeRegistration:
-  name: "$NEW_HOSTNAME"
+  name: "$CONTROL_PLANE_NODE_NAME"
   criSocket: "unix:///run/containerd/containerd.sock"
   kubeletExtraArgs:
     cloud-provider: "external"
@@ -280,6 +285,7 @@ apiServer:
   certSANs:
   - "$PRIVATE_IP"
   - "$NEW_HOSTNAME"
+  - "$CONTROL_PLANE_NODE_NAME"
   - "127.0.0.1"
   - "localhost"
   - "kubernetes"
@@ -339,6 +345,29 @@ else
     echo "   Default user '$DEFAULT_USER' not found, skipping its kubeconfig setup."
 fi
 echo "✅ Kubeconfig setup for local users completed."
+
+# Step 7a: Set up kubectl alias system-wide
+echo ""
+echo "🔧 STEP 7a: Setting up kubectl alias for all users..."
+echo "   Creating system-wide kubectl alias (k='kubectl')..."
+cat > /etc/profile.d/kubectl-alias.sh <<'EOF'
+# Kubectl alias for convenience
+alias k='kubectl'
+alias kgp='kubectl get pods'
+alias kgs='kubectl get services'
+alias kgn='kubectl get nodes'
+alias kd='kubectl describe'
+alias ka='kubectl apply'
+alias kl='kubectl logs'
+EOF
+chmod +x /etc/profile.d/kubectl-alias.sh
+echo "   Setting up kubectl completion for bash..."
+if command -v kubectl >/dev/null 2>&1; then
+    kubectl completion bash > /etc/bash_completion.d/kubectl
+    # Also set up completion for the 'k' alias
+    echo 'complete -o default -F __start_kubectl k' >> /etc/bash_completion.d/kubectl
+fi
+echo "✅ kubectl alias and completion setup completed."
 
 # Step 8: Store modified Kubeconfig in AWS Secrets Manager
 echo ""
