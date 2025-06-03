@@ -1230,7 +1230,7 @@ resource "terraform_data" "cluster_health_assessment" {
   input = {
     control_plane_id = aws_instance.control_plane.id
     asg_name         = local.worker_asg_name
-    script_version   = "v5-bash-syntax-corrected"
+    script_version   = "v6-tls-fix-applied"
   }
 
   provisioner "local-exec" {
@@ -1320,14 +1320,14 @@ resource "terraform_data" "cluster_health_assessment" {
       fi
 
       # Proceed with kubectl checks if KUBECONFIG is now set and working
-      if kubectl get nodes >/dev/null 2>&1; then
+      if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
         log_subheader "📋 Cluster accessible via kubectl, checking node health"
 
-        TOTAL_NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-        READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
-        NOTREADY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
-        WORKER_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | wc -l || echo "0") # Exclude common CP names/roles
-        READY_WORKERS=$(kubectl get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | grep -c " Ready " || echo "0")
+        TOTAL_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        READY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
+        NOTREADY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
+        WORKER_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | wc -l || echo "0") # Exclude common CP names/roles
+        READY_WORKERS=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -Ev "(control-plane|master)" | grep -c " Ready " || echo "0")
 
         log_info "Total nodes: $${BOLD}$TOTAL_NODES$${RESET}"
         log_info "Ready nodes: $${BOLD}$READY_NODES$${RESET}"

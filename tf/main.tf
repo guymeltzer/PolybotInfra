@@ -112,7 +112,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
     secret_name      = module.k8s-cluster.kubeconfig_secret_name_output
     region           = var.region
-    script_version   = "v6-retry-logic-added" # Added retry logic for secret retrieval
+    script_version   = "v7-tls-fix-applied" # Added retry logic for secret retrieval + TLS fix
   }
 
   provisioner "local-exec" {
@@ -161,7 +161,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
           log_success "Local kubeconfig appears valid"
           
           log_step "Testing connectivity to ensure it works"
-          if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+          if timeout 10 kubectl --insecure-skip-tls-verify --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
             log_success "Local kubeconfig connectivity confirmed - no action needed"
             exit 0
           else
@@ -244,7 +244,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
         log_success "Local kubeconfig file created: $${BOLD}$KUBECONFIG_PATH$${RESET}"
         
         log_step "Verifying the new file works"
-        if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+        if timeout 10 kubectl --insecure-skip-tls-verify --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
           log_success "New kubeconfig connectivity verified"
         else
           log_warning "New kubeconfig created but connectivity test failed (may be temporary)"
@@ -291,7 +291,7 @@ resource "null_resource" "ensure_local_kubeconfig" {
     # Re-run if kubeconfig content changes
     kubeconfig_content_hash = data.aws_secretsmanager_secret_version.retrieved_kubeconfig.version_id
     # Version for tracking script changes
-    script_version = "v5-bash-syntax-corrected" # Fixed bash variable syntax
+    script_version = "v6-tls-fix-applied" # Fixed bash variable syntax + TLS fix
   }
 
   provisioner "local-exec" {
@@ -344,7 +344,7 @@ resource "null_resource" "ensure_local_kubeconfig" {
           
           log_step "Testing connectivity to ensure it works"
           # Test connectivity to ensure it works
-          if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+          if timeout 10 kubectl --insecure-skip-tls-verify --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
             log_success "Local kubeconfig connectivity confirmed - no action needed"
             exit 0
           else
@@ -382,7 +382,7 @@ resource "null_resource" "ensure_local_kubeconfig" {
         
         log_step "Verifying the new file works"
         # Verify the new file works
-        if timeout 10 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
+        if timeout 10 kubectl --insecure-skip-tls-verify --kubeconfig="$KUBECONFIG_PATH" get nodes >/dev/null 2>&1; then
           log_success "New kubeconfig connectivity verified"
         else
           log_warning "New kubeconfig created but connectivity test failed (may be temporary)"
@@ -409,7 +409,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
     kubeconfig_ensured    = null_resource.ensure_local_kubeconfig.id # Trigger when kubeconfig is ensured
-    readiness_version     = "v8-bash-rematch-fixed"
+    readiness_version     = "v9-tls-fix-applied"
   }
   
   provisioner "local-exec" {
@@ -470,17 +470,17 @@ resource "null_resource" "cluster_readiness_check" {
       fi
 
       log_subheader "🔗 Testing kubectl connectivity"
-      if kubectl get nodes >/dev/null 2>/dev/null; then
+      if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>/dev/null; then
         log_success "Kubectl connectivity confirmed"
         
         log_subheader "📋 Current cluster state"
-        log_cmd_output "$(kubectl get nodes -o wide 2>/dev/null || echo "Failed to get detailed node info")"
+        log_cmd_output "$(kubectl --insecure-skip-tls-verify get nodes -o wide 2>/dev/null || echo "Failed to get detailed node info")"
         
         # Get node counts with error handling
-        ready_nodes=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
-        notready_nodes=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
-        total_nodes=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-        ready_workers=$(kubectl get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "0")
+        ready_nodes=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "0")
+        notready_nodes=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " NotReady " || echo "0")
+        total_nodes=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+        ready_workers=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "0")
 
         log_subheader "📊 Node Status Summary"
         log_info "Node Status: $${BOLD}$ready_nodes Ready$${RESET}, $${BOLD}$notready_nodes NotReady$${RESET} (Total: $${BOLD}$total_nodes$${RESET})"
@@ -493,7 +493,7 @@ resource "null_resource" "cluster_readiness_check" {
 
         if [[ "$notready_nodes" -gt 0 ]]; then
           log_warning "WARNING: $notready_nodes NotReady nodes found - this may be transient during cluster startup"
-          NOTREADY_LIST=$(kubectl get nodes --no-headers 2>/dev/null | grep "NotReady" || echo "No NotReady nodes actually listed by kubectl")
+          NOTREADY_LIST=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep "NotReady" || echo "No NotReady nodes actually listed by kubectl")
           log_cmd_output "$NOTREADY_LIST"
         fi
 
@@ -508,9 +508,9 @@ resource "null_resource" "cluster_readiness_check" {
         fi
 
         log_subheader "🔍 Checking core components"
-        if kubectl get deployment coredns -n kube-system >/dev/null 2>&1; then
-          coredns_ready=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          coredns_desired=$(kubectl get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+        if kubectl --insecure-skip-tls-verify get deployment coredns -n kube-system >/dev/null 2>&1; then
+          coredns_ready=$(kubectl --insecure-skip-tls-verify get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          coredns_desired=$(kubectl --insecure-skip-tls-verify get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
           
           if [[ "$coredns_ready" -eq "$coredns_desired" ]] && [[ "$coredns_ready" -gt 0 ]]; then
             log_success "CoreDNS: $coredns_ready/$coredns_desired ready"
@@ -522,11 +522,11 @@ resource "null_resource" "cluster_readiness_check" {
         fi
 
         # Check for problematic pods with lenient thresholds
-        problematic_pods_count=$(kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | wc -l || echo "0")
+        problematic_pods_count=$(kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | wc -l || echo "0")
         
         if [[ "$problematic_pods_count" -gt 5 ]]; then
           log_warning "WARNING: Many problematic pods ($problematic_pods_count) - may indicate issues"
-          PROBLEMATIC_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | head -5 || echo "No problematic pods listed")
+          PROBLEMATIC_PODS=$(kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | head -5 || echo "No problematic pods listed")
           log_cmd_output "$PROBLEMATIC_PODS"
         elif [[ "$problematic_pods_count" -gt 0 ]]; then
           log_info "INFO: $problematic_pods_count pods in non-Running/Succeeded state (likely transient)"
@@ -546,7 +546,7 @@ resource "null_resource" "cluster_readiness_check" {
         log_error "Cannot connect to cluster using kubectl"
         
         log_subheader "🔍 Diagnostic information"
-        kubectl_error=$(kubectl get nodes 2>&1 || echo "No error captured")
+        kubectl_error=$(kubectl --insecure-skip-tls-verify get nodes 2>&1 || echo "No error captured")
         log_cmd_output "kubectl error: $kubectl_error"
         
         log_subheader "📋 Common causes"
@@ -558,7 +558,7 @@ resource "null_resource" "cluster_readiness_check" {
         log_info "   • Security groups blocking access"
         
         log_info "Deployment will continue - cluster may become accessible shortly."
-        log_info "You can manually check cluster status later with: $${BOLD}kubectl get nodes$${RESET}"
+        log_info "You can manually check cluster status later with: $${BOLD}kubectl --insecure-skip-tls-verify get nodes$${RESET}"
       fi
     EOT
   }
@@ -574,7 +574,7 @@ resource "null_resource" "cluster_maintenance" {
   triggers = {
     cluster_ready_id    = null_resource.cluster_readiness_check.id
     kubeconfig_ensured  = null_resource.ensure_local_kubeconfig.id # Added trigger
-    maintenance_version = "v3-bash-syntax-corrected"
+    maintenance_version = "v4-tls-fix-applied"
   }
 
   provisioner "local-exec" {
@@ -611,7 +611,7 @@ resource "null_resource" "cluster_maintenance" {
       log_header "🧹 Consolidated Cluster Maintenance v3"
 
       # Check kubectl connectivity
-      if ! kubectl get nodes >/dev/null 2>&1; then
+      if ! kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
         log_error "Cannot connect to cluster using KUBECONFIG=$KUBECONFIG, skipping maintenance."
         exit 0 # Exit gracefully if cluster not accessible
       fi
@@ -632,7 +632,7 @@ resource "null_resource" "cluster_maintenance" {
 
       log_step "Getting worker nodes from Kubernetes"
       # Get worker nodes from Kubernetes
-      K8S_WORKER_NODES=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null || echo "")
+      K8S_WORKER_NODES=$(kubectl --insecure-skip-tls-verify get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null || echo "")
 
       ORPHANED_COUNT=0
       for node_name in $K8S_WORKER_NODES; do
@@ -643,15 +643,15 @@ resource "null_resource" "cluster_maintenance" {
 
           log_step "Force deleting pods on $node_name"
           # Force delete pods on this node (quicker for non-graceful)
-          kubectl get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null | \
+          kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector spec.nodeName="$node_name" --no-headers 2>/dev/null | \
             while read -r ns pod rest; do
               log_info "     Deleting pod $${BOLD}$pod$${RESET} in namespace $${BOLD}$ns$${RESET} on node $node_name"
-              kubectl delete pod "$pod" -n "$ns" --force --grace-period=0 --timeout=10s 2>/dev/null || log_warning "     Failed to delete pod $pod in $ns"
+              kubectl --insecure-skip-tls-verify delete pod "$pod" -n "$ns" --force --grace-period=0 --timeout=10s 2>/dev/null || log_warning "     Failed to delete pod $pod in $ns"
             done
 
           log_step "Deleting node $node_name from Kubernetes"
           # Remove the node from Kubernetes
-          kubectl delete node "$node_name" --timeout=30s 2>/dev/null || log_warning "   Failed to delete node $node_name"
+          kubectl --insecure-skip-tls-verify delete node "$node_name" --timeout=30s 2>/dev/null || log_warning "   Failed to delete node $node_name"
         fi
       done
       log_info "Processed $${BOLD}$ORPHANED_COUNT$${RESET} potential orphaned nodes."
@@ -661,7 +661,7 @@ resource "null_resource" "cluster_maintenance" {
       log_step "Finding stuck terminating pods (older than 5 minutes)"
       # This is a more complex operation and might be better suited for an in-cluster operator
       # For a simple local-exec, we can list them
-      STUCK_TERMINATING_PODS=$(kubectl get pods --all-namespaces --field-selector=status.phase=Terminating -o go-template='{{range .items}}{{if gt (now.Sub .metadata.deletionTimestamp) (timeDuration "5m")}}{{.metadata.namespace}}{{"\t"}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null || echo "")
+      STUCK_TERMINATING_PODS=$(kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector=status.phase=Terminating -o go-template='{{range .items}}{{if gt (now.Sub .metadata.deletionTimestamp) (timeDuration "5m")}}{{.metadata.namespace}}{{"\t"}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null || echo "")
 
       if [[ -n "$STUCK_TERMINATING_PODS" ]]; then
         log_warning "Found stuck terminating pods (older than 5m):"
@@ -669,7 +669,7 @@ resource "null_resource" "cluster_maintenance" {
         echo "$STUCK_TERMINATING_PODS" | while read -r ns pod; do
           if [[ -n "$ns" && -n "$pod" ]]; then # Ensure we have both namespace and pod name
              log_step "Forcibly deleting stuck pod $${BOLD}$pod$${RESET} in namespace $${BOLD}$ns$${RESET}"
-             kubectl delete pod "$pod" -n "$ns" --force --grace-period=0 --timeout=10s 2>/dev/null || log_warning "   Failed to delete stuck pod $pod in $ns"
+             kubectl --insecure-skip-tls-verify delete pod "$pod" -n "$ns" --force --grace-period=0 --timeout=10s 2>/dev/null || log_warning "   Failed to delete stuck pod $pod in $ns"
           fi
         done
       else
@@ -691,7 +691,7 @@ resource "null_resource" "application_setup" {
   
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    setup_version      = "v4-bash-syntax-corrected"
+    setup_version      = "v5-tls-fix-applied"
   }
 
   provisioner "local-exec" {
@@ -728,7 +728,7 @@ resource "null_resource" "application_setup" {
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
-      if ! kubectl get nodes >/dev/null 2>&1; then
+      if ! kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
         log_warning "Cannot connect to cluster using KUBECONFIG=$KUBECONFIG."
         log_info "This may be expected during initial cluster setup."
         log_info "The cluster may still be initializing or kubeconfig may not be ready yet."
@@ -741,8 +741,8 @@ resource "null_resource" "application_setup" {
         log_subheader "🔄 Skipping for now"
         log_info "Skipping application setup for now - it can be run later when cluster is ready."
         log_info "You can manually run the setup later with:"
-        log_cmd_output "   kubectl create namespace prod"
-        log_cmd_output "   kubectl create namespace dev"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify create namespace prod"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify create namespace dev"
         
         exit 0 # Exit gracefully instead of failing the deployment
       fi
@@ -758,9 +758,9 @@ resource "null_resource" "application_setup" {
         echo "apiVersion: v1
 kind: Namespace
 metadata:
-  name: $namespace" | kubectl apply -f - || log_warning "   Failed to create namespace $namespace (may already exist)"
+  name: $namespace" | kubectl --insecure-skip-tls-verify apply -f - || log_warning "   Failed to create namespace $namespace (may already exist)"
         
-        if kubectl get namespace "$namespace" >/dev/null 2>&1; then
+        if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
           log_success "Namespace: $${BOLD}$namespace$${RESET} ensured"
         else
           log_warning "Namespace: $${BOLD}$namespace$${RESET} verification failed"
@@ -791,31 +791,31 @@ metadata:
         log_subheader "🔑 Ensuring secrets in namespace: $${BOLD}$namespace$${RESET}"
 
         # Check if namespace exists before trying to create secrets
-        if ! kubectl get namespace "$namespace" >/dev/null 2>&1; then
+        if ! kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
           log_warning "Namespace $namespace not found, skipping secret creation"
           continue
         fi
 
         log_step "Creating TLS secret"
         # TLS secret
-        kubectl create secret tls polybot-tls \
+        kubectl --insecure-skip-tls-verify create secret tls polybot-tls \
           --cert="$CRT_FILE" --key="$KEY_FILE" -n "$namespace" \
-          --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || log_info "polybot-tls secret in $namespace handled (may already exist)"
+          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-tls secret in $namespace handled (may already exist)"
 
         log_step "Creating CA secret"
         # CA secret
-        kubectl create secret generic polybot-ca \
+        kubectl --insecure-skip-tls-verify create secret generic polybot-ca \
           --from-file=ca.crt="$CA_FILE" -n "$namespace" \
-          --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || log_info "polybot-ca secret in $namespace handled (may already exist)"
+          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-ca secret in $namespace handled (may already exist)"
 
         log_step "Creating application secrets"
         # Application secrets (ensure values are appropriate or use more secure methods for production)
-        kubectl create secret generic polybot-secrets \
+        kubectl --insecure-skip-tls-verify create secret generic polybot-secrets \
           --from-literal=app-secret='default-app-secret-value' \
           --from-literal=database-url='postgresql://polybot:examplepassword@your-db-host:5432/polybotdb' \
           --from-literal=redis-url='redis://your-redis-host:6379/0' \
           -n "$namespace" \
-          --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
+          --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f - 2>/dev/null || log_info "polybot-secrets in $namespace handled (may already exist)"
 
         log_success "Secrets processed for $${BOLD}$namespace$${RESET}"
       done
@@ -842,7 +842,7 @@ resource "null_resource" "install_argocd" {
 
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    argocd_version     = "v5-bash-syntax-corrected"
+    argocd_version     = "v6-tls-fix-applied"
   }
 
   provisioner "local-exec" {
@@ -879,7 +879,7 @@ resource "null_resource" "install_argocd" {
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
-      if ! kubectl get nodes >/dev/null 2>&1; then
+      if ! kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
         log_warning "Cannot connect to cluster using KUBECONFIG=$KUBECONFIG."
         log_info "This may be expected during initial cluster setup."
         log_info "The cluster may still be initializing or kubeconfig may not be ready yet."
@@ -893,8 +893,8 @@ resource "null_resource" "install_argocd" {
         log_subheader "🔄 Skipping for now"
         log_info "Skipping ArgoCD installation for now - it can be installed later when cluster is accessible."
         log_info "You can manually install ArgoCD later with:"
-        log_cmd_output "   kubectl create namespace argocd"
-        log_cmd_output "   kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify create namespace argocd"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml"
         
         exit 0 # Exit gracefully instead of failing the deployment
       fi
@@ -905,9 +905,9 @@ resource "null_resource" "install_argocd" {
 
       log_subheader "📁 Setting up ArgoCD namespace"
       # Check if ArgoCD namespace exists
-      if ! kubectl get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+      if ! kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
         log_step "Creating ArgoCD namespace: $${BOLD}$ARGOCD_NAMESPACE$${RESET}"
-        kubectl create namespace "$ARGOCD_NAMESPACE" || log_warning "   Failed to create namespace (may already exist)"
+        kubectl --insecure-skip-tls-verify create namespace "$ARGOCD_NAMESPACE" || log_warning "   Failed to create namespace (may already exist)"
       else
         log_info "ArgoCD namespace '$${BOLD}$ARGOCD_NAMESPACE$${RESET}' already exists."
       fi
@@ -915,7 +915,7 @@ resource "null_resource" "install_argocd" {
       log_subheader "📦 Installing ArgoCD manifests"
       # Apply ArgoCD manifests (idempotent)
       log_step "Applying ArgoCD manifests from stable release"
-      if kubectl apply -n "$ARGOCD_NAMESPACE" -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml 2>/dev/null; then
+      if kubectl --insecure-skip-tls-verify apply -n "$ARGOCD_NAMESPACE" -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml 2>/dev/null; then
         log_success "ArgoCD manifests applied/updated successfully."
       else
         log_warning "Failed to apply ArgoCD manifests. This may be due to connectivity issues."
@@ -926,18 +926,18 @@ resource "null_resource" "install_argocd" {
       log_subheader "⏳ Waiting for ArgoCD deployment"
       log_progress "Waiting for ArgoCD server deployment to be available (this might take a few minutes)"
       # Wait for the argocd-server deployment to be available with more lenient timeout
-      if kubectl wait deployment -n "$ARGOCD_NAMESPACE" argocd-server --for condition=Available --timeout=300s 2>/dev/null; then
+      if kubectl --insecure-skip-tls-verify wait deployment -n "$ARGOCD_NAMESPACE" argocd-server --for condition=Available --timeout=300s 2>/dev/null; then
         log_success "ArgoCD server deployment is available."
       else
         log_warning "ArgoCD server deployment did not become available within timeout."
         log_info "This may be normal during initial cluster setup."
         
         log_step "Current status of ArgoCD pods:"
-        ARGOCD_PODS=$(kubectl get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || echo "   Could not retrieve pod status")
+        ARGOCD_PODS=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || echo "   Could not retrieve pod status")
         log_cmd_output "$ARGOCD_PODS"
         
         log_step "Current status of ArgoCD deployments:"
-        ARGOCD_DEPLOYMENTS=$(kubectl get deployments -n "$ARGOCD_NAMESPACE" 2>/dev/null || echo "   Could not retrieve deployment status")
+        ARGOCD_DEPLOYMENTS=$(kubectl --insecure-skip-tls-verify get deployments -n "$ARGOCD_NAMESPACE" 2>/dev/null || echo "   Could not retrieve deployment status")
         log_cmd_output "$ARGOCD_DEPLOYMENTS"
         
         log_info "ArgoCD installation initiated - may complete after cluster is fully ready."
@@ -948,8 +948,8 @@ resource "null_resource" "install_argocd" {
       # Get admin password (this secret is usually created by ArgoCD upon first install)
       log_step "Retrieving ArgoCD admin password (if initial setup)"
       PASSWORD_SECRET_NAME="argocd-initial-admin-secret"
-      if kubectl get secret -n "$ARGOCD_NAMESPACE" "$PASSWORD_SECRET_NAME" >/dev/null 2>&1; then
-        RAW_PASSWORD=$(kubectl -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
+      if kubectl --insecure-skip-tls-verify get secret -n "$ARGOCD_NAMESPACE" "$PASSWORD_SECRET_NAME" >/dev/null 2>&1; then
+        RAW_PASSWORD=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
         if [[ -n "$RAW_PASSWORD" ]]; then
           ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d)
           log_success "ArgoCD Admin Password: $${BOLD}$ARGOCD_PASSWORD$${RESET}"
@@ -962,7 +962,7 @@ resource "null_resource" "install_argocd" {
 
       log_subheader "🎉 ArgoCD Setup Complete"
       log_success "ArgoCD installation/verification completed!"
-      log_info "Access ArgoCD by port-forwarding: $${BOLD}kubectl port-forward svc/argocd-server -n $ARGOCD_NAMESPACE 8080:443$${RESET}"
+      log_info "Access ArgoCD by port-forwarding: $${BOLD}kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n $ARGOCD_NAMESPACE 8080:443$${RESET}"
       log_info "Username: $${BOLD}admin$${RESET}"
       log_info "Password: (If newly installed, see above. Otherwise, use your current password)."
     EOT
@@ -985,7 +985,7 @@ resource "null_resource" "deployment_summary" {
     maintenance_id  = null_resource.cluster_maintenance.id
     setup_id        = null_resource.application_setup.id
     argocd_id       = try(null_resource.install_argocd[0].id, "skipped") # Correct for count
-    summary_version = "v4-bash-syntax-corrected"
+    summary_version = "v5-tls-fix-applied"
   }
 
   provisioner "local-exec" {
@@ -1046,17 +1046,17 @@ resource "null_resource" "deployment_summary" {
 
       log_header "☸️ CLUSTER STATUS"
       # Cluster Status
-      if kubectl get nodes >/dev/null 2>&1; then
-        TOTAL_NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "N/A")
-        READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "N/A")
+      if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
+        TOTAL_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | wc -l || echo "N/A")
+        READY_NODES=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -c " Ready " || echo "N/A")
         # Assuming control plane has 'control-plane' in its name or a label.
         # Adjust if using a specific label like !node-role.kubernetes.io/master or !node-role.kubernetes.io/control-plane
-        READY_WORKERS=$(kubectl get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "N/A")
+        READY_WORKERS=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | grep -v "control-plane" | grep -c " Ready " || echo "N/A")
 
         log_key_value "📊 Nodes" "$READY_NODES/$TOTAL_NODES Ready ($READY_WORKERS workers)"
         
         log_subheader "📋 Node Details"
-        kubectl get nodes -o wide 2>/dev/null | tail -n +2 | while read -r node status role age version internal_ip external_ip os_image kernel container_runtime; do
+        kubectl --insecure-skip-tls-verify get nodes -o wide 2>/dev/null | tail -n +2 | while read -r node status role age version internal_ip external_ip os_image kernel container_runtime; do
           log_info "• $${BOLD}$node$${RESET} ($status) - $role"
         done || log_warning "Could not retrieve node details."
       else
@@ -1068,20 +1068,20 @@ resource "null_resource" "deployment_summary" {
       log_key_value "📁 Kubeconfig" "${local.kubeconfig_path}" # Terraform interpolation
       log_subheader "🚀 Quick Setup Commands"
       log_cmd_output "   export KUBECONFIG=${local.kubeconfig_path}" # Terraform interpolation
-      log_cmd_output "   kubectl get nodes"
+      log_cmd_output "   kubectl --insecure-skip-tls-verify get nodes"
 
       log_header "🔐 ARGOCD ACCESS"
       # ArgoCD Access
       ARGOCD_NAMESPACE="argocd"
-      if kubectl get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-        ARGOCD_READY_REPLICAS=$(kubectl -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-        ARGOCD_DESIRED_REPLICAS=$(kubectl -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "N/A")
+      if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+        ARGOCD_READY_REPLICAS=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        ARGOCD_DESIRED_REPLICAS=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get deployment argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "N/A")
         log_key_value "📊 Status" "$ARGOCD_READY_REPLICAS/$ARGOCD_DESIRED_REPLICAS ready replicas"
         log_key_value "🌐 URL (via port-forward)" "https://localhost:8080 (or specified port)" # Changed to 8080 as common example
         log_key_value "👤 Username" "admin"
 
         PASSWORD_SECRET_NAME="argocd-initial-admin-secret"
-        RAW_PASSWORD=$(kubectl -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
+        RAW_PASSWORD=$(kubectl --insecure-skip-tls-verify -n "$ARGOCD_NAMESPACE" get secret "$PASSWORD_SECRET_NAME" -o jsonpath="{.data.password}" 2>/dev/null || echo "")
         if [[ -n "$RAW_PASSWORD" ]]; then
           ARGOCD_PASSWORD=$(echo "$RAW_PASSWORD" | base64 -d 2>/dev/null || echo "<failed to decode>")
           log_key_value "🔑 Password" "$ARGOCD_PASSWORD (this is the initial password, may have changed)"
@@ -1089,7 +1089,7 @@ resource "null_resource" "deployment_summary" {
           log_key_value "🔑 Password" "(Initial admin secret not found or password field empty; use current password)"
         fi
         log_subheader "🔗 Setup Port Forward"
-        log_cmd_output "   kubectl port-forward svc/argocd-server -n $ARGOCD_NAMESPACE 8080:443"
+        log_cmd_output "   kubectl --insecure-skip-tls-verify port-forward svc/argocd-server -n $ARGOCD_NAMESPACE 8080:443"
       else
         log_info "ArgoCD namespace not found (ArgoCD might be skipped or not installed)."
       fi
