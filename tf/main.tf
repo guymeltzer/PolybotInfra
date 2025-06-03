@@ -512,7 +512,11 @@ resource "null_resource" "cluster_readiness_check" {
           coredns_ready=$(kubectl --insecure-skip-tls-verify get deployment coredns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
           coredns_desired=$(kubectl --insecure-skip-tls-verify get deployment coredns -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
           
-          if [[ "$coredns_ready" -eq "$coredns_desired" ]] && [[ "$coredns_ready" -gt 0 ]]; then
+          # Ensure variables are numeric and properly quoted
+          coredns_ready=$${coredns_ready:-0}
+          coredns_desired=$${coredns_desired:-1}
+          
+          if [[ "$${coredns_ready}" -eq "$${coredns_desired}" ]] && [[ "$${coredns_ready}" -gt 0 ]]; then
             log_success "CoreDNS: $coredns_ready/$coredns_desired ready"
           else
             log_warning "CoreDNS: $coredns_ready/$coredns_desired ready (may still be starting)"
@@ -524,11 +528,14 @@ resource "null_resource" "cluster_readiness_check" {
         # Check for problematic pods with lenient thresholds
         problematic_pods_count=$(kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | wc -l || echo "0")
         
-        if [[ "$problematic_pods_count" -gt 5 ]]; then
+        # Ensure the count is numeric
+        problematic_pods_count=$${problematic_pods_count:-0}
+        
+        if [[ "$${problematic_pods_count}" -gt 5 ]]; then
           log_warning "WARNING: Many problematic pods ($problematic_pods_count) - may indicate issues"
           PROBLEMATIC_PODS=$(kubectl --insecure-skip-tls-verify get pods --all-namespaces --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | grep -v "Completed" | tail -n +2 | head -5 || echo "No problematic pods listed")
           log_cmd_output "$PROBLEMATIC_PODS"
-        elif [[ "$problematic_pods_count" -gt 0 ]]; then
+        elif [[ "$${problematic_pods_count}" -gt 0 ]]; then
           log_info "INFO: $problematic_pods_count pods in non-Running/Succeeded state (likely transient)"
         else
           log_success "All pods in good state"
@@ -574,7 +581,7 @@ resource "null_resource" "cluster_maintenance" {
   triggers = {
     cluster_ready_id    = null_resource.cluster_readiness_check.id
     kubeconfig_ensured  = null_resource.ensure_local_kubeconfig.id # Added trigger
-    maintenance_version = "v4-tls-fix-applied"
+    maintenance_version = "v5-refined-worker-deletion-logic"
   }
 
   provisioner "local-exec" {
@@ -608,7 +615,7 @@ resource "null_resource" "cluster_maintenance" {
       # Ensure KUBECONFIG is set from local.kubeconfig_path which is now managed by local_file
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🧹 Consolidated Cluster Maintenance v3"
+      log_header "🧹 Refined Cluster Maintenance v5 (Health-aware node deletion)"
 
       # Check kubectl connectivity
       if ! kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>&1; then
@@ -616,8 +623,8 @@ resource "null_resource" "cluster_maintenance" {
         exit 0 # Exit gracefully if cluster not accessible
       fi
 
-      log_subheader "👻 Checking for orphaned worker nodes"
-      # 1. Clean up orphaned nodes (nodes in k8s but not in ASG)
+      log_subheader "👻 Checking for orphaned worker nodes (with health check)"
+      # 1. Clean up orphaned nodes (nodes in k8s but not in ASG) - only if unhealthy
 
       log_step "Getting active ASG instances"
       # Get active ASG instances (ensure local.worker_asg_name is correct)
@@ -635,10 +642,23 @@ resource "null_resource" "cluster_maintenance" {
       K8S_WORKER_NODES=$(kubectl --insecure-skip-tls-verify get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null || echo "")
 
       ORPHANED_COUNT=0
+      HEALTHY_SKIPPED=0
       for node_name in $K8S_WORKER_NODES; do
         # Check if the K8s node name (which is often the private DNS name) is in the list of active ASG instances
         if ! echo "$ACTIVE_ASG_INSTANCE_IDS" | grep -qxF "$node_name"; then
-          log_warning "Potential orphaned node found: $${BOLD}$node_name$${RESET}. Attempting removal..."
+          log_warning "Potential orphaned node found: $${BOLD}$node_name$${RESET}"
+          
+          # Check node health status before deletion
+          NODE_READY_STATUS=$(kubectl --insecure-skip-tls-verify get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+          
+          if [[ "$NODE_READY_STATUS" == "True" ]]; then
+            log_info "Node $${BOLD}$node_name$${RESET} is Ready - skipping deletion to avoid removing healthy nodes"
+            HEALTHY_SKIPPED=$((HEALTHY_SKIPPED + 1))
+            continue
+          else
+            log_warning "Node $${BOLD}$node_name$${RESET} is NotReady/Unknown (status: $NODE_READY_STATUS) - proceeding with cleanup"
+          fi
+          
           ORPHANED_COUNT=$((ORPHANED_COUNT + 1))
 
           log_step "Force deleting pods on $node_name"
@@ -654,7 +674,8 @@ resource "null_resource" "cluster_maintenance" {
           kubectl --insecure-skip-tls-verify delete node "$node_name" --timeout=30s 2>/dev/null || log_warning "   Failed to delete node $node_name"
         fi
       done
-      log_info "Processed $${BOLD}$ORPHANED_COUNT$${RESET} potential orphaned nodes."
+      log_info "Processed $${BOLD}$ORPHANED_COUNT$${RESET} orphaned unhealthy nodes."
+      log_info "Skipped $${BOLD}$HEALTHY_SKIPPED$${RESET} healthy orphaned nodes (preserved to avoid disruption)."
 
       log_subheader "🗑️ Cleaning up stuck terminating pods"
       # 2. Clean up stuck terminating pods
@@ -676,7 +697,7 @@ resource "null_resource" "cluster_maintenance" {
         log_success "No stuck terminating pods found (older than 5 minutes)."
       fi
 
-      log_success "Cluster maintenance checks completed."
+      log_success "Refined cluster maintenance checks completed."
     EOT
   }
 }
@@ -695,7 +716,7 @@ resource "null_resource" "application_setup" {
   triggers = {
     kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
     argocd_installed   = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version      = "v7-enhanced-argocd-apps-deployment" # Enhanced ArgoCD app deployment with global file support
+    setup_version      = "v8-fix-namespace-detection-and-deps" # Fix namespace detection and enhance dependencies
   }
 
   provisioner "local-exec" {
@@ -728,7 +749,7 @@ resource "null_resource" "application_setup" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔐 Application Setup - Namespaces and Secrets v4 (fixed syntax)"
+      log_header "🔐 Application Setup - Namespaces and Secrets v8 (fixed namespace detection)"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -764,6 +785,9 @@ kind: Namespace
 metadata:
   name: $namespace" | kubectl --insecure-skip-tls-verify apply -f - || log_warning "   Failed to create namespace $namespace (may already exist)"
         
+        # Add a small delay for namespace to be ready
+        sleep 2
+        
         if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
           log_success "Namespace: $${BOLD}$namespace$${RESET} ensured"
         else
@@ -794,9 +818,20 @@ metadata:
       for namespace in prod dev; do
         log_subheader "🔑 Ensuring secrets in namespace: $${BOLD}$namespace$${RESET}"
 
-        # Check if namespace exists before trying to create secrets
-        if ! kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
-          log_warning "Namespace $namespace not found, skipping secret creation"
+        # Check if namespace exists before trying to create secrets with retries
+        NAMESPACE_FOUND=false
+        for retry in {1..3}; do
+          if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
+            NAMESPACE_FOUND=true
+            break
+          else
+            log_info "Namespace $namespace not found on attempt $retry, waiting 3 seconds..."
+            sleep 3
+          fi
+        done
+        
+        if [[ "$NAMESPACE_FOUND" != "true" ]]; then
+          log_warning "Namespace $namespace not found after retries, skipping secret creation"
           continue
         fi
 
@@ -833,161 +868,178 @@ metadata:
       # Deploy ArgoCD applications only if ArgoCD is installed
       ARGOCD_NAMESPACE="argocd"
       
-      log_step "Checking if ArgoCD is installed and ready"
-      if ! kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-        log_warning "ArgoCD namespace not found. Skipping application deployment."
+      log_step "Checking if ArgoCD is installed and ready (with retries)"
+      ARGOCD_NAMESPACE_FOUND=false
+      
+      # Enhanced ArgoCD namespace detection with retries
+      for retry in {1..6}; do
+        if kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          log_success "ArgoCD namespace found on attempt $retry"
+          ARGOCD_NAMESPACE_FOUND=true
+          break
+        else
+          log_info "ArgoCD namespace not found on attempt $retry/6, waiting 10 seconds..."
+          if [[ $retry -lt 6 ]]; then
+            sleep 10
+          fi
+        fi
+      done
+      
+      if [[ "$ARGOCD_NAMESPACE_FOUND" != "true" ]]; then
+        log_warning "ArgoCD namespace not found after retries. Skipping application deployment."
         log_info "ArgoCD applications can be deployed manually later with:"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml"
         log_cmd_output "   kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n argocd"
-      else
-        log_success "ArgoCD namespace found. Proceeding with application deployment..."
+        exit 0
+      fi
+      
+      log_success "ArgoCD namespace confirmed. Proceeding with application deployment..."
         
-        # Wait for ArgoCD to be ready with extended timeout and better verification
-        log_step "Waiting for ArgoCD server to be ready (timeout: 120s)"
-        RETRY_COUNT=0
-        MAX_RETRIES=12  # 12 retries * 10 seconds = 2 minutes
-        ARGOCD_READY=false
-        
-        while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-          if kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server >/dev/null 2>&1; then
-            READY_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-            DESIRED_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
-            
-            if [[ "$READY_REPLICAS" == "$DESIRED_REPLICAS" ]] && [[ "$READY_REPLICAS" -gt 0 ]]; then
-              log_success "ArgoCD server is ready ($READY_REPLICAS/$DESIRED_REPLICAS replicas)"
-              ARGOCD_READY=true
-              break
-            else
-              log_info "ArgoCD server not ready yet ($READY_REPLICAS/$DESIRED_REPLICAS), attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
-            fi
-          else
-            log_info "ArgoCD server deployment not found yet, attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
-          fi
+      # Wait for ArgoCD to be ready with extended timeout and better verification
+      log_step "Waiting for ArgoCD server to be ready (timeout: 120s)"
+      RETRY_COUNT=0
+      MAX_RETRIES=12  # 12 retries * 10 seconds = 2 minutes
+      ARGOCD_READY=false
+      
+      while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+        if kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server >/dev/null 2>&1; then
+          READY_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          DESIRED_REPLICAS=$(kubectl --insecure-skip-tls-verify get deployment -n "$ARGOCD_NAMESPACE" argocd-server -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
           
-          RETRY_COUNT=$((RETRY_COUNT + 1))
-          if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
-            sleep 10
+          if [[ "$READY_REPLICAS" == "$DESIRED_REPLICAS" ]] && [[ "$READY_REPLICAS" -gt 0 ]]; then
+            log_success "ArgoCD server is ready ($READY_REPLICAS/$DESIRED_REPLICAS replicas)"
+            ARGOCD_READY=true
+            break
+          else
+            log_info "ArgoCD server not ready yet ($READY_REPLICAS/$DESIRED_REPLICAS), attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+          fi
+        else
+          log_info "ArgoCD server deployment not found yet, attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+        fi
+        
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
+          sleep 10
+        fi
+      done
+      
+      if [[ "$ARGOCD_READY" != "true" ]]; then
+        log_warning "ArgoCD server not ready within timeout, but proceeding with application deployment"
+        log_step "Current ArgoCD pod status:"
+        kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_info "   Could not retrieve pod status"
+      fi
+      
+      # Apply global ArgoCD applications file first (contains all applications)
+      log_step "Applying global ArgoCD applications file"
+      if [[ -f "./k8s/argocd-applications.yaml" ]]; then
+        log_info "Found global applications file: ./k8s/argocd-applications.yaml"
+        if kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml 2>/dev/null; then
+          log_success "Global ArgoCD applications file applied successfully"
+        else
+          log_warning "Failed to apply global ArgoCD applications file - this may be expected during first run"
+          log_info "ArgoCD CRDs may still be initializing. Will try individual files."
+        fi
+      else
+        log_info "Global applications file not found, proceeding with individual application files"
+      fi
+      
+      # Apply individual ArgoCD Applications as backup/supplement
+      log_step "Applying individual MongoDB ArgoCD Application"
+      if [[ -f "./k8s/MongoDB/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+          log_success "MongoDB ArgoCD Application applied successfully"
+        else
+          log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
+        fi
+      else
+        log_info "MongoDB application.yaml not found at ./k8s/MongoDB/application.yaml"
+      fi
+
+      # Check for Polybot application file
+      log_step "Checking for Polybot ArgoCD Application"
+      if [[ -f "./k8s/Polybot/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f ./k8s/Polybot/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+          log_success "Polybot ArgoCD Application applied successfully"
+        else
+          log_warning "Failed to apply Polybot ArgoCD Application (may already exist or CRDs not ready)"
+        fi
+      else
+        log_info "Polybot application.yaml not found - applications should be defined in global argocd-applications.yaml"
+      fi
+
+      # Check for Yolo5 application file (note: directory is Yolo5, not YOLOv5)
+      log_step "Checking for Yolo5 ArgoCD Application"
+      if [[ -f "./k8s/Yolo5/application.yaml" ]]; then
+        if kubectl --insecure-skip-tls-verify apply -f ./k8s/Yolo5/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+          log_success "Yolo5 ArgoCD Application applied successfully"
+        else
+          log_warning "Failed to apply Yolo5 ArgoCD Application (may already exist or CRDs not ready)"
+        fi
+      else
+        log_info "Yolo5 application.yaml not found - applications should be defined in global argocd-applications.yaml"
+      fi
+
+      # Check for any other application.yaml files in subdirectories
+      log_step "Scanning for additional ArgoCD applications"
+      if find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" >/dev/null 2>&1; then
+        find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" | while read -r app_file; do
+          app_name=$(basename "$(dirname "$app_file")")
+          log_step "Applying $app_name ArgoCD Application"
+          if kubectl --insecure-skip-tls-verify apply -f "$app_file" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
+            log_success "$app_name ArgoCD Application applied successfully"
+          else
+            log_warning "Failed to apply $app_name ArgoCD Application (may already exist or CRDs not ready)"
           fi
         done
+      else
+        log_info "No additional individual ArgoCD application files found"
+      fi
+      
+      # Wait a moment for applications to be processed
+      log_step "Waiting for ArgoCD to process applications (10 seconds)"
+      sleep 10
+      
+      log_subheader "🔍 Verifying ArgoCD Applications"
+      log_step "Checking if ArgoCD Application CRD is available"
+      if kubectl --insecure-skip-tls-verify get crd applications.argoproj.io >/dev/null 2>&1; then
+        log_success "ArgoCD Application CRD is available"
         
-        if [[ "$ARGOCD_READY" != "true" ]]; then
-          log_warning "ArgoCD server not ready within timeout, but proceeding with application deployment"
-          log_step "Current ArgoCD pod status:"
-          kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" 2>/dev/null || log_info "   Could not retrieve pod status"
-        fi
-        
-        # Apply global ArgoCD applications file first (contains all applications)
-        log_step "Applying global ArgoCD applications file"
-        if [[ -f "./k8s/argocd-applications.yaml" ]]; then
-          log_info "Found global applications file: ./k8s/argocd-applications.yaml"
-          if kubectl --insecure-skip-tls-verify apply -f ./k8s/argocd-applications.yaml 2>/dev/null; then
-            log_success "Global ArgoCD applications file applied successfully"
+        log_step "Listing deployed ArgoCD applications"
+        if kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+          APPLICATIONS=$(kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
+          if [[ "$APPLICATIONS" -gt 0 ]]; then
+            log_success "Found $APPLICATIONS ArgoCD applications deployed"
+            log_info "Application details:"
+            kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REPO:.spec.source.repoURL" --no-headers 2>/dev/null | while read -r name sync health repo; do
+              if [[ -n "$name" ]]; then
+                sync=$${sync:-"Unknown"}
+                health=$${health:-"Unknown"}
+                log_info "   • $${BOLD}$name$${RESET} - Sync: $sync, Health: $health"
+              fi
+            done || log_info "   (Could not retrieve application details)"
           else
-            log_warning "Failed to apply global ArgoCD applications file - this may be expected during first run"
-            log_info "ArgoCD CRDs may still be initializing. Will try individual files."
+            log_warning "No ArgoCD applications found after deployment attempts"
+            log_info "This may be normal if ArgoCD is still initializing"
+            log_info "Check ArgoCD controller logs: kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller"
           fi
         else
-          log_info "Global applications file not found, proceeding with individual application files"
+          log_warning "Unable to list ArgoCD applications"
         fi
-        
-        # Apply individual ArgoCD Applications as backup/supplement
-        log_step "Applying individual MongoDB ArgoCD Application"
-        if [[ -f "./k8s/MongoDB/application.yaml" ]]; then
-          if kubectl --insecure-skip-tls-verify apply -f ./k8s/MongoDB/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
-            log_success "MongoDB ArgoCD Application applied successfully"
-          else
-            log_warning "Failed to apply MongoDB ArgoCD Application (may already exist or CRDs not ready)"
-          fi
-        else
-          log_info "MongoDB application.yaml not found at ./k8s/MongoDB/application.yaml"
-        fi
-
-        # Check for Polybot application file
-        log_step "Checking for Polybot ArgoCD Application"
-        if [[ -f "./k8s/Polybot/application.yaml" ]]; then
-          if kubectl --insecure-skip-tls-verify apply -f ./k8s/Polybot/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
-            log_success "Polybot ArgoCD Application applied successfully"
-          else
-            log_warning "Failed to apply Polybot ArgoCD Application (may already exist or CRDs not ready)"
-          fi
-        else
-          log_info "Polybot application.yaml not found - applications should be defined in global argocd-applications.yaml"
-        fi
-
-        # Check for Yolo5 application file (note: directory is Yolo5, not YOLOv5)
-        log_step "Checking for Yolo5 ArgoCD Application"
-        if [[ -f "./k8s/Yolo5/application.yaml" ]]; then
-          if kubectl --insecure-skip-tls-verify apply -f ./k8s/Yolo5/application.yaml -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
-            log_success "Yolo5 ArgoCD Application applied successfully"
-          else
-            log_warning "Failed to apply Yolo5 ArgoCD Application (may already exist or CRDs not ready)"
-          fi
-        else
-          log_info "Yolo5 application.yaml not found - applications should be defined in global argocd-applications.yaml"
-        fi
-
-        # Check for any other application.yaml files in subdirectories
-        log_step "Scanning for additional ArgoCD applications"
-        if find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" >/dev/null 2>&1; then
-          find ./k8s -name "application.yaml" -type f | grep -v -E "(MongoDB|Polybot|Yolo5)" | while read -r app_file; do
-            app_name=$(basename "$(dirname "$app_file")")
-            log_step "Applying $app_name ArgoCD Application"
-            if kubectl --insecure-skip-tls-verify apply -f "$app_file" -n "$ARGOCD_NAMESPACE" 2>/dev/null; then
-              log_success "$app_name ArgoCD Application applied successfully"
-            else
-              log_warning "Failed to apply $app_name ArgoCD Application (may already exist or CRDs not ready)"
-            fi
-          done
-        else
-          log_info "No additional individual ArgoCD application files found"
-        fi
-        
-        # Wait a moment for applications to be processed
-        log_step "Waiting for ArgoCD to process applications (10 seconds)"
-        sleep 10
-        
-        log_subheader "🔍 Verifying ArgoCD Applications"
-        log_step "Checking if ArgoCD Application CRD is available"
-        if kubectl --insecure-skip-tls-verify get crd applications.argoproj.io >/dev/null 2>&1; then
-          log_success "ArgoCD Application CRD is available"
-          
-          log_step "Listing deployed ArgoCD applications"
-          if kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
-            APPLICATIONS=$(kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
-            if [[ "$APPLICATIONS" -gt 0 ]]; then
-              log_success "Found $APPLICATIONS ArgoCD applications deployed"
-              log_info "Application details:"
-              kubectl --insecure-skip-tls-verify get applications -n "$ARGOCD_NAMESPACE" -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REPO:.spec.source.repoURL" --no-headers 2>/dev/null | while read -r name sync health repo; do
-                if [[ -n "$name" ]]; then
-                  sync=$${sync:-"Unknown"}
-                  health=$${health:-"Unknown"}
-                  log_info "   • $${BOLD}$name$${RESET} - Sync: $sync, Health: $health"
-                fi
-              done || log_info "   (Could not retrieve application details)"
-            else
-              log_warning "No ArgoCD applications found after deployment attempts"
-              log_info "This may be normal if ArgoCD is still initializing"
-              log_info "Check ArgoCD controller logs: kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller"
-            fi
-          else
-            log_warning "Unable to list ArgoCD applications"
-          fi
-        else
-          log_warning "ArgoCD Application CRD not yet available - ArgoCD may still be initializing"
-          log_info "You can check status later with: kubectl get applications -n argocd"
-        fi
-        
-        log_subheader "🔍 ArgoCD Application Controller Status"
-        log_step "Checking ArgoCD application controller pod status"
-        APP_CONTROLLER_PODS=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller --no-headers 2>/dev/null | wc -l || echo "0")
-        if [[ "$APP_CONTROLLER_PODS" -gt 0 ]]; then
-          log_success "Found $APP_CONTROLLER_PODS ArgoCD application controller pod(s)"
-          kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller 2>/dev/null | while read -r line; do
-            log_info "   $line"
-          done || true
-        else
-          log_warning "No ArgoCD application controller pods found"
-        fi
+      else
+        log_warning "ArgoCD Application CRD not yet available - ArgoCD may still be initializing"
+        log_info "You can check status later with: kubectl get applications -n argocd"
+      fi
+      
+      log_subheader "🔍 ArgoCD Application Controller Status"
+      log_step "Checking ArgoCD application controller pod status"
+      APP_CONTROLLER_PODS=$(kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller --no-headers 2>/dev/null | wc -l || echo "0")
+      if [[ "$APP_CONTROLLER_PODS" -gt 0 ]]; then
+        log_success "Found $APP_CONTROLLER_PODS ArgoCD application controller pod(s)"
+        kubectl --insecure-skip-tls-verify get pods -n "$ARGOCD_NAMESPACE" -l app.kubernetes.io/name=argocd-application-controller 2>/dev/null | while read -r line; do
+          log_info "   $line"
+        done || true
+      else
+        log_warning "No ArgoCD application controller pods found"
       fi
 
       log_success "Application setup and ArgoCD deployment completed successfully"
