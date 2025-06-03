@@ -112,7 +112,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
     control_plane_id = module.k8s-cluster.control_plane_instance_id_output
     secret_name      = module.k8s-cluster.kubeconfig_secret_name_output
     region           = var.region
-    script_version   = "v5-bash-syntax-corrected" # Fixed bash variable syntax
+    script_version   = "v6-retry-logic-added" # Added retry logic for secret retrieval
   }
 
   provisioner "local-exec" {
@@ -143,7 +143,7 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
       log_progress() { echo -e "$${YELLOW}⏳ $1...$${RESET}"; }
       log_cmd_output() { echo -e "$${WHITE}$1$${RESET}"; }
       
-      log_header "🔧 Ensuring Local Kubeconfig Availability"
+      log_header "🔧 Waiting for Kubeconfig Secret (with retry logic)"
       
       KUBECONFIG_PATH="${local.kubeconfig_path}"
       SECRET_NAME="${module.k8s-cluster.kubeconfig_secret_name_output}"
@@ -174,16 +174,65 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
         log_warning "Local kubeconfig file not found - creating"
       fi
       
-      log_subheader "📥 Downloading Fresh Kubeconfig"
-      log_progress "Downloading kubeconfig from Secrets Manager"
-      KUBECONFIG_CONTENT=$(aws secretsmanager get-secret-value \
-        --secret-id "$SECRET_NAME" \
-        --region "$REGION" \
-        --query SecretString \
-        --output text)
+      log_subheader "📥 Downloading Fresh Kubeconfig (with retry logic)"
+      log_info "Attempting to download kubeconfig from Secrets Manager for secret: $${BOLD}$SECRET_NAME$${RESET}"
       
+      # Retry logic configuration
+      KUBECONFIG_CONTENT=""
+      MAX_RETRIES=36  # 36 retries * 10 seconds = 6 minutes total wait time
+      RETRY_COUNT=0
+      SLEEP_DURATION=10  # seconds between retries
+      
+      log_progress "Starting retry loop (max $MAX_RETRIES attempts, $SLEEP_DURATION second intervals)"
+      
+      while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        log_step "Attempt $RETRY_COUNT/$MAX_RETRIES: Fetching secret from AWS Secrets Manager"
+        
+        # Capture both stdout and stderr, and the exit code
+        # Temporarily disable set -e for this command to handle errors manually
+        set +e
+        AWS_CLI_OUTPUT=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_NAME" \
+          --region "$REGION" \
+          --query SecretString \
+          --output text 2>&1)
+        AWS_CLI_EXIT_CODE=$?
+        set -e  # Re-enable set -e
+        
+        if [[ $AWS_CLI_EXIT_CODE -eq 0 ]]; then
+          KUBECONFIG_CONTENT="$AWS_CLI_OUTPUT"
+          log_success "Successfully retrieved kubeconfig content on attempt $RETRY_COUNT"
+          break
+        else
+          log_warning "Attempt $RETRY_COUNT/$MAX_RETRIES failed. AWS CLI exit code: $AWS_CLI_EXIT_CODE"
+          
+          # Check if it's a ResourceNotFoundException specifically
+          if echo "$AWS_CLI_OUTPUT" | grep -q "ResourceNotFoundException"; then
+            log_info "Secret not found yet (ResourceNotFoundException) - this is expected during initial cluster setup"
+          else
+            log_warning "Unexpected error from AWS CLI:"
+            log_cmd_output "$AWS_CLI_OUTPUT"
+          fi
+          
+          if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
+            log_progress "Waiting $SLEEP_DURATION seconds before next attempt..."
+            sleep $SLEEP_DURATION
+          else
+            log_error "All $MAX_RETRIES attempts failed. Could not retrieve secret: $SECRET_NAME"
+            log_error "This may indicate:"
+            log_error "  • Control plane hasn't finished creating/uploading the kubeconfig secret yet"
+            log_error "  • IAM permissions issue preventing access to Secrets Manager"
+            log_error "  • Network connectivity issue to AWS Secrets Manager"
+            log_error "  • Incorrect secret name or region"
+            break
+          fi
+        fi
+      done
+      
+      # Process the retrieved kubeconfig content
       if [[ -n "$KUBECONFIG_CONTENT" ]] && echo "$KUBECONFIG_CONTENT" | grep -q "apiVersion"; then
-        log_success "Retrieved valid kubeconfig from Secrets Manager"
+        log_success "Retrieved valid kubeconfig from Secrets Manager after $RETRY_COUNT attempts"
         
         log_step "Creating directory if it doesn't exist"
         mkdir -p "$(dirname "$KUBECONFIG_PATH")"
@@ -201,7 +250,13 @@ resource "null_resource" "wait_for_kubeconfig_secret" {
           log_warning "New kubeconfig created but connectivity test failed (may be temporary)"
         fi
       else
-        log_error "Failed to retrieve valid kubeconfig from Secrets Manager"
+        log_error "Failed to retrieve valid kubeconfig from Secrets Manager after $MAX_RETRIES attempts"
+        log_error "Last AWS CLI output: $AWS_CLI_OUTPUT"
+        log_info "Troubleshooting steps:"
+        log_info "  1. Check that the control plane instance is running and has completed bootstrap"
+        log_info "  2. Verify IAM permissions for Secrets Manager access"
+        log_info "  3. Confirm the secret name '$SECRET_NAME' matches what the control plane creates"
+        log_info "  4. Check AWS Secrets Manager console in region '$REGION'"
         exit 1
       fi
     EOT
