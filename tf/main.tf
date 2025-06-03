@@ -962,25 +962,12 @@ resource "null_resource" "application_setup" {
         # ===== DOCKER REGISTRY CREDENTIALS =====
         log_step "Creating docker-registry-credentials secret"
         
-        # Prepare Docker credentials - try to get from AWS secret first, fallback to placeholder
+        # Prepare Docker credentials
         DOCKER_USERNAME="placeholder-docker-username"
         DOCKER_PASSWORD="placeholder-docker-password"
         
-        # If we successfully fetched AWS secrets (for prod namespace), try to extract docker credentials
-        if [[ "$namespace" == "prod" && -n "$POLYBOT_SECRET_JSON" ]]; then
-          AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_USERNAME // ""' 2>/dev/null)
-          AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_PASSWORD // ""' 2>/dev/null)
-          
-          if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" ]]; then
-            DOCKER_USERNAME="$AWS_DOCKER_USERNAME"
-            log_info "Using Docker username from AWS Secrets Manager"
-          fi
-          
-          if [[ -n "$AWS_DOCKER_PASSWORD" && "$AWS_DOCKER_PASSWORD" != "null" ]]; then
-            DOCKER_PASSWORD="$AWS_DOCKER_PASSWORD"
-            log_info "Using Docker password from AWS Secrets Manager"
-          fi
-        fi
+        # For prod namespace: Get credentials from AWS secret if available (will be set later in the script)
+        # For other namespaces: Use placeholder values
         
         # Create the docker auth string
         DOCKER_AUTH_ENCODED=$(echo -n "$${DOCKER_USERNAME}:$${DOCKER_PASSWORD}" | base64 -w0)
@@ -1003,7 +990,7 @@ EOF_DOCKER_SECRET
         if [ $? -eq 0 ]; then 
           log_success "docker-registry-credentials secret created/configured in $namespace"
           if [[ "$DOCKER_USERNAME" == "placeholder-docker-username" ]]; then
-            log_warning "Using placeholder Docker credentials. Update if using private registry."
+            log_warning "Using placeholder Docker credentials. Will be updated for prod namespace if AWS secret contains DOCKERHUB credentials."
           fi
         else 
           log_warning "Failed to create/configure docker-registry-credentials in $namespace"
@@ -1163,6 +1150,44 @@ EOF_DOCKER_SECRET
               else
                 log_error "Failed to create Kubernetes secret 'prod/polybot-secrets'."
                 exit 1
+              fi
+              
+              # ===== UPDATE DOCKER REGISTRY CREDENTIALS FOR PROD =====
+              log_step "Updating Docker registry credentials for prod namespace with AWS secret values"
+              
+              # Extract Docker credentials from AWS secret
+              AWS_DOCKER_USERNAME=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_USERNAME // ""' 2>/dev/null)
+              AWS_DOCKER_PASSWORD=$(echo "$POLYBOT_SECRET_JSON" | jq -r '.DOCKERHUB_PASSWORD // ""' 2>/dev/null)
+              
+              if [[ -n "$AWS_DOCKER_USERNAME" && "$AWS_DOCKER_USERNAME" != "null" && -n "$AWS_DOCKER_PASSWORD" && "$AWS_DOCKER_PASSWORD" != "null" ]]; then
+                log_info "Found Docker credentials in AWS secret - updating docker-registry-credentials for prod"
+                
+                # Create updated docker auth string
+                DOCKER_AUTH_ENCODED=$(echo -n "$${AWS_DOCKER_USERNAME}:$${AWS_DOCKER_PASSWORD}" | base64 -w0)
+                DOCKERCONFIGJSON="{\"auths\":{\"https://index.docker.io/v1/\":{\"auth\":\"$DOCKER_AUTH_ENCODED\"}}}"
+                
+                # Delete existing secret and recreate with real credentials
+                kubectl --insecure-skip-tls-verify delete secret docker-registry-credentials -n prod --ignore-not-found=true 2>/dev/null
+                
+                # Create the secret using kubectl apply with YAML
+                cat <<EOF_DOCKER_SECRET | kubectl --insecure-skip-tls-verify apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: docker-registry-credentials
+  namespace: prod
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $(echo -n "$DOCKERCONFIGJSON" | base64 -w0)
+EOF_DOCKER_SECRET
+                if [ $? -eq 0 ]; then 
+                  log_success "docker-registry-credentials secret updated in prod with real AWS credentials"
+                else 
+                  log_warning "Failed to update docker-registry-credentials in prod"
+                fi
+              else
+                log_warning "DOCKERHUB_USERNAME or DOCKERHUB_PASSWORD not found in AWS secret - keeping placeholder Docker credentials for prod"
+                log_info "Add DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD to your AWS secret 'polybot-secrets' for private registry access"
               fi
             else
               log_error "No secret data prepared for prod/polybot-secrets. Both AWS fetch and Terraform variables failed."

@@ -552,6 +552,25 @@ resource "aws_iam_role_policy" "worker_secrets_manager_policy" {
   policy = data.aws_iam_policy_document.worker_secrets_manager_policy_doc.json
 }
 
+# Worker nodes need Secrets Manager access to retrieve polybot application secrets
+data "aws_iam_policy_document" "worker_polybot_secrets_policy_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "secretsmanager:GetSecretValue"
+    ]
+    resources = [
+      "arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:polybot-secrets-*"
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "worker_polybot_secrets_policy" {
+  name   = "${var.cluster_name}-worker-polybot-secrets-policy"
+  role   = aws_iam_role.worker_role.id
+  policy = data.aws_iam_policy_document.worker_polybot_secrets_policy_doc.json
+}
+
 resource "aws_iam_instance_profile" "worker_profile" {
   name = "${var.cluster_name}-worker-profile"
   role = aws_iam_role.worker_role.name

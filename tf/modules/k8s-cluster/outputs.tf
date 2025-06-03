@@ -197,6 +197,16 @@ output "control_plane_iam_role_arn" {
   value       = aws_iam_role.control_plane_role.arn
 }
 
+output "worker_iam_role_arn" {
+  description = "ARN of the IAM role for worker nodes" #OUTPUT
+  value       = aws_iam_role.worker_role.arn
+}
+
+output "worker_iam_role_name" {
+  description = "Name of the IAM role for worker nodes" #OUTPUT
+  value       = aws_iam_role.worker_role.name
+}
+
 output "control_plane_instance" {
   description = "Control plane EC2 instance resource" #OUTPUT
   value       = aws_instance.control_plane
