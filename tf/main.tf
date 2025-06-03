@@ -409,7 +409,7 @@ resource "null_resource" "cluster_readiness_check" {
   triggers = {
     kubeconfig_file_id    = local_file.kubeconfig.id # Trigger when kubeconfig file changes
     kubeconfig_ensured    = null_resource.ensure_local_kubeconfig.id # Trigger when kubeconfig is ensured
-    readiness_version     = "v9-tls-fix-applied"
+    readiness_version     = "v10-create-namespaces"
   }
   
   provisioner "local-exec" {
@@ -442,7 +442,7 @@ resource "null_resource" "cluster_readiness_check" {
 
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔍 Enhanced Cluster Readiness Check v7"
+      log_header "🔍 Enhanced Cluster Readiness Check v10 (Create Namespaces)"
 
       log_subheader "📊 Debug Information"
       log_info "Kubeconfig file: $${BOLD}$KUBECONFIG$${RESET}"
@@ -472,6 +472,16 @@ resource "null_resource" "cluster_readiness_check" {
       log_subheader "🔗 Testing kubectl connectivity"
       if kubectl --insecure-skip-tls-verify get nodes >/dev/null 2>/dev/null; then
         log_success "Kubectl connectivity confirmed"
+        
+        # Create essential namespaces immediately after connectivity is confirmed
+        log_subheader "🏗️ Creating essential namespaces"
+        for ns in argocd prod dev; do
+          if kubectl --insecure-skip-tls-verify create namespace "$ns" 2>/dev/null; then
+            log_success "Created namespace: $ns"
+          else
+            log_info "Namespace $ns already exists"
+          fi
+        done
         
         log_subheader "📋 Current cluster state"
         log_cmd_output "$(kubectl --insecure-skip-tls-verify get nodes -o wide 2>/dev/null || echo "Failed to get detailed node info")"
@@ -581,7 +591,7 @@ resource "null_resource" "cluster_maintenance" {
   triggers = {
     cluster_ready_id    = null_resource.cluster_readiness_check.id
     kubeconfig_ensured  = null_resource.ensure_local_kubeconfig.id # Added trigger
-    maintenance_version = "v5-refined-worker-deletion-logic"
+    maintenance_version = "v6-fixed-node-processing"
   }
 
   provisioner "local-exec" {
@@ -643,7 +653,8 @@ resource "null_resource" "cluster_maintenance" {
 
       ORPHANED_COUNT=0
       HEALTHY_SKIPPED=0
-      for node_name in $K8S_WORKER_NODES; do
+      while IFS= read -r node_name; do
+        [[ -z "$node_name" ]] && continue
         # Check if the K8s node name (which is often the private DNS name) is in the list of active ASG instances
         if ! echo "$ACTIVE_ASG_INSTANCE_IDS" | grep -qxF "$node_name"; then
           log_warning "Potential orphaned node found: $${BOLD}$node_name$${RESET}"
@@ -673,7 +684,7 @@ resource "null_resource" "cluster_maintenance" {
           # Remove the node from Kubernetes
           kubectl --insecure-skip-tls-verify delete node "$node_name" --timeout=30s 2>/dev/null || log_warning "   Failed to delete node $node_name"
         fi
-      done
+      done <<< "$K8S_WORKER_NODES"
       log_info "Processed $${BOLD}$ORPHANED_COUNT$${RESET} orphaned unhealthy nodes."
       log_info "Skipped $${BOLD}$HEALTHY_SKIPPED$${RESET} healthy orphaned nodes (preserved to avoid disruption)."
 
@@ -709,14 +720,12 @@ resource "null_resource" "cluster_maintenance" {
 # Essential namespace and secret creation
 resource "null_resource" "application_setup" {
   depends_on = [
-    null_resource.ensure_local_kubeconfig, # Ensure kubeconfig is available
-    null_resource.install_argocd           # Ensure ArgoCD is installed before deploying applications
+    null_resource.cluster_readiness_check # Ensure cluster is ready and namespaces exist
   ]
   
   triggers = {
-    kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
-    argocd_installed   = try(null_resource.install_argocd[0].id, "skipped") # Trigger when ArgoCD changes
-    setup_version      = "v8-fix-namespace-detection-and-deps" # Fix namespace detection and enhance dependencies
+    cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
+    setup_version    = "v10-fixed-dependencies" # Fixed circular dependency
   }
 
   provisioner "local-exec" {
@@ -749,7 +758,7 @@ resource "null_resource" "application_setup" {
       
       export KUBECONFIG="${local.kubeconfig_path}"
 
-      log_header "🔐 Application Setup - Namespaces and Secrets v8 (fixed namespace detection)"
+      log_header "🔐 Application Setup v9 (verify namespaces created by cluster_readiness_check)"
 
       log_subheader "🔗 Checking cluster connectivity"
       # Check kubectl connectivity with graceful handling
@@ -774,24 +783,14 @@ resource "null_resource" "application_setup" {
 
       log_success "Cluster connectivity confirmed. Proceeding with application setup..."
 
-      log_subheader "📁 Creating namespaces"
-      # Create namespaces idempotently
-      log_step "Creating namespaces (if they don't exist)"
+      log_subheader "📁 Verifying namespaces"
+      # Verify namespaces exist (created by cluster_readiness_check)
+      log_step "Verifying namespaces exist (created by cluster_readiness_check)"
       for namespace in prod dev; do
-        log_progress "Processing namespace: $${BOLD}$namespace$${RESET}"
-        # Use apply for idempotency
-        echo "apiVersion: v1
-kind: Namespace
-metadata:
-  name: $namespace" | kubectl --insecure-skip-tls-verify apply -f - || log_warning "   Failed to create namespace $namespace (may already exist)"
-        
-        # Add a small delay for namespace to be ready
-        sleep 2
-        
         if kubectl --insecure-skip-tls-verify get namespace "$namespace" >/dev/null 2>&1; then
-          log_success "Namespace: $${BOLD}$namespace$${RESET} ensured"
+          log_success "Namespace: $${BOLD}$namespace$${RESET} confirmed"
         else
-          log_warning "Namespace: $${BOLD}$namespace$${RESET} verification failed"
+          log_warning "Namespace: $${BOLD}$namespace$${RESET} not found - may need to wait for cluster_readiness_check"
         fi
       done
 
@@ -1058,7 +1057,7 @@ resource "null_resource" "install_argocd" {
   depends_on = [null_resource.ensure_local_kubeconfig] # Changed to depend on kubeconfig being ensured
 
   triggers = {
-    kubeconfig_ensured = null_resource.ensure_local_kubeconfig.id # Changed trigger
+    cluster_ready_id = null_resource.cluster_readiness_check.id # Trigger when cluster and namespaces are ready
     argocd_version     = "v6-tls-fix-applied"
   }
 
@@ -1124,7 +1123,7 @@ resource "null_resource" "install_argocd" {
       # Check if ArgoCD namespace exists
       if ! kubectl --insecure-skip-tls-verify get namespace "$ARGOCD_NAMESPACE" >/dev/null 2>&1; then
         log_step "Creating ArgoCD namespace: $${BOLD}$ARGOCD_NAMESPACE$${RESET}"
-        kubectl --insecure-skip-tls-verify create namespace "$ARGOCD_NAMESPACE" || log_warning "   Failed to create namespace (may already exist)"
+        log_info "ArgoCD namespace should exist from cluster_readiness_check"
       else
         log_info "ArgoCD namespace '$${BOLD}$ARGOCD_NAMESPACE$${RESET}' already exists."
       fi
